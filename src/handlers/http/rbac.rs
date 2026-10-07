@@ -140,6 +140,7 @@ pub async fn post_user(
     let userid = userid.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
     validator::user_role_name(&userid)?;
+    let _guard = UPDATE_LOCK.lock().await;
     let mut metadata = get_metadata(&tenant_id).await?;
 
     let user_roles: HashSet<String> = if let Some(body) = body {
@@ -159,7 +160,23 @@ pub async fn post_user(
     if !non_existent_roles.is_empty() {
         return Err(RBACError::RolesDoNotExist(non_existent_roles));
     }
-    let _guard = UPDATE_LOCK.lock().await;
+    if metadata
+        .users
+        .iter()
+        .any(|user| user.protected && !user.roles.is_disjoint(&user_roles))
+    {
+        return Err(RBACError::ProtectedRole);
+    }
+    if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
+        && user_roles.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &rbac::role::model::RoleType::Internal
+                    || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(RBACError::ProtectedRole);
+    }
     if Users.contains(&userid, &tenant_id)
         || metadata.users.iter().any(|user| match &user.ty {
             UserType::Native(basic) => basic.username == userid,
@@ -171,21 +188,12 @@ pub async fn post_user(
         return Err(RBACError::UserExists(userid));
     }
 
-    let (user, password) = user::User::new_basic(userid.clone(), tenant_id.clone(), false);
-
+    let (mut user, password) = user::User::new_basic(userid.clone(), tenant_id.clone(), false);
+    user.roles = user_roles;
     metadata.users.push(user.clone());
 
     put_metadata(&metadata, &tenant_id).await?;
-    let created_role = user_roles.clone();
-    Users.put_user(user.clone());
-    if !created_role.is_empty() {
-        add_roles_to_user(
-            req,
-            web::Path::<String>::from(userid.clone()),
-            web::Json(created_role),
-        )
-        .await?;
-    }
+    Users.put_user(user);
     Ok(password)
 }
 
@@ -329,6 +337,20 @@ pub fn get_role_internal(
     let res = RolesResponse {
         direct_roles,
         group_roles,
+        oidc: Users.get_user(userid, tenant_id).and_then(|user| {
+            let UserType::OAuth(oauth) = user.ty else {
+                return None;
+            };
+            let grants = oauth.role_grants;
+            Some(json!({
+                "issuer": oauth.issuer,
+                "legacy": grants.is_none(),
+                "groups": grants.as_ref().map(|g| &g.observed_groups),
+                "manualRoles": grants.as_ref().map(|g| &g.manual_roles),
+                "providerRoles": grants.as_ref().map(|g| &g.provider_roles),
+                "defaultRole": grants.as_ref().and_then(|g| g.default_role.as_ref()),
+            }))
+        }),
     };
     Ok(serde_json::to_value(res)?)
 }
@@ -387,6 +409,7 @@ pub async fn add_roles_to_user(
     let userid = userid.into_inner();
     let roles_to_add = roles_to_add.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
+    let _guard = UPDATE_LOCK.lock().await;
     let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     if !Users.contains(&userid, &tenant_id) {
         return Err(RBACError::UserDoesNotExist);
@@ -420,6 +443,17 @@ pub async fn add_roles_to_user(
         return Err(RBACError::UserDoesNotExist);
     };
 
+    if let Some(tenant_roles) = roles().get(tenant_str)
+        && roles_to_add.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &rbac::role::model::RoleType::Internal
+                    || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(RBACError::ProtectedRole);
+    }
+
     let mut non_existent_roles = Vec::new();
 
     // check if the role exists
@@ -442,7 +476,9 @@ pub async fn add_roles_to_user(
         .iter_mut()
         .find(|user| user.userid() == userid)
     {
-        user.roles.extend(roles_to_add.clone());
+        let mut manual = user.manual_roles();
+        manual.extend(roles_to_add.clone());
+        user.set_manual_roles(manual);
     } else {
         // should be unreachable given state is always consistent
         return Err(RBACError::UserDoesNotExist);
@@ -464,6 +500,7 @@ pub async fn remove_roles_from_user(
     let userid = userid.into_inner();
     let roles_to_remove = roles_to_remove.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
+    let _guard = UPDATE_LOCK.lock().await;
     if !Users.contains(&userid, &tenant_id) {
         return Err(RBACError::UserDoesNotExist);
     };
@@ -516,9 +553,13 @@ pub async fn remove_roles_from_user(
         .iter_mut()
         .find(|user| user.userid() == userid)
     {
-        let diff: HashSet<String> =
-            HashSet::from_iter(user.roles.difference(&roles_to_remove).cloned());
-        user.roles = diff;
+        let manual = user.manual_roles();
+        if !roles_to_remove.is_subset(&manual) {
+            return Err(RBACError::RolesManagedByOidc);
+        }
+        user.set_manual_roles(HashSet::from_iter(
+            manual.difference(&roles_to_remove).cloned(),
+        ));
     } else {
         // should be unreachable given state is always consistent
         return Err(RBACError::UserDoesNotExist);
@@ -572,6 +613,10 @@ pub enum RBACError {
     RolesDoNotExist(Vec<String>),
     #[error("Roles have not been assigned: {0:?}")]
     RolesNotAssigned(Vec<String>),
+    #[error(
+        "Provider and default OIDC roles cannot be removed as manual grants; change the identity-provider group or default role instead."
+    )]
+    RolesManagedByOidc,
     #[error("{0:?}")]
     InvalidUserGroupRequest(Box<InvalidUserGroupError>),
     #[error("{0}")]
@@ -601,6 +646,7 @@ impl actix_web::ResponseError for RBACError {
             Self::UserGroupDoesNotExist(_) => StatusCode::BAD_REQUEST,
             Self::RolesDoNotExist(_) => StatusCode::BAD_REQUEST,
             Self::RolesNotAssigned(_) => StatusCode::BAD_REQUEST,
+            Self::RolesManagedByOidc => StatusCode::BAD_REQUEST,
             Self::InvalidUserGroupRequest(_) => StatusCode::BAD_REQUEST,
             Self::InvalidSyncOperation(_) => StatusCode::BAD_REQUEST,
             Self::UserGroupNotEmpty(_) => StatusCode::BAD_REQUEST,
@@ -639,4 +685,6 @@ pub struct RolesResponse {
     #[serde(rename = "roles")]
     pub direct_roles: HashMap<String, Role>,
     pub group_roles: HashMap<String, HashMap<String, Role>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<serde_json::Value>,
 }

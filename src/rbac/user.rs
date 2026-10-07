@@ -159,7 +159,9 @@ impl User {
     ) -> Self {
         Self {
             ty: UserType::OAuth(Box::new(OAuth {
-                userid: user_info.sub.clone().unwrap_or(userid),
+                userid,
+                issuer: None,
+                role_grants: None,
                 user_info,
                 bearer,
             })),
@@ -225,6 +227,33 @@ impl User {
 
     pub fn is_super_admin(&self) -> bool {
         self.roles.contains("super-admin")
+    }
+
+    /// Explicit administrative grants, excluding provider/default grants.
+    /// Legacy OAuth users have no provenance, so administrative edits treat
+    /// their flat roles as manual; this keeps adds non-destructive and lets
+    /// any assigned role be revoked.
+    pub fn manual_roles(&self) -> HashSet<String> {
+        match &self.ty {
+            UserType::OAuth(oauth) => oauth
+                .role_grants
+                .as_ref()
+                .map_or_else(|| self.roles.clone(), |grants| grants.manual_roles.clone()),
+            _ => self.roles.clone(),
+        }
+    }
+
+    pub fn set_manual_roles(&mut self, roles: HashSet<String>) {
+        match &mut self.ty {
+            UserType::OAuth(oauth) => {
+                let grants = oauth
+                    .role_grants
+                    .get_or_insert_with(OAuthRoleGrants::default);
+                grants.manual_roles = roles;
+                self.roles = grants.effective_roles();
+            }
+            _ => self.roles = roles,
+        }
     }
 
     pub fn roles(&self) -> Vec<String> {
@@ -326,6 +355,35 @@ pub struct OAuth {
     pub userid: String,
     pub user_info: UserInfo,
     pub bearer: Option<Bearer>,
+    /// Verified OIDC issuer. Legacy records have no binding until reauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Provenance for the effective roles stored on `User`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_grants: Option<OAuthRoleGrants>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OAuthRoleGrants {
+    #[serde(default)]
+    pub observed_groups: HashSet<String>,
+    #[serde(default)]
+    pub manual_roles: HashSet<String>,
+    #[serde(default)]
+    pub provider_roles: HashSet<String>,
+    #[serde(default)]
+    pub default_role: Option<String>,
+}
+
+impl OAuthRoleGrants {
+    pub fn effective_roles(&self) -> HashSet<String> {
+        let mut roles = self.manual_roles.clone();
+        roles.extend(self.provider_roles.iter().cloned());
+        if roles.is_empty() {
+            roles.extend(self.default_role.iter().cloned());
+        }
+        roles
+    }
 }
 
 impl AsRef<Bearer> for Box<OAuth> {

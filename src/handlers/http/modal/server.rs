@@ -691,6 +691,11 @@ impl Server {
                 // PUT and GET Default Role
                 resource("/default")
                     .route(web::put().to(role::put_default).authorize(Action::PutRole))
+                    .route(
+                        web::delete()
+                            .to(role::delete_default)
+                            .authorize(Action::PutRole),
+                    )
                     .route(web::get().to(role::get_default).authorize(Action::GetRole)),
             )
             .service(

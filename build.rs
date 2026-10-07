@@ -16,6 +16,9 @@
  *
  */
 
+#[path = "build_support/community_ui.rs"]
+mod community_ui;
+
 use anyhow::Result;
 use vergen_gitcl::{
     BuildBuilder, CargoBuilder, Emitter, GitclBuilder, RustcBuilder, SysinfoBuilder,
@@ -65,6 +68,7 @@ mod ui {
     }
 
     pub fn setup() -> io::Result<()> {
+        println!("cargo:rerun-if-env-changed=LOCAL_ASSETS_PATH");
         let cargo_manifest_dir = PathBuf::from(env::var(CARGO_MANIFEST_DIR).unwrap());
         let cargo_toml = cargo_manifest_dir.join("Cargo.toml");
         let out_dir = PathBuf::from(env::var(OUT_DIR).unwrap());
@@ -98,50 +102,53 @@ mod ui {
             }
         }
 
-        // If UI is already downloaded in the target directory then verify and return
-        if checksum_path.exists() && parseable_ui_path.exists() {
-            let checksum = fs::read_to_string(&checksum_path)?;
-            if checksum == metadata["assets-sha1"].as_str().unwrap() {
-                // Nothing to do.
-                return Ok(());
-            }
-        }
-
-        // If there is no UI in the target directory or checksum check failed
-        // then we downlaod the UI from given url in cargo.toml metadata
         let url = metadata["assets-url"].as_str().unwrap();
+        let cached = checksum_path.exists()
+            && parseable_ui_path.join("dist").exists()
+            && fs::read_to_string(&checksum_path)? == metadata["assets-sha1"].as_str().unwrap();
+        if !cached {
+            // If there is no UI in the target directory or checksum check failed
+            // then we downlaod the UI from given url in cargo.toml metadata
+            let url = metadata["assets-url"].as_str().unwrap();
 
-        // See https://docs.rs/ureq/2.5.0/ureq/struct.Response.html#method.into_reader
-        let parseable_ui_bytes = get_from_url(url)
-            .call()
-            .map(|data| {
-                let mut buf: Vec<u8> = Vec::new();
-                data.into_reader().read_to_end(&mut buf).unwrap();
-                buf
-            })
-            .expect("Failed to get resource from {url}");
+            // See https://docs.rs/ureq/2.5.0/ureq/struct.Response.html#method.into_reader
+            let parseable_ui_bytes = get_from_url(url)
+                .call()
+                .map(|data| {
+                    let mut buf: Vec<u8> = Vec::new();
+                    data.into_reader().read_to_end(&mut buf).unwrap();
+                    buf
+                })
+                .expect("Failed to get resource from {url}");
 
-        let checksum = Sha1::from(&parseable_ui_bytes).hexdigest();
+            let checksum = Sha1::from(&parseable_ui_bytes).hexdigest();
 
-        assert_eq!(
-            metadata["assets-sha1"].as_str().unwrap(),
-            checksum,
-            "Downloaded parseable UI shasum differs from the one specified in the Cargo.toml"
-        );
+            assert_eq!(
+                metadata["assets-sha1"].as_str().unwrap(),
+                checksum,
+                "Downloaded parseable UI shasum differs from the one specified in the Cargo.toml"
+            );
 
-        create_dir_all(&parseable_ui_path)?;
-        let mut zip = zip::read::ZipArchive::new(Cursor::new(&parseable_ui_bytes))?;
-        zip.extract(&parseable_ui_path)?;
-        resource_dir(parseable_ui_path.join("dist")).build()?;
+            create_dir_all(&parseable_ui_path)?;
+            let mut zip = zip::read::ZipArchive::new(Cursor::new(&parseable_ui_bytes))?;
+            zip.extract(&parseable_ui_path)?;
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(checksum_path)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(checksum_path)?;
 
-        file.write_all(checksum.as_bytes())?;
-        file.flush()?;
+            file.write_all(checksum.as_bytes())?;
+            file.flush()?;
+        }
+        let community_path = out_dir.join("community-ui");
+        crate::community_ui::prepare(
+            &cargo_manifest_dir,
+            &parseable_ui_path.join("dist"),
+            &community_path,
+        )?;
+        resource_dir(&community_path).build()?;
 
         if local_assets_path.is_none() {
             // emit ui version for asset url

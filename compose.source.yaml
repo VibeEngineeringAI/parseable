@@ -1,0 +1,8 @@
+# Build and run this checkout using the Rust toolchain in Dockerfile.
+# docker compose -f compose.yaml -f compose.source.yaml up -d --build
+services:
+  parseable:
+    image: parseable-local:dev
+    build:
+      context: .
+      dockerfile: Dockerfile

@@ -17,18 +17,23 @@
 *
 */
 
-use std::future::{Ready, ready};
+use std::{
+    future::{Ready, ready},
+    rc::Rc,
+    sync::Arc,
+};
 
 use actix_web::{
     Error, HttpMessage, HttpRequest, Route,
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
-    error::{ErrorBadRequest, ErrorForbidden, ErrorUnauthorized},
+    error::{ErrorBadRequest, ErrorForbidden, ErrorServiceUnavailable, ErrorUnauthorized},
     http::header::{self, HeaderMap, HeaderName, HeaderValue},
 };
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use chrono::{Duration, TimeDelta, Utc};
+use chrono::{TimeDelta, Utc};
+use dashmap::DashMap;
 use futures_util::future::LocalBoxFuture;
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use ulid::Ulid;
 
 use crate::{
@@ -41,7 +46,7 @@ use crate::{
     parseable::{DEFAULT_TENANT, PARSEABLE},
     rbac::{
         EXPIRY_DURATION,
-        map::{SessionKey, mut_sessions, mut_users, sessions, users},
+        map::{SessionKey, mut_sessions, sessions, users},
         roles_to_permission, user,
         user::UserType,
     },
@@ -110,7 +115,7 @@ pub struct Auth {
 
 impl<S, B> Transform<S, ServiceRequest> for Auth
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: 'static,
 {
@@ -123,7 +128,7 @@ where
     fn new_transform(&self, service: S) -> Self::Future {
         ready(Ok(AuthMiddleware {
             action: self.action,
-            service,
+            service: Rc::new(service),
             auth_method: self.method,
         }))
     }
@@ -132,12 +137,12 @@ where
 pub struct AuthMiddleware<S> {
     action: Action,
     auth_method: fn(&mut ServiceRequest, Action) -> Result<rbac::Response, Error>,
-    service: S,
+    service: Rc<S>,
 }
 
 impl<S, B> Service<ServiceRequest> for AuthMiddleware<S>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: 'static,
 {
@@ -249,7 +254,9 @@ where
 
         let auth_result: Result<_, Error> = (self.auth_method)(&mut req, self.action);
         let headers = req.headers().clone();
-        let fut = self.service.call(req);
+        let service = Rc::clone(&self.service);
+        let auth_method = self.auth_method;
+        let action = self.action;
         Box::pin(async move {
             // Guard cleans up the ephemeral session created for an API-key
             // request when this future finishes (success OR failure).
@@ -274,11 +281,12 @@ where
             }
 
             // if session is expired, refresh token
+            auth_result?;
             if sessions().is_session_expired(&key) {
                 refresh_token(user_and_tenant_id, &key, headers).await?;
             }
-
-            match auth_result? {
+            // Recheck after any async refresh or administrative grant change.
+            match auth_method(&mut req, action)? {
                 rbac::Response::UnAuthorized => {
                     return Err(ErrorForbidden(
                         "You don't have permission to access this resource. Please contact your administrator for assistance.",
@@ -295,7 +303,7 @@ where
                 _ => {}
             }
 
-            fut.await
+            service.call(req).await
         })
     }
 }
@@ -448,97 +456,127 @@ fn get_user_and_tenant(
     }
 }
 
+// Serialize refreshes per (tenant, userid) and reload bearer state after waiting.
+// Concurrent browser requests must not reuse a refresh token that the previous
+// request rotated; other users' refreshes proceed independently.
+type RefreshLocks = DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
+static OAUTH_REFRESH_LOCKS: Lazy<RefreshLocks> = Lazy::new(DashMap::new);
+
+const SESSION_EXPIRED: &str = "Your session has expired. Please re-authenticate.";
+
 #[inline]
 pub async fn refresh_token(
     user_and_tenant_id: Result<(Result<String, RBACError>, Option<String>), RBACError>,
     key: &SessionKey,
     headers: HeaderMap,
 ) -> Result<(), Error> {
-    let oidc_client = OIDC_CLIENT.get();
-
-    if let Some(client) = oidc_client
-        && let Ok((userid, tenant_id)) = user_and_tenant_id
-        && let Ok(userid) = userid
-    {
-        let bearer_to_refresh = {
-            if let Some(users) = users().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-                && let Some(user) = users.get(&userid)
-            {
-                match &user.ty {
-                    user::UserType::OAuth(oauth) if oauth.bearer.is_some() => Some(oauth.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            }
+    if !sessions().is_session_expired(key) {
+        return Ok(());
+    }
+    let (userid, tenant_id) = user_and_tenant_id
+        .and_then(|(userid, tenant)| userid.map(|userid| (userid, tenant)))
+        .map_err(|_| ErrorUnauthorized(SESSION_EXPIRED))?;
+    let user = Users
+        .get_user(&userid, &tenant_id)
+        .ok_or_else(|| ErrorUnauthorized(SESSION_EXPIRED))?;
+    if user.is_oauth() {
+        let lock_key = (
+            tenant_id.as_deref().unwrap_or(DEFAULT_TENANT).to_owned(),
+            userid.clone(),
+        );
+        let lock = OAUTH_REFRESH_LOCKS
+            .entry(lock_key.clone())
+            .or_default()
+            .clone();
+        let result = {
+            let _refresh_guard = lock.lock().await;
+            refresh_oauth_session(&userid, &tenant_id, key, headers).await
         };
+        drop(lock);
+        // Waiters hold their own clone, so an entry is only dropped when idle.
+        OAUTH_REFRESH_LOCKS.remove_if(&lock_key, |_, lock| Arc::strong_count(lock) == 1);
+        return result;
+    }
+    // Serialize native renewal with administrative writes.
+    let _guard = crate::handlers::http::rbac::UPDATE_LOCK.lock().await;
+    if !Users
+        .get_userid_from_session(key)
+        .is_some_and(|(user, tenant)| {
+            user == userid && tenant == tenant_id.as_deref().unwrap_or(DEFAULT_TENANT)
+        })
+    {
+        return Err(ErrorUnauthorized(SESSION_EXPIRED));
+    }
+    let current = Users
+        .get_user(&userid, &tenant_id)
+        .ok_or_else(|| ErrorUnauthorized(SESSION_EXPIRED))?;
+    Users.new_session(&current, key.clone(), EXPIRY_DURATION);
+    Ok(())
+}
 
-        if let Some(oauth_data) = bearer_to_refresh {
-            let refreshed_token = match client
-                .read()
-                .await
-                .refresh_token(&oauth_data, Some(PARSEABLE.options.scope.as_str()), headers)
-                .await
-            {
-                Ok(bearer) => bearer,
-                Err(e) => {
-                    tracing::error!("client refresh_token call failed- {e}");
-                    // remove user session
-                    Users.remove_session(key);
-                    return Err(ErrorUnauthorized(
-                        "Your session has expired or is no longer valid. Please re-authenticate to access this resource.",
-                    ));
-                }
-            };
+/// Must run under the user's refresh lock. Only an affirmative refusal from the
+/// provider (or a deleted/rebound user) ends all of the user's sessions;
+/// transient provider or storage failures fail just this request and leave the
+/// expired session in place so the next request retries.
+async fn refresh_oauth_session(
+    userid: &str,
+    tenant_id: &Option<String>,
+    key: &SessionKey,
+    headers: HeaderMap,
+) -> Result<(), Error> {
+    use crate::{handlers::http::oidc::OIDCError, oauth::AuthorizationRevoked};
 
-            let expires_in = if let Some(expires_in) = refreshed_token.expires_in.as_ref() {
-                if *expires_in > u32::MAX.into() {
-                    EXPIRY_DURATION
+    // Another request may have refreshed this session while we waited.
+    if !sessions().is_session_expired(key) {
+        return Ok(());
+    }
+    // Reload after waiting: the previous holder may have rotated the bearer.
+    let user = Users
+        .get_user(userid, tenant_id)
+        .ok_or_else(|| ErrorUnauthorized(SESSION_EXPIRED))?;
+    let UserType::OAuth(oauth) = &user.ty else {
+        return Err(ErrorUnauthorized(SESSION_EXPIRED));
+    };
+    let revoke = || {
+        mut_sessions().remove_user(userid, tenant_id.as_deref().unwrap_or(DEFAULT_TENANT));
+        ErrorUnauthorized(SESSION_EXPIRED)
+    };
+    let unavailable = || {
+        ErrorServiceUnavailable(
+            "Unable to revalidate your session with the identity provider. Please retry.",
+        )
+    };
+    let session = match OIDC_CLIENT.get() {
+        Some(client) => client
+            .read()
+            .await
+            .refresh_session(oauth, Some(PARSEABLE.options.scope.as_str()), headers)
+            .await
+            .map_err(|error| {
+                if AuthorizationRevoked::is_revoked(&error) {
+                    revoke()
                 } else {
-                    let v = i64::from(*expires_in as u32);
-                    Duration::seconds(v)
+                    tracing::warn!("OIDC session refresh failed transiently: {error}");
+                    unavailable()
                 }
-            } else {
-                EXPIRY_DURATION
-            };
-
-            let user_roles = {
-                let mut users_guard = mut_users();
-                if let Some(users) =
-                    users_guard.get_mut(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-                    && let Some(user) = users.get_mut(&userid)
-                {
-                    if let user::UserType::OAuth(oauth) = &mut user.ty {
-                        oauth.bearer = Some(refreshed_token);
-                    }
-                    user.roles().to_vec()
-                } else {
-                    return Err(ErrorUnauthorized(
-                        "Your session has expired or is no longer valid. Please re-authenticate to access this resource.",
-                    ));
-                }
-            };
-
-            mut_sessions().track_new(
-                userid.clone(),
-                key.clone(),
-                Utc::now() + expires_in,
-                roles_to_permission(user_roles, tenant_id.as_deref().unwrap_or(DEFAULT_TENANT)),
-                &tenant_id,
-            );
-        } else if let Some(users) = users().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-            && let Some(user) = users.get(&userid)
-        {
-            mut_sessions().track_new(
-                userid.clone(),
-                key.clone(),
-                Utc::now() + EXPIRY_DURATION,
-                roles_to_permission(user.roles(), tenant_id.as_deref().unwrap_or(DEFAULT_TENANT)),
-                &tenant_id,
-            );
+            })?,
+        None => return Err(revoke()),
+    };
+    match crate::handlers::http::oidc::reconcile_oauth_session(
+        session,
+        tenant_id.clone(),
+        Some(userid),
+        key.clone(),
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(OIDCError::Unauthorized) => Err(revoke()),
+        Err(error) => {
+            tracing::warn!("Failed to persist refreshed OIDC authorization: {error}");
+            Err(unavailable())
         }
     }
-    Ok(())
 }
 
 #[inline(always)]

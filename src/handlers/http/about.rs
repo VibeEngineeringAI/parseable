@@ -99,6 +99,10 @@ pub async fn about() -> Json<Value> {
         "latestVersion": latest_release,
         "oidcActive": is_oidc_active,
         "license": license_info,
+        "capabilities": {
+            "oidcRoleMapping": crate::handlers::http::oidc::group_mapping_enabled(),
+            "oidcRoleSync": crate::handlers::http::oidc::group_mapping_enabled(),
+        },
         "mode": mode,
         "staging": staging,
         "hotTier": hot_tier_details,

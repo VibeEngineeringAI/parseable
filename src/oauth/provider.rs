@@ -25,9 +25,9 @@ pub trait OAuthProvider: Send + Sync + Any {
     /// - JWKS key rotation / reconnection (OIDC-specific)
     /// - userinfo fetch
     ///
-    /// Requires `&mut self` so OIDC can swap out its client on JWKS rotation
-    /// while holding the `write()` lock that the caller already holds.
-    async fn exchange_code(&mut self, code: &str) -> Result<OAuthSession, anyhow::Error>;
+    /// Takes `&self` so callers only need a read lock; implementations swap any
+    /// rotated state internally without blocking other sign-ins or refreshes.
+    async fn exchange_code(&self, code: &str) -> Result<OAuthSession, anyhow::Error>;
 
     /// Refresh an existing access token using the credentials stored in the
     /// user's `OAuth` record.
@@ -38,8 +38,41 @@ pub trait OAuthProvider: Send + Sync + Any {
         headers: HeaderMap,
     ) -> Result<Bearer, anyhow::Error>;
 
+    /// Refresh authentication AND authorization from newly verified claims.
+    /// Providers that cannot return fresh claims must require reauthentication.
+    /// Errors wrapping [`AuthorizationRevoked`] end every session of the user;
+    /// any other error is treated as transient and only fails the request.
+    async fn refresh_session(
+        &self,
+        _oauth: &OAuth,
+        _scope: Option<&str>,
+        _headers: HeaderMap,
+    ) -> Result<OAuthSession, anyhow::Error> {
+        Err(AuthorizationRevoked::new(
+            "Provider does not support authorization refresh; reauthenticate",
+        )
+        .into())
+    }
+
     /// Return the provider's logout / end-session URL, if one exists.
     fn logout_url(&self) -> Option<Url>;
+}
+
+/// The provider affirmatively refused to renew the session (for example an
+/// `invalid_grant` response, a missing refresh token or ID token, or a changed
+/// subject or issuer), as opposed to a transport or availability failure.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct AuthorizationRevoked(String);
+
+impl AuthorizationRevoked {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
+    }
+
+    pub fn is_revoked(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
 }
 
 // ── Output types ────────────────────────────────────────────────────────────
@@ -56,6 +89,8 @@ pub struct OAuthSession {
 /// Identity claims extracted from the ID token / JWT.
 #[derive(Debug, Clone)]
 pub struct ProviderClaims {
+    /// Verified issuer from the ID token.
+    pub issuer: String,
     /// `sub` – stable unique identifier for the user at this provider.
     pub sub: Option<String>,
     pub email: Option<String>,

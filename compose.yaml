@@ -1,0 +1,26 @@
+name: parseable-local
+
+services:
+  parseable:
+    image: ${PARSEABLE_IMAGE:-quay.io/parseablehq/parseable:v3.2.4}
+    command: ["/usr/bin/parseable", "local-store"]
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8001"
+    environment:
+      P_ADDR: "0.0.0.0:8000"
+      P_USERNAME: "admin"
+      P_PASSWORD: "admin"
+      P_FS_DIR: "/parseable/data"
+      P_STAGING_DIR: "/parseable/staging"
+      P_SEND_ANONYMOUS_USAGE_DATA: "false"
+      P_CHECK_UPDATE: "false"
+    volumes:
+      - data:/parseable/data
+      - staging:/parseable/staging
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+volumes:
+  data:
+  staging:

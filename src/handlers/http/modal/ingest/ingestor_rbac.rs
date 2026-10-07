@@ -99,6 +99,7 @@ pub async fn add_roles_to_user(
     let userid = userid.into_inner();
     let roles_to_add = roles_to_add.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
+    let _guard = UPDATE_LOCK.lock().await;
     if !Users.contains(&userid, &tenant_id) {
         return Err(RBACError::UserDoesNotExist);
     };
@@ -126,7 +127,9 @@ pub async fn add_roles_to_user(
         .iter_mut()
         .find(|user| user.userid() == userid)
     {
-        user.roles.extend(roles_to_add.clone());
+        let mut manual = user.manual_roles();
+        manual.extend(roles_to_add.clone());
+        user.set_manual_roles(manual);
     } else {
         // should be unreachable given state is always consistent
         return Err(RBACError::UserDoesNotExist);
@@ -147,6 +150,7 @@ pub async fn remove_roles_from_user(
     let userid = userid.into_inner();
     let roles_to_remove = roles_to_remove.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
+    let _guard = UPDATE_LOCK.lock().await;
     if !Users.contains(&userid, &tenant_id) {
         return Err(RBACError::UserDoesNotExist);
     };
@@ -183,9 +187,13 @@ pub async fn remove_roles_from_user(
         .iter_mut()
         .find(|user| user.userid() == userid)
     {
-        let diff: HashSet<String> =
-            HashSet::from_iter(user.roles.difference(&roles_to_remove).cloned());
-        user.roles = diff;
+        let manual = user.manual_roles();
+        if !roles_to_remove.is_subset(&manual) {
+            return Err(RBACError::RolesManagedByOidc);
+        }
+        user.set_manual_roles(HashSet::from_iter(
+            manual.difference(&roles_to_remove).cloned(),
+        ));
     } else {
         // should be unreachable given state is always consistent
         return Err(RBACError::UserDoesNotExist);
