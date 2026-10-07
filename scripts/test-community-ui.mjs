@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -49,7 +49,8 @@ test('versioned entry, imports, dynamic imports, and preload paths share a fresh
     assert.equal(module.value, 42);
     assert.equal((await module.load()).value, 42);
     assert.deepEqual(module.deps, ['assets/gates-community-0123456789ab.js']);
-    assert.equal(await readFile(join(directory, 'assets', 'index-main.js'), 'utf8'), entry);
+    // Each asset ships once, under its renamed graph only.
+    assert.deepEqual((await readdir(join(directory, 'assets'))).sort(), ['gates-community-0123456789ab.js', 'index-main-community-0123456789ab.js']);
     const html = await readFile(join(directory, 'index.html'), 'utf8');
     assert.match(html, /index-main-community-0123456789ab\.js/);
     assert.match(html, /\/assets\/style\.css/);
@@ -176,11 +177,11 @@ test('OIDC overlay retains native groups gate and handles clearing the role mark
   assert.ok(edits.some(edit => edit.to.includes('communityNativeDefaultRole,props')));
 });
 
-test('provider-only and legacy roles cannot be removed as manual grants', () => {
+test('provider-only roles cannot be removed as manual grants, legacy roles always can', () => {
   const summary = {oidc: {legacy: false, manualRoles: ['reader'], providerRoles: ['reader', 'writer']}};
   assert.equal(capabilities.oidcManualRoleRemovable(summary, 'reader'), true);
   assert.equal(capabilities.oidcManualRoleRemovable(summary, 'writer'), false);
-  assert.equal(capabilities.oidcManualRoleRemovable({oidc: {legacy: true, manualRoles: null}}, 'reader'), false);
+  assert.equal(capabilities.oidcManualRoleRemovable({oidc: {legacy: true, manualRoles: null}}, 'reader'), true);
   assert.equal(capabilities.oidcManualRoleRemovable({}, 'reader'), false);
 });
 
@@ -206,7 +207,7 @@ test('role inspector fetches safe provenance with encoded user ID and explains o
   assert.match(JSON.stringify(tree), /Fallback role \(when no manual or provider role\): fallback/);
 });
 
-test('error account recovery works without application providers and reaches server logout', async () => {
+test('error account recovery works without application providers and navigates to server logout', async () => {
   const React = {useState: value => [value, () => {}], createElement: (type, props, ...children) => ({type, props, children})};
   const menu = capabilities.CommunityErrorAccountMenu({react: React});
   assert.equal(menu.type, 'details');
@@ -215,20 +216,16 @@ test('error account recovery works without application providers and reaches ser
   assert.equal(typeof menu.children[1].children[0].props.onClick, 'function');
   const removed = [];
   let target;
-  const cookies = [];
-  let request;
-  const browser = {fetch: async (url, options) => {request = {url, options}; return {ok: false, type: 'opaqueredirect', status: 0};}, document: {set cookie(value) {cookies.push(value);}}, localStorage: {removeItem: key => removed.push(key)}, location: {origin: 'https://parseable.example', assign: url => {target = url;}}};
-  await capabilities.errorAccountLogout(browser);
+  const browser = {localStorage: {removeItem: key => removed.push(key)}, location: {origin: 'https://parseable.example', assign: url => {target = url;}}};
+  capabilities.errorAccountLogout(browser);
   assert.deepEqual(removed, ['authToken']);
-  assert.equal(target, '/login');
-  assert.deepEqual(request.options, {redirect: 'manual', credentials: 'same-origin'});
-  assert.equal(cookies.length, 3);
-  const logout = new URL(request.url, browser.location.origin);
+  // A top-level navigation lets the browser follow the redirect to the IdP end-session endpoint.
+  const logout = new URL(target, browser.location.origin);
   assert.equal(logout.pathname, '/api/v1/o/logout');
   assert.equal(logout.searchParams.get('redirect'), 'https://parseable.example/login');
   browser.localStorage.removeItem = () => {throw Error('Storage blocked');};
   target = null;
-  await capabilities.errorAccountLogout(browser);
+  capabilities.errorAccountLogout(browser);
   assert.ok(target, 'storage failure must not prevent server session logout');
 });
 
@@ -264,24 +261,6 @@ test('route recovery stays within its panel and account trigger has no list mark
   assert.ok(root.replacements.some(item => item.to.includes('position:`absolute`')));
 });
 
-test('failed server or network logout preserves the session and does not navigate', async () => {
-  let touched = false;
-  const browser = {
-    location: {origin: 'https://parseable.example', assign: () => {touched = true;}},
-    localStorage: {removeItem: () => {touched = true;}},
-    document: {set cookie(value) {touched = true;}},
-    fetch: async () => ({ok: false, type: 'basic', status: 500}),
-  };
-  await assert.rejects(capabilities.errorAccountLogout(browser), /Sign out failed \(500\)/);
-  assert.equal(touched, false);
-  browser.fetch = async () => {throw Error('Network unavailable');};
-  await assert.rejects(capabilities.errorAccountLogout(browser), /Network unavailable/);
-  assert.equal(touched, false);
-  browser.fetch = async () => ({ok: true, type: 'basic', status: 200});
-  await capabilities.errorAccountLogout(browser);
-  assert.equal(touched, true);
-});
-
 test('account menu displays logout failure and restores retry control', async () => {
   const updates = [];
   const React = {
@@ -289,11 +268,11 @@ test('account menu displays logout failure and restores retry control', async ()
     createElement: (type, props, ...children) => ({type, props, children}),
   };
   const originalWindow = globalThis.window;
-  globalThis.window = {location: {origin: 'https://parseable.example'}, fetch: async () => {throw Error('Network unavailable');}};
+  globalThis.window = {location: {origin: 'https://parseable.example', assign: () => {throw Error('Navigation blocked');}}, localStorage: {removeItem: () => {}}};
   try {
     const menu = capabilities.CommunityErrorAccountMenu({react: React});
     await menu.children[1].children[0].props.onClick();
-    assert.deepEqual(updates, [true, '', 'Network unavailable', false]);
+    assert.deepEqual(updates, [true, '', 'Navigation blocked', false]);
     const failureReact = {...React, useState: value => [typeof value === 'string' ? 'Sign out failed' : value, () => {}]};
     const failedMenu = capabilities.CommunityErrorAccountMenu({react: failureReact});
     assert.equal(failedMenu.children[1].children[1].props.role, 'alert');

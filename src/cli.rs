@@ -664,6 +664,16 @@ pub struct Options {
     )]
     pub oidc_query_params: Option<String>,
 
+    // upper bound on how long an OIDC session is trusted before revalidation
+    #[arg(
+        long,
+        env = "P_OIDC_REVALIDATION_INTERVAL",
+        default_value = "300",
+        value_parser = clap::value_parser!(u64).range(30..),
+        help = "Maximum seconds an OIDC session is trusted before its roles are revalidated with the identity provider. Revalidation needs a refresh token; see docs/oidc.md"
+    )]
+    pub oidc_revalidation_interval: u64,
+
     // event's maximum chunk age in hours
     #[arg(
         long,

@@ -100,8 +100,8 @@ pub async fn about() -> Json<Value> {
         "oidcActive": is_oidc_active,
         "license": license_info,
         "capabilities": {
-            "oidcRoleMapping": matches!(PARSEABLE.options.mode, crate::option::Mode::All),
-            "oidcRoleSync": matches!(PARSEABLE.options.mode, crate::option::Mode::All),
+            "oidcRoleMapping": crate::handlers::http::oidc::group_mapping_enabled(),
+            "oidcRoleSync": crate::handlers::http::oidc::group_mapping_enabled(),
         },
         "mode": mode,
         "staging": staging,

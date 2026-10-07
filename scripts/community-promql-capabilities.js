@@ -80,8 +80,10 @@ export function CommunityOidcGroups({react: React, roles, search = '', roleSync 
 }
 
 export function oidcManualRoleRemovable(summary, role) {
-  return summary?.oidc?.legacy === false && Array.isArray(summary.oidc.manualRoles) &&
-    summary.oidc.manualRoles.includes(role);
+  const oidc = summary?.oidc;
+  // Legacy users have no provenance; the server edits their assigned roles directly.
+  if (oidc?.legacy === true) return true;
+  return oidc?.legacy === false && Array.isArray(oidc.manualRoles) && oidc.manualRoles.includes(role);
 }
 
 export function CommunityOidcRoleInspector({react: React, api, userId, role, onInspection}) {
@@ -115,20 +117,14 @@ export function CommunityOidcRoleInspector({react: React, api, userId, role, onI
 
 // Root and route error boundaries can outlive the normal Redux/router providers.
 // Keep recovery independent of application initialization and its data requests.
-export async function errorAccountLogout(browser = window) {
+// Navigate at the top level so the browser follows the server's redirect to the
+// provider's end-session endpoint; a fetch would leave the IdP session alive and
+// /login would silently sign the same user back in. The server ends the session
+// and clears its cookies before redirecting.
+export function errorAccountLogout(browser = window) {
   const redirect = new URL('/login', browser.location.origin).href;
-  const response = await browser.fetch(`/api/v1/o/logout?redirect=${encodeURIComponent(redirect)}`, {
-    redirect: 'manual', credentials: 'same-origin',
-  });
-  // A manual redirect is opaque in browsers, including a provider logout redirect.
-  if (!response.ok && response.type !== 'opaqueredirect') {
-    throw Error(`Sign out failed (${response.status}). Please try again.`);
-  }
   try { browser.localStorage.removeItem('authToken'); } catch { /* storage can be unavailable */ }
-  for (const name of ['session', 'username', 'user_id']) {
-    browser.document.cookie = `${name}=; Path=/; Max-Age=0; SameSite=Lax`;
-  }
-  browser.location.assign('/login');
+  browser.location.assign(`/api/v1/o/logout?redirect=${encodeURIComponent(redirect)}`);
 }
 
 export function CommunityErrorAccountMenu({react: React, position = 'fixed'}) {
@@ -139,7 +135,7 @@ export function CommunityErrorAccountMenu({react: React, position = 'fixed'}) {
     if (pending) return;
     setPending(true);
     setFailure('');
-    try { await errorAccountLogout(); }
+    try { errorAccountLogout(); }
     catch (error) { setFailure(error.message || 'Sign out failed. Please try again.'); setPending(false); }
   };
   return h('details', {className: 'right-4 top-4 z-50 text-left', style: {position}, 'data-testid': 'error-account-menu'},

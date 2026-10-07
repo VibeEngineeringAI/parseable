@@ -8,6 +8,16 @@ on:
 
 name: Lint, Test and Coverage Report
 jobs:
+  community-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test community UI overlay
+        run: node --test scripts/test-community-ui.mjs
+
   coverage:
     runs-on: ubuntu-latest
     steps:

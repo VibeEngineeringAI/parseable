@@ -1,14 +1,22 @@
 # OIDC roles and smoke testing
 
-Parseable requests the scopes in `P_OIDC_SCOPE`. For Pocket ID group role mapping, include `groups`, for example:
+Parseable requests the scopes in `P_OIDC_SCOPE`. For Pocket ID group role mapping, include `groups`. Also request a refresh token, usually with `offline_access` (see [Session revalidation](#session-revalidation)):
 
 ```sh
-P_OIDC_SCOPE='openid profile email groups'
+P_OIDC_SCOPE='openid profile email groups offline_access'
 ```
 
 The `groups` claim contains each group's machine name. Create a Parseable role with the exact same name to grant it to an OIDC user. Role grants are reconciled from validated ID-token groups during sign-in and token refresh. Parseable tracks provider grants separately from roles an administrator assigns by hand, so a provider group removal removes only that provider grant. An administrator cannot remove a provider-only grant directly; change the user's group at the provider. If an administrator separately assigns the same role, that manual grant remains after the group is removed.
 
-The configured default role applies when an OAuth user has no provider or manual grants. It must name an existing user role. Internal roles such as `super-admin` cannot be used as the default. Clearing the default removes default grants from existing OAuth users, persists the change, and invalidates their sessions.
+The configured default role applies when an OAuth user has no provider or manual grants. It must name an existing user role. Internal roles such as `super-admin` cannot be used as the default. Changing or clearing the default updates default grants for existing OAuth users and persists the change. Only users whose effective roles change (those without manual or provider grants) have their sessions invalidated; everyone else stays signed in.
+
+## Session revalidation
+
+Active cookie sessions of OAuth users are trusted for at most `P_OIDC_REVALIDATION_INTERVAL` seconds (default `300`, minimum `30`), or less if the provider's access or ID token expires sooner. When that time is up, the next request refreshes the token and reconciles roles from the newly signed ID token's groups.
+
+Revalidation needs a refresh token. Many providers (for example Google, and Auth0 or Okta depending on client settings) issue one only when `offline_access` (or a provider-specific equivalent such as `access_type=offline` in `P_OIDC_QUERY_PARAMS`) is requested. Without a refresh token, users must sign in again every interval, and Parseable logs a warning on the first such sign-in. Add the scope, or raise the interval to trade revocation latency for fewer sign-ins.
+
+If the provider refuses a refresh (for example with `invalid_grant`, a missing ID token, or a changed subject or issuer), all of the user's sessions end. Transient failures, such as network errors, provider 5xx responses, or storage errors, fail only the current request with `503`. The session stays expired, so the next request retries and no request is authorized until a refresh succeeds. Refreshes are serialized per user, so a slow provider response does not delay other users.
 
 ## Sign out from an error screen
 
@@ -17,10 +25,13 @@ Route errors, the root error boundary, No access, and 404 pages also provide an
 account icon with Sign out when the full account interface is unavailable. Route
 recovery stays inside the error panel so it does not obscure the normal avatar.
 
-The fallback invalidates the Parseable session and returns to `/login` without
-following the provider's logout page. Choose Login with OAuth to obtain fresh
-group claims. If sign-out fails, the menu displays the failure and allows retry.
-Refresh tabs opened before deployment to load these controls. This recovery UI
+Sign out navigates to the server logout endpoint, which ends the Parseable
+session, clears its cookies, and redirects to the provider's end-session
+endpoint (when the provider has one) before returning to `/login`. Ending the
+provider session lets a user who reached No access sign in as a different
+account, or sign in again to obtain fresh group claims. Refresh tabs opened
+before deployment to load these controls; older tabs cannot lazy-load the
+replaced scripts. This recovery UI
 does not change role grants or Pocket ID group membership.
 
 ## Isolated integration smoke test
@@ -43,14 +54,15 @@ For a manual check against a dedicated Pocket ID test instance:
 1. Use the existing test OIDC client or create a disposable one. Set its callback URL to `http://<parseable-host>:<port>/api/v1/o/code`, and request the `groups` scope from Parseable. Make sure the client still allows the test user to sign in after the role group is removed. If Pocket ID restricts the client to allowed groups, leave access unrestricted for this test or keep the test user in a second allowed group.
 2. In Pocket ID, open **Administration → User Groups** and create a group with machine name `parseable-oidc-test-readers`. In **Administration → Users**, create a dedicated test account and add it to this group. Complete sign-in setup for that account, such as registering its passkey.
 3. In Parseable, create a role named exactly `parseable-oidc-test-readers`. Sign in using the dedicated test account and confirm the role appears in the user's direct roles.
-4. Remove the test account from the Pocket ID group. On the next Parseable authorization refresh, the provider grant should disappear while any separately assigned manual roles remain. Active sessions revalidate at most every five minutes, and sooner when the provider access or ID token expires.
+4. Remove the test account from the Pocket ID group. On the next Parseable authorization refresh, the provider grant should disappear while any separately assigned manual roles remain. Active sessions revalidate at most every `P_OIDC_REVALIDATION_INTERVAL` seconds (five minutes by default), and sooner when the provider access or ID token expires.
 
 Pocket ID documents that `groups` is an optional scope, that its value is an array of machine group names, and that group membership controls those values in the ID token and userinfo response: [Scopes and claims](https://pocket-id.org/docs/guides/scopes-and-claims), [User management](https://pocket-id.org/docs/setup/user-management). Use a separate test client and test account, and avoid modifying a production user's group membership for this check.
 
 ## Authorization lifecycle and migration
 
 The supported, advertised deployment for the OIDC administration UI is standalone
-(`Mode::All`). Distributed synchronization has not been verified by this change.
+(`Mode::All`). Other modes ignore provider groups and keep only manual and default
+grants, because refreshed grants are not synchronized to every node.
 The group view explains existing exact-name role mappings; it does not provision
 Pocket ID groups or enable Enterprise native-group CRUD.
 
@@ -61,7 +73,10 @@ issuer binding are matched only by an exact stored subject; ambiguous matches
 fail authentication. Their old flat role sets and local-group membership have no
 trusted provenance, so first verified migration resets them and applies current
 provider/default grants. Review existing accounts before rollout and explicitly
-regrant intended manual access after migration. Changing legacy user IDs also
+regrant intended manual access after migration. Before a legacy user signs in,
+administrators can still add or revoke any of their roles; such an edit records
+the user's resulting role set as manual grants, which survive migration.
+Changing legacy user IDs also
 requires reviewing resources that refer to their former IDs; automatic migration
 of dashboard or alert ownership is not part of this change.
 
@@ -72,9 +87,9 @@ inactive when manual or provider roles supply access. Role removal through the
 manual-role API only removes manual grants; it cannot override a matching
 provider grant. The role inspector shows this distinction.
 
-The five-minute revalidation bound applies to active cookie-authenticated
-requests. Providers that cannot return a fresh signed ID token during refresh
-require a new sign-in. Dormant users and background jobs do not poll the identity
+The revalidation bound applies to active cookie-authenticated requests.
+Providers that cannot return a fresh signed ID token during refresh require a
+new sign-in. Dormant users and background jobs do not poll the identity
 provider; a stored role set is not a promise of continuous provider membership.
 The existing callback state/nonce design was not redesigned here and requires a
 separate OIDC protocol-hardening review. The built-in `reader` privilege includes

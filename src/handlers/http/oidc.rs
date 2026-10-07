@@ -48,7 +48,7 @@ use crate::{
     parseable::{DEFAULT_TENANT, PARSEABLE},
     rbac::{
         self, EXPIRY_DURATION, Users,
-        map::{SessionKey, mut_sessions, mut_users, write_user_groups},
+        map::{DEFAULT_ROLE, SessionKey, mut_sessions, mut_users, roles, write_user_groups},
         user::{self, GroupUser, User, UserType},
     },
     storage::{self, ObjectStorageError, StorageMetadata},
@@ -192,7 +192,10 @@ pub async fn logout(
     }
 
     let Some(session) = extract_session_key_from_req(&req).ok() else {
-        return Ok(redirect_to_client(query.redirect.as_str(), None));
+        return Ok(redirect_to_client(
+            query.redirect.as_str(),
+            removal_cookies(),
+        ));
     };
     let tenant_id = get_tenant_id_from_key(&session);
     let user = {
@@ -211,7 +214,10 @@ pub async fn logout(
         {
             Ok(redirect_to_oidc_logout(logout_endpoint, &query.redirect))
         }
-        _ => Ok(redirect_to_client(query.redirect.as_str(), None)),
+        _ => Ok(redirect_to_client(
+            query.redirect.as_str(),
+            removal_cookies(),
+        )),
     }
 }
 
@@ -225,7 +231,7 @@ pub async fn reply_login(
     let tenant_id = get_tenant_id_from_request(&req);
 
     let session = oidc_client
-        .write()
+        .read()
         .await
         .exchange_code(&login_query.code)
         .await
@@ -235,6 +241,7 @@ pub async fn reply_login(
         })?;
 
     let (username, user_id, _) = extract_identity(&session)?;
+    warn_if_refresh_unavailable(&session.bearer);
     let id = Ulid::new();
     let user = reconcile_oauth_session(session, tenant_id.clone(), None, SessionKey::SessionId(id))
         .await?;
@@ -302,10 +309,34 @@ fn extract_identity(session: &OAuthSession) -> Result<(String, String, user::Use
     Ok((username, user_id, user_info.clone().into()))
 }
 
-/// Authorization is revalidated at least every five minutes of active usage,
-/// regardless of a provider's longer access token lifetime.
+/// Authorization is revalidated at least every `P_OIDC_REVALIDATION_INTERVAL`
+/// seconds of active usage, regardless of a provider's longer token lifetime.
 pub(crate) fn bearer_expiry(bearer: &Bearer) -> TimeDelta {
-    TimeDelta::seconds(bearer.expires_in.unwrap_or(300).min(300) as i64)
+    let interval = PARSEABLE.options.oidc_revalidation_interval;
+    TimeDelta::seconds(bearer.expires_in.unwrap_or(interval).min(interval) as i64)
+}
+
+/// Provider groups map to roles only in standalone mode, the only mode that
+/// advertises the capability. Other modes do not sync refreshed grants to every
+/// node, so they keep manual and default grants only.
+pub(crate) fn group_mapping_enabled() -> bool {
+    matches!(PARSEABLE.options.mode, crate::option::Mode::All)
+}
+
+/// Without a refresh token every revalidation is a full sign-in, so make the
+/// usual cause (a scope missing `offline_access`) visible to operators once.
+fn warn_if_refresh_unavailable(bearer: &Bearer) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if bearer.refresh_token.is_none() {
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "OIDC provider issued no refresh token; users must sign in again every {}s. \
+                 Add `offline_access` (or the provider's equivalent) to P_OIDC_SCOPE, \
+                 or raise P_OIDC_REVALIDATION_INTERVAL. See docs/oidc.md.",
+                PARSEABLE.options.oidc_revalidation_interval
+            );
+        });
+    }
 }
 
 /// Build the HTTP response for the login callback (XHR JSON or redirect).
@@ -357,13 +388,27 @@ fn exchange_basic_for_cookie(
 
 fn redirect_to_oidc_logout(mut logout_endpoint: Url, redirect: &Url) -> HttpResponse {
     logout_endpoint.set_query(Some(&format!("post_logout_redirect_uri={redirect}")));
-    HttpResponse::TemporaryRedirect()
+    let mut response = HttpResponse::TemporaryRedirect();
+    for cookie in removal_cookies() {
+        response.cookie(cookie);
+    }
+    response
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
         .insert_header((
             actix_web::http::header::LOCATION,
             logout_endpoint.to_string(),
         ))
         .finish()
+}
+
+/// The session is already gone server-side; also drop the browser's copies so
+/// a top-level logout navigation leaves no stale identity behind.
+fn removal_cookies() -> [Cookie<'static>; 3] {
+    [SESSION_COOKIE_NAME, USER_COOKIE_NAME, USER_ID_COOKIE_NAME].map(|name| {
+        let mut cookie = build_cookie(name, String::new());
+        cookie.make_removal();
+        cookie
+    })
 }
 
 pub fn redirect_to_client(
@@ -417,13 +462,16 @@ pub fn cookie_userid(user_id: &str) -> Cookie<'static> {
 /// Persist authorization from freshly verified claims, then update sessions and
 /// the local user map. Admin writes share this lock to avoid lost manual grants.
 pub(crate) async fn reconcile_oauth_session(
-    session: OAuthSession,
+    mut session: OAuthSession,
     tenant: Option<String>,
     expected_userid: Option<&str>,
     session_key: SessionKey,
 ) -> Result<User, OIDCError> {
     use crate::oauth::authorization::{legacy_identity, matching_identity, reconcile_roles};
 
+    if !group_mapping_enabled() {
+        session.claims.groups.clear();
+    }
     let expires_in = bearer_expiry(&session.bearer);
     let (_, user_id, user_info) = extract_identity(&session)?;
     let issuer = &session.claims.issuer;
@@ -440,6 +488,12 @@ pub(crate) async fn reconcile_oauth_session(
             user == expected && session_tenant == tenant.as_deref().unwrap_or(DEFAULT_TENANT)
         }) {
             return Err(OIDCError::Unauthorized);
+        }
+        // Most refreshes change nothing durable; skip the metastore round trip.
+        if let Some(user) = unchanged_refresh(expected, &tenant, &session, &user_id, &user_info) {
+            mut_users().insert(user.clone());
+            Users.new_session(&user, session_key, expires_in);
+            return Ok(user);
         }
     }
     let mut metadata = get_metadata(&tenant).await?;
@@ -551,6 +605,50 @@ pub(crate) async fn reconcile_oauth_session(
     // The session and current grants become visible under the same admin lock.
     Users.new_session(&user, session_key, expires_in);
     Ok(user)
+}
+
+/// Returns the in-memory user with the refreshed bearer when the verified claims
+/// reproduce exactly the stored identity and grants. Must hold `UPDATE_LOCK`,
+/// which serializes this with administrative role and grant writes.
+fn unchanged_refresh(
+    userid: &str,
+    tenant: &Option<String>,
+    session: &OAuthSession,
+    user_id: &str,
+    user_info: &user::UserInfo,
+) -> Option<User> {
+    use crate::oauth::authorization::{matching_identity, reconcile_roles};
+
+    let mut user = Users.get_user(userid, tenant)?;
+    let subject = session.claims.sub.as_deref()?;
+    if user.protected || !matching_identity(&user, &session.claims.issuer, subject) {
+        return None;
+    }
+    let tenant_name = tenant.as_deref().unwrap_or(DEFAULT_TENANT);
+    let default_role = DEFAULT_ROLE.read().get(tenant_name).cloned().flatten();
+    let grants = {
+        let roles = roles();
+        let empty = Default::default();
+        reconcile_roles(
+            Some(&user),
+            &session.claims.groups,
+            roles.get(tenant_name).unwrap_or(&empty),
+            default_role.as_deref(),
+        )
+    };
+    let UserType::OAuth(oauth) = &mut user.ty else {
+        return None;
+    };
+    let unchanged = oauth.userid == user_id
+        && &oauth.user_info == user_info
+        && oauth.role_grants.as_ref() == Some(&grants)
+        && user.roles == grants.effective_roles();
+    if !unchanged {
+        return None;
+    }
+    // Access/refresh tokens remain in memory and are never persisted here.
+    oauth.bearer = Some(session.bearer.clone());
+    Some(user)
 }
 
 async fn get_metadata(

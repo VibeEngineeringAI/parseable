@@ -152,21 +152,117 @@ pub fn prepare(root: &Path, source: &Path, destination: &Path) -> io::Result<()>
                     .unwrap_or_else(|| captures[0].to_owned())
             });
             if extension == Some("js") {
+                // Only the renamed graph ships. Stale tabs must reload (see
+                // docs/oidc.md); keeping originals would double the embedded
+                // UI and let old tabs mix unpatched chunks into the new graph.
                 let new = &names[path.file_name().unwrap().to_str().unwrap()];
                 fs::write(path.with_file_name(new), text.as_bytes())?;
+                fs::remove_file(path)?;
             } else {
                 fs::write(path, text.as_bytes())?;
             }
         }
     }
-    for file in &manifest.files {
-        fs::copy(
-            relative(source, &file.path)?,
-            relative(destination, &file.path)?,
-        )?;
-    }
     Ok(())
 }
 fn invalid_json(error: serde_json::Error) -> io::Error {
     invalid(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ENTRY: &str = r#"import { v } from "./chunk-a.js"; export const deps = ["assets/chunk-a.js", "assets/extra.js"];"#;
+    const CHUNK: &str = "export const v = 1;";
+
+    fn fixture(chunk_sha: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        write(
+            "dist/index.html",
+            r#"<script type="module" src="/assets/index-main.js"></script>"#,
+        );
+        write("dist/assets/index-main.js", ENTRY);
+        write("dist/assets/chunk-a.js", CHUNK);
+        write("dist/assets/style.css", "body { content: 'chunk-a.js'; }");
+        write("scripts/extra.js", "export const extra = true;");
+        let manifest = serde_json::json!({
+            "version": "test",
+            "files": [{
+                "path": "assets/chunk-a.js",
+                "sha256": chunk_sha,
+                "replacements": [{"from": "v = 1", "to": "v = 2", "count": 1}],
+            }],
+            "additions": [{"path": "assets/extra.js", "source": "scripts/extra.js"}],
+            "cacheBust": {"mode": "javascript-filenames"},
+        });
+        write("scripts/community-ui-overlay.json", &manifest.to_string());
+        dir
+    }
+
+    fn js_files(dir: &Path) -> Vec<String> {
+        let mut output = Vec::new();
+        files(dir, &mut output).unwrap();
+        let mut names: Vec<_> = output
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "js"))
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn ships_only_the_patched_renamed_graph() {
+        let dir = fixture(&format!("{:x}", Sha256::digest(CHUNK)));
+        let (root, out) = (dir.path(), dir.path().join("out"));
+        prepare(root, &root.join("dist"), &out).unwrap();
+
+        let names = js_files(&out);
+        assert_eq!(
+            names.len(),
+            3,
+            "every JS asset ships exactly once: {names:?}"
+        );
+        assert!(names.iter().all(|name| name.contains("-community-")));
+        let renamed = |stem: &str| {
+            names
+                .iter()
+                .find(|name| name.starts_with(&format!("{stem}-community-")))
+                .unwrap()
+                .clone()
+        };
+        let (entry, chunk, extra) = (renamed("index-main"), renamed("chunk-a"), renamed("extra"));
+
+        let html = fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(html.contains(&format!("/assets/{entry}")));
+        let entry_text = fs::read_to_string(out.join("assets").join(&entry)).unwrap();
+        assert!(entry_text.contains(&format!("./{chunk}")));
+        assert!(entry_text.contains(&format!("assets/{chunk}")));
+        assert!(entry_text.contains(&format!("assets/{extra}")));
+        let chunk_text = fs::read_to_string(out.join("assets").join(&chunk)).unwrap();
+        assert_eq!(chunk_text, "export const v = 2;");
+        // Non-JS assets are copied verbatim.
+        let css = fs::read_to_string(out.join("assets/style.css")).unwrap();
+        assert_eq!(css, "body { content: 'chunk-a.js'; }");
+
+        // Rebuilding from pristine inputs is deterministic.
+        prepare(root, &root.join("dist"), &out).unwrap();
+        assert_eq!(js_files(&out), names);
+    }
+
+    #[test]
+    fn refuses_unpinned_inputs() {
+        let dir = fixture(&"0".repeat(64));
+        let root = dir.path();
+        let error = prepare(root, &root.join("dist"), &root.join("out")).unwrap_err();
+        assert!(error.to_string().contains("SHA256 mismatch"));
+        assert!(!root.join("out").exists());
+    }
 }

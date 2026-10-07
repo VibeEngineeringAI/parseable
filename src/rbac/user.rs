@@ -230,14 +230,15 @@ impl User {
     }
 
     /// Explicit administrative grants, excluding provider/default grants.
-    /// Legacy OAuth roles have ambiguous provenance and must be re-granted.
+    /// Legacy OAuth users have no provenance, so administrative edits treat
+    /// their flat roles as manual; this keeps adds non-destructive and lets
+    /// any assigned role be revoked.
     pub fn manual_roles(&self) -> HashSet<String> {
         match &self.ty {
             UserType::OAuth(oauth) => oauth
                 .role_grants
                 .as_ref()
-                .map(|grants| grants.manual_roles.clone())
-                .unwrap_or_default(),
+                .map_or_else(|| self.roles.clone(), |grants| grants.manual_roles.clone()),
             _ => self.roles.clone(),
         }
     }

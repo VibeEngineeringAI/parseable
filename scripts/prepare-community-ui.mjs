@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -19,16 +19,31 @@ export function rewriteJavaScriptReferences(text, mapping) {
   return text.replace(/[A-Za-z0-9_.-]+\.js/g, name => mapping.get(name) ?? name);
 }
 
+async function listFiles(directory) {
+  const entries = await readdir(directory, { withFileTypes: true, recursive: true });
+  return entries.filter(entry => entry.isFile()).map(entry => join(entry.parentPath, entry.name)).sort();
+}
+
+// Mirrors build_support/community_ui.rs, which produces the embedded UI: every
+// JS file anywhere is renamed (the original removed) and every JS/HTML file has
+// its references rewritten.
 export async function bustJavaScriptCache(directory, identity) {
-  const assets = join(directory, 'assets');
-  const names = (await readdir(assets)).filter(name => name.endsWith('.js')).sort();
-  const mapping = new Map(names.map(name => [name, name.slice(0, -3) + `-community-${identity}.js`]));
-  for (const [original, renamed] of mapping) {
-    const text = await readFile(join(assets, original), 'utf8');
-    await writeFile(join(assets, renamed), rewriteJavaScriptReferences(text, mapping));
+  const paths = await listFiles(directory);
+  const scripts = paths.filter(path => path.endsWith('.js'));
+  const mapping = new Map(scripts.map(path => {
+    const name = basename(path);
+    return [name, name.slice(0, -3) + `-community-${identity}.js`];
+  }));
+  for (const path of paths) {
+    if (!path.endsWith('.js') && !path.endsWith('.html')) continue;
+    const text = rewriteJavaScriptReferences(await readFile(path, 'utf8'), mapping);
+    if (path.endsWith('.js')) {
+      await writeFile(join(dirname(path), mapping.get(basename(path))), text);
+      await rm(path);
+    } else {
+      await writeFile(path, text);
+    }
   }
-  const htmlPath = join(directory, 'index.html');
-  await writeFile(htmlPath, rewriteJavaScriptReferences(await readFile(htmlPath, 'utf8'), mapping));
   return mapping;
 }
 
@@ -74,8 +89,6 @@ export async function prepare(sourceDirectory, outputDirectory) {
       await writeFile(join(output, file.path), file.text);
     }
     await bustJavaScriptCache(output, identity);
-    // Keep the stock import graph available to already-open browser sessions.
-    for (const file of manifest.files) await cp(join(source, file.path), join(output, file.path));
     await writeFile(join(output, 'community-ui-overlay.json'), JSON.stringify({ version: manifest.version, identity, assets: manifest.files.map(file => file.path) }, null, 2) + '\n');
   } catch (error) {
     await rm(output, { recursive: true, force: true });

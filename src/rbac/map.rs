@@ -290,6 +290,8 @@ impl Sessions {
             tenant_sessions.remove(username);
         }
         // Also remove legacy orphaned keys left by the previous tracking scheme.
+        // This scans every active session, so bulk callers should only invoke
+        // it for users whose authorization actually changed.
         self.active_sessions
             .retain(|_, (user, tenant, _)| user != username || tenant != tenant_id);
     }

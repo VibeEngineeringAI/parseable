@@ -31,7 +31,7 @@ use crate::{
     parseable::{DEFAULT_TENANT, PARSEABLE},
     rbac::{
         Users,
-        map::{DEFAULT_ROLE, mut_roles, mut_sessions, read_user_groups, users},
+        map::{DEFAULT_ROLE, mut_roles, mut_sessions, mut_users, read_user_groups, users},
         user::UserType,
     },
     storage::{self, ObjectStorageError, StorageMetadata},
@@ -238,19 +238,22 @@ async fn set_default(name: Option<String>, tenant_id: &Option<String>) -> Result
         tenant_id.as_deref().unwrap_or(DEFAULT_TENANT).to_owned(),
         name,
     );
+    let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     for mut user in metadata.users.into_iter().filter(|u| u.is_oauth()) {
+        let current = Users.get_user(user.userid(), tenant_id);
         // Bearers live in memory; changing defaults must not discard them.
-        if let Some(current) = Users.get_user(user.userid(), tenant_id)
+        if let Some(current) = &current
             && let (UserType::OAuth(updated), UserType::OAuth(existing)) =
-                (&mut user.ty, current.ty)
+                (&mut user.ty, &current.ty)
         {
-            updated.bearer = existing.bearer;
+            updated.bearer = existing.bearer.clone();
         }
-        mut_sessions().remove_user(
-            user.userid(),
-            tenant_id.as_deref().unwrap_or(DEFAULT_TENANT),
-        );
-        Users.put_user(user);
+        // The default only applies to users without manual or provider roles;
+        // everyone else keeps their sessions.
+        if current.is_none_or(|current| current.roles != user.roles) {
+            mut_sessions().remove_user(user.userid(), tenant);
+        }
+        mut_users().insert(user);
     }
     Ok(())
 }

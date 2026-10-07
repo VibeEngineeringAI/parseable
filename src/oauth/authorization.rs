@@ -31,7 +31,8 @@ pub fn legacy_identity(user: &User, subject: &str) -> bool {
 }
 
 /// Recompute all provider/default grants. Legacy flat roles cannot safely be
-/// classified as manual; only an explicit grant recorded in provenance survives.
+/// classified as manual; only an explicit grant recorded in provenance survives,
+/// including one an administrator recorded before the legacy user signed in.
 pub fn reconcile_roles(
     existing_user: Option<&User>,
     groups: &HashSet<String>,
@@ -44,8 +45,11 @@ pub fn reconcile_roles(
             .is_some_and(|role| role.role_type() != &RoleType::Internal && !role.deny_super_admin())
     };
     let manual_roles = existing_user
-        .filter(|user| matches!(&user.ty, UserType::OAuth(oauth) if oauth.issuer.is_some()))
-        .map(User::manual_roles)
+        .and_then(|user| match &user.ty {
+            UserType::OAuth(oauth) => oauth.role_grants.as_ref(),
+            _ => None,
+        })
+        .map(|grants| grants.manual_roles.clone())
         .unwrap_or_default()
         .into_iter()
         .filter(|role| valid_role(role))
@@ -276,5 +280,45 @@ mod tests {
         assert!(reconciled.manual_roles.is_empty());
         assert!(reconciled.provider_roles.is_empty());
         assert!(reconciled.effective_roles().is_empty());
+    }
+
+    #[test]
+    fn administrator_edits_to_legacy_users_are_revocable_and_survive_sign_in() {
+        let roles = HashMap::from([
+            ("admin-like".to_owned(), user_role()),
+            ("kept".to_owned(), user_role()),
+            ("added".to_owned(), user_role()),
+        ]);
+        let mut legacy = user_with_grants(None, "subject", &[], &[]);
+        if let UserType::OAuth(oauth) = &mut legacy.ty {
+            oauth.role_grants = None;
+        }
+        legacy.roles = HashSet::from(["admin-like".to_owned(), "kept".to_owned()]);
+
+        // Adding keeps existing flat roles instead of replacing them.
+        let mut manual = legacy.manual_roles();
+        manual.insert("added".to_owned());
+        legacy.set_manual_roles(manual);
+        assert_eq!(
+            legacy.roles,
+            HashSet::from([
+                "admin-like".to_owned(),
+                "kept".to_owned(),
+                "added".to_owned()
+            ])
+        );
+
+        // Any assigned role can be revoked.
+        let manual = legacy.manual_roles();
+        assert!(manual.contains("admin-like"));
+        legacy.set_manual_roles(manual.into_iter().filter(|r| r != "admin-like").collect());
+        assert!(!legacy.roles.contains("admin-like"));
+
+        // The recorded administrative grants survive the legacy user's next sign-in.
+        let reconciled = reconcile_roles(Some(&legacy), &HashSet::new(), &roles, None);
+        assert_eq!(
+            reconciled.effective_roles(),
+            HashSet::from(["kept".to_owned(), "added".to_owned()])
+        );
     }
 }

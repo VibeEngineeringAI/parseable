@@ -104,6 +104,7 @@ class MockIssuer:
         self.token_request_rejection: str | None = None
         self.userinfo_request_count = 0
         self.block_next_refresh = False
+        self.fail_next_refresh_transiently = False
         self.refresh_entered = threading.Event()
         self.release_refresh = threading.Event()
         self.server: http.server.ThreadingHTTPServer | None = None
@@ -228,6 +229,10 @@ class MockIssuer:
                     if token not in issuer.refresh_tokens:
                         issuer.token_request_rejection = "invalid refresh token"
                         self.send_json({"error": "invalid_grant"}, 400)
+                        return
+                    if issuer.fail_next_refresh_transiently:
+                        issuer.fail_next_refresh_transiently = False
+                        self.send_json({"error": "temporarily_unavailable"}, 503)
                         return
                     if issuer.block_next_refresh:
                         issuer.block_next_refresh = False
@@ -582,6 +587,33 @@ def test_flow(smoke: Smoke, issuer: MockIssuer) -> None:
     if status != 401:
         fail(f"refresh without an ID token did not fail closed (HTTP {status})")
 
+    # A transient provider failure fails only the current request. The session
+    # survives, and the next request refreshes it with the same refresh token.
+    issuer.subject = "oidc-smoke-transient-user"
+    issuer.groups = {GROUP_SOURCE_ONLY}
+    issuer.omit_refresh_id_token = False
+    issuer.token_expiry = 5
+    _transient_user, transient_cookie = do_login(smoke, issuer)
+    issuer.token_expiry = 1
+    time.sleep(5.25)
+    issuer.fail_next_refresh_transiently = True
+    status, _body, _headers = smoke.request(
+        info_path,
+        headers={"Cookie": transient_cookie},
+        follow=False,
+        admin_auth=False,
+    )
+    if status != 503:
+        fail(f"transient provider refresh failure was not reported as unavailable (HTTP {status})")
+    status, _body, _headers = smoke.request(
+        info_path,
+        headers={"Cookie": transient_cookie},
+        follow=False,
+        admin_auth=False,
+    )
+    if status != 200:
+        fail(f"session did not survive a transient provider refresh failure (HTTP {status})")
+
     # Logout while the issuer is holding a refresh response. The refresh must
     # not recreate the removed cookie session after the response is released.
     issuer.subject = "oidc-smoke-logout-race-user"
@@ -632,6 +664,11 @@ def test_flow(smoke: Smoke, issuer: MockIssuer) -> None:
         fail(f"in-flight refresh survived logout (HTTP {in_flight_result[0]})")
     if logout_result[0] != 301:
         fail(f"logout did not complete after the blocked refresh (HTTP {logout_result[0]})")
+    if not any(
+        name.lower() == "set-cookie" and "Max-Age=0" in value
+        for name, value in logout_result[2].items()
+    ):
+        fail("logout did not clear the browser's session cookies")
     if issuer.refresh_count != refresh_count_before + 1:
         fail("logout-race refresh did not complete exactly once")
     status, _body, _headers = smoke.request(
@@ -643,6 +680,13 @@ def test_flow(smoke: Smoke, issuer: MockIssuer) -> None:
     if status != 401:
         fail(f"logout cookie was recreated after refresh (HTTP {status})")
 
+    # Changing the default must not sign out users whose roles it does not
+    # affect, here a user with a provider grant.
+    issuer.subject = "oidc-smoke-unaffected-by-default-user"
+    issuer.groups = {GROUP_SOURCE_ONLY}
+    issuer.token_expiry = 5
+    _unaffected_user, unaffected_cookie = do_login(smoke, issuer)
+
     # Clearing a configured default while refresh is waiting must have the
     # same revocation behavior and must not restore the default grant.
     status, _payload, _headers = smoke.admin(
@@ -650,6 +694,14 @@ def test_flow(smoke: Smoke, issuer: MockIssuer) -> None:
     )
     if status not in (200, 204):
         fail("setting default role for invalidation race failed")
+    status, _body, _headers = smoke.request(
+        info_path,
+        headers={"Cookie": unaffected_cookie},
+        follow=False,
+        admin_auth=False,
+    )
+    if status != 200:
+        fail(f"changing the default role signed out a user it does not affect (HTTP {status})")
     issuer.subject = "oidc-smoke-default-race-user"
     issuer.groups = set()
     issuer.token_expiry = 5
@@ -703,7 +755,7 @@ def test_flow(smoke: Smoke, issuer: MockIssuer) -> None:
     if smoke.user_roles(default_race_user):
         fail("removed default role returned after refresh")
 
-    print("OIDC smoke passed: discovery, RS256/JWKS code exchange, group mapping, permission revocation, manual grant protection, serialized refresh, fail-closed refresh, default validation/clear, and logout/default invalidation races.")
+    print("OIDC smoke passed: discovery, RS256/JWKS code exchange, group mapping, permission revocation, manual grant protection, serialized refresh, fail-closed refresh, transient refresh failure, default validation/clear, and logout/default invalidation races.")
 
 
 def main() -> int:
