@@ -83,6 +83,7 @@ impl ParseableServer for Server {
     fn configure_routes(config: &mut web::ServiceConfig) {
         // there might be a bug in the configure routes method
         config
+            .service(crate::handlers::http::promql::scope())
             .service(
                 web::scope(&base_path())
                     .service(Self::get_query_factory())

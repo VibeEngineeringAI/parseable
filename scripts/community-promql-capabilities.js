@@ -1,5 +1,17 @@
 // Separate capabilities keep the community server's OSS license intact.
 // Enterprise instances without capability metadata retain their existing behavior.
+function supports(state, capability) {
+  const config = state?.app?.instanceConfig;
+  const advertised = config?.capabilities?.[capability];
+  if (typeof advertised === 'boolean') return advertised;
+  const plan = config?.license?.plan;
+  return typeof plan === 'string' && plan !== 'OSS';
+}
+
+export const promqlDashboard = state => supports(state, 'promqlDashboard');
+export const promql = state => supports(state, 'promql');
+export const promqlMetadata = state => supports(state, 'promqlMetadata');
+
 // This view describes OSS provider claims; Enterprise keeps its native Groups UI.
 export const oidcRoleMapping = state => state?.app?.instanceConfig?.license?.plan === 'OSS' &&
   state?.app?.instanceConfig?.oidcActive === true &&
@@ -113,6 +125,75 @@ export function CommunityOidcRoleInspector({react: React, api, userId, role, onI
     h('p', {}, 'Assignments here are manual grants. Provider and default grants are managed through the identity provider and default role configuration.'),
     role && provenance && !provenance.legacy && h('p', {role: 'status'},
       oidcManualRoleRemovable(summary, role) ? provenance.providerRoles?.includes(role) ? 'Removing the manual grant leaves this role assigned through the provider group.' : 'This removes the administrator’s manual grant.' : 'This role has no manual grant to remove. Update the provider group or default role configuration.'));
+}
+
+export function promqlPreviewError(results, rawStream, resolvedStream) {
+  if (rawStream && !resolvedStream) {
+    return 'Select a value for the dataset variable to preview this query.';
+  }
+  for (const result of results) {
+    const envelope = result.error?.response?.data ?? result.data;
+    if (envelope?.status === 'error' && typeof envelope.error === 'string') {
+      return envelope.error;
+    }
+    if (result.error) return result.error.message || 'PromQL query failed';
+  }
+  return null;
+}
+
+export const promqlAlerts = state => supports(state, 'promqlAlerts');
+
+export function concretePromqlAlert(tile) {
+  const queries = Array.isArray(tile.chartQuery) ? tile.chartQuery : [tile.chartQuery];
+  const datasets = Array.isArray(tile.dbName) ? tile.dbName : [tile.dbName];
+  return queries.length === 1 && datasets.length === 1 &&
+    typeof queries[0] === 'string' && queries[0].trim() !== '' &&
+    typeof datasets[0] === 'string' && datasets[0].trim() !== '' &&
+    !/\$(?:[a-zA-Z_]|\{)/.test(queries[0] + datasets[0]);
+}
+
+export function promqlCondition(value, operator, threshold) {
+  const sample = Number(value), limit = Number(threshold);
+  if (!Number.isFinite(sample) || !Number.isFinite(limit)) throw Error('Preview requires finite numeric values.');
+  switch (operator) {
+    case '>': return sample > limit;
+    case '>=': return sample >= limit;
+    case '<': return sample < limit;
+    case '<=': return sample <= limit;
+    case '=': case '==': return sample === limit;
+    case '!=': return sample !== limit;
+    default: throw Error('Select a threshold operator.');
+  }
+}
+
+// Injected into the pinned Prism modules; native controls keep the same Redux alert object.
+export function CommunityPromqlAlertDetails({react: React, alert, onChange, queryInstant, readOnly = false}) {
+  const h = React.createElement;
+  const [preview, setPreview] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+  React.useEffect(() => { setPreview(null); setError(null); }, [alert.query, alert.datasets?.join(','), alert.thresholdConfig?.operator, alert.thresholdConfig?.value]);
+  async function run() {
+    setLoading(true); setError(null); setPreview(null);
+    try {
+      const response = await queryInstant({query: alert.query, stream: alert.datasets?.[0]});
+      const envelope = response.data;
+      if (envelope?.status !== 'success') throw Error(envelope?.error || 'PromQL preview failed.');
+      if (envelope.data?.resultType !== 'vector') throw Error('Alerts require an instant vector of numeric samples.');
+      setPreview(envelope.data.result.map(series => ({labels: series.metric, value: series.value[1], breached: promqlCondition(series.value[1], alert.thresholdConfig.operator, alert.thresholdConfig.value)})));
+    } catch (failure) { setError(failure.response?.data?.error || failure.message || 'PromQL preview failed.'); }
+    finally { setLoading(false); }
+  }
+  const runtime = alert.promqlRuntime;
+  return h('section', {className:'p-3 border border-coolGray-900 rounded-lg flex flex-col gap-2 text-sm'},
+    h('label', {}, 'Continuous breach duration ', readOnly ? (alert.promqlConfig?.holdDuration || '0s') : h('input', {value:alert.promqlConfig?.holdDuration || '0s', placeholder:'5m', 'aria-label':'Continuous breach duration', className:'bg-background border rounded px-2 py-1', onChange:event=>onChange({...alert,promqlConfig:{...alert.promqlConfig,holdDuration:event.target.value}})})),
+    h('p', {}, 'Each series is evaluated independently. Missing data retains firing state and resets pending duration. Evaluation errors do not report recovery. Notifications are sent on firing and recovery transitions, with at most three delivery attempts.'),
+    !readOnly && h('button', {type:'button', onClick:run, disabled:loading || !alert.datasets?.[0] || !alert.query?.trim(), className:'border rounded px-2 py-1'}, loading ? 'Previewing…' : 'Preview current values (no notifications)'),
+    error && h('p', {role:'alert'}, error),
+    preview && h('pre', {className:'overflow-auto whitespace-pre-wrap'}, preview.length ? preview.map(row=>`${JSON.stringify(row.labels)}: ${row.value} — ${row.breached ? 'threshold breached' : 'within threshold'}`).join('\n') : 'No Data: no series returned.'),
+    runtime && h('div', {}, h('p', {role:runtime.health === 'error' ? 'alert' : 'status'}, `Evaluation: ${runtime.health}${runtime.error ? ' — '+runtime.error : ''}${runtime.lastEvaluatedAt ? ' at '+runtime.lastEvaluatedAt : ''}`), h('pre', {className:'overflow-auto whitespace-pre-wrap'}, Object.values(runtime.instances || {}).map(instance=>`${JSON.stringify(instance.labels)}: ${instance.state}${instance.pendingSince ? ' since '+instance.pendingSince : ''} — ${instance.value}`).join('\n') || 'No alert instances.')),
+    !alert.targets?.length && h('p', {role:'status'}, 'State tracking only: no notifications until a target is selected.'),
+    runtime?.deliveries?.length > 0 && h('div', {role:runtime.deliveries.some(delivery=>delivery.error) ? 'alert' : 'status'}, h('p', {}, 'Notification deliveries'), h('pre', {className:'overflow-auto whitespace-pre-wrap'}, runtime.deliveries.map(delivery=>`${JSON.stringify(delivery.labels)}: ${delivery.firing ? 'firing' : 'resolved'} → target ${delivery.target} — ${delivery.attempts}/3 attempts${delivery.attempts >= 3 ? ' (retries exhausted)' : ' (retry pending)'}${delivery.error ? ' — '+delivery.error : ''}`).join('\n'))));
 }
 
 // Root and route error boundaries can outlive the normal Redux/router providers.

@@ -47,6 +47,7 @@ pub mod otel;
 pub mod otel_generator;
 pub mod parseable;
 pub mod prism;
+pub mod promql;
 pub mod query;
 pub mod rbac;
 mod response;

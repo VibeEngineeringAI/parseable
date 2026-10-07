@@ -92,6 +92,28 @@ impl MetastoreObject for ThresholdAlert {
 impl AlertTrait for ThresholdAlert {
     async fn eval_alert(&self) -> Result<Option<String>, AlertError> {
         self.validate_oss_query_type()?;
+        if self.query_type == AlertQueryType::Promql {
+            super::promql_alerts::authorize_execution(&self.to_alert_config())
+                .map_err(AlertError::InvalidAlertQuery)?;
+            let samples = crate::handlers::http::promql::execute_alert_instant(
+                &self.datasets[0],
+                &self.query,
+                &self.tenant_id,
+            )
+            .await
+            .map_err(AlertError::InvalidAlertQuery)?;
+            return samples
+                .into_iter()
+                .find(|(_, value)| {
+                    evaluate_condition(
+                        &self.threshold_config.operator,
+                        *value,
+                        self.threshold_config.value,
+                    )
+                })
+                .map(|(_, value)| self.create_threshold_message(value))
+                .transpose();
+        }
 
         let time_range = extract_time_range(&self.eval_config)?;
 
@@ -194,6 +216,29 @@ impl AlertTrait for ThresholdAlert {
 
         self.validate_oss_query_type()?;
 
+        if self.query_type == AlertQueryType::Promql {
+            super::user_auth_for_alert_config(session_key, &self.to_alert_config()).await?;
+            if self.get_eval_frequency() == 0 || self.get_eval_frequency() > 1440 {
+                return Err(AlertError::ValidationFailure(
+                    "PromQL evaluation frequency must be between 1 and 1440 minutes".into(),
+                ));
+            }
+            if !self.threshold_config.value.is_finite() {
+                return Err(AlertError::ValidationFailure(
+                    "Threshold must be finite".into(),
+                ));
+            }
+            if self.targets.len() > 20 {
+                return Err(AlertError::ValidationFailure(
+                    "PromQL alerts support at most 20 notification targets".into(),
+                ));
+            }
+            super::promql_alerts::hold_duration(&self.to_alert_config())?;
+            crate::handlers::http::promql::validate_alert_expression(&self.query)
+                .map_err(AlertError::InvalidAlertQuery)?;
+            return Ok(());
+        }
+
         let tables = resolve_stream_names(&self.query)?;
         if tables.is_empty() {
             return Err(AlertError::InvalidAlertQuery(
@@ -237,6 +282,9 @@ impl AlertTrait for ThresholdAlert {
         new_state: AlertState,
         trigger_notif: Option<String>,
     ) -> Result<(), AlertError> {
+        if self.query_type == AlertQueryType::Promql && new_state == AlertState::Disabled {
+            super::promql_alerts::reset_runtime_for_disable(&mut self.other_fields);
+        }
         if self.state.eq(&AlertState::Disabled) {
             warn!(
                 "Alert- {} is currently Disabled. Updating state to {new_state}.",
@@ -492,8 +540,15 @@ impl From<ThresholdAlert> for AlertConfig {
 
 impl ThresholdAlert {
     pub(crate) fn validate_oss_query_type(&self) -> Result<(), AlertError> {
-        if self.query_type == AlertQueryType::Promql {
-            return Err(AlertError::NotPresentInOSS("promql alerts"));
+        if self.query_type == AlertQueryType::Promql
+            && !matches!(
+                PARSEABLE.options.mode,
+                crate::option::Mode::All | crate::option::Mode::Query
+            )
+        {
+            return Err(AlertError::ValidationFailure(
+                "PromQL alerts require All or Query deployment mode".into(),
+            ));
         }
 
         Ok(())

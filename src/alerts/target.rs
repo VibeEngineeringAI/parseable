@@ -272,6 +272,80 @@ impl Target {
         }
     }
 
+    /// Delivery with an observable result for the persisted PromQL notification outbox.
+    pub async fn deliver_promql(
+        &self,
+        tenant: &Option<String>,
+        context: &Context,
+    ) -> Result<(), String> {
+        let request = match &self.target {
+            TargetType::Slack(target) => {
+                let prepared = outbound_http_policy::prepare_alert_target(
+                    tenant,
+                    &target.endpoint,
+                    AlertTargetKind::Slack,
+                    false,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                prepared
+                    .client
+                    .post(target.endpoint.clone())
+                    .json(&serde_json::json!({"text": context.message}))
+            }
+            TargetType::Other(target) => {
+                let prepared = outbound_http_policy::prepare_alert_target(
+                    tenant,
+                    &target.endpoint,
+                    AlertTargetKind::Webhook,
+                    target.skip_tls_check,
+                    Some(&target.headers),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                prepared
+                    .client
+                    .post(target.endpoint.clone())
+                    .headers(prepared.headers)
+                    .body(context.message.clone())
+            }
+            TargetType::AlertManager(target) => {
+                let prepared = outbound_http_policy::prepare_alert_target(
+                    tenant,
+                    &target.endpoint,
+                    AlertTargetKind::AlertManager,
+                    target.skip_tls_check,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                let mut alert = serde_json::json!({"labels":{"alertname":context.alert_info.alert_name},"annotations":{"message":context.message}});
+                if context.alert_info.alert_state == AlertState::NotTriggered {
+                    alert["endsAt"] = Utc::now().to_rfc3339().into();
+                }
+                let mut request = prepared
+                    .client
+                    .post(target.endpoint.clone())
+                    .json(&serde_json::json!([alert]));
+                if let Some(auth) = &target.auth {
+                    if !prepared.authorization_allowed {
+                        return Err("Target credentials blocked by outbound policy".into());
+                    }
+                    request = request.basic_auth(&auth.username, Some(&auth.password));
+                }
+                request
+            }
+        };
+        request
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn call(&self, context: Context) {
         trace!("target.call context- {context:?}");
         let timeout = context.notification_config.clone();
