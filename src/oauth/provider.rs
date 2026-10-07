@@ -38,6 +38,17 @@ pub trait OAuthProvider: Send + Sync + Any {
         headers: HeaderMap,
     ) -> Result<Bearer, anyhow::Error>;
 
+    /// Refresh authentication AND authorization from newly verified claims.
+    /// Providers that cannot return fresh claims must require reauthentication.
+    async fn refresh_session(
+        &mut self,
+        _oauth: &OAuth,
+        _scope: Option<&str>,
+        _headers: HeaderMap,
+    ) -> Result<OAuthSession, anyhow::Error> {
+        anyhow::bail!("Provider does not support authorization refresh; reauthenticate")
+    }
+
     /// Return the provider's logout / end-session URL, if one exists.
     fn logout_url(&self) -> Option<Url>;
 }
@@ -56,6 +67,8 @@ pub struct OAuthSession {
 /// Identity claims extracted from the ID token / JWT.
 #[derive(Debug, Clone)]
 pub struct ProviderClaims {
+    /// Verified issuer from the ID token.
+    pub issuer: String,
     /// `sub` – stable unique identifier for the user at this provider.
     pub sub: Option<String>,
     pub email: Option<String>,

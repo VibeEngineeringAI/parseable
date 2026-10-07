@@ -184,7 +184,9 @@ impl Users {
         if let Some(users) = mut_users().get_mut(tenant_id)
             && let Some(user) = users.get_mut(userid)
         {
-            user.roles.extend(roles);
+            let mut manual = user.manual_roles();
+            manual.extend(roles);
+            user.set_manual_roles(manual);
             let new_perms = roles_to_permission(user.roles(), tenant_id);
             mut_sessions().refresh_user_permissions(userid, tenant_id, &new_perms);
         };
@@ -195,8 +197,8 @@ impl Users {
         if let Some(users) = mut_users().get_mut(tenant_id)
             && let Some(user) = users.get_mut(userid)
         {
-            let diff = HashSet::from_iter(user.roles.difference(&roles).cloned());
-            user.roles = diff;
+            let manual = user.manual_roles();
+            user.set_manual_roles(HashSet::from_iter(manual.difference(&roles).cloned()));
             let new_perms = roles_to_permission(user.roles(), tenant_id);
             mut_sessions().refresh_user_permissions(userid, tenant_id, &new_perms);
         };

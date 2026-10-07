@@ -1,0 +1,149 @@
+{
+  "version": "prism-v3.2.4-community-oidc-v1-error-account-v1",
+  "files": [
+    {
+      "path": "assets/Team-DjnIdab9.js",
+      "sha256": "30c1946a50662ea8f321def6d2916f1cee0c86756a24e92f913a381bb0b4fe17",
+      "replacements": [
+        {
+          "from": "import{o as e}",
+          "to": "import{oidcRoleMapping as communityOidcRoleMapping,CommunityOidcDefaultRole,CommunityOidcGroups,CommunityOidcRoleInspector}from\"./community-promql-capabilities.js\";import{D as communityOidcApi}from\"./utils-d72tcMCs.js\";import{o as e}",
+          "count": 1
+        },
+        {
+          "from": "ct=({open:e,onClose:t})=>{",
+          "to": "communityNativeDefaultRole=({open:e,onClose:t})=>{",
+          "count": 1
+        },
+        {
+          "from": "},lt=[`admin`,`editor`]",
+          "to": "},ct=props=>{let enabled=g(communityOidcRoleMapping),roles=g(e=>e.app.roles);return enabled?(0,$.jsx)(K,{open:props.open,onOpenChange:props.onClose,children:(0,$.jsxs)(W,{children:[(0,$.jsx)(H,{children:(0,$.jsx)(G,{children:`Default OIDC role`})}),props.open&&(0,$.jsx)(CommunityOidcDefaultRole,{react:Q,api:communityOidcApi(),roles,onClose:props.onClose})]})}):(0,$.jsx)(communityNativeDefaultRole,props)},communityOidcGroupView=({searchQuery:e})=>{let{getRolesData:r,getRolesIsLoading:i,getRolesIsError:a}=Z(),sync=g(e=>e.app.instanceConfig?.capabilities?.oidcRoleSync===!0);return i?(0,$.jsx)(Te,{}):a?(0,$.jsx)(Pe,{}):(0,$.jsx)(CommunityOidcGroups,{react:Q,roles:r?.data,search:e,roleSync:sync})},lt=[`admin`,`editor`]",
+          "count": 1
+        },
+        {
+          "from": "s?.data&&p(s?.data)",
+          "to": "s&&p(s.data??null)",
+          "count": 1
+        },
+        {
+          "from": "o=!!e?.hasGroupAccess,[s,c]=l()",
+          "to": "communityOidcEnabled=g(communityOidcRoleMapping),o=!!e?.hasGroupAccess||communityOidcEnabled,[s,c]=l()",
+          "count": 1
+        },
+        {
+          "from": "k===`groups`&&(0,$.jsxs)(ge,{open:_",
+          "to": "k===`groups`&&!communityOidcEnabled&&(0,$.jsxs)(ge,{open:_",
+          "count": 1
+        },
+        {
+          "from": "children:`Set default OIDC role`",
+          "to": "children:`Manage default OIDC role`",
+          "count": 1
+        },
+        {
+          "from": "\"data-testid\":`team-group`,className:`text-coolGray-500`,children:`Groups`",
+          "to": "\"data-testid\":`team-group`,className:`text-coolGray-500`,children:communityOidcEnabled?`OIDC groups`:`Groups`",
+          "count": 1
+        },
+        {
+          "from": "k===`groups`&&o&&(0,$.jsx)(yt,{searchQuery:m})",
+          "to": "k===`groups`&&o&&(communityOidcEnabled?(0,$.jsx)(communityOidcGroupView,{searchQuery:m}):(0,$.jsx)(yt,{searchQuery:m}))",
+          "count": 1
+        },
+        {
+          "from": "Je=({user:e,open:t,onClose:n,type:r,role:i=``})=>{let[a,o]",
+          "to": "Je=({user:e,open:t,onClose:n,type:r,role:i=``})=>{let communityOidcEnabled=g(communityOidcRoleMapping),[communityCanRemove,communitySetCanRemove]=(0,Q.useState)(!1),[a,o]",
+          "count": 1
+        },
+        {
+          "from": "children:r===`add`?`Assign new role`:`Delete user role`})}),r!==`add`",
+          "to": "children:r===`add`?`Assign new role`:`Delete user role`})}),communityOidcEnabled&&t&&e?.method===`oauth`&&(0,$.jsx)(CommunityOidcRoleInspector,{react:Q,api:communityOidcApi(),userId:e.id,role:r===`add`?void 0:i,onInspection:communitySetCanRemove},`${e.id}:${i}`),r!==`add`",
+          "count": 1
+        },
+        {
+          "from": "disabled:s!==e?.username,onClick:v,children:`Delete`",
+          "to": "disabled:s!==e?.username||communityOidcEnabled&&e?.method===`oauth`&&!communityCanRemove,onClick:v,children:`Delete`",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/index-BLF851sq.js",
+      "sha256": "5baf82b1804c5069d71b8df4f2de1e6e2d2cccd0318a5c5f782b9cfa82b01822",
+      "replacements": [
+        {
+          "from": "import{o as e,t}",
+          "to": "import{CommunityErrorAccountMenu}from\"./community-promql-capabilities.js\";import{o as e,t}",
+          "count": 1
+        },
+        {
+          "from": "className:`error-boundary`,children:[",
+          "to": "className:`error-boundary`,children:[(0,D.jsx)(CommunityErrorAccountMenu,{react:E}),",
+          "count": 1
+        },
+        {
+          "from": "children:[(0,D.jsx)(`img`,{src:R,alt:`Parseable Error Icon`",
+          "to": "children:[(0,D.jsx)(CommunityErrorAccountMenu,{react:E,position:`absolute`}),(0,D.jsx)(`img`,{src:R,alt:`Parseable Error Icon`",
+          "count": 1
+        },
+        {
+          "from": "className:`h-screen w-full flex flex-col items-center justify-center gap-10 px-6 text-center`",
+          "to": "className:`relative h-screen w-full flex flex-col items-center justify-center gap-10 px-6 text-center`",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/App-BaXntU9S.js",
+      "sha256": "22d0efcbe258a990ff0ce229f8935188d74aef63dc34043dadd6cbf826a5de07",
+      "replacements": [
+        {
+          "from": "children:[(0,J.jsx)(`img`,{src:je,alt:`Parseable Error Icon`",
+          "to": "children:[(0,J.jsx)(`div`,{className:`fixed right-4 top-4 z-50`,children:(0,J.jsx)($n,{})}),(0,J.jsx)(`img`,{src:je,alt:`Parseable Error Icon`",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/NoAccessPage-BiZpLDSB.js",
+      "sha256": "49b734228a340786ec1a1f8c622f287aa0f753ee71f68dd520f9006e0443e5c4",
+      "replacements": [
+        {
+          "from": "import{o as e}",
+          "to": "import{CommunityErrorAccountMenu}from\"./community-promql-capabilities.js\";import{o as e}",
+          "count": 1
+        },
+        {
+          "from": "children:[(0,l.jsx)(`img`,{src:o,alt:`Parseable Error Icon`",
+          "to": "children:[(0,l.jsx)(CommunityErrorAccountMenu,{react:c}),(0,l.jsx)(`img`,{src:o,alt:`Parseable Error Icon`",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/NotFoundPage-q_LZqNzB.js",
+      "sha256": "281a0a79f47a8a03a399e0ae1b21520faf7148791376720ab072f42d123edfb2",
+      "replacements": [
+        {
+          "from": "import{S as e}",
+          "to": "import{CommunityErrorAccountMenu}from\"./community-promql-capabilities.js\";import{o as communityInterop}from\"./rolldown-runtime-CMxvf4Kt.js\";import{r as communityReactModule}from\"./apexcharts-CtzYX57T.js\";const communityErrorReact=communityInterop(communityReactModule(),1);import{S as e}",
+          "count": 1
+        },
+        {
+          "from": "children:[(0,r.jsx)(`img`,{src:n,alt:`Parseable Error Icon`",
+          "to": "children:[(0,r.jsx)(CommunityErrorAccountMenu,{react:communityErrorReact}),(0,r.jsx)(`img`,{src:n,alt:`Parseable Error Icon`",
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "additions": [
+    {
+      "path": "assets/community-promql-capabilities.js",
+      "source": "scripts/community-promql-capabilities.js"
+    }
+  ],
+  "cacheBust": {
+    "mode": "javascript-filenames"
+  }
+}

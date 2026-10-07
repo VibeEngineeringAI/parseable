@@ -99,6 +99,10 @@ pub async fn about() -> Json<Value> {
         "latestVersion": latest_release,
         "oidcActive": is_oidc_active,
         "license": license_info,
+        "capabilities": {
+            "oidcRoleMapping": matches!(PARSEABLE.options.mode, crate::option::Mode::All),
+            "oidcRoleSync": matches!(PARSEABLE.options.mode, crate::option::Mode::All),
+        },
         "mode": mode,
         "staging": staging,
         "hotTier": hot_tier_details,

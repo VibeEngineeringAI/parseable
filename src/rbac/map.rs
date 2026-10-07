@@ -36,7 +36,6 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
 pub type Roles = HashMap<String, HashMap<String, Role>>;
@@ -220,27 +219,15 @@ impl Sessions {
 
     // only checks if the session is expired or not
     pub fn is_session_expired(&self, key: &SessionKey) -> bool {
-        // fetch userid from session key
-        let (userid, tenant_id) = if let Some((user, tenant_id, _)) = self.active_sessions.get(key)
-        {
-            (user, tenant_id)
-        } else {
+        let Some((userid, tenant_id, _)) = self.active_sessions.get(key) else {
             return false;
         };
-
-        // check against user sessions if this session is still valid
-        let session = if let Some(tenant_sessions) = self.user_sessions.get(tenant_id)
-            && let Some(session) = tenant_sessions.get(userid)
-        {
-            session
-        } else {
-            return false;
-        };
-
-        session
-            .par_iter()
-            .find_first(|(sessionid, expiry)| sessionid.eq(key) && expiry < &Utc::now())
-            .is_some()
+        // An active key without expiry tracking must never bypass revalidation.
+        self.user_sessions
+            .get(tenant_id)
+            .and_then(|tenant| tenant.get(userid))
+            .and_then(|sessions| sessions.iter().find(|(session, _)| session == key))
+            .is_none_or(|(_, expiry)| expiry <= &Utc::now())
     }
 
     // track new session key
@@ -257,8 +244,9 @@ impl Sessions {
         self.remove_expired_session(&user, tenant_id);
 
         let sessions = self.user_sessions.entry(tenant_id.to_owned()).or_default();
-        sessions.insert(user.clone(), vec![(key.clone(), expiry)]);
-        // sessions.push((key.clone(), expiry));
+        let tracked = sessions.entry(user.clone()).or_default();
+        tracked.retain(|(session, _)| session != &key);
+        tracked.push((key.clone(), expiry));
         self.active_sessions
             .insert(key, (user, tenant_id.to_string(), permissions));
     }
@@ -298,29 +286,28 @@ impl Sessions {
 
     // remove sessions related to a user
     pub fn remove_user(&mut self, username: &str, tenant_id: &str) {
-        let sessions = if let Some(tenant_sessions) = self.user_sessions.get_mut(tenant_id) {
-            tenant_sessions.remove(username)
-        } else {
-            None
-        };
-        if let Some(sessions) = sessions {
-            sessions.into_iter().for_each(|(key, _)| {
-                self.active_sessions.remove(&key);
-            })
+        if let Some(tenant_sessions) = self.user_sessions.get_mut(tenant_id) {
+            tenant_sessions.remove(username);
         }
+        // Also remove legacy orphaned keys left by the previous tracking scheme.
+        self.active_sessions
+            .retain(|_, (user, tenant, _)| user != username || tenant != tenant_id);
     }
 
     fn remove_expired_session(&mut self, user: &str, tenant_id: &str) {
         let now = Utc::now();
-
-        let sessions = if let Some(tenant_sessions) = self.user_sessions.get_mut(tenant_id)
+        if let Some(tenant_sessions) = self.user_sessions.get_mut(tenant_id)
             && let Some(sessions) = tenant_sessions.get_mut(user)
         {
-            sessions
-        } else {
-            return;
-        };
-        sessions.retain(|(_, expiry)| expiry < &now);
+            sessions.retain(|(key, expiry)| {
+                if expiry <= &now {
+                    self.active_sessions.remove(key);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     // get permission related to this session
@@ -568,5 +555,100 @@ impl From<Vec<UserGroup>> for UserGroups {
         //         .map(|group| (group.name.to_owned(), group)),
         // );
         map
+    }
+}
+
+#[cfg(test)]
+mod session_expiry_tests {
+    use super::*;
+    use chrono::TimeDelta;
+    use ulid::Ulid;
+
+    fn key() -> SessionKey {
+        SessionKey::SessionId(Ulid::new())
+    }
+
+    #[test]
+    fn every_concurrent_session_retains_its_own_expiry_and_revokes_together() {
+        let mut sessions = Sessions::default();
+        let first = key();
+        let second = key();
+        let tenant = Some("oidc-test".to_owned());
+        for key in [&first, &second] {
+            sessions.track_new(
+                "user".into(),
+                key.clone(),
+                Utc::now() + TimeDelta::minutes(5),
+                Vec::new(),
+                &tenant,
+            );
+        }
+        assert_eq!(sessions.user_sessions["oidc-test"]["user"].len(), 2);
+        assert!(!sessions.is_session_expired(&first));
+        assert!(!sessions.is_session_expired(&second));
+        sessions
+            .user_sessions
+            .get_mut("oidc-test")
+            .unwrap()
+            .get_mut("user")
+            .unwrap()[0]
+            .1 = Utc::now() - TimeDelta::seconds(1);
+        assert!(sessions.is_session_expired(&first));
+        assert!(!sessions.is_session_expired(&second));
+        sessions.remove_user("user", "oidc-test");
+        assert!(sessions.get(&first).is_none());
+        assert!(sessions.get(&second).is_none());
+    }
+
+    #[test]
+    fn renewing_one_session_preserves_other_sessions_and_cleans_expired_keys() {
+        let mut sessions = Sessions::default();
+        let expired = key();
+        let active = key();
+        sessions.track_new(
+            "user".into(),
+            expired.clone(),
+            Utc::now() - TimeDelta::seconds(1),
+            Vec::new(),
+            &None,
+        );
+        sessions.track_new(
+            "user".into(),
+            active.clone(),
+            Utc::now() + TimeDelta::minutes(5),
+            Vec::new(),
+            &None,
+        );
+        assert!(sessions.get(&expired).is_none());
+        sessions.track_new(
+            "user".into(),
+            active.clone(),
+            Utc::now() + TimeDelta::minutes(5),
+            Vec::new(),
+            &None,
+        );
+        assert_eq!(sessions.user_sessions[DEFAULT_TENANT]["user"].len(), 1);
+        assert!(!sessions.is_session_expired(&active));
+    }
+
+    #[test]
+    fn legacy_orphan_requires_refresh_and_user_revocation_cleans_it() {
+        let mut sessions = Sessions::default();
+        let orphan = key();
+        let other_tenant = key();
+        sessions
+            .active_sessions
+            .insert(orphan.clone(), ("user".into(), "one".into(), Vec::new()));
+        sessions.track_new(
+            "user".into(),
+            other_tenant.clone(),
+            Utc::now() + TimeDelta::minutes(5),
+            Vec::new(),
+            &Some("two".into()),
+        );
+        assert!(sessions.is_session_expired(&orphan));
+        sessions.remove_user("user", "one");
+        assert!(sessions.get(&orphan).is_none());
+        assert!(sessions.get(&other_tenant).is_some());
     }
 }

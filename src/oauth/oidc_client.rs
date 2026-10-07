@@ -49,71 +49,8 @@ impl OAuthProvider for GlobalClient {
     /// rotation transparently: if `decode_token` fails with the cached client,
     /// a fresh discovery is performed and decoding is retried once.
     async fn exchange_code(&mut self, code: &str) -> Result<OAuthSession, anyhow::Error> {
-        let mut token: Token<Claims> = self.client.request_token(code).await?.into();
-
-        let id_token = token
-            .id_token
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("OIDC provider did not return an id_token"))?;
-
-        if let Err(e) = self.client.decode_token(id_token) {
-            // Stale JWKS – reconnect and retry once.
-            tracing::warn!("id_token decode failed ({e}), rotating JWKS and retrying");
-            self.client = self.config.clone().connect(&self.redirect_suffix).await?;
-            self.client.decode_token(id_token)?;
-        }
-
-        self.client.validate_token(id_token, None, None)?;
-
-        let raw_claims = id_token
-            .payload()
-            .expect("token is decoded at this point")
-            .clone();
-
-        // `sub` is a required non-optional String in StandardClaims.
-        // `email` and `name` are not in StandardClaims (they're userinfo fields)
-        // but providers sometimes include them as additional claims in the ID
-        // token; extract them from `other` if present.
-        let groups: std::collections::HashSet<String> = raw_claims
-            .other
-            .get("groups")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        let claims = ProviderClaims {
-            sub: Some(raw_claims.standard.sub.clone()),
-            email: raw_claims
-                .other
-                .get("email")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            name: raw_claims
-                .other
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            groups,
-            other: raw_claims.other.clone(),
-        };
-
-        let userinfo_raw = self.client.request_userinfo(&token).await?;
-        let userinfo = ProviderUserInfo {
-            sub: userinfo_raw.sub.clone(),
-            email: userinfo_raw.email.clone(),
-            name: userinfo_raw.name.clone(),
-            preferred_username: userinfo_raw.preferred_username.clone(),
-
-            picture: userinfo_raw
-                .picture
-                .as_ref()
-                .map(|p| p.as_str().to_string()),
-        };
-
-        Ok(OAuthSession {
-            bearer: token.bearer,
-            claims,
-            userinfo,
-        })
+        let bearer = self.client.request_token(code).await?;
+        self.verified_session(bearer).await
     }
 
     async fn refresh_token(
@@ -127,8 +64,97 @@ impl OAuthProvider for GlobalClient {
         Ok(self.client.refresh_token(boxed, scope).await?)
     }
 
+    async fn refresh_session(
+        &mut self,
+        oauth: &OAuth,
+        scope: Option<&str>,
+        _headers: HeaderMap,
+    ) -> Result<OAuthSession, anyhow::Error> {
+        anyhow::ensure!(
+            oauth.issuer.as_deref() == Some(self.config.issuer.as_str()),
+            "OIDC issuer binding changed; reauthenticate"
+        );
+        anyhow::ensure!(
+            oauth
+                .bearer
+                .as_ref()
+                .and_then(|token| token.refresh_token.as_ref())
+                .is_some(),
+            "OIDC refresh token unavailable; reauthenticate"
+        );
+        let bearer = self
+            .client
+            .refresh_token(Box::new(oauth.clone()), scope)
+            .await?;
+        // Never reuse old groups if the refresh response omits its ID token.
+        let session = self.verified_session(bearer).await?;
+        anyhow::ensure!(
+            session.claims.sub == oauth.user_info.sub,
+            "OIDC subject changed during refresh"
+        );
+        Ok(session)
+    }
+
     fn logout_url(&self) -> Option<Url> {
         self.client.config().end_session_endpoint.clone()
+    }
+}
+
+impl GlobalClient {
+    async fn verified_session(
+        &mut self,
+        bearer: openid::Bearer,
+    ) -> Result<OAuthSession, anyhow::Error> {
+        let mut token: Token<Claims> = bearer.into();
+        let id_token = token.id_token.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("OIDC provider did not return an id_token; reauthenticate")
+        })?;
+        if self.client.decode_token(id_token).is_err() {
+            // Rotate JWKS once. Avoid logging token error details or credentials.
+            self.client = self.config.clone().connect(&self.redirect_suffix).await?;
+            self.client.decode_token(id_token)?;
+        }
+        self.client.validate_token(id_token, None, None)?;
+        let raw = id_token.payload()?.clone();
+        anyhow::ensure!(
+            raw.standard.iss == self.config.issuer,
+            "Unexpected OIDC issuer"
+        );
+        let groups = crate::oauth::authorization::parse_groups(raw.other.get("groups"))?;
+        let userinfo_raw = self.client.request_userinfo(&token).await?;
+        crate::oauth::authorization::validate_subjects(
+            &raw.standard.sub,
+            userinfo_raw.sub.as_deref(),
+        )?;
+        // The authorization interval is also bounded by the verified ID token.
+        let id_lifetime = raw
+            .standard
+            .exp
+            .saturating_sub(chrono::Utc::now().timestamp())
+            .max(0) as u64;
+        let mut bearer = token.bearer;
+        bearer.expires_in = Some(bearer.expires_in.unwrap_or(id_lifetime).min(id_lifetime));
+        Ok(OAuthSession {
+            bearer,
+            claims: ProviderClaims {
+                issuer: raw.standard.iss.to_string(),
+                sub: Some(raw.standard.sub),
+                email: userinfo_raw.email.clone(),
+                name: userinfo_raw.name.clone(),
+                groups,
+                other: raw.other,
+            },
+            userinfo: ProviderUserInfo {
+                sub: userinfo_raw.sub,
+                email: userinfo_raw.email,
+                name: userinfo_raw.name,
+                preferred_username: userinfo_raw.preferred_username,
+                picture: userinfo_raw
+                    .picture
+                    .as_ref()
+                    .map(|p| p.as_str().to_string()),
+            },
+        })
     }
 }
 

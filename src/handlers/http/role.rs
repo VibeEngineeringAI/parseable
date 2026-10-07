@@ -29,7 +29,11 @@ use crate::rbac::map::roles;
 use crate::rbac::role::model::{Role, RoleType, RoleUI};
 use crate::{
     parseable::{DEFAULT_TENANT, PARSEABLE},
-    rbac::map::{DEFAULT_ROLE, mut_roles, mut_sessions, read_user_groups, users},
+    rbac::{
+        Users,
+        map::{DEFAULT_ROLE, mut_roles, mut_sessions, read_user_groups, users},
+        user::UserType,
+    },
     storage::{self, ObjectStorageError, StorageMetadata},
     utils::get_tenant_id_from_request,
     validator::{self, error::UsernameValidationError},
@@ -42,6 +46,7 @@ pub async fn put(
     name: web::Path<String>,
     Json(role): Json<Role>,
 ) -> Result<impl Responder, RoleError> {
+    let _guard = super::rbac::UPDATE_LOCK.lock().await;
     // internal role manipulation not allowed
     if role.role_type().eq(&RoleType::Internal) {
         return Err(RoleError::ProtectedRole);
@@ -56,6 +61,13 @@ pub async fn put(
     validator::user_role_name(&name).map_err(RoleError::ValidationError)?;
 
     let mut metadata = get_metadata(&tenant_id).await?;
+    if metadata
+        .roles
+        .get(&name)
+        .is_some_and(|role| role.role_type() == &RoleType::Internal)
+    {
+        return Err(RoleError::ProtectedRole);
+    }
     metadata.roles.insert(name.clone(), role.clone());
 
     put_metadata(&metadata, &tenant_id).await?;
@@ -140,6 +152,7 @@ pub async fn delete(
     req: HttpRequest,
     name: web::Path<String>,
 ) -> Result<impl Responder, RoleError> {
+    let _guard = super::rbac::UPDATE_LOCK.lock().await;
     let name = name.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
@@ -152,6 +165,9 @@ pub async fn delete(
 
     // check if the role is being used by any user or group
     let mut metadata = get_metadata(&tenant_id).await?;
+    if metadata.default_role.as_deref() == Some(name.as_str()) {
+        return Err(RoleError::DefaultRoleInUse);
+    }
     if metadata.users.iter().any(|user| user.roles.contains(&name)) {
         return Err(RoleError::RoleInUse);
     }
@@ -175,25 +191,68 @@ pub async fn delete(
 }
 
 // Handler for PUT /api/v1/role/default
-// Delete existing role
+// Set the fallback role for OIDC users without manual or mapped grants.
 pub async fn put_default(
     req: HttpRequest,
     name: web::Json<String>,
 ) -> Result<impl Responder, RoleError> {
-    let name = name.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let mut metadata = get_metadata(&tenant_id).await?;
-    metadata.default_role = Some(name.clone());
-    DEFAULT_ROLE
-        .write()
-        // .unwrap()
-        .insert(
-            tenant_id.as_deref().unwrap_or(DEFAULT_TENANT).to_owned(),
-            Some(name),
-        );
-    // *DEFAULT_ROLE.lock().unwrap() = Some(name);
-    put_metadata(&metadata, &tenant_id).await?;
+    set_default(Some(name.into_inner()), &tenant_id).await?;
     Ok(HttpResponse::Ok().finish())
+}
+
+// Handler for DELETE /api/v1/role/default
+pub async fn delete_default(req: HttpRequest) -> Result<impl Responder, RoleError> {
+    let tenant_id = get_tenant_id_from_request(&req);
+    set_default(None, &tenant_id).await?;
+    Ok(HttpResponse::Ok().finish())
+}
+
+fn validate_default_role(name: &str, roles: &HashMap<String, Role>) -> Result<(), RoleError> {
+    validator::user_role_name(name)?;
+    let role = roles.get(name).ok_or(RoleError::UnknownDefaultRole)?;
+    if role.role_type() == &RoleType::Internal || role.deny_super_admin() {
+        return Err(RoleError::ProtectedRole);
+    }
+    Ok(())
+}
+
+async fn set_default(name: Option<String>, tenant_id: &Option<String>) -> Result<(), RoleError> {
+    let _guard = super::rbac::UPDATE_LOCK.lock().await;
+    let mut metadata = get_metadata(tenant_id).await?;
+    if let Some(name) = &name {
+        validate_default_role(name, &metadata.roles)?;
+    }
+    metadata.default_role = name.clone();
+    for user in &mut metadata.users {
+        if let UserType::OAuth(oauth) = &mut user.ty
+            && let Some(grants) = &mut oauth.role_grants
+        {
+            grants.default_role = name.clone();
+            user.roles = grants.effective_roles();
+        }
+    }
+    // Publish cache changes only after the durable write succeeds.
+    put_metadata(&metadata, tenant_id).await?;
+    DEFAULT_ROLE.write().insert(
+        tenant_id.as_deref().unwrap_or(DEFAULT_TENANT).to_owned(),
+        name,
+    );
+    for mut user in metadata.users.into_iter().filter(|u| u.is_oauth()) {
+        // Bearers live in memory; changing defaults must not discard them.
+        if let Some(current) = Users.get_user(user.userid(), tenant_id)
+            && let (UserType::OAuth(updated), UserType::OAuth(existing)) =
+                (&mut user.ty, current.ty)
+        {
+            updated.bearer = existing.bearer;
+        }
+        mut_sessions().remove_user(
+            user.userid(),
+            tenant_id.as_deref().unwrap_or(DEFAULT_TENANT),
+        );
+        Users.put_user(user);
+    }
+    Ok(())
 }
 
 // Handler for GET /api/v1/role/default
@@ -251,6 +310,10 @@ async fn put_metadata(
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoleError {
+    #[error("Default OIDC role must name an existing role.")]
+    UnknownDefaultRole,
+    #[error("Clear or change the default OIDC role before deleting this role.")]
+    DefaultRoleInUse,
     #[error("Failed to connect to storage: {0}")]
     ObjectStorageError(#[from] ObjectStorageError),
     #[error("Cannot perform this operation as role is assigned to an existing user.")]
@@ -272,6 +335,7 @@ pub enum RoleError {
 impl actix_web::ResponseError for RoleError {
     fn status_code(&self) -> StatusCode {
         match self {
+            Self::UnknownDefaultRole | Self::DefaultRoleInUse => StatusCode::BAD_REQUEST,
             Self::ObjectStorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RoleInUse => StatusCode::BAD_REQUEST,
             Self::SuperAdminPrivilege => StatusCode::BAD_REQUEST,
@@ -287,5 +351,46 @@ impl actix_web::ResponseError for RoleError {
         actix_web::HttpResponse::build(self.status_code())
             .insert_header(ContentType::plaintext())
             .body(self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod oidc_default_tests {
+    use super::*;
+    use crate::rbac::role::model::DefaultPrivilege;
+    use actix_web::ResponseError;
+
+    #[test]
+    fn default_must_reference_an_existing_role_in_this_tenant() {
+        let roles = HashMap::from([(
+            "readers".to_owned(),
+            Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }]),
+        )]);
+        assert!(validate_default_role("readers", &roles).is_ok());
+        let error = validate_default_role("missing", &roles).unwrap_err();
+        assert!(matches!(error, RoleError::UnknownDefaultRole));
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert!(validate_default_role("readers", &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn default_rejects_internal_and_super_admin_roles() {
+        let roles = HashMap::from([
+            (
+                "internal-role".to_owned(),
+                Role::create_internal_role(vec![DefaultPrivilege::Admin]),
+            ),
+            (
+                "elevated-role".to_owned(),
+                Role::create_user_role(vec![DefaultPrivilege::SuperAdmin]),
+            ),
+        ]);
+        for name in roles.keys() {
+            assert!(matches!(
+                validate_default_role(name, &roles),
+                Err(RoleError::ProtectedRole)
+            ));
+        }
+        assert!(validate_default_role("", &roles).is_err());
     }
 }

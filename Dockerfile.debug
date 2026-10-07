@@ -25,6 +25,8 @@ WORKDIR /parseable
 
 # Cache dependencies
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY build_support ./build_support
+COPY scripts/community-ui-overlay.json scripts/community-promql-capabilities.js ./scripts/
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build && rm -rf src
 
 # Build the actual binary

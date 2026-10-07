@@ -1,3 +1,4 @@
+pub mod authorization;
 pub mod oidc_client;
 pub mod provider;
 
