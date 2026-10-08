@@ -274,6 +274,7 @@ pub async fn post_internal(
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
     let mut alert: AlertConfig = alert.into(tenant_id.clone()).await?;
+    crate::alerts::promql_alerts::capture_identity(&mut alert, session_key)?;
 
     if alert.notification_config.interval > alert.get_eval_frequency() {
         return Err(AlertError::ValidationFailure(
@@ -386,6 +387,7 @@ pub async fn get_internal(
 pub async fn delete(req: HttpRequest, alert_id: Path<Ulid>) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
+    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let tenant_id = get_tenant_id_from_request(&req);
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
@@ -417,6 +419,7 @@ pub async fn delete(req: HttpRequest, alert_id: Path<Ulid>) -> Result<impl Respo
 
     // delete the scheduled task
     alerts.delete_task(alert_id).await?;
+    crate::alerts::promql_alerts::forget_lifecycle(alert_id);
 
     Ok(format!("Deleted alert with ID- {alert_id}"))
 }
@@ -431,6 +434,7 @@ pub async fn update_notification_state(
 ) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
+    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let tenant_id = get_tenant_id_from_request(&req);
     let new_notification_state = match new_notification_state.state.as_str() {
         "notify" => NotificationState::Notify,
@@ -500,6 +504,7 @@ pub async fn disable_alert_internal(
     alert_id: Ulid,
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
+    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
         alerts
@@ -541,6 +546,7 @@ pub async fn enable_alert_internal(
     alert_id: Ulid,
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
+    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
         alerts
@@ -584,6 +590,7 @@ pub async fn modify_alert(
 ) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
+    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let tenant_id = get_tenant_id_from_request(&req);
     // Get alerts manager reference without holding the global lock
     let alerts = {
@@ -600,6 +607,17 @@ pub async fn modify_alert(
     user_auth_for_alert_config(&session_key, &alert.to_alert_config()).await?;
 
     let mut new_config = alert_request.into(tenant_id.clone()).await?;
+    crate::alerts::promql_alerts::capture_identity(&mut new_config, &session_key)?;
+    if new_config.get_eval_frequency() == 0 || new_config.notification_config.interval == 0 {
+        return Err(AlertError::ValidationFailure(
+            "Evaluation and notification intervals must be nonzero".into(),
+        ));
+    }
+    if new_config.notification_config.interval > new_config.get_eval_frequency() {
+        return Err(AlertError::ValidationFailure(
+            "Notification interval cannot exceed evaluation frequency".into(),
+        ));
+    }
     if &new_config.alert_type != alert.get_alert_type() {
         return Err(AlertError::InvalidAlertModifyRequest);
     }
@@ -628,6 +646,7 @@ pub async fn modify_alert(
     old_config.tags = new_config.tags;
     old_config.targets = new_config.targets;
     old_config.title = new_config.title;
+    old_config.other_fields = new_config.other_fields;
 
     let new_alert: Box<dyn AlertTrait> = match &new_config.alert_type {
         AlertType::Threshold => Box::new(ThresholdAlert::from(old_config)) as Box<dyn AlertTrait>,
@@ -681,6 +700,7 @@ pub async fn evaluate_alert_internal(
     alert_id: Ulid,
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
+    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
         alerts

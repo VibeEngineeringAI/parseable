@@ -43,6 +43,7 @@ pub mod alert_traits;
 pub mod alert_types;
 pub mod alerts_utils;
 pub mod outbound_http_policy;
+pub mod promql_alerts;
 pub mod target;
 
 pub use crate::alerts::alert_enums::{
@@ -95,12 +96,9 @@ pub async fn set_alert_manager(manager: Arc<dyn AlertManagerTrait>) {
 }
 
 fn ensure_schedulable_in_oss(alert: &dyn AlertTrait) -> Result<(), AlertError> {
-    if matches!(alert.get_alert_type(), AlertType::Threshold)
-        && alert.get_query_type() == AlertQueryType::Promql
-    {
-        return Err(AlertError::NotPresentInOSS("promql alerts"));
+    if alert.get_query_type() == AlertQueryType::Promql {
+        alert_types::ThresholdAlert::from(alert.to_alert_config()).validate_oss_query_type()?;
     }
-
     Ok(())
 }
 
@@ -1242,8 +1240,8 @@ impl actix_web::ResponseError for AlertError {
             Self::ObjectStorage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Serde(_) => StatusCode::BAD_REQUEST,
             Self::Metadata(_) => StatusCode::BAD_REQUEST,
-            Self::Unauthorized => StatusCode::BAD_REQUEST,
-            Self::Error(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Unauthorized => StatusCode::FORBIDDEN,
+            Self::Error(error) => error.as_response_error().status_code(),
             Self::DatafusionError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CustomError(_) => StatusCode::BAD_REQUEST,
             Self::InvalidStateChange(_) => StatusCode::BAD_REQUEST,
@@ -1298,6 +1296,18 @@ impl AlertManagerTrait for Alerts {
                     continue;
                 };
 
+                if alert.query_type == AlertQueryType::Promql
+                    && let Some(fields) = alert.other_fields.as_mut()
+                    && let Some(runtime) = fields.get_mut("promqlRuntime")
+                    && let Some(instances) =
+                        runtime.get_mut("instances").and_then(|v| v.as_object_mut())
+                {
+                    for instance in instances.values_mut() {
+                        if instance["state"] == "pending" {
+                            instance["pendingSince"] = JsonValue::Null;
+                        }
+                    }
+                }
                 // ensure that alert config's tenant is correctly set
                 alert.tenant_id.clone_from(&tenant);
 
@@ -1792,6 +1802,20 @@ fn get_severity_priority(severity: &Severity) -> u8 {
 mod tests {
     use super::alert_tenant_from_storage_key;
     use crate::parseable::DEFAULT_TENANT;
+
+    #[test]
+    fn alert_errors_preserve_authorization_status() {
+        use actix_web::{ResponseError, http::StatusCode};
+        assert_eq!(
+            super::AlertError::Unauthorized.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        let denied = super::AlertError::Error(actix_web::error::ErrorUnauthorized("denied"));
+        assert_eq!(denied.status_code(), StatusCode::UNAUTHORIZED);
+        let failure =
+            super::AlertError::Error(actix_web::error::ErrorInternalServerError("failed"));
+        assert_eq!(failure.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[test]
     fn default_storage_tenant_is_not_an_explicit_tenant() {

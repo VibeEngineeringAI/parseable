@@ -90,6 +90,10 @@ pub async fn about() -> Json<Value> {
         })
     };
 
+    let promql_enabled = matches!(
+        PARSEABLE.options.mode,
+        crate::option::Mode::All | crate::option::Mode::Query
+    );
     Json(json!({
         "version": current_version,
         "uiVersion": ui_version,
@@ -102,6 +106,10 @@ pub async fn about() -> Json<Value> {
         "capabilities": {
             "oidcRoleMapping": crate::handlers::http::oidc::group_mapping_enabled(),
             "oidcRoleSync": crate::handlers::http::oidc::group_mapping_enabled(),
+            "promql": promql_enabled,
+            "promqlDashboard": promql_enabled,
+            "promqlMetadata": promql_enabled,
+            "promqlAlerts": promql_enabled,
         },
         "mode": mode,
         "staging": staging,

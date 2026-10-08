@@ -272,6 +272,65 @@ impl Target {
         }
     }
 
+    pub fn alertmanager(&self) -> Option<&AlertManager> {
+        match &self.target {
+            TargetType::AlertManager(target) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// Delivery with an observable result for the persisted PromQL notification outbox.
+    /// Alertmanager receives `alerts`, which keep the series labels; Slack and
+    /// webhook targets receive `message`.
+    pub async fn deliver_promql(
+        &self,
+        tenant: &Option<String>,
+        message: &str,
+        alerts: &[Value],
+    ) -> Result<(), String> {
+        let request = match &self.target {
+            TargetType::Slack(target) => {
+                let prepared = outbound_http_policy::prepare_alert_target(
+                    tenant,
+                    &target.endpoint,
+                    AlertTargetKind::Slack,
+                    false,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                prepared
+                    .client
+                    .post(target.endpoint.clone())
+                    .json(&serde_json::json!({"text": message}))
+            }
+            TargetType::Other(target) => {
+                let prepared = outbound_http_policy::prepare_alert_target(
+                    tenant,
+                    &target.endpoint,
+                    AlertTargetKind::Webhook,
+                    target.skip_tls_check,
+                    Some(&target.headers),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                prepared
+                    .client
+                    .post(target.endpoint.clone())
+                    .headers(prepared.headers)
+                    .body(message.to_owned())
+            }
+            TargetType::AlertManager(target) => return target.post_promql(tenant, alerts).await,
+        };
+        request
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn call(&self, context: Context) {
         trace!("target.call context- {context:?}");
         let timeout = context.notification_config.clone();
@@ -584,6 +643,39 @@ pub struct AlertManager {
     skip_tls_check: bool,
     #[serde(flatten)]
     auth: Option<Auth>,
+}
+
+impl AlertManager {
+    /// Post a batch of PromQL alerts, each already carrying its labels and `endsAt`.
+    pub async fn post_promql(
+        &self,
+        tenant: &Option<String>,
+        alerts: &[Value],
+    ) -> Result<(), String> {
+        let prepared = outbound_http_policy::prepare_alert_target(
+            tenant,
+            &self.endpoint,
+            AlertTargetKind::AlertManager,
+            self.skip_tls_check,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut request = prepared.client.post(self.endpoint.clone()).json(alerts);
+        if let Some(auth) = &self.auth {
+            if !prepared.authorization_allowed {
+                return Err("Target credentials blocked by outbound policy".into());
+            }
+            request = request.basic_auth(&auth.username, Some(&auth.password));
+        }
+        request
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
 #[async_trait]

@@ -69,6 +69,8 @@ curl --location --request POST 'http://localhost:8000/api/v1/ingest' \
 
 Access the UI at http://localhost:8000. Log in with the default credentials `admin` / `admin`.
 
+Source builds of this fork include a [community PromQL query API](docs/promql.md) for OTLP metrics, with instant and range queries and no Enterprise dependency. See the guide for the supported language subset and limits.
+
 For production deployments, refer to the [installation guide ↗︎](https://www.parseable.com/docs/self-hosted/installation) for best practices and hardening tips.
 
 > [!TIP]
