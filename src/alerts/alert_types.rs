@@ -101,7 +101,7 @@ impl AlertTrait for ThresholdAlert {
                 &self.tenant_id,
             )
             .await
-            .map_err(AlertError::InvalidAlertQuery)?;
+            .map_err(|e| AlertError::InvalidAlertQuery(e.to_string()))?;
             return samples
                 .into_iter()
                 .find(|(_, value)| {

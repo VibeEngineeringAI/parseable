@@ -5,6 +5,7 @@ use crate::{
         alert_structs::DeploymentInfo, alert_types::ThresholdAlert,
         alerts_utils::evaluate_condition, target::TARGETS,
     },
+    handlers::http::promql::AlertQueryError,
     parseable::{DEFAULT_TENANT, PARSEABLE},
     promql::Labels,
     rbac::{
@@ -182,6 +183,20 @@ impl Runtime {
         self.last_evaluated_at = Some(now);
         for instance in self.instances.values_mut() {
             if instance.state == "pending" {
+                instance.pending_since = None;
+            }
+        }
+    }
+    /// Record an evaluation that lacked capacity rather than data. Pending
+    /// holds survive it, unless their series has not been seen for the
+    /// staleness bound, so a busy incident does not restart every hold.
+    pub fn interrupted(&mut self, error: String, config: &AlertConfig, now: DateTime<Utc>) {
+        self.health = "error".into();
+        self.error = Some(error);
+        self.last_evaluated_at = Some(now);
+        let stale_after = staleness_bound(config);
+        for instance in self.instances.values_mut() {
+            if instance.state == "pending" && now - instance.last_seen > stale_after {
                 instance.pending_since = None;
             }
         }
@@ -465,16 +480,23 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
             )
             .await
         }
-        Err(error) => Err(error),
+        Err(error) => Err(AlertQueryError::Failed(error)),
     };
-    let transitions =
-        match result.and_then(|samples| runtime.observe_transactionally(samples, &config, now)) {
-            Ok(transitions) => transitions,
-            Err(error) => {
-                runtime.discontinuity("error", Some(error), now);
-                vec![]
-            }
-        };
+    let result = match result {
+        Ok(samples) => runtime.observe_transactionally(samples, &config, now),
+        Err(AlertQueryError::Busy(error)) => {
+            runtime.interrupted(error, &config, now);
+            Ok(vec![])
+        }
+        Err(AlertQueryError::Failed(error)) => Err(error),
+    };
+    let transitions = match result {
+        Ok(transitions) => transitions,
+        Err(error) => {
+            runtime.discontinuity("error", Some(error), now);
+            vec![]
+        }
+    };
     let mut updated = config;
     let previous_state = updated.state;
     updated.state = if runtime.instances.values().any(|i| i.state == "firing") {
@@ -862,6 +884,43 @@ mod tests {
             runtime
                 .observe(vec![sample("b", f64::NAN)], &config, now)
                 .is_err()
+        );
+    }
+    #[test]
+    fn capacity_errors_keep_holds_until_series_is_stale() {
+        let config = config();
+        let now = Utc::now();
+        let minutes = |m| now + chrono::Duration::minutes(m);
+        let mut runtime = Runtime::default();
+        runtime
+            .observe(vec![sample("a", 9.0)], &config, now)
+            .unwrap();
+        for m in 1..=4 {
+            runtime.interrupted("PromQL alert query timed out".into(), &config, minutes(m));
+        }
+        assert_eq!(runtime.health, "error");
+        let transitions = runtime
+            .observe(vec![sample("a", 9.0)], &config, minutes(5))
+            .unwrap();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(runtime.instances.values().next().unwrap().state, "firing");
+
+        let mut runtime = Runtime::default();
+        runtime
+            .observe(vec![sample("a", 9.0)], &config, now)
+            .unwrap();
+        for m in 1..=5 {
+            runtime.interrupted("PromQL alert query timed out".into(), &config, minutes(m));
+        }
+        assert!(
+            runtime
+                .observe(vec![sample("a", 9.0)], &config, minutes(6))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            runtime.instances.values().next().unwrap().pending_since,
+            Some(minutes(6))
         );
     }
     #[tokio::test]

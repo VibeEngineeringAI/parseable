@@ -28,6 +28,8 @@ const MAX_QUERY_BYTES: usize = 16 * 1024;
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 static REQUEST_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(32)));
 static QUERY_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
+/// Alerts evaluate in their own slots so dashboard load cannot starve them.
+static ALERT_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(2)));
 
 pub fn scope() -> Scope {
     web::scope("/prometheus/api/v1")
@@ -477,10 +479,19 @@ async fn handle(
     let work = async {
         let tenant = get_tenant_id_from_request(&req);
         authorize_dataset(&req, &dataset, &tenant).await?;
-        let body = execute_query(plan, &dataset, &tenant, start, end, step, |data| {
-            serde_json::to_vec(&json!({"status":"success", "data":data.into_json()}))
-                .map_err(|e| ApiError::execution(e.to_string()))
-        })
+        let body = execute_query(
+            &QUERY_SLOTS,
+            plan,
+            &dataset,
+            &tenant,
+            start,
+            end,
+            step,
+            |data| {
+                serde_json::to_vec(&json!({"status":"success", "data":data.into_json()}))
+                    .map_err(|e| ApiError::execution(e.to_string()))
+            },
+        )
         .await?;
         Ok(HttpResponse::Ok()
             .content_type("application/json")
@@ -493,7 +504,9 @@ async fn handle(
 
 /// Shared storage/evaluation worker. Callers authorize the concrete dataset,
 /// bound admission and apply a deadline before entering this service.
+#[allow(clippy::too_many_arguments)]
 async fn execute_query<T: Send + 'static>(
+    slots: &Arc<Semaphore>,
     plan: QueryPlan,
     dataset: &str,
     tenant: &Option<String>,
@@ -503,7 +516,7 @@ async fn execute_query<T: Send + 'static>(
     finish: impl FnOnce(promql::QueryValue) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
     let permit =
-        QUERY_SLOTS.clone().acquire_owned().await.map_err(|_| {
+        slots.clone().acquire_owned().await.map_err(|_| {
             ApiError::unavailable("unavailable", "PromQL query service unavailable")
         })?;
     let batches = load_batches(&plan, dataset, tenant, start, end, BatchPurpose::Query).await?;
@@ -565,24 +578,35 @@ fn alert_vector(data: promql::QueryValue) -> Result<Vec<(Labels, f64)>, ApiError
         .collect()
 }
 
+/// Why an alert evaluation produced no samples. `Busy` failures (no capacity
+/// within the deadline) say nothing about the data, so callers may keep
+/// pending state across them.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AlertQueryError {
+    #[error("{0}")]
+    Busy(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
 /// Evaluate an alert after its persisted execution identity has been authorized
 /// for this dataset and tenant. Never call this with an untrusted dataset alone.
 pub(crate) async fn execute_alert_instant(
     dataset: &str,
     query: &str,
     tenant: &Option<String>,
-) -> Result<Vec<(Labels, f64)>, String> {
+) -> Result<Vec<(Labels, f64)>, AlertQueryError> {
     if !matches!(
         PARSEABLE.options.mode,
         crate::option::Mode::All | crate::option::Mode::Query
     ) {
-        return Err("Community PromQL alerts require All or Query mode".into());
+        return Err(AlertQueryError::Failed(
+            "Community PromQL alerts require All or Query mode".into(),
+        ));
     }
-    let plan = alert_query_plan(query)?;
-    let _admission = REQUEST_SLOTS
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| "PromQL request queue is full".to_owned())?;
+    let plan = alert_query_plan(query).map_err(AlertQueryError::Failed)?;
+    // Alerts bypass interactive admission and wait for a dedicated slot, so a
+    // busy dashboard cannot make a hold fail during the incident it watches.
     let work = async {
         crate::handlers::http::query::create_streams_for_distributed(
             vec![dataset.to_owned()],
@@ -591,12 +615,25 @@ pub(crate) async fn execute_alert_instant(
         .await
         .map_err(|e| ApiError::execution(e.to_string()))?;
         let now = Utc::now().timestamp_millis();
-        execute_query(plan, dataset, tenant, now, now, None, alert_vector).await
+        execute_query(
+            &ALERT_SLOTS,
+            plan,
+            dataset,
+            tenant,
+            now,
+            now,
+            None,
+            alert_vector,
+        )
+        .await
     };
     tokio::time::timeout(Duration::from_secs(30), work)
         .await
-        .map_err(|_| "PromQL alert query timed out".to_owned())?
-        .map_err(|e| e.to_string())
+        .map_err(|_| AlertQueryError::Busy("PromQL alert query timed out".into()))?
+        .map_err(|e| match e.status {
+            StatusCode::SERVICE_UNAVAILABLE => AlertQueryError::Busy(e.to_string()),
+            _ => AlertQueryError::Failed(e.to_string()),
+        })
 }
 
 fn sql_string(value: &str) -> String {
