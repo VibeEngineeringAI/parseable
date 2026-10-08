@@ -851,15 +851,17 @@ impl Context<'_> {
                 let mut result = Vec::new();
                 for mut point in lhs {
                     let key = matching_labels(&point.labels, matching);
-                    if !seen.insert(key.clone()) {
-                        return Err(evaluation(
-                            "many-to-many matching: left side has duplicate matching labels",
-                        ));
-                    }
                     if let Some(right) = right.get(&key)
                         && let Some(value) =
                             binary_value(&op, point.sample.value, right.sample.value, return_bool)
                     {
+                        // Like Prometheus, only left-side duplicates that
+                        // produce a result conflict.
+                        if !seen.insert(key) {
+                            return Err(evaluation(
+                                "many-to-many matching: left side has duplicate matching labels",
+                            ));
+                        }
                         point.sample.value = value;
                         point.labels = grouping_labels(&point.labels, matching, true);
                         if !comparison

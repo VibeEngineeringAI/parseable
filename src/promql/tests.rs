@@ -265,6 +265,34 @@ fn scalar_vector_comparison_filters_vector_values_and_bool_returns_zero_one() {
 }
 
 #[test]
+fn one_to_one_matching_only_rejects_left_duplicates_that_match() {
+    let data = vec![
+        series("cpu", &[("host", "a"), ("core", "0")], &[(0, 1.0)]),
+        series("cpu", &[("host", "a"), ("core", "1")], &[(0, 2.0)]),
+        series("cpu", &[("host", "b"), ("core", "0")], &[(0, 6.0)]),
+        series("limit", &[("host", "b")], &[(0, 3.0)]),
+    ];
+    let ratio = point("cpu / on (host) limit", &data, 0);
+    assert_eq!(ratio.labels, BTreeMap::from([("host".into(), "b".into())]));
+    assert_eq!(ratio.sample.value, 2.0);
+
+    let data = vec![
+        series("cpu", &[("host", "a"), ("core", "0")], &[(0, 1.0)]),
+        series("cpu", &[("host", "a"), ("core", "1")], &[(0, 8.0)]),
+        series("limit", &[("host", "a")], &[(0, 5.0)]),
+    ];
+    assert_eq!(point("cpu > on (host) limit", &data, 0).sample.value, 8.0);
+    assert!(matches!(
+        evaluate(
+            &QueryPlan::parse("cpu / on (host) limit").unwrap(),
+            &data,
+            0
+        ),
+        Err(PromqlError::Evaluation(_))
+    ));
+}
+
+#[test]
 fn timestamp_uses_source_time_for_selectors_and_evaluation_time_for_computations() {
     let data = vec![series("cpu", &[], &[(1000, 2.0)])];
     assert_eq!(point("timestamp(cpu)", &data, 2000).sample.value, 1.0);
