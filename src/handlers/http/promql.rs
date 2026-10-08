@@ -778,7 +778,8 @@ async fn load_batches(
         row_limit + 1
     );
     // The SQL API's automatic time predicate normally uses ingestion time.
-    // Widen that predicate to preserve delayed/backfilled OTLP samples. The
+    // Widen that predicate by the configured ingest delay to keep delayed
+    // samples, or to the dataset's lifetime when the bound is disabled. The
     // explicit predicate above always filters by the original metric time.
     let time_partition = stream.get_time_partition();
     if time_partition
@@ -796,9 +797,16 @@ async fn load_batches(
         .map_err(|_| ApiError::execution("dataset metadata unavailable"))?
         .created_at
         .clone();
-    let ingestion_start = DateTime::parse_from_rfc3339(&created_at)
+    let created_ms = DateTime::parse_from_rfc3339(&created_at)
         .map(|time| time.timestamp_millis().max(0))
         .unwrap_or(0);
+    let (ingestion_start, ingestion_end) = ingestion_window(
+        from,
+        end,
+        created_ms,
+        Utc::now().timestamp_millis(),
+        PARSEABLE.options.promql_max_ingest_delay,
+    );
     let request = Query {
         query,
         start_time: rfc3339(if partitioned_by_sample {
@@ -809,7 +817,7 @@ async fn load_batches(
         end_time: rfc3339(if partitioned_by_sample {
             end.saturating_add(1)
         } else {
-            Utc::now().timestamp_millis().saturating_add(1000)
+            ingestion_end
         })?,
         send_null: false,
         fields: false,
@@ -837,6 +845,30 @@ async fn load_batches(
         ));
     }
     Ok(batches)
+}
+
+/// Ingestion-time window `[start, end)` that holds samples timestamped within
+/// `[from, end]` when they arrive at most `delay_minutes` late (or early, from
+/// producer clock skew). A zero delay scans the dataset's whole lifetime.
+fn ingestion_window(
+    from: i64,
+    end: i64,
+    created_ms: i64,
+    now_ms: i64,
+    delay_minutes: u64,
+) -> (i64, i64) {
+    let latest = now_ms.saturating_add(1000);
+    if delay_minutes == 0 {
+        return (created_ms, latest);
+    }
+    let delay = i64::try_from(delay_minutes)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(60_000);
+    let start = from.saturating_sub(delay).max(created_ms);
+    let stop = end.saturating_add(1).saturating_add(delay).min(latest);
+    // Keep a non-empty window for queries entirely before the dataset existed
+    // or in the future; the explicit sample-time predicate still applies.
+    (start.min(stop.saturating_sub(1)), stop)
 }
 
 /// Label columns plus the named known columns that exist in `schema`.
@@ -979,6 +1011,37 @@ fn finish_series(grouped: BTreeMap<Labels, Vec<Sample>>) -> Result<Vec<Series>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingestion_window_bounds_scan_by_delay() {
+        const MIN: i64 = 60_000;
+        let year = 365 * 24 * 60 * MIN;
+        let now = year + 10 * MIN;
+        // A 5m alert window on a year-old dataset scans about 2h, not a year.
+        assert_eq!(
+            ingestion_window(now - 5 * MIN, now, 0, now, 60),
+            (now - 65 * MIN, now + 1000)
+        );
+        // Historical windows stretch only by the delay on each side.
+        assert_eq!(
+            ingestion_window(10 * MIN, 20 * MIN, 0, now, 60),
+            (0, 80 * MIN + 1)
+        );
+        assert_eq!(
+            ingestion_window(100 * MIN, 120 * MIN, 0, now, 60),
+            (40 * MIN, 180 * MIN + 1)
+        );
+        // Zero keeps the full-lifetime scan.
+        assert_eq!(
+            ingestion_window(now - 5 * MIN, now, 7, now, 0),
+            (7, now + 1000)
+        );
+        // Windows wholly outside the dataset's lifetime stay non-empty.
+        let (start, end) = ingestion_window(MIN, 2 * MIN, year, now, 1);
+        assert!(start < end);
+        let (start, end) = ingestion_window(now + year, now + year, 0, now, 1);
+        assert!(start < end);
+    }
 
     #[test]
     fn alert_expression_contract_rejects_scalar_matrix_and_unsupported_work() {

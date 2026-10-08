@@ -311,6 +311,15 @@ pub struct Options {
     )]
     pub otel_flatten_exemplars: bool,
 
+    #[arg(
+        long,
+        env = "P_PROMQL_MAX_INGEST_DELAY",
+        value_parser = clap::value_parser!(u64).range(0..=44640),
+        default_value = "60",
+        help = "Max minutes between an OTLP metric sample's timestamp and its ingestion that PromQL still finds on datasets without time_unix_nano partitioning; it also covers producer clock skew. 0 scans the dataset's full lifetime."
+    )]
+    pub promql_max_ingest_delay: u64,
+
     // TLS/Security
     #[arg(
         long,

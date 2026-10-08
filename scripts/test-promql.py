@@ -70,8 +70,9 @@ def main():
     metric = f"parseable_promql_smoke_{suffix}"
     counter = f"parseable_promql_counter_{suffix}"
     job = f"promql-smoke-{suffix}"
-    # Backfill a deterministic, millisecond-aligned sample set one day ago.
-    now_ns = ((time.time_ns() - 86_400_000_000_000) // 1_000_000) * 1_000_000
+    # Backfill a deterministic, millisecond-aligned sample set 30 minutes ago,
+    # inside the default P_PROMQL_MAX_INGEST_DELAY of 60 minutes.
+    now_ns = ((time.time_ns() - 1_800_000_000_000) // 1_000_000) * 1_000_000
     # Two samples for one series plus a second series to check label filtering.
     points = [
         (now_ns - 20_000_000_000, 1.25, "blue"),
