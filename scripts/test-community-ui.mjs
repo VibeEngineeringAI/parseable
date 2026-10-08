@@ -11,6 +11,50 @@ const capabilitySource = await readFile(new URL('./community-promql-capabilities
 const capabilities = await import(`data:text/javascript;base64,${Buffer.from(capabilitySource).toString('base64')}`);
 const state = (plan, advertised) => ({ app: { instanceConfig: { license: { plan }, capabilities: advertised } } });
 
+test('community PromQL capabilities are independent of Enterprise and alerts', () => {
+  const enabled = state('OSS', { promqlDashboard: true, promql: true, promqlMetadata: true, promqlAlerts: false });
+  assert.equal(capabilities.promqlDashboard(enabled), true);
+  assert.equal(capabilities.promql(enabled), true);
+  assert.equal(capabilities.promqlMetadata(enabled), true);
+  assert.equal(enabled.app.instanceConfig.license.plan, 'OSS');
+  assert.equal(enabled.app.instanceConfig.capabilities.promqlAlerts, false);
+  assert.equal(capabilities.promqlDashboard(state('OSS', {})), false);
+  assert.equal(capabilities.promql({}), false);
+});
+
+test('older Enterprise servers retain support and explicit disabled capabilities take precedence', () => {
+  for (const plan of ['Enterprise', 'EnterpriseTrial', 'Pro', 'ProTrial']) {
+    assert.equal(capabilities.promqlDashboard(state(plan)), true);
+    assert.equal(capabilities.promql(state(plan)), true);
+    assert.equal(capabilities.promqlMetadata(state(plan)), true);
+    assert.equal(capabilities.promqlDashboard(state(plan, { promqlDashboard: false })), false);
+  }
+});
+
+test('preview surfaces Prometheus, HTTP, and network errors without treating empty data as failure', () => {
+  assert.equal(capabilities.promqlPreviewError([{ error: { response: { data: { status: 'error', error: 'unsupported function' } }, message: 'HTTP 422' } }]), 'unsupported function');
+  assert.equal(capabilities.promqlPreviewError([{ data: { status: 'error', error: 'invalid query' } }]), 'invalid query');
+  assert.equal(capabilities.promqlPreviewError([{ error: { message: 'Network Error' } }]), 'Network Error');
+  assert.equal(capabilities.promqlPreviewError([{ data: { status: 'success', data: { resultType: 'vector', result: [] } } }]), null);
+});
+
+test('unresolved dataset variables produce an actionable preview message', () => {
+  assert.equal(capabilities.promqlPreviewError([], '$metrics_dataset', ''), 'Select a value for the dataset variable to preview this query.');
+  assert.equal(capabilities.promqlPreviewError([], '${metrics_dataset}', ''), 'Select a value for the dataset variable to preview this query.');
+  assert.equal(capabilities.promqlPreviewError([], '$metrics_dataset', 'actual_metrics'), null);
+  assert.equal(capabilities.promqlPreviewError([], '', ''), null);
+});
+
+test('preview dataset resolver is safe when the editor shadows the stock imported name', async () => {
+  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
+  const replacements = manifest.files.find(file => file.path.startsWith('assets/DashboardView-')).replacements;
+  const imports = replacements.find(item => item.from.startsWith('import{n as gn,t as _n}'));
+  assert.match(imports.to, /n as communityResolvePreviewDataset/);
+  const binding = replacements.find(item => item.from === 'T=J(u),E=J(').to.match(/communityPreviewStream=(.*),E=J\($/)[1];
+  const preview = new Function('Q', 's', 'communityVariableValues', 'communityResolvePreviewDataset', `const communityPreviewStream=${binding}; const gn='editor local'; return communityPreviewStream;`);
+  assert.equal(preview({ useMemo: callback => callback() }, '$metrics_dataset', { metrics_dataset: 'real_metrics' }, (stream, values) => values[stream.slice(1)]), 'real_metrics');
+});
+
 test('overlay refuses assets with different content, even when replacement text exists', () => {
   const original = Buffer.from('original gate');
   const file = { path: 'fixture.js', sha256: createHash('sha256').update(original).digest('hex'), replacements: [{ from: 'gate', to: 'capability', count: 1 }] };
@@ -58,6 +102,78 @@ test('versioned entry, imports, dynamic imports, and preload paths share a fresh
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('alert capability is independent and explicit false wins over Enterprise', () => {
+  assert.equal(capabilities.promqlAlerts(state('OSS', {promqlAlerts:true, promqlDashboard:false})), true);
+  assert.equal(capabilities.promqlAlerts(state('Enterprise', {promqlAlerts:false})), false);
+  assert.equal(capabilities.promqlAlerts(state('OSS', {promqlDashboard:true})), false);
+});
+
+test('dashboard alerts require one concrete dataset and expression', () => {
+  assert.equal(capabilities.concretePromqlAlert({dbName:['metrics'],chartQuery:['load{host="mac"}']}), true);
+  for (const tile of [
+    {dbName:['$metrics_dataset'],chartQuery:['load']},
+    {dbName:['metrics'],chartQuery:['load{host="$host"}']},
+    {dbName:['metrics'],chartQuery:['load{host="${host}"}']},
+    {dbName:['metrics'],chartQuery:['load','cpu']},
+    {dbName:[],chartQuery:['load']},
+    {dbName:['metrics'],chartQuery:['']},
+  ]) assert.equal(capabilities.concretePromqlAlert(tile), false);
+});
+
+test('numeric preview uses the selected threshold and rejects invalid samples', () => {
+  assert.equal(capabilities.promqlCondition('8.5', '>', 8), true);
+  assert.equal(capabilities.promqlCondition('8', '>', 8), false);
+  assert.equal(capabilities.promqlCondition('8', '>=', 8), true);
+  assert.equal(capabilities.promqlCondition('-2', '<', 0), true);
+  assert.equal(capabilities.promqlCondition('8', '=', 8), true);
+  assert.equal(capabilities.promqlCondition('8', '!=', 8), false);
+  assert.throws(()=>capabilities.promqlCondition('NaN', '>', 8), /finite/);
+  assert.throws(()=>capabilities.promqlCondition('Infinity', '>', 8), /finite/);
+  assert.throws(()=>capabilities.promqlCondition(8, 'unknown', 8), /operator/);
+});
+
+test('hold editor preserves native alert settings and preview sends only an instant query', async () => {
+  const updates = [], hookValues = [], requests = [];
+  let hook = 0;
+  const react = {createElement:(type, props, ...children)=>({type,props:props || {},children}),useState:initial=>{const index=hook++;return [initial,value=>{hookValues[index]=value}];},useEffect:()=>{}};
+  const alert = {query:'load{host="mac"}',datasets:['metrics'],queryType:'promql',targets:['webhook'],thresholdConfig:{operator:'>',value:8},promqlConfig:{holdDuration:'5m'}};
+  const tree=capabilities.CommunityPromqlAlertDetails({react,alert,onChange:value=>updates.push(value),queryInstant:async params=>{requests.push(params);return {data:{status:'success',data:{resultType:'vector',result:[{metric:{host:'mac'},value:[1,'9']}]}}};}});
+  const input=tree.children[0].children[1];
+  input.props.onChange({target:{value:'10m'}});
+  assert.equal(updates[0].promqlConfig.holdDuration,'10m');
+  assert.deepEqual(updates[0].targets,alert.targets);
+  await tree.children[2].props.onClick();
+  assert.deepEqual(requests,[{query:alert.query,stream:'metrics'}]);
+  assert.deepEqual(hookValues[0],[{labels:{host:'mac'},value:'9',breached:true}]);
+  assert.equal(hookValues[2],false);
+});
+
+test('instant preview distinguishes no data, unsupported result types and HTTP errors', async () => {
+  for (const [response,expectedError,expectedPreview] of [
+    [{data:{status:'success',data:{resultType:'vector',result:[]}}},null,[]],
+    [{data:{status:'success',data:{resultType:'scalar',result:[1,'9']}}},'Alerts require an instant vector of numeric samples.',null],
+    [{data:{status:'error',error:'unsupported function'}},'unsupported function',null],
+  ]) {
+    const values=[];let hook=0;
+    const react={createElement:(type,props,...children)=>({type,props,children}),useState:initial=>{const index=hook++;return [initial,value=>values[index]=value]},useEffect:()=>{}};
+    const tree=capabilities.CommunityPromqlAlertDetails({react,alert:{query:'load',datasets:['metrics'],thresholdConfig:{operator:'>',value:8}},onChange:()=>{},queryInstant:async()=>response});
+    await tree.children[2].props.onClick();
+    assert.equal(values[1],expectedError);
+    assert.deepEqual(values[0],expectedPreview);
+  }
+});
+
+test('persisted delivery failures expose target, attempts and exhausted retries', () => {
+  const react={createElement:(type,props,...children)=>({type,props,children}),useState:initial=>[initial,()=>{}],useEffect:()=>{}};
+  const tree=capabilities.CommunityPromqlAlertDetails({react,readOnly:true,alert:{promqlRuntime:{health:'ok',instances:{},deliveries:[{labels:{host:'mac'},firing:true,target:'target-id',attempts:3,error:'Connection refused'}]}}});
+  const delivery=tree.children.at(-1);
+  assert.equal(delivery.props.role,'alert');
+  const text=delivery.children[1].children[0];
+  assert.match(text,/target target-id/);
+  assert.match(text,/3\/3 attempts \(retries exhausted\)/);
+  assert.match(text,/Connection refused/);
 });
 
 test('OIDC mapping requires active configured OSS capability and preserves license', () => {

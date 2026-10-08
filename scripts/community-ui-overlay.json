@@ -1,6 +1,253 @@
 {
-  "version": "prism-v3.2.4-community-oidc-v1-error-account-v1",
+  "version": "prism-v3.2.4-community-promql-v3-oidc-v1-error-account-v1",
   "files": [
+    {
+      "path": "assets/DashboardView-B1EWEcGo.js",
+      "sha256": "74d6efb43716ce02d83f795ef48916a807473afd405f384f1b4a492180c4781a",
+      "replacements": [
+        {
+          "from": "import{o as e,t}",
+          "to": "import{promqlDashboard as communityPromqlDashboard,promqlPreviewError as communityPromqlPreviewError}from\"./community-promql-capabilities.js\";import{o as e,t}",
+          "count": 1
+        },
+        {
+          "from": "T=J(u),E=J(",
+          "to": "T=J(u),communityDashboardEnabled=J(communityPromqlDashboard),communityVariableValues=J(e=>e.dashboard.variableValues),communityPreviewStream=(0,Q.useMemo)(()=>communityResolvePreviewDataset(s??``,communityVariableValues),[s,communityVariableValues]),E=J(",
+          "count": 1
+        },
+        {
+          "from": "et=!T&&C?.tileType===`promql`",
+          "to": "et=!communityDashboardEnabled&&C?.tileType===`promql`",
+          "count": 1
+        },
+        {
+          "from": "let t=T&&Ze?`promql`",
+          "to": "let t=communityDashboardEnabled&&Ze?`promql`",
+          "count": 1
+        },
+        {
+          "from": "[s,r,C,T,Ze,P,e]",
+          "to": "[s,r,C,T,communityDashboardEnabled,Ze,P,e]",
+          "count": 1
+        },
+        {
+          "from": "l=J(u),d=(0,Q.useMemo)",
+          "to": "l=J(communityPromqlDashboard),d=(0,Q.useMemo)",
+          "count": 1
+        },
+        {
+          "from": "import{a as cn,f as ln,l as un,n as dn,s as fn}",
+          "to": "import{a as cn,f as ln,l as un,n as dn,s as fn,t as communityInterpolatePromql}",
+          "count": 1
+        },
+        {
+          "from": "query:e.trim()})).filter(({query:e})=>e.length>0),[Ue])",
+          "to": "query:communityInterpolatePromql(e.trim(),communityVariableValues)})).filter(({query:e})=>e.length>0),[Ue,communityVariableValues])",
+          "count": 1
+        },
+        {
+          "from": "Lt=(P===`promql`||P===`ai`&&pt===`promql`)&&!!s&&!!Pt",
+          "to": "Lt=(P===`promql`||P===`ai`&&pt===`promql`)&&!!communityPreviewStream&&!!Pt",
+          "count": 1
+        },
+        {
+          "from": "queryKey:[`unified-promql-preview`,`instant`,s,e,Pt?.endSec]",
+          "to": "queryKey:[`unified-promql-preview`,`instant`,communityPreviewStream,e,Pt?.endSec]",
+          "count": 1
+        },
+        {
+          "from": "queryFn:async({signal:t})=>!s||!Pt?null:(await Tn({query:e,stream:s,time:Pt.endSec},t)).data",
+          "to": "queryFn:async({signal:t})=>!communityPreviewStream||!Pt?null:(await Tn({query:e,stream:communityPreviewStream,time:Pt.endSec},t)).data",
+          "count": 1
+        },
+        {
+          "from": "queryKey:[`unified-promql-preview`,`range`,s,e,Pt?.startSec,Pt?.endSec]",
+          "to": "queryKey:[`unified-promql-preview`,`range`,communityPreviewStream,e,Pt?.startSec,Pt?.endSec]",
+          "count": 1
+        },
+        {
+          "from": "queryFn:async({signal:t})=>{if(!s||!Pt)return null;let n=`${jn(Pt.startSec,Pt.endSec,{query:e,maxDataPoints:600})}s`;return(await En({query:e,stream:s,start:Pt.startSec,end:Pt.endSec,step:n},t)).data",
+          "to": "queryFn:async({signal:t})=>{if(!communityPreviewStream||!Pt)return null;let n=`${jn(Pt.startSec,Pt.endSec,{query:e,maxDataPoints:600})}s`;return(await En({query:e,stream:communityPreviewStream,start:Pt.startSec,end:Pt.endSec,step:n},t)).data",
+          "count": 1
+        },
+        {
+          "from": "Xt=D.find(e=>e.id===O?.providerId),",
+          "to": "communityPreviewError=(P===`promql`||P===`ai`&&pt===`promql`)?communityPromqlPreviewError(It?[...Rt,...zt]:(ze===`instant`||ze===`both`&&Ve===`instant`?Rt:zt),s,communityPreviewStream):null,Xt=D.find(e=>e.id===O?.providerId),",
+          "count": 1
+        },
+        {
+          "from": "}):m===`table`&&gt?(0,$.jsx)(wn,{queryData:gt}):tn?",
+          "to": "}):communityPreviewError?(0,$.jsx)(`div`,{role:`alert`,className:`max-w-full p-3 text-sm text-semRed-600 break-words`,children:communityPreviewError}):m===`table`&&gt?(0,$.jsx)(wn,{queryData:gt}):tn?",
+          "count": 1
+        },
+        {
+          "from": "import{n as gn,t as _n}from\"./datasetVariables-BLemIFd9.js\"",
+          "to": "import{n as gn,t as _n,n as communityResolvePreviewDataset}from\"./datasetVariables-BLemIFd9.js\"",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/VariablesBar-DUQkJr3a.js",
+      "sha256": "944c9b7b27947479b281cc93a09afa14dc5281d5342edc9b995c1bd52b68e34d",
+      "replacements": [
+        {
+          "from": "import{o as e}",
+          "to": "import{promqlDashboard as communityPromqlDashboard,promqlAlerts as communityPromqlAlerts,concretePromqlAlert as communityConcretePromqlAlert}from\"./community-promql-capabilities.js\";import{o as e}",
+          "count": 1
+        },
+        {
+          "from": "let y=t===`promql`&&!n;return",
+          "to": "let communityDashboardEnabled=C(communityPromqlDashboard),communityAlertsLocked=t===`promql`&&!C(communityPromqlAlerts),y=t===`promql`&&!communityDashboardEnabled;return",
+          "count": 1
+        },
+        {
+          "from": "}),y||!d?(0,X.jsx)",
+          "to": "}),communityAlertsLocked||!d?(0,X.jsx)",
+          "count": 1
+        },
+        {
+          "from": "children:y?`Available on Enterprise plans.`",
+          "to": "children:communityAlertsLocked?`Available on Enterprise plans.`",
+          "count": 1
+        },
+        {
+          "from": "_=C(o),v=C(",
+          "to": "_=C(o),communityDashboardEnabled=C(communityPromqlDashboard),communityAlertsEnabled=C(communityPromqlAlerts),v=C(",
+          "count": 1
+        },
+        {
+          "from": "Se=()=>{T===`promql`&&!_||",
+          "to": "Se=()=>{T===`promql`&&!communityDashboardEnabled||",
+          "count": 1
+        },
+        {
+          "from": "p=C(o),m=Array.isArray(e.dbName)",
+          "to": "p=C(communityPromqlDashboard),m=Array.isArray(e.dbName)",
+          "count": 1
+        },
+        {
+          "from": "ye=T!==`promql`||!Array.isArray(e.chartQuery)||e.chartQuery.length<=1",
+          "to": "ye=T!==`promql`||se.length===1&&communityConcretePromqlAlert({dbName:se,chartQuery:(Array.isArray(e.chartQuery)?e.chartQuery:[e.chartQuery]).map(query=>Me(query||``,j))})",
+          "count": 1
+        },
+        {
+          "from": "`Alerts can only be created from tiles with a single PromQL query.`",
+          "to": "`Alerts require one concrete PromQL query and dataset. Replace dashboard variables with explicit selections first.`",
+          "count": 1
+        },
+        {
+          "from": "we=()=>{if(!ye||T===`promql`&&!_)return;",
+          "to": "we=()=>{if(!ye||T===`promql`&&!communityAlertsEnabled)return;",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/Metrics-ewM4cMwk.js",
+      "sha256": "b7c1f82ff1daa79ce4eaade786bae020ca1416fdcd5232b6fb4ec8447e68eec0",
+      "replacements": [
+        {
+          "from": "import{o as e}",
+          "to": "import{promql as communityPromql}from\"./community-promql-capabilities.js\";import{o as e}",
+          "count": 1
+        },
+        {
+          "from": "let l=oe(),u=I(d),f=I(",
+          "to": "let l=oe(),u=I(communityPromql),f=I(",
+          "count": 1
+        },
+        {
+          "from": "n=_(),r=I(d),i=I(",
+          "to": "n=_(),r=I(d),communityPromqlEnabled=I(communityPromql),i=I(",
+          "count": 1
+        },
+        {
+          "from": "o===`explorer`&&(r?(0,$.jsx)(Lt,{})",
+          "to": "o===`explorer`&&(communityPromqlEnabled?(0,$.jsx)(Lt,{})",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/TableToggle-Bijf4bkq.js",
+      "sha256": "14e851245fcd8826ec2a0bb8085f84eb6a15ea2fe3589a1c2b4b49371f3a8436",
+      "replacements": [
+        {
+          "from": "import{o as e}",
+          "to": "import{CommunityPromqlAlertDetails as CommunityAlertDetails}from\"./community-promql-capabilities.js\";import{lr as communitySetAlert}from\"./index-BLF851sq.js\";import{f as communityInstantQuery}from\"./utils-C7n1bOe_.js\";import{o as e}",
+          "count": 1
+        },
+        {
+          "from": "children:`Step 2: Set evaluation`})})})}),(0,J.jsxs)",
+          "to": "children:`Step 2: Set evaluation`})})})}),n.queryType===`promql`&&(0,J.jsx)(CommunityAlertDetails,{react:q,alert:{...n,datasets:[communityAlertStream]},onChange:t=>e(communitySetAlert(t)),queryInstant:communityInstantQuery}),(0,J.jsxs)",
+          "count": 1
+        },
+        {
+          "from": "Nt=()=>{let e=A(),t=v(),n=O(",
+          "to": "Nt=()=>{let communityAlertStream=O(e=>e.app.currentStream),e=A(),t=v(),n=O(",
+          "count": 1
+        },
+        {
+          "from": "St=()=>{let e=O(e=>e.alerts.queryBuilderType),[t,n]=(0,q.useState)(`builder`)",
+          "to": "St=()=>{let e=O(e=>e.alerts.queryBuilderType),[t,n]=(0,q.useState)(`promql`)",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/AlertView-DeeBQjhO.js",
+      "sha256": "dce31e8754a4305cf0b3ae29015aef53cf049c258d06114ce0a7c8f34574b319",
+      "replacements": [
+        {
+          "from": "import{o as e}",
+          "to": "import{CommunityPromqlAlertDetails as CommunityAlertDetails}from\"./community-promql-capabilities.js\";import{o as e}",
+          "count": 1
+        },
+        {
+          "from": "(0,G.jsx)(q,{label:`Dataset`,value:a}),",
+          "to": "(0,G.jsx)(q,{label:`Dataset`,value:a}),n===`promql`&&(0,G.jsx)(CommunityAlertDetails,{react:U,alert:t,readOnly:!0}),",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/EditAlerts-BvP4Cbwc.js",
+      "sha256": "6445c5a9cf41af0bb6cc82c8da69fd6587717cbfcc4dae0fb12f58cf46abb3be",
+      "replacements": [
+        {
+          "from": "if(!B||V!==``||!a.query)return;",
+          "to": "if(Pe||!B||V!==``||!a.query)return;",
+          "count": 1
+        },
+        {
+          "from": "if(!B||V!==``||D){R===`threshold`&&D&&q();",
+          "to": "if(!Pe&&(!B||V!==``||D)){R===`threshold`&&D&&q();",
+          "count": 1
+        },
+        {
+          "from": "a.notificationConfig.interval>0),He=",
+          "to": "a.notificationConfig.interval>0&&(!Pe||a.query.trim()!==``&&Number.isFinite(Number(a.thresholdConfig.value))&&a.thresholdConfig.value!==``)),He=",
+          "count": 1
+        },
+        {
+          "from": "a.targets.length>0&&a.targets.every(e=>e)",
+          "to": "(Pe||a.targets.length>0)&&a.targets.every(e=>e)",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "path": "assets/CreateAlerts-BWbM5YaA.js",
+      "sha256": "fe2793882d1185e5c99c1bac1f20f8348c7058880f951cfeae967dc44f86597d",
+      "replacements": [
+        {
+          "from": "C.targets.length>0&&C.targets.every(e=>e)",
+          "to": "(I||C.targets.length>0)&&C.targets.every(e=>e)",
+          "count": 1
+        }
+      ]
+    },
     {
       "path": "assets/Team-DjnIdab9.js",
       "sha256": "30c1946a50662ea8f321def6d2916f1cee0c86756a24e92f913a381bb0b4fe17",

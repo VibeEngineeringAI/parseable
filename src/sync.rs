@@ -462,10 +462,15 @@ pub async fn alert_runtime(mut rx: mpsc::Receiver<AlertTask>) -> Result<(), anyh
                                     "Error while evaluation- {}\nRetrying after sleeping for 1 minute",
                                     err
                                 );
-                                sleep_duration = 1;
+                                if alert.get_query_type() != crate::alerts::AlertQueryType::Promql {
+                                    sleep_duration = 1;
+                                }
                                 retry_counter += 1;
 
-                                if retry_counter > 3 {
+                                if retry_counter > 3
+                                    && alert.get_query_type()
+                                        != crate::alerts::AlertQueryType::Promql
+                                {
                                     error!(
                                         "Alert with id {} failed to evaluate after 3 retries with err- {}",
                                         id, err

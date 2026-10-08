@@ -46,6 +46,7 @@ pub mod oidc;
 pub mod otel_generator;
 pub mod prism_home;
 pub mod prism_logstream;
+pub mod promql;
 pub mod query;
 pub mod query_context;
 pub mod rbac;

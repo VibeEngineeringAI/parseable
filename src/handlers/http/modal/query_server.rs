@@ -54,6 +54,7 @@ impl ParseableServer for QueryServer {
     // configure the api routes
     fn configure_routes(config: &mut ServiceConfig) {
         config
+            .service(crate::handlers::http::promql::scope())
             .service(
                 web::scope(&base_path())
                     .service(Server::get_query_factory())

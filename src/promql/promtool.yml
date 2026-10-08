@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Oracle cases paired with tests.rs. Validate against official Prometheus:
+# docker run --rm --entrypoint /bin/promtool \
+#   -v "$PWD/src/promql:/fixtures:ro" prom/prometheus:v3.15.0 \
+#   test rules /fixtures/promtool.yml
+rule_files: []
+evaluation_interval: 1s
+fuzzy_compare: true
+tests:
+  - name: counter-resets-extrapolation-and-left-open-range
+    interval: 1m
+    input_series:
+      - series: 'requests_total{job="api"}'
+        values: '_ 10 20 5 15 25'
+    promql_expr_test:
+      - expr: 'increase(requests_total[5m])'
+        eval_time: 5m
+        exp_samples: [{labels: '{job="api"}', value: 43.75}]
+      - expr: 'rate(requests_total[5m])'
+        eval_time: 5m
+        exp_samples: [{labels: '{job="api"}', value: 0.14583333333333334}]
+      - expr: 'irate(requests_total[5m])'
+        eval_time: 5m
+        exp_samples: [{labels: '{job="api"}', value: 0.16666666666666666}]
+      - expr: 'delta(requests_total[5m])'
+        eval_time: 5m
+        exp_samples: [{labels: '{job="api"}', value: 18.75}]
+      - expr: 'resets(requests_total[5m])'
+        eval_time: 5m
+        exp_samples: [{labels: '{job="api"}', value: 1}]
+      - expr: 'rate(requests_total[30s])'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'count_over_time(requests_total[2m])'
+        eval_time: 5m
+        exp_samples: [{labels: '{job="api"}', value: 2}]
+      - expr: 'requests_total'
+        eval_time: 10m
+        exp_samples: []
+  - name: counter-zero-point
+    interval: 1m
+    input_series:
+      - series: 'counter'
+        values: '_ 0 10'
+    promql_expr_test:
+      - expr: 'increase(counter[2m])'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 10}]
+  - name: counter-large-start-gap
+    interval: 1m
+    input_series:
+      - series: 'counter'
+        values: '_ _ _ 100 110'
+    promql_expr_test:
+      - expr: 'increase(counter[5m])'
+        eval_time: 5m
+        exp_samples: [{labels: '{}', value: 25}]
+  - name: labels-aggregation-and-vector-matching
+    interval: 1m
+    input_series:
+      - series: 'requests_total{job="api",instance="one"}'
+        values: '10'
+      - series: 'requests_total{job="api",instance="two"}'
+        values: '20'
+      - series: 'limits{job="api",instance="one"}'
+        values: '5'
+    promql_expr_test:
+      - expr: 'sum by (job) (requests_total)'
+        eval_time: 0m
+        exp_samples: [{labels: '{job="api"}', value: 30}]
+      - expr: 'sum without (instance) (requests_total)'
+        eval_time: 0m
+        exp_samples: [{labels: '{job="api"}', value: 30}]
+      - expr: 'requests_total / limits'
+        eval_time: 0m
+        exp_samples: [{labels: '{job="api",instance="one"}', value: 2}]
+      - expr: 'requests_total > ignoring (nonexistent) limits'
+        eval_time: 0m
+        exp_samples: [{labels: 'requests_total{job="api",instance="one"}', value: 10}]
+      - expr: 'requests_total{instance="one"} + on (job) limits'
+        eval_time: 0m
+        exp_samples: [{labels: '{job="api"}', value: 15}]
+      - expr: '5 < requests_total'
+        eval_time: 0m
+        exp_samples:
+          - {labels: 'requests_total{job="api",instance="one"}', value: 10}
+          - {labels: 'requests_total{job="api",instance="two"}', value: 20}
+      - expr: 'requests_total > bool 15'
+        eval_time: 0m
+        exp_samples:
+          - {labels: '{job="api",instance="one"}', value: 0}
+          - {labels: '{job="api",instance="two"}', value: 1}
+  - name: nested-timestamps
+    interval: 1s
+    input_series:
+      - series: 'cpu'
+        values: '_ 2'
+    promql_expr_test:
+      - expr: 'timestamp(cpu)'
+        eval_time: 2s
+        exp_samples: [{labels: '{}', value: 1}]
+      - expr: 'timestamp(cpu + 0)'
+        eval_time: 2s
+        exp_samples: [{labels: '{}', value: 2}]
+      - expr: 'timestamp(-cpu)'
+        eval_time: 2s
+        exp_samples: [{labels: '{}', value: 2}]
+      - expr: 'last_over_time(cpu[1m])'
+        eval_time: 2s
+        exp_samples: [{labels: 'cpu', value: 2}]
+  - name: regex-ascii-classes-and-missing-labels
+    interval: 1s
+    input_series:
+      - series: 'cpu{job="api",code="123"}'
+        values: '1'
+      - series: 'cpu{job="api-worker",code="١٢٣"}'
+        values: '2'
+      - series: 'cpu{job="line\nbreak",zone="us",code="abc"}'
+        values: '3'
+    promql_expr_test:
+      - expr: 'cpu{job=~"api"}'
+        eval_time: 0s
+        exp_samples: [{labels: 'cpu{job="api",code="123"}', value: 1}]
+      - expr: 'cpu{job=~"line.break"}'
+        eval_time: 0s
+        exp_samples: [{labels: 'cpu{job="line\nbreak",zone="us",code="abc"}', value: 3}]
+      - expr: 'cpu{zone=""}'
+        eval_time: 0s
+        exp_samples:
+          - {labels: 'cpu{job="api",code="123"}', value: 1}
+          - {labels: 'cpu{job="api-worker",code="١٢٣"}', value: 2}
+      - expr: 'cpu{code=~"\\d+"}'
+        eval_time: 0s
+        exp_samples: [{labels: 'cpu{job="api",code="123"}', value: 1}]
+      - expr: 'cpu{code=~"[\\D]+"}'
+        eval_time: 0s
+        exp_samples:
+          - {labels: 'cpu{job="api-worker",code="١٢٣"}', value: 2}
+          - {labels: 'cpu{job="line\nbreak",zone="us",code="abc"}', value: 3}
+  - name: ascii-word-boundaries
+    interval: 1s
+    input_series:
+      - series: 'm{word="abc"}'
+        values: '1'
+      - series: 'm{word="éabc"}'
+        values: '2'
+    promql_expr_test:
+      - expr: 'm{word=~".\\babc"}'
+        eval_time: 0s
+        exp_samples: [{labels: 'm{word="éabc"}', value: 2}]
+  - name: compensated-sum-and-mean-cancellation
+    interval: 1s
+    input_series:
+      - series: 'm{id="a"}'
+        values: '1e16'
+      - series: 'm{id="b"}'
+        values: '1'
+      - series: 'm{id="c"}'
+        values: '-1e16'
+      - series: 'over_time'
+        values: '1e16 1 -1e16'
+    promql_expr_test:
+      - expr: 'sum(m)'
+        eval_time: 0s
+        exp_samples: [{labels: '{}', value: 1}]
+      - expr: 'avg(m)'
+        eval_time: 0s
+        exp_samples: [{labels: '{}', value: 0.3333333333333333}]
+      - expr: 'sum_over_time(over_time[1m])'
+        eval_time: 2s
+        exp_samples: [{labels: '{}', value: 1}]
+      - expr: 'avg_over_time(over_time[1m])'
+        eval_time: 2s
+        exp_samples: [{labels: '{}', value: 0.3333333333333333}]
+  - name: mean-and-variance-with-large-finite-values
+    interval: 1s
+    input_series:
+      - series: 'm{id="a"}'
+        values: '1e308'
+      - series: 'm{id="b"}'
+        values: '1e308'
+      - series: 'over_time'
+        values: '1e308 1e308'
+    promql_expr_test:
+      - expr: 'avg(m)'
+        eval_time: 0s
+        exp_samples: [{labels: '{}', value: 1e308}]
+      - expr: 'stdvar(m)'
+        eval_time: 0s
+        exp_samples: [{labels: '{}', value: 0}]
+      - expr: 'stddev(m)'
+        eval_time: 0s
+        exp_samples: [{labels: '{}', value: 0}]
+      - expr: 'avg_over_time(over_time[1m])'
+        eval_time: 1s
+        exp_samples: [{labels: '{}', value: 1e308}]

@@ -68,6 +68,9 @@ pub async fn evaluate_alert(alert: &dyn AlertTrait) -> Result<(), AlertError> {
 
     trace!("RUNNING EVAL TASK FOR- {alert:?}");
 
+    if alert.get_query_type() == super::AlertQueryType::Promql {
+        return super::promql_alerts::evaluate(*alert.get_id(), alert.get_tenant_id()).await;
+    }
     let message = alert.eval_alert().await?;
 
     update_alert_state(alert, message).await
