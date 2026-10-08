@@ -15,10 +15,39 @@ use crate::{
     },
 };
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use ulid::Ulid;
 
-pub static LIFECYCLE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+/// One lock per alert, serializing changes to that alert. Each lock counts the
+/// changes made under it, so a PromQL evaluation that ran its query or its
+/// deliveries without the lock can tell that the alert changed meanwhile and
+/// must not write back stale state. Evaluations never hold a lock across a
+/// query or a delivery, so a slow rule cannot stall other alerts or tenants.
+static LIFECYCLES: Lazy<DashMap<Ulid, Arc<Mutex<u64>>>> = Lazy::new(DashMap::new);
+
+fn lifecycle(id: Ulid) -> Arc<Mutex<u64>> {
+    LIFECYCLES.entry(id).or_default().clone()
+}
+
+/// Lock an alert for a change. Hold the guard until the change is persisted.
+pub async fn lock_lifecycle(id: Ulid) -> OwnedMutexGuard<u64> {
+    let mut guard = lifecycle(id).lock_owned().await;
+    *guard += 1;
+    guard
+}
+
+/// Drop a deleted alert's lock. Call this while still holding its guard.
+pub fn forget_lifecycle(id: Ulid) {
+    LIFECYCLES.remove(&id);
+}
+
 const MAX_INSTANCES: usize = 1000;
 const MAX_DELIVERY_ATTEMPTS: u32 = 3;
 /// Retryable deliveries kept in the outbox; the oldest are dropped on overflow.
@@ -403,7 +432,17 @@ fn notifications_allowed(state: &NotificationState, now: DateTime<Utc>) -> bool 
     }
 }
 
-pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
+pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertError> {
+    let lifecycle = lifecycle(id);
+    let manager = super::get_alert_manager().await;
+    let (config, generation) = {
+        let generation = lifecycle.lock().await;
+        let config = manager
+            .get_alert_by_id(id, tenant_id)
+            .await?
+            .to_alert_config();
+        (config, *generation)
+    };
     if config.state == AlertState::Disabled {
         return Ok(());
     }
@@ -456,24 +495,36 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
             );
         }
     }
+    let committed = serde_json::to_value(&runtime)?;
     updated
         .other_fields
         .get_or_insert_with(Default::default)
-        .insert("promqlRuntime".into(), serde_json::to_value(&runtime)?);
-    PARSEABLE
-        .metastore
-        .put_alert(&updated, &updated.tenant_id)
-        .await?;
-    let manager = super::get_alert_manager().await;
-    manager.update(&ThresholdAlert::from(updated.clone())).await;
-    if previous_state != updated.state {
+        .insert("promqlRuntime".into(), committed.clone());
+    {
+        let mut guard = lifecycle.lock().await;
+        if *guard != generation {
+            // The alert was changed, disabled or deleted while the query ran.
+            return Ok(());
+        }
+        *guard += 1;
         PARSEABLE
             .metastore
-            .put_alert_state(
-                &super::AlertStateEntry::new(updated.id, updated.state, updated.tenant_id.clone()),
-                &updated.tenant_id,
-            )
+            .put_alert(&updated, &updated.tenant_id)
             .await?;
+        manager.update(&ThresholdAlert::from(updated.clone())).await;
+        if previous_state != updated.state {
+            PARSEABLE
+                .metastore
+                .put_alert_state(
+                    &super::AlertStateEntry::new(
+                        updated.id,
+                        updated.state,
+                        updated.tenant_id.clone(),
+                    ),
+                    &updated.tenant_id,
+                )
+                .await?;
+        }
     }
     if notify && may_deliver {
         // Each evaluation makes at most one delivery attempt per queued transition.
@@ -573,16 +624,27 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
             .deliveries
             .retain(|delivery| delivery.error.is_some() || delivery.attempts == 0);
         runtime.trim_deliveries();
-        updated
-            .other_fields
-            .as_mut()
-            .unwrap()
-            .insert("promqlRuntime".into(), serde_json::to_value(&runtime)?);
+        // Re-read the alert so that changes made during delivery, such as a
+        // new notification state, are kept. Delivery results are only
+        // recorded if nothing replaced or reset the runtime meanwhile.
+        let mut guard = lifecycle.lock().await;
+        let Ok(current) = manager.get_alert_by_id(id, tenant_id).await else {
+            return Ok(());
+        };
+        let mut current = current.to_alert_config();
+        let Some(fields) = current.other_fields.as_mut() else {
+            return Ok(());
+        };
+        if fields.get("promqlRuntime") != Some(&committed) {
+            return Ok(());
+        }
+        fields.insert("promqlRuntime".into(), serde_json::to_value(&runtime)?);
+        *guard += 1;
         PARSEABLE
             .metastore
-            .put_alert(&updated, &updated.tenant_id)
+            .put_alert(&current, &current.tenant_id)
             .await?;
-        manager.update(&ThresholdAlert::from(updated)).await;
+        manager.update(&ThresholdAlert::from(current)).await;
     }
     Ok(())
 }
@@ -801,6 +863,21 @@ mod tests {
                 .observe(vec![sample("b", f64::NAN)], &config, now)
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn lifecycle_locks_are_per_alert_and_count_changes() {
+        let (held_id, other_id) = (Ulid::new(), Ulid::new());
+        let held = lock_lifecycle(held_id).await;
+        // A change to one alert must not wait for another alert's lock.
+        let other =
+            tokio::time::timeout(std::time::Duration::from_secs(1), lock_lifecycle(other_id))
+                .await
+                .expect("an unrelated alert's lock should be free");
+        assert_eq!((*held, *other), (1, 1));
+        drop(held);
+        assert_eq!(*lock_lifecycle(held_id).await, 2);
+        forget_lifecycle(held_id);
+        forget_lifecycle(other_id);
     }
     #[test]
     fn duplicate_labels_leave_instance_state_unchanged() {
