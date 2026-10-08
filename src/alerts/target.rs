@@ -272,11 +272,21 @@ impl Target {
         }
     }
 
+    pub fn alertmanager(&self) -> Option<&AlertManager> {
+        match &self.target {
+            TargetType::AlertManager(target) => Some(target),
+            _ => None,
+        }
+    }
+
     /// Delivery with an observable result for the persisted PromQL notification outbox.
+    /// Alertmanager receives `alerts`, which keep the series labels; Slack and
+    /// webhook targets receive `message`.
     pub async fn deliver_promql(
         &self,
         tenant: &Option<String>,
-        context: &Context,
+        message: &str,
+        alerts: &[Value],
     ) -> Result<(), String> {
         let request = match &self.target {
             TargetType::Slack(target) => {
@@ -292,7 +302,7 @@ impl Target {
                 prepared
                     .client
                     .post(target.endpoint.clone())
-                    .json(&serde_json::json!({"text": context.message}))
+                    .json(&serde_json::json!({"text": message}))
             }
             TargetType::Other(target) => {
                 let prepared = outbound_http_policy::prepare_alert_target(
@@ -308,34 +318,9 @@ impl Target {
                     .client
                     .post(target.endpoint.clone())
                     .headers(prepared.headers)
-                    .body(context.message.clone())
+                    .body(message.to_owned())
             }
-            TargetType::AlertManager(target) => {
-                let prepared = outbound_http_policy::prepare_alert_target(
-                    tenant,
-                    &target.endpoint,
-                    AlertTargetKind::AlertManager,
-                    target.skip_tls_check,
-                    None,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                let mut alert = serde_json::json!({"labels":{"alertname":context.alert_info.alert_name},"annotations":{"message":context.message}});
-                if context.alert_info.alert_state == AlertState::NotTriggered {
-                    alert["endsAt"] = Utc::now().to_rfc3339().into();
-                }
-                let mut request = prepared
-                    .client
-                    .post(target.endpoint.clone())
-                    .json(&serde_json::json!([alert]));
-                if let Some(auth) = &target.auth {
-                    if !prepared.authorization_allowed {
-                        return Err("Target credentials blocked by outbound policy".into());
-                    }
-                    request = request.basic_auth(&auth.username, Some(&auth.password));
-                }
-                request
-            }
+            TargetType::AlertManager(target) => return target.post_promql(tenant, alerts).await,
         };
         request
             .send()
@@ -658,6 +643,39 @@ pub struct AlertManager {
     skip_tls_check: bool,
     #[serde(flatten)]
     auth: Option<Auth>,
+}
+
+impl AlertManager {
+    /// Post a batch of PromQL alerts, each already carrying its labels and `endsAt`.
+    pub async fn post_promql(
+        &self,
+        tenant: &Option<String>,
+        alerts: &[Value],
+    ) -> Result<(), String> {
+        let prepared = outbound_http_policy::prepare_alert_target(
+            tenant,
+            &self.endpoint,
+            AlertTargetKind::AlertManager,
+            self.skip_tls_check,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut request = prepared.client.post(self.endpoint.clone()).json(alerts);
+        if let Some(auth) = &self.auth {
+            if !prepared.authorization_allowed {
+                return Err("Target credentials blocked by outbound policy".into());
+            }
+            request = request.basic_auth(&auth.username, Some(&auth.password));
+        }
+        request
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
 #[async_trait]

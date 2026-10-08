@@ -2,7 +2,8 @@
 use crate::{
     alerts::{
         AlertConfig, AlertError, AlertQueryType, AlertState, NotificationState,
-        alert_types::ThresholdAlert, alerts_utils::evaluate_condition, target::TARGETS,
+        alert_structs::DeploymentInfo, alert_types::ThresholdAlert,
+        alerts_utils::evaluate_condition, target::TARGETS,
     },
     parseable::{DEFAULT_TENANT, PARSEABLE},
     promql::Labels,
@@ -318,6 +319,70 @@ pub(super) fn reset_runtime_for_disable(
     }
 }
 
+/// The human-readable notification for one instance, also used as the
+/// Alertmanager `message` annotation.
+fn instance_message(config: &AlertConfig, labels: &Labels, value: f64, firing: bool) -> String {
+    let identity = labels
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{} [{}]: {}\nValue: {}\nThreshold: {} {}\nQuery: {}",
+        config.title,
+        identity,
+        if firing { "firing" } else { "resolved" },
+        value,
+        config.threshold_config.operator,
+        config.threshold_config.value,
+        config.query
+    )
+}
+
+/// Alertmanager identifies an alert by its label set, so the series labels
+/// are sent as labels for grouping, inhibition and routing. As in Prometheus,
+/// `alertname` overrides a series label of the same name and `__name__` is
+/// dropped. A firing and a resolved alert for one instance carry the same
+/// labels, so the resolution matches the alert it ends.
+fn alertmanager_alert(
+    title: &str,
+    deployment: &DeploymentInfo,
+    labels: &Labels,
+    message: String,
+    ends_at: DateTime<Utc>,
+) -> serde_json::Value {
+    let mut alert_labels: serde_json::Map<_, _> = labels
+        .iter()
+        .filter(|(name, _)| name.as_str() != "__name__")
+        .map(|(name, value)| (name.clone(), value.clone().into()))
+        .collect();
+    alert_labels.insert(
+        "deployment_instance".into(),
+        deployment.deployment_instance.clone().into(),
+    );
+    alert_labels.insert(
+        "deployment_id".into(),
+        deployment.deployment_id.to_string().into(),
+    );
+    alert_labels.insert(
+        "deployment_mode".into(),
+        deployment.deployment_mode.clone().into(),
+    );
+    alert_labels.insert("alertname".into(), title.into());
+    serde_json::json!({
+        "labels": alert_labels,
+        "annotations": {"message": message},
+        "endsAt": ends_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    })
+}
+
+/// Alertmanager resolves an alert once its `endsAt` passes. Like Prometheus,
+/// firing alerts stay valid for four evaluation intervals, so a few missed
+/// re-sends do not resolve them.
+fn firing_valid_until(config: &AlertConfig, now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::minutes(4 * config.get_eval_frequency().max(1) as i64)
+}
+
 fn notifications_allowed(state: &NotificationState, now: DateTime<Utc>) -> bool {
     match state {
         NotificationState::Notify => true,
@@ -402,6 +467,8 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
     if notify && may_deliver {
         // Each evaluation makes at most one delivery attempt per queued transition.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deployment = updated.get_context().deployment_info;
+        let valid_until = firing_valid_until(&updated, now);
         for delivery in runtime
             .deliveries
             .iter_mut()
@@ -411,31 +478,14 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            let identity = delivery
-                .labels
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut context = updated.get_context();
-            context.alert_info.alert_name = format!("{} [{}]", updated.title, identity);
-            context.alert_info.alert_state = if delivery.firing {
-                AlertState::Triggered
-            } else {
-                AlertState::NotTriggered
-            };
-            context.message = format!(
-                "{}: {}\nValue: {}\nThreshold: {} {}\nQuery: {}",
-                context.alert_info.alert_name,
-                if delivery.firing {
-                    "firing"
-                } else {
-                    "resolved"
-                },
-                delivery.value,
-                updated.threshold_config.operator,
-                updated.threshold_config.value,
-                updated.query
+            let message =
+                instance_message(&updated, &delivery.labels, delivery.value, delivery.firing);
+            let alert = alertmanager_alert(
+                &updated.title,
+                &deployment,
+                &delivery.labels,
+                message.clone(),
+                if delivery.firing { valid_until } else { now },
             );
             delivery.attempts += 1;
             let target_result = TARGETS
@@ -445,7 +495,7 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
             let result = match target_result {
                 Ok(target) => match tokio::time::timeout_at(
                     deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
-                    target.deliver_promql(&updated.tenant_id, &context),
+                    target.deliver_promql(&updated.tenant_id, &message, &[alert]),
                 )
                 .await
                 {
@@ -460,6 +510,52 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
                     delivery.error = None;
                 }
                 Err(error) => delivery.error = Some(error),
+            }
+        }
+        // Alertmanager expects active alerts to be re-sent, so every
+        // evaluation posts all firing instances to Alertmanager targets. It
+        // deduplicates them by label set. Slack and webhook targets only get
+        // the transitions queued above.
+        let firing = runtime
+            .instances
+            .values()
+            .filter(|instance| instance.state == "firing")
+            .map(|instance| {
+                alertmanager_alert(
+                    &updated.title,
+                    &deployment,
+                    &instance.labels,
+                    instance_message(&updated, &instance.labels, instance.value, true),
+                    valid_until,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !firing.is_empty() {
+            for target_id in &updated.targets {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let Ok(target) = TARGETS
+                    .get_target_by_id(target_id, &updated.tenant_id)
+                    .await
+                else {
+                    continue;
+                };
+                let Some(alertmanager) = target.alertmanager() else {
+                    continue;
+                };
+                let result = tokio::time::timeout_at(
+                    deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
+                    alertmanager.post_promql(&updated.tenant_id, &firing),
+                )
+                .await
+                .unwrap_or_else(|_| Err("Notification delivery timed out".into()));
+                if let Err(error) = result {
+                    tracing::warn!(
+                        "PromQL alert {} could not re-send firing alerts to Alertmanager target {target_id}: {error}",
+                        updated.id
+                    );
+                }
             }
         }
         runtime
@@ -804,6 +900,60 @@ mod tests {
         assert_eq!(
             enabled.instances.values().next().unwrap().pending_since,
             Some(now + chrono::Duration::minutes(1))
+        );
+    }
+    #[test]
+    fn alertmanager_alert_keeps_series_labels_and_stable_identity() {
+        let config = config();
+        let now = Utc::now();
+        let deployment = DeploymentInfo::new(
+            "http://localhost:8000".into(),
+            ulid::Ulid::new(),
+            "All".into(),
+        );
+        let labels = BTreeMap::from([
+            ("__name__".into(), "load".into()),
+            ("alertname".into(), "series".into()),
+            ("host".into(), "a".into()),
+            ("job".into(), "node".into()),
+        ]);
+        let valid_until = firing_valid_until(&config, now);
+        let firing = alertmanager_alert(
+            &config.title,
+            &deployment,
+            &labels,
+            instance_message(&config, &labels, 9.0, true),
+            valid_until,
+        );
+        assert_eq!(
+            firing["labels"],
+            serde_json::json!({
+                "alertname": "Host load",
+                "host": "a",
+                "job": "node",
+                "deployment_instance": "http://localhost:8000",
+                "deployment_id": deployment.deployment_id.to_string(),
+                "deployment_mode": "All",
+            })
+        );
+        assert!(
+            firing["annotations"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("firing\nValue: 9")
+        );
+        assert_eq!(valid_until, now + chrono::Duration::minutes(4));
+        let resolved = alertmanager_alert(
+            &config.title,
+            &deployment,
+            &labels,
+            instance_message(&config, &labels, 2.0, false),
+            now,
+        );
+        assert_eq!(resolved["labels"], firing["labels"]);
+        assert_eq!(
+            resolved["endsAt"],
+            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         );
     }
 }

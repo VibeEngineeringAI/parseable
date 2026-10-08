@@ -57,8 +57,9 @@ exposes `promqlRuntime` with evaluation health and per-label instance state.
 
 ## Operational behavior
 
-Firing and recovery notifications are sent for state transitions. An ongoing
-firing instance does not generate recurring repeat messages. A failed delivery
+Firing and recovery notifications are sent for state transitions. For Slack and
+webhook targets, an ongoing firing instance does not generate recurring repeat
+messages. A failed delivery
 is retained in `promqlRuntime.deliveries` with its attempt count and error, then
 retried on later alert evaluations for up to three attempts. Each evaluation
 makes at most one attempt for a queued delivery. After the third failure, the
@@ -68,6 +69,19 @@ Only the 50 most recent exhausted deliveries are kept.
 The outbox never blocks state evaluation. It holds at most 1000 queued
 deliveries. If a burst of transitions exceeds that, the oldest queued
 deliveries are dropped and a warning is logged.
+
+Alertmanager targets receive each instance as its own alert. Its labels are the
+series labels (without `__name__`), `alertname` set to the rule title, and the
+`deployment_instance`, `deployment_id` and `deployment_mode` labels. Grouping,
+inhibition and routing can therefore match series labels such as `host` or
+`job`. Every evaluation re-sends all firing instances to Alertmanager targets,
+as Prometheus does, with `endsAt` four evaluation intervals ahead. Alertmanager
+deduplicates these by label set, so they do not cause repeat notifications.
+A firing alert therefore stays active in Alertmanager while Parseable still
+reports it as firing. If re-sends stop, for example because the rule is muted,
+disabled or edited, or its owner loses access, Alertmanager resolves the alert
+once `endsAt` passes. A failed re-send is logged and retried at the next
+evaluation.
 
 Editing a rule resets its instance state and pending timers because its query,
 dataset, threshold, or hold duration may have changed. Disabling a rule clears
