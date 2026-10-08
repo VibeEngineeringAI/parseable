@@ -187,11 +187,16 @@ fn validate_selector(
         let negative = matches!(matcher.op, MatchOp::NotRe(_));
         if matches!(matcher.op, MatchOp::Re(_) | MatchOp::NotRe(_)) {
             validate_regex_subset(&matcher.value)?;
-            let regex =
-                regex::RegexBuilder::new(&format!("^(?:{})$", re2_ascii_classes(&matcher.value)))
+            let build = |pattern: &str| {
+                regex::RegexBuilder::new(&format!("^(?:{})$", re2_ascii_classes(pattern)))
                     .dot_matches_new_line(true)
                     .build()
-                    .map_err(|e| unsupported(format!("label regex: {e}")))?;
+            };
+            // Like promql-parser, retry with literal `{` escaped, since Go accepts
+            // `/api/{id}` but Rust rejects it as an invalid repetition.
+            let regex = build(&matcher.value)
+                .or_else(|_| build(&escape_literal_braces(&matcher.value)))
+                .map_err(|e| unsupported(format!("label regex: {e}")))?;
             matcher.op = if negative {
                 MatchOp::NotRe(regex)
             } else {
@@ -236,6 +241,43 @@ fn re2_ascii_classes(pattern: &str) -> String {
             }
             None => output.push('\\'),
         }
+    }
+    output
+}
+
+fn escape_literal_braces(pattern: &str) -> String {
+    let mut output = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            output.push(c);
+            output.extend(chars.next());
+            continue;
+        }
+        if c != '{' {
+            output.push(c);
+            continue;
+        }
+        // A repetition is `{n}`, `{n,}` or `{n,m}`; anything else is literal in Go.
+        let mut body = String::new();
+        while let Some(&next) = chars.peek() {
+            if !(next.is_ascii_digit() || next == ',') {
+                break;
+            }
+            body.push(next);
+            chars.next();
+        }
+        let mut bounds = body.splitn(2, ',');
+        let min = bounds.next().unwrap_or_default();
+        let max = bounds.next();
+        let repeat = chars.peek() == Some(&'}')
+            && !min.is_empty()
+            && max.is_none_or(|max| !max.contains(','));
+        if !repeat {
+            output.push('\\');
+        }
+        output.push('{');
+        output.push_str(&body);
     }
     output
 }

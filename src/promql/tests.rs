@@ -105,6 +105,20 @@ fn regex_digit_class_uses_re2_ascii_semantics() {
 }
 
 #[test]
+fn regex_literal_braces_follow_go_semantics() {
+    let data = vec![
+        series("m", &[("path", "/api/{id}")], &[(0, 1.0)]),
+        series("m", &[("path", "/api/aa")], &[(0, 2.0)]),
+    ];
+    assert_eq!(point(r#"m{path=~"/api/{id}"}"#, &data, 0).sample.value, 1.0);
+    assert_eq!(point(r#"m{path=~"/api/a{2}"}"#, &data, 0).sample.value, 2.0);
+    assert_eq!(
+        point(r#"m{path=~"/api/a{1,}"}"#, &data, 0).sample.value,
+        2.0
+    );
+}
+
+#[test]
 fn repeated_selector_matcher_operators_stay_distinct() {
     let data = vec![
         series("m", &[("job", "a")], &[(0, 2.0)]),
