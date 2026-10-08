@@ -5,6 +5,13 @@ const username = process.env.PARSEABLE_LIVE_USERNAME || 'frontend-smoke';
 const password = process.env.PARSEABLE_LIVE_PASSWORD || 'local-smoke-password';
 const dataset = process.env.PARSEABLE_LIVE_DATASET || 'frontend_smoke';
 const datasetPath = `/logs/explore/${encodeURIComponent(dataset)}`;
+// The embedded build is mounted at `/next`; set it empty for a server (or Vite dev) at the root.
+const base = (process.env.PARSEABLE_LIVE_BASE ?? '/next').replace(/\/+$/, '');
+
+/** Document path for an application route, mirroring `appPath` in src/lib/config.ts. */
+const app = (route: string) => `${base}${route}`;
+const appUrl = (route: string) => new URL(app(route), live).href;
+const atLogin = (url: URL) => url.pathname === app('/login');
 
 test.skip(!live, 'Set PARSEABLE_LIVE_URL to opt in to the real-server suite.');
 
@@ -45,11 +52,11 @@ test.beforeAll(async ({ request }) => {
 });
 
 async function signIn(page: Page, path = datasetPath) {
-  await page.goto(`/login?next=${encodeURIComponent(path)}`);
+  await page.goto(app(`/login?next=${encodeURIComponent(path)}`));
   await page.getByLabel('Username', { exact: true }).fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Login', exact: true }).click();
-  await expect(page).toHaveURL(new URL(path, live).href);
+  await expect(page).toHaveURL(appUrl(path));
 }
 
 test('native login uses a session and shell logout invalidates it', async ({ page }) => {
@@ -59,7 +66,7 @@ test('native login uses a session and shell logout invalidates it', async ({ pag
   const savedSession = (await page.context().cookies()).find((cookie) => cookie.name === 'session');
   expect(savedSession).toBeDefined();
   await page.getByRole('button', { name: 'Sign out', exact: true }).click();
-  await expect(page).toHaveURL(/\/login/);
+  await expect(page).toHaveURL(atLogin);
   await expect(page.getByRole('table')).toHaveCount(0);
   const result = await page.request.get('/api/v1/logstream', {
     headers: { Cookie: `session=${savedSession!.value}` },
@@ -75,12 +82,12 @@ test('missing session asks for login and preserves the intended route', async ({
   await expect(page.getByRole('table')).toContainText('Live smoke');
   await context.clearCookies();
   await page.reload();
-  await expect(page).toHaveURL(/\/login\?next=/);
+  await expect(page).toHaveURL((url) => atLogin(url) && url.searchParams.has('next'));
   expect(new URL(page.url()).searchParams.get('next')).toBe(datasetPath);
   await page.getByLabel('Username', { exact: true }).fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Login', exact: true }).click();
-  await expect(page).toHaveURL(new URL(datasetPath, live).href);
+  await expect(page).toHaveURL(appUrl(datasetPath));
   await expect(page.getByRole('table')).toContainText('Live smoke');
 });
 
@@ -88,11 +95,11 @@ test('an invalidated server session is recovered without stale identity', async 
   await signIn(page);
   await expect(page.getByRole('table')).toContainText('Live smoke');
   // Invalidate server-side but leave the browser's old session cookie in place.
-  const redirect = new URL('/login', live).href;
+  const redirect = appUrl('/login');
   const response = await page.request.get(`/api/v1/o/logout?${new URLSearchParams({ redirect })}`);
   expect(response.ok()).toBe(true);
   await page.reload();
-  await expect(page).toHaveURL(/\/login\?next=/);
+  await expect(page).toHaveURL((url) => atLogin(url) && url.searchParams.has('next'));
   await page.getByLabel('Username', { exact: true }).fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Login', exact: true }).click();
@@ -138,7 +145,7 @@ test('dataset inventory and Arrow schema lead back to logs', async ({ page }) =>
   await expect(schema.locator('[data-field-node="message"]')).toBeVisible();
   await expect(schema.locator('[data-field-node="request_id"]')).toBeVisible();
   await schema.getByRole('link', { name: 'Explore dataset' }).click();
-  await expect(page).toHaveURL(new URL(datasetPath, live).href);
+  await expect(page).toHaveURL(appUrl(datasetPath));
   await expect(page.getByRole('table')).toContainText('Live smoke');
 });
 
@@ -153,7 +160,7 @@ test('SSO traverses the provider, real callback and signed-in UI', async ({ page
     data: [{ privilege: 'reader', resource: { stream: dataset } }],
   });
   expect(role.ok(), await role.text()).toBe(true);
-  await page.goto(`/login?next=${encodeURIComponent(datasetPath)}`);
+  await page.goto(app(`/login?next=${encodeURIComponent(datasetPath)}`));
   await page.getByRole('button', { name: 'Sign in with SSO', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Local mock identity provider' })).toBeVisible();
   await expect(page).toHaveURL(
@@ -164,14 +171,14 @@ test('SSO traverses the provider, real callback and signed-in UI', async ({ page
   const callback = page.waitForRequest((req) => new URL(req.url()).pathname === '/api/v1/o/code');
   await page.getByRole('button', { name: 'Sign in as Smoke SSO User' }).click();
   expect((await callback).isNavigationRequest()).toBe(true);
-  await expect(page).toHaveURL(new URL(datasetPath, live).href);
+  await expect(page).toHaveURL(appUrl(datasetPath));
   await expect(page.getByText('Smoke SSO User', { exact: true }).first()).toBeVisible();
   await expect(page.getByRole('table')).toContainText('Live smoke');
   // Reader accounts can inspect metadata, but cannot enumerate administrative roles.
   const deniedRoles = await page.request.get('/api/v1/roles');
   expect(deniedRoles.status()).toBe(403);
   await page.getByRole('button', { name: 'Sign out', exact: true }).click();
-  await expect(page).toHaveURL(/\/login/);
+  await expect(page).toHaveURL(atLogin);
   await expect(page.getByLabel('Username', { exact: true })).toBeVisible();
   // Re-enter SSO with any stale cookie still supplied by the backend logout response.
   await page.getByRole('button', { name: 'Sign in with SSO', exact: true }).click();
@@ -185,15 +192,15 @@ test('an unconfigured OIDC server explains native login and keeps the return pat
     process.env.PARSEABLE_LIVE_NO_OIDC !== 'true',
     'Run against a server started without OIDC options.',
   );
-  await page.goto(`/login?next=${encodeURIComponent(datasetPath)}`);
+  await page.goto(app(`/login?next=${encodeURIComponent(datasetPath)}`));
   await page.getByRole('button', { name: 'Sign in with SSO', exact: true }).click();
-  await expect(page).toHaveURL(/\/oidc-not-configured/);
+  await expect(page).toHaveURL((url) => url.pathname === app('/oidc-not-configured'));
   await expect(
     page.getByRole('heading', { name: 'Single sign-on is not configured' }),
   ).toBeVisible();
   await page.getByLabel('Username', { exact: true }).fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Login', exact: true }).click();
-  await expect(page).toHaveURL(new URL(datasetPath, live).href);
+  await expect(page).toHaveURL(appUrl(datasetPath));
   await expect(page.getByRole('table')).toContainText('Live smoke');
 });
