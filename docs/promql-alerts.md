@@ -52,7 +52,11 @@ series continue their own timers and states.
 An empty result reports `noData`; it is not treated as a zero value. Evaluation
 errors report `error`. Neither state advances pending time or produces a false
 recovery for an already firing instance. After a data gap, pending duration must
-be established again from continuous observations. The alert detail response
+be established again from continuous observations. A firing series that is
+missing from successful evaluations for more than four evaluation intervals is
+treated as gone: it resolves and sends a recovery notification with its last
+value, so churned series such as replaced pods do not stay firing or fill the
+1000-instance limit. The alert detail response
 exposes `promqlRuntime` with evaluation health and per-label instance state.
 
 ## Operational behavior

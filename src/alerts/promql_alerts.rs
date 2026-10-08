@@ -253,9 +253,6 @@ impl Runtime {
             if !seen.insert(key.clone()) {
                 return Err("Duplicate PromQL label set".into());
             }
-            if !self.instances.contains_key(&key) && self.instances.len() >= MAX_INSTANCES {
-                return Err("PromQL alert instance limit reached".into());
-            }
             let entry = self.instances.entry(key).or_insert_with(|| Instance {
                 labels: labels.clone(),
                 state: "resolved".into(),
@@ -288,17 +285,26 @@ impl Runtime {
                 entry.pending_since = None;
             }
         }
-        let missing = self
-            .instances
-            .iter()
-            .any(|(key, instance)| !seen.contains(key) && instance.state != "resolved");
-        for (key, instance) in &mut self.instances {
-            if !seen.contains(key) {
-                instance.pending_since = None;
+        // A firing instance survives short data gaps, but one whose series has
+        // been absent for longer than the staleness bound resolves, as the
+        // series is gone. That also frees its slot under the instance limit.
+        let stale_after = staleness_bound(config);
+        let mut missing = false;
+        self.instances.retain(|key, instance| {
+            if seen.contains(key) {
+                return true;
             }
+            if instance.state == "firing" && now - instance.last_seen > stale_after {
+                transitions.push((instance.labels.clone(), instance.value, false));
+                return false;
+            }
+            missing |= instance.state != "resolved";
+            instance.pending_since = None;
+            instance.state == "firing"
+        });
+        if self.instances.len() > MAX_INSTANCES {
+            return Err("PromQL alert instance limit reached".into());
         }
-        self.instances
-            .retain(|key, instance| seen.contains(key) || instance.state == "firing");
         self.health = if seen.is_empty() || missing {
             "noData"
         } else {
@@ -376,11 +382,16 @@ fn alertmanager_alert(
     })
 }
 
-/// Alertmanager resolves an alert once its `endsAt` passes. Like Prometheus,
-/// firing alerts stay valid for four evaluation intervals, so a few missed
-/// re-sends do not resolve them.
+/// How long a firing instance stays firing without a sample: four evaluation
+/// intervals, as with Prometheus' Alertmanager `endsAt`.
+fn staleness_bound(config: &AlertConfig) -> chrono::Duration {
+    chrono::Duration::minutes(4 * config.get_eval_frequency().max(1) as i64)
+}
+
+/// Alertmanager resolves an alert once its `endsAt` passes. Firing alerts stay
+/// valid for the staleness bound, so a few missed re-sends do not resolve them.
 fn firing_valid_until(config: &AlertConfig, now: DateTime<Utc>) -> DateTime<Utc> {
-    now + chrono::Duration::minutes(4 * config.get_eval_frequency().max(1) as i64)
+    now + staleness_bound(config)
 }
 
 fn notifications_allowed(state: &NotificationState, now: DateTime<Utc>) -> bool {
@@ -671,6 +682,86 @@ mod tests {
         let restored: Runtime = serde_json::from_str(&persisted).unwrap();
         assert_eq!(restored.health, "error");
         assert_eq!(restored.instances.values().next().unwrap().state, "firing");
+    }
+    #[test]
+    fn vanished_firing_series_resolve_after_staleness_bound() {
+        let mut config = config();
+        config.other_fields.as_mut().unwrap().insert(
+            "promqlConfig".into(),
+            serde_json::json!({"holdDuration":"0s"}),
+        );
+        let now = Utc::now();
+        let minutes = |m| now + chrono::Duration::minutes(m);
+        let mut runtime = Runtime::default();
+        runtime
+            .observe(vec![sample("a", 9.0), sample("b", 9.0)], &config, now)
+            .unwrap();
+        // Within four intervals, "a" keeps firing through the gap.
+        for minute in 1..=4 {
+            assert!(
+                runtime
+                    .observe(vec![sample("b", 9.0)], &config, minutes(minute))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(runtime.health, "noData");
+        }
+        let resolved = runtime
+            .observe(vec![sample("b", 9.0)], &config, minutes(5))
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0["host"], "a");
+        assert_eq!(resolved[0].1, 9.0);
+        assert!(!resolved[0].2);
+        assert_eq!(runtime.health, "ok");
+        assert_eq!(runtime.instances.len(), 1);
+        assert_eq!(
+            runtime.instances.values().next().unwrap().labels["host"],
+            "b"
+        );
+    }
+    #[test]
+    fn churned_firing_series_do_not_exhaust_instance_limit() {
+        let mut config = config();
+        config.other_fields.as_mut().unwrap().insert(
+            "promqlConfig".into(),
+            serde_json::json!({"holdDuration":"0s"}),
+        );
+        let now = Utc::now();
+        let batch = |generation: usize| {
+            (0..MAX_INSTANCES)
+                .map(|pod| sample(&format!("{generation}-{pod}"), 9.0))
+                .collect::<Vec<_>>()
+        };
+        let mut runtime = Runtime::default();
+        runtime
+            .observe_transactionally(batch(0), &config, now)
+            .unwrap();
+        // Replacing every series while the old ones are still fresh exceeds the limit.
+        assert!(
+            runtime
+                .observe_transactionally(batch(1), &config, now + chrono::Duration::minutes(1))
+                .is_err()
+        );
+        // Once the old series are stale, they resolve and the new ones fire.
+        let transitions = runtime
+            .observe_transactionally(batch(1), &config, now + chrono::Duration::minutes(5))
+            .unwrap();
+        assert_eq!(
+            transitions.iter().filter(|(_, _, firing)| *firing).count(),
+            MAX_INSTANCES
+        );
+        assert_eq!(
+            transitions.iter().filter(|(_, _, firing)| !*firing).count(),
+            MAX_INSTANCES
+        );
+        assert_eq!(runtime.instances.len(), MAX_INSTANCES);
+        assert!(
+            runtime
+                .instances
+                .values()
+                .all(|i| i.labels["host"].starts_with("1-"))
+        );
     }
     #[test]
     fn pending_restarts_after_missing_sample_or_long_gap() {
