@@ -1,0 +1,431 @@
+/* Measured Prism v3.2.4 shell: full-width 48px header and 192px navigation. */
+body .app-shell {
+  grid-template-columns: 192px minmax(0, 1fr);
+  padding-top: 48px;
+}
+body .app-shell.sidebar-collapsed {
+  grid-template-columns: 56px minmax(0, 1fr);
+}
+body .app-sidebar {
+  padding: 12px 8px 8px;
+  top: 48px;
+  height: calc(100dvh - 48px);
+  background: var(--color-bg);
+}
+.app-sidebar nav {
+  gap: 4px;
+}
+.app-sidebar .nav-item {
+  min-height: 28px;
+  padding: 4px 8px;
+  gap: 9px;
+  font-size: 13px;
+  border-radius: 5px;
+}
+.app-sidebar .nav-item.active {
+  font-weight: 500;
+  background: var(--color-surface-hover);
+}
+.app-sidebar .sidebar-group-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 18px 8px 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--color-muted);
+  font-size: 10px;
+}
+.sidebar-group-label span {
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+.sidebar-search {
+  position: relative;
+  margin-bottom: 10px;
+}
+.sidebar-search svg {
+  position: absolute;
+  left: 9px;
+  top: 7px;
+  color: var(--color-muted);
+}
+.sidebar-search input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 4px 8px 4px 30px;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.sidebar-no-results {
+  font-size: 12px;
+  padding: 12px 8px;
+  color: var(--color-muted);
+}
+.app-shell .topbar {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 20;
+  height: 48px;
+  min-height: 48px;
+  padding: 0 16px;
+  justify-content: flex-start;
+  gap: 16px;
+  background: var(--color-bg);
+}
+.app-shell .topbar > .inline {
+  margin-left: auto;
+}
+.shell-brand {
+  width: 23px;
+  height: 23px;
+  display: inline-flex;
+}
+.shell-brand svg {
+  width: 100%;
+  height: 100%;
+}
+#workspace-context {
+  min-width: 0;
+}
+#workspace-context select {
+  width: 200px;
+  max-width: 100%;
+  height: 32px;
+}
+.shell-identity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.shell-username {
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.shell-identity .avatar {
+  width: 28px;
+  height: 28px;
+  font-size: 12px;
+}
+body .sidebar-collapsed .app-sidebar {
+  padding-inline: 8px;
+}
+.sidebar-collapsed .app-sidebar .brand {
+  padding-inline: 9px;
+}
+.sidebar-collapsed .app-sidebar .workspace-label {
+  text-align: center;
+  padding-inline: 0;
+}
+.sidebar-collapsed .app-sidebar .nav-item {
+  padding-inline: 11px;
+}
+.auth-page {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: var(--color-bg);
+}
+.auth-card {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  width: min(1152px, 100%);
+  min-height: 645px;
+  border-radius: 28px;
+  overflow: hidden;
+  background: var(--color-surface);
+  box-shadow: 0 24px 52px #18182724;
+}
+.auth-intro {
+  display: flex;
+  flex-direction: column;
+  padding: 38px 48px 46px;
+  background-color: var(--color-primary-soft);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28'%3E%3Cpath d='M11 14h6m-3-3v6' stroke='%238a83de' stroke-opacity='.16'/%3E%3C/svg%3E");
+}
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 32px;
+  font-weight: 750;
+  letter-spacing: -1px;
+  margin-bottom: 33px;
+  width: fit-content;
+}
+.auth-brand svg {
+  width: 25px;
+  height: 25px;
+}
+.auth-intro h1 {
+  font-size: 36px;
+  line-height: 1.22;
+  font-weight: 600;
+  letter-spacing: -0.8px;
+}
+.auth-intro h1 span {
+  color: var(--color-primary);
+}
+.auth-tagline {
+  margin-top: 22px;
+  font-size: 16px;
+  color: var(--color-muted);
+}
+.auth-benefits {
+  list-style: none;
+  padding: 0;
+  margin: 40px 0 0;
+  display: grid;
+  gap: 16px;
+}
+.auth-benefits li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 16px;
+  line-height: 1.35;
+}
+.auth-benefits svg {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  padding: 10px;
+  color: #008b91;
+  background: var(--color-surface);
+  border-radius: 12px;
+  box-shadow: 0 2px 2px #18183f18;
+}
+.auth-benefits li:nth-child(2) svg {
+  color: #8542e5;
+}
+.auth-benefits li:nth-child(3) svg {
+  color: #078937;
+}
+.auth-benefits li:nth-child(4) svg {
+  color: #a86500;
+}
+.auth-benefits li:nth-child(5) svg {
+  color: #6554c5;
+}
+.auth-footer {
+  color: var(--color-muted);
+  font-size: 12px;
+  margin-top: auto;
+  padding-top: 40px;
+}
+.auth-content {
+  padding: 48px 64px;
+  display: flex;
+  flex-direction: column;
+}
+.auth-content h2 {
+  font-size: 20px;
+  line-height: 1.4;
+  font-weight: 600;
+  text-align: center;
+}
+.auth-content > .login-form {
+  margin-top: 62px;
+}
+.auth-description {
+  margin-top: 14px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.auth-description + .login-form {
+  margin-top: 24px;
+}
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.login-form .ui-input {
+  height: 40px;
+}
+.login-form > .ui-button {
+  min-height: 40px;
+}
+.password-field {
+  position: relative;
+}
+.password-field input {
+  padding-right: 44px;
+}
+.password-field .password-visibility {
+  position: absolute;
+  right: 4px;
+  bottom: 3px;
+  width: 34px;
+  height: 34px;
+}
+.login-form .forgot-password {
+  align-self: flex-start;
+  padding: 0;
+  min-height: 20px;
+  height: auto;
+  font-size: 14px;
+  color: var(--color-primary);
+}
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 11px;
+  color: var(--color-muted);
+  margin: 16px 0;
+}
+.login-divider::before,
+.login-divider::after {
+  content: '';
+  height: 1px;
+  flex: 1;
+  background: var(--color-border);
+}
+.auth-demo,
+.auth-help {
+  margin-top: auto;
+  padding-top: 40px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--color-muted);
+}
+.auth-demo.ui-button {
+  padding-block: 12px;
+  margin-top: 40px;
+}
+.auth-native-link {
+  justify-content: center;
+  margin-top: 14px;
+}
+.connection-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 20px;
+}
+@media (max-width: 1100px) {
+  .auth-content,
+  .auth-intro {
+    padding: 40px 32px;
+  }
+  .auth-benefits li {
+    font-size: 14px;
+  }
+  .shell-username {
+    max-width: 110px;
+  }
+}
+@media (max-width: 800px) {
+  body .app-shell {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+  body .app-sidebar {
+    padding-inline: 8px;
+  }
+  .app-sidebar .nav-item > span,
+  .sidebar-search,
+  .sidebar-group-label {
+    display: none !important;
+  }
+  .app-sidebar .nav-item {
+    padding-inline: 11px;
+  }
+  .app-shell .topbar {
+    padding: 0 16px;
+  }
+  .shell-username {
+    display: none;
+  }
+  .sidebar-footer button {
+    font-size: 0;
+    gap: 0;
+    padding-inline: 11px;
+  }
+  .auth-content,
+  .auth-intro {
+    padding: 32px 24px;
+  }
+  .auth-intro h1 {
+    font-size: 30px;
+  }
+  .auth-benefits {
+    gap: 20px;
+  }
+}
+@media (max-width: 640px) {
+  .auth-page {
+    padding: 24px 16px;
+  }
+  .auth-card {
+    grid-template-columns: 1fr;
+    min-height: auto;
+    border-radius: 20px;
+  }
+  .auth-intro {
+    padding: 24px;
+  }
+  .auth-brand {
+    font-size: 26px;
+    margin-bottom: 20px;
+  }
+  .auth-intro h1 {
+    font-size: 27px;
+  }
+  .auth-intro h1 br {
+    display: none;
+  }
+  .auth-intro h1 span::before {
+    content: ' ';
+  }
+  .auth-tagline {
+    font-size: 14px;
+    margin-top: 10px;
+  }
+  .auth-benefits,
+  .auth-footer {
+    display: none;
+  }
+  .auth-content {
+    padding: 28px 24px;
+  }
+  .auth-content > .login-form {
+    margin-top: 28px;
+  }
+  .auth-help {
+    padding-top: 28px;
+  }
+  .app-shell .topbar {
+    padding-inline: 10px;
+    gap: 8px;
+  }
+  #workspace-context select {
+    width: 110px;
+  }
+  .app-shell .topbar > .inline {
+    gap: 3px;
+  }
+  .app-shell .topbar > .inline > .ui-badge {
+    max-width: 60px;
+    font-size: 9px;
+    padding-inline: 5px;
+  }
+  .shell-brand {
+    display: none;
+  }
+  .topbar .breadcrumbs > span,
+  .topbar .breadcrumbs > svg {
+    display: none;
+  }
+}

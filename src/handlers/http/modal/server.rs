@@ -73,8 +73,8 @@ use crate::{
 
 // use super::generate;
 use super::ParseableServer;
-use super::generate;
 use super::load_on_init;
+use super::{generate, generate_next};
 
 pub struct Server;
 
@@ -123,7 +123,7 @@ impl ParseableServer for Server {
             .service(Self::get_ingest_otel_factory().wrap(from_fn(
                 resource_check::check_resource_utilization_middleware,
             )))
-            .service(Self::get_generated());
+            .configure(Self::configure_ui);
     }
 
     async fn load_metadata(&self) -> anyhow::Result<Option<Bytes>> {
@@ -833,5 +833,19 @@ impl Server {
     // GET "/" ==> Serve the static frontend directory
     pub fn get_generated() -> ResourceFiles {
         ResourceFiles::new("/", generate()).resolve_not_found_to_root()
+    }
+
+    // GET "/next" ==> Serve the second frontend, when one was embedded at build time
+    pub fn get_next_generated() -> Option<ResourceFiles> {
+        let files = generate_next();
+        (!files.is_empty()).then(|| ResourceFiles::new("/next", files).resolve_not_found_to_root())
+    }
+
+    /// Registers `/next` ahead of the catch-all `/` so each UI owns its own routes.
+    pub fn configure_ui(config: &mut web::ServiceConfig) {
+        if let Some(next) = Self::get_next_generated() {
+            config.service(next);
+        }
+        config.service(Self::get_generated());
     }
 }

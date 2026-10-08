@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build.zip
+build.zip.sha1
+storybook-static/
+playwright-report/
+test-results/
+.env.local
+# The repository's data* rule is for backend data, not this source directory.
+!src/features/datasets/
+!src/features/datasets/**

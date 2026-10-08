@@ -41,6 +41,7 @@ jobs:
       - name: Clean up builder cache
         run: docker builder prune -f
 
+      # The Dockerfile builds frontend/ with Node 24 before embedding it in Rust.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:

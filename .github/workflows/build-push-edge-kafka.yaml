@@ -41,6 +41,7 @@ jobs:
       - name: Clean up builder cache
         run: docker builder prune -f
 
+      # The Dockerfile builds frontend/ with Node 24 before embedding it in Rust.
       - name: Build and push x86_64
         uses: docker/build-push-action@v6
         with:
@@ -52,6 +53,7 @@ jobs:
           build-args: |
             LIB_DIR=x86_64-linux-gnu
 
+      # The Dockerfile builds frontend/ with Node 24 before embedding it in Rust.
       - name: Build and push aarch64
         uses: docker/build-push-action@v6
         with:

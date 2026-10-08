@@ -13,6 +13,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+# Frontend assets are independent of the target CPU architecture.
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS frontend
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 # build stage
 FROM rust:1.96.0-bookworm AS builder
 
@@ -23,6 +31,8 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 WORKDIR /parseable
 COPY . .
+COPY --from=frontend /frontend/dist /parseable/frontend/dist
+ENV NEXT_ASSETS_PATH=/parseable/frontend/dist
 RUN cargo build --release
 
 # final stage

@@ -1,0 +1,118 @@
+{
+  "url": "http://127.0.0.1:8260/login?next=%2F",
+  "text": "Observability\nSimplified.\nAI Native observability datalake.\nPetascale ingestion\nNatural language interface\nNative OpenTelemetry support\nBlazing fast query engine\nUp to 90% compression with columnar design\nDocumentation\n|\nHelp\n|\nPrivacy\n|\n© 2026 Parseable Inc.\nLog in to your account\nUsername\nPassword\nForgot password?\nLogin\nOR WITH OAUTH\nLogin with OAuth\nNeed help? Contact support",
+  "boxes": [
+    {
+      "tag": "FORM",
+      "name": null,
+      "text": "Username\nPassword\nForgot password?\nLogin",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 313.25,
+        "width": 448,
+        "height": 244,
+        "top": 313.25,
+        "right": 1232,
+        "bottom": 557.25,
+        "left": 784
+      }
+    },
+    {
+      "tag": "INPUT",
+      "name": "username",
+      "text": "",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 337.25,
+        "width": 448,
+        "height": 40,
+        "top": 337.25,
+        "right": 1232,
+        "bottom": 377.25,
+        "left": 784
+      }
+    },
+    {
+      "tag": "INPUT",
+      "name": "password",
+      "text": "",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 417.25,
+        "width": 448,
+        "height": 40,
+        "top": 417.25,
+        "right": 1232,
+        "bottom": 457.25,
+        "left": 784
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "",
+      "ariaLabel": null,
+      "box": {
+        "x": 1200,
+        "y": 427.25,
+        "width": 20,
+        "height": 20,
+        "top": 427.25,
+        "right": 1220,
+        "bottom": 447.25,
+        "left": 1200
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "Forgot password?",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 477.25,
+        "width": 119.8125,
+        "height": 20,
+        "top": 477.25,
+        "right": 903.8125,
+        "bottom": 497.25,
+        "left": 784
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "Login",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 517.25,
+        "width": 448,
+        "height": 40,
+        "top": 517.25,
+        "right": 1232,
+        "bottom": 557.25,
+        "left": 784
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "Login with OAuth",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 646.75,
+        "width": 448,
+        "height": 40,
+        "top": 646.75,
+        "right": 1232,
+        "bottom": 686.75,
+        "left": 784
+      }
+    }
+  ]
+}

@@ -1,2 +1,6 @@
+[build.env]
+# Cross mounts the workspace at its original absolute path inside the container.
+passthrough = ["NEXT_ASSETS_PATH"]
+
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:1e2a0291f92a4372cbc22d8994e735473045383f1ce7fa44a16c234ba00187f4"

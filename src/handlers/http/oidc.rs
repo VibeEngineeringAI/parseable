@@ -426,7 +426,13 @@ pub fn redirect_to_client(
 }
 
 fn redirect_no_oauth_setup(mut url: Url) -> HttpResponse {
-    url.set_path("oidc-not-configured");
+    // The side-by-side frontend under `/next` has its own explanation page.
+    let next_ui = url.path() == "/next" || url.path().starts_with("/next/");
+    url.set_path(if next_ui {
+        "next/oidc-not-configured"
+    } else {
+        "oidc-not-configured"
+    });
     let mut response = HttpResponse::MovedPermanently();
     response.insert_header((actix_web::http::header::LOCATION, url.as_str()));
     response.insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"));

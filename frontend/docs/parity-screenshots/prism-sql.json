@@ -1,0 +1,851 @@
+{
+  "url": "http://127.0.0.1:8260/sql-editor?start=10m&end=now&type=fixed&tz=UTC",
+  "viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "text": "Community\nSQL editor\nConnect MCP\nFS\nCtrl K\nHome\nIngest telemetry\nANALYZE\nKeystone\nDashboards\nSQL Editor\nOBSERVE\nLogs\nMetrics\nTraces\nAPM\nAgents\nMONITOR\nAlerts\nErrors\nDATA\nDatasets\nSettings\nBook a call\nSupport\nSidebar controls\nQuery 1\nExplorer\nLast 10 minutes\nUTC\nOff\nView library\nAI assistant\nDatasets\nNo datasets selected.\nColumns\nSelect a dataset to view its columns.\n1\n\n\nRun\nCtrl\n↵\nSave\nRun a query to view results\nGenerate with AI",
+  "issues": [],
+  "boxes": [
+    {
+      "tag": "HEADER",
+      "hook": "",
+      "text": "Community\nSQL editor\nConnect MCP\nFS",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 48,
+        "top": 0,
+        "right": 1440,
+        "bottom": 48,
+        "left": 0
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "sidebar",
+      "text": "Ctrl K\nHome\nIngest telemetry\nANALYZE\nKeystone\nDashboards\nSQL Editor\nOBSERVE\nLogs\nMetrics\nTraces\nAPM\nAgents\nMONITOR\nAlert",
+      "box": {
+        "x": 0,
+        "y": 48,
+        "width": 192,
+        "height": 952,
+        "top": 48,
+        "right": 192,
+        "bottom": 1000,
+        "left": 0
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "sidebar",
+      "text": "Ctrl K\nHome\nIngest telemetry\nANALYZE\nKeystone\nDashboards\nSQL Editor\nOBSERVE\nLogs\nMetrics\nTraces\nAPM\nAgents\nMONITOR\nAlert",
+      "box": {
+        "x": 0,
+        "y": 48,
+        "width": 191,
+        "height": 952,
+        "top": 48,
+        "right": 191,
+        "bottom": 1000,
+        "left": 0
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "content",
+      "text": "Ctrl K\nHome\nIngest telemetry\nANALYZE\nKeystone\nDashboards\nSQL Editor\nOBSERVE\nLogs\nMetrics\nTraces\nAPM\nAgents\nMONITOR\nAlert",
+      "box": {
+        "x": 0,
+        "y": 48,
+        "width": 191,
+        "height": 952,
+        "top": 48,
+        "right": 191,
+        "bottom": 1000,
+        "left": 0
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "Ctrl K",
+      "box": {
+        "x": 0,
+        "y": 48,
+        "width": 191,
+        "height": 40,
+        "top": 48,
+        "right": 191,
+        "bottom": 88,
+        "left": 0
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Ctrl K",
+      "box": {
+        "x": 8,
+        "y": 60,
+        "width": 175,
+        "height": 28,
+        "top": 60,
+        "right": 183,
+        "bottom": 88,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Ctrl K",
+      "box": {
+        "x": 8,
+        "y": 60,
+        "width": 175,
+        "height": 28,
+        "top": 60,
+        "right": 183,
+        "bottom": 88,
+        "left": 8
+      }
+    },
+    {
+      "tag": "INPUT",
+      "hook": "sidebar-search",
+      "text": "",
+      "box": {
+        "x": 41,
+        "y": 60,
+        "width": 98.546875,
+        "height": 28,
+        "top": 60,
+        "right": 139.546875,
+        "bottom": 88,
+        "left": 41
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "Home\nIngest telemetry",
+      "box": {
+        "x": 0,
+        "y": 88,
+        "width": 191,
+        "height": 70,
+        "top": 88,
+        "right": 191,
+        "bottom": 158,
+        "left": 0
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Home\nIngest telemetry",
+      "box": {
+        "x": 8,
+        "y": 100,
+        "width": 175,
+        "height": 58,
+        "top": 100,
+        "right": 183,
+        "bottom": 158,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Home",
+      "box": {
+        "x": 8,
+        "y": 100,
+        "width": 175,
+        "height": 28,
+        "top": 100,
+        "right": 183,
+        "bottom": 128,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Home",
+      "box": {
+        "x": 8,
+        "y": 100,
+        "width": 175,
+        "height": 28,
+        "top": 100,
+        "right": 183,
+        "bottom": 128,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Ingest telemetry",
+      "box": {
+        "x": 8,
+        "y": 130,
+        "width": 175,
+        "height": 28,
+        "top": 130,
+        "right": 183,
+        "bottom": 158,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Ingest telemetry",
+      "box": {
+        "x": 8,
+        "y": 130,
+        "width": 175,
+        "height": 28,
+        "top": 130,
+        "right": 183,
+        "bottom": 158,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "ANALYZE\nKeystone\nDashboards\nSQL Editor",
+      "box": {
+        "x": 0,
+        "y": 158,
+        "width": 191,
+        "height": 126,
+        "top": 158,
+        "right": 191,
+        "bottom": 284,
+        "left": 0
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Keystone\nDashboards\nSQL Editor",
+      "box": {
+        "x": 8,
+        "y": 196,
+        "width": 175,
+        "height": 88,
+        "top": 196,
+        "right": 183,
+        "bottom": 284,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Keystone",
+      "box": {
+        "x": 8,
+        "y": 196,
+        "width": 175,
+        "height": 28,
+        "top": 196,
+        "right": 183,
+        "bottom": 224,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Keystone",
+      "box": {
+        "x": 8,
+        "y": 196,
+        "width": 175,
+        "height": 28,
+        "top": 196,
+        "right": 183,
+        "bottom": 224,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Dashboards",
+      "box": {
+        "x": 8,
+        "y": 226,
+        "width": 175,
+        "height": 28,
+        "top": 226,
+        "right": 183,
+        "bottom": 254,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Dashboards",
+      "box": {
+        "x": 8,
+        "y": 226,
+        "width": 175,
+        "height": 28,
+        "top": 226,
+        "right": 183,
+        "bottom": 254,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "SQL Editor",
+      "box": {
+        "x": 8,
+        "y": 256,
+        "width": 175,
+        "height": 28,
+        "top": 256,
+        "right": 183,
+        "bottom": 284,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "SQL Editor",
+      "box": {
+        "x": 8,
+        "y": 256,
+        "width": 175,
+        "height": 28,
+        "top": 256,
+        "right": 183,
+        "bottom": 284,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "OBSERVE\nLogs\nMetrics\nTraces\nAPM\nAgents",
+      "box": {
+        "x": 0,
+        "y": 284,
+        "width": 191,
+        "height": 186,
+        "top": 284,
+        "right": 191,
+        "bottom": 470,
+        "left": 0
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Logs\nMetrics\nTraces\nAPM\nAgents",
+      "box": {
+        "x": 8,
+        "y": 322,
+        "width": 175,
+        "height": 148,
+        "top": 322,
+        "right": 183,
+        "bottom": 470,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Logs",
+      "box": {
+        "x": 8,
+        "y": 322,
+        "width": 175,
+        "height": 28,
+        "top": 322,
+        "right": 183,
+        "bottom": 350,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Logs",
+      "box": {
+        "x": 8,
+        "y": 322,
+        "width": 175,
+        "height": 28,
+        "top": 322,
+        "right": 183,
+        "bottom": 350,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Metrics",
+      "box": {
+        "x": 8,
+        "y": 352,
+        "width": 175,
+        "height": 28,
+        "top": 352,
+        "right": 183,
+        "bottom": 380,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Metrics",
+      "box": {
+        "x": 8,
+        "y": 352,
+        "width": 175,
+        "height": 28,
+        "top": 352,
+        "right": 183,
+        "bottom": 380,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Traces",
+      "box": {
+        "x": 8,
+        "y": 382,
+        "width": 175,
+        "height": 28,
+        "top": 382,
+        "right": 183,
+        "bottom": 410,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Traces",
+      "box": {
+        "x": 8,
+        "y": 382,
+        "width": 175,
+        "height": 28,
+        "top": 382,
+        "right": 183,
+        "bottom": 410,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "APM",
+      "box": {
+        "x": 8,
+        "y": 412,
+        "width": 175,
+        "height": 28,
+        "top": 412,
+        "right": 183,
+        "bottom": 440,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "APM",
+      "box": {
+        "x": 8,
+        "y": 412,
+        "width": 175,
+        "height": 28,
+        "top": 412,
+        "right": 183,
+        "bottom": 440,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Agents",
+      "box": {
+        "x": 8,
+        "y": 442,
+        "width": 175,
+        "height": 28,
+        "top": 442,
+        "right": 183,
+        "bottom": 470,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Agents",
+      "box": {
+        "x": 8,
+        "y": 442,
+        "width": 175,
+        "height": 28,
+        "top": 442,
+        "right": 183,
+        "bottom": 470,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "MONITOR\nAlerts\nErrors",
+      "box": {
+        "x": 0,
+        "y": 470,
+        "width": 191,
+        "height": 96,
+        "top": 470,
+        "right": 191,
+        "bottom": 566,
+        "left": 0
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Alerts\nErrors",
+      "box": {
+        "x": 8,
+        "y": 508,
+        "width": 175,
+        "height": 58,
+        "top": 508,
+        "right": 183,
+        "bottom": 566,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Alerts",
+      "box": {
+        "x": 8,
+        "y": 508,
+        "width": 175,
+        "height": 28,
+        "top": 508,
+        "right": 183,
+        "bottom": 536,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Alerts",
+      "box": {
+        "x": 8,
+        "y": 508,
+        "width": 175,
+        "height": 28,
+        "top": 508,
+        "right": 183,
+        "bottom": 536,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Errors",
+      "box": {
+        "x": 8,
+        "y": 538,
+        "width": 175,
+        "height": 28,
+        "top": 538,
+        "right": 183,
+        "bottom": 566,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Errors",
+      "box": {
+        "x": 8,
+        "y": 538,
+        "width": 175,
+        "height": 28,
+        "top": 538,
+        "right": 183,
+        "bottom": 566,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "DATA\nDatasets",
+      "box": {
+        "x": 0,
+        "y": 566,
+        "width": 191,
+        "height": 66,
+        "top": 566,
+        "right": 191,
+        "bottom": 632,
+        "left": 0
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Datasets",
+      "box": {
+        "x": 8,
+        "y": 604,
+        "width": 175,
+        "height": 28,
+        "top": 604,
+        "right": 183,
+        "bottom": 632,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Datasets",
+      "box": {
+        "x": 8,
+        "y": 604,
+        "width": 175,
+        "height": 28,
+        "top": 604,
+        "right": 183,
+        "bottom": 632,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Datasets",
+      "box": {
+        "x": 8,
+        "y": 604,
+        "width": 175,
+        "height": 28,
+        "top": 604,
+        "right": 183,
+        "bottom": 632,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "Settings\nBook a call\nSupport\nSidebar controls",
+      "box": {
+        "x": 0,
+        "y": 874,
+        "width": 191,
+        "height": 126,
+        "top": 874,
+        "right": 191,
+        "bottom": 1000,
+        "left": 0
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Settings\nBook a call\nSupport",
+      "box": {
+        "x": 8,
+        "y": 874,
+        "width": 175,
+        "height": 88,
+        "top": 874,
+        "right": 183,
+        "bottom": 962,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Settings",
+      "box": {
+        "x": 8,
+        "y": 874,
+        "width": 175,
+        "height": 28,
+        "top": 874,
+        "right": 183,
+        "bottom": 902,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Settings",
+      "box": {
+        "x": 8,
+        "y": 874,
+        "width": 175,
+        "height": 28,
+        "top": 874,
+        "right": 183,
+        "bottom": 902,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Book a call",
+      "box": {
+        "x": 8,
+        "y": 904,
+        "width": 175,
+        "height": 28,
+        "top": 904,
+        "right": 183,
+        "bottom": 932,
+        "left": 8
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Book a call",
+      "box": {
+        "x": 8,
+        "y": 904,
+        "width": 175,
+        "height": 28,
+        "top": 904,
+        "right": 183,
+        "bottom": 932,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Support",
+      "box": {
+        "x": 8,
+        "y": 934,
+        "width": 175,
+        "height": 28,
+        "top": 934,
+        "right": 183,
+        "bottom": 962,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Support",
+      "box": {
+        "x": 8,
+        "y": 934,
+        "width": 175,
+        "height": 28,
+        "top": 934,
+        "right": 183,
+        "bottom": 962,
+        "left": 8
+      }
+    },
+    {
+      "tag": "UL",
+      "hook": "menu",
+      "text": "Sidebar controls",
+      "box": {
+        "x": 8,
+        "y": 964,
+        "width": 175,
+        "height": 28,
+        "top": 964,
+        "right": 183,
+        "bottom": 992,
+        "left": 8
+      }
+    },
+    {
+      "tag": "LI",
+      "hook": "menu-item",
+      "text": "Sidebar controls",
+      "box": {
+        "x": 8,
+        "y": 964,
+        "width": 175,
+        "height": 28,
+        "top": 964,
+        "right": 183,
+        "bottom": 992,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "menu-button",
+      "text": "Sidebar controls",
+      "box": {
+        "x": 8,
+        "y": 964,
+        "width": 175,
+        "height": 28,
+        "top": 964,
+        "right": 183,
+        "bottom": 992,
+        "left": 8
+      }
+    },
+    {
+      "tag": "MAIN",
+      "hook": "main-section",
+      "text": "Query 1\nExplorer\nLast 10 minutes\nUTC\nOff\nView library\nAI assistant\nDatasets\nNo datasets selected.\nColumns\nSelect a datas",
+      "box": {
+        "x": 192,
+        "y": 48,
+        "width": 1248,
+        "height": 952,
+        "top": 48,
+        "right": 1440,
+        "bottom": 1000,
+        "left": 192
+      }
+    }
+  ]
+}

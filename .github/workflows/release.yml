@@ -17,7 +17,54 @@ on:
       - "assets/**"
       - "**.md"
 
+# Cross preserves this absolute workspace path inside its build container.
+env:
+  NEXT_ASSETS_PATH: ${{ github.workspace }}/frontend/dist
+
 jobs:
+  build-frontend:
+    name: Package frontend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
+
+      - name: Package frontend
+        working-directory: frontend
+        run: npm run package
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: parseable-frontend
+          path: |
+            frontend/build.zip
+            frontend/build.zip.sha1
+          if-no-files-found: error
+
+      - name: Attach frontend to release
+        uses: softprops/action-gh-release@v0.1.15
+        with:
+          draft: false
+          files: |
+            frontend/build.zip
+            frontend/build.zip.sha1
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-linux:
     name: Build for ${{matrix.target}}
     runs-on: self-hosted
@@ -35,6 +82,18 @@ jobs:
             use-cross: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
+
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -42,11 +101,17 @@ jobs:
           target: ${{matrix.target}}
           override: true
 
-      - uses: actions-rs/cargo@v1
-        with:
-          use-cross: ${{ matrix.use-cross }}
-          command: build
-          args: --profile release-lto --target ${{matrix.target}}
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build with cross
+        if: matrix.use-cross
+        run: cross build --profile release-lto --target ${{ matrix.target }}
+
+      - name: Build native
+        if: ${{ !matrix.use-cross }}
+        run: cargo build --profile release-lto --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
@@ -81,6 +146,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
 
       - name: Install latest rust toolchain
         uses: actions-rs/toolchain@v1
@@ -132,6 +208,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
+
       - name: Install latest rust toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -179,6 +266,17 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
 
       - name: Install Linux dependencies
         run: |
@@ -258,6 +356,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
 
       - name: Install macOS dependencies
         run: |

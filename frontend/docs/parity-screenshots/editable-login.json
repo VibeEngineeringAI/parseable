@@ -1,0 +1,134 @@
+{
+  "url": "http://127.0.0.1:8270/login",
+  "text": "parseable\nObservability\nSimplified.\n\nAI Native observability datalake.\n\nPetascale ingestion\nNatural language interface\nNative OpenTelemetry support\nBlazing fast query engine\nUp to 90% compression with columnar design\n\nSelf-hosted workspace · Your infrastructure. Your data.\n\nLog in to your account\nUsername\nPassword\nForgot password?\nLogin\nOR WITH OAUTH\nSign in with SSO\nExplore demo data",
+  "boxes": [
+    {
+      "tag": "FORM",
+      "name": null,
+      "text": "Username\nPassword\nForgot password?\nLogin\nOR WITH OAUTH\nSign in with SSO",
+      "ariaLabel": "Sign in to Parseable",
+      "box": {
+        "x": 784,
+        "y": 313.953125,
+        "width": 448,
+        "height": 376.09375,
+        "top": 313.953125,
+        "right": 1232,
+        "bottom": 690.046875,
+        "left": 784
+      }
+    },
+    {
+      "tag": "INPUT",
+      "name": "username",
+      "text": "",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 336.75,
+        "width": 448,
+        "height": 40,
+        "top": 336.75,
+        "right": 1232,
+        "bottom": 376.75,
+        "left": 784
+      }
+    },
+    {
+      "tag": "INPUT",
+      "name": "password",
+      "text": "",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 419.546875,
+        "width": 448,
+        "height": 40,
+        "top": 419.546875,
+        "right": 1232,
+        "bottom": 459.546875,
+        "left": 784
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "",
+      "ariaLabel": "Show password",
+      "box": {
+        "x": 1194,
+        "y": 422.546875,
+        "width": 34,
+        "height": 34,
+        "top": 422.546875,
+        "right": 1228,
+        "bottom": 456.546875,
+        "left": 1194
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "Forgot password?",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 479.546875,
+        "width": 124.125,
+        "height": 22,
+        "top": 479.546875,
+        "right": 908.125,
+        "bottom": 501.546875,
+        "left": 784
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "Login",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 521.546875,
+        "width": 448,
+        "height": 40,
+        "top": 521.546875,
+        "right": 1232,
+        "bottom": 561.546875,
+        "left": 784
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "Sign in with SSO",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 650.046875,
+        "width": 448,
+        "height": 40,
+        "top": 650.046875,
+        "right": 1232,
+        "bottom": 690.046875,
+        "left": 784
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "name": null,
+      "text": "Explore demo data",
+      "ariaLabel": null,
+      "box": {
+        "x": 784,
+        "y": 730.046875,
+        "width": 448,
+        "height": 46,
+        "top": 730.046875,
+        "right": 1232,
+        "bottom": 776.046875,
+        "left": 784
+      }
+    }
+  ]
+}

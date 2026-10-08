@@ -13,6 +13,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+# Frontend assets are independent of the target CPU architecture.
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS frontend
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 # build stage
 FROM rust:1.96.0-bookworm AS builder
 
@@ -23,10 +31,8 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 WORKDIR /parseable
 COPY . .
-
-## Ensure that you build the console assests https://github.com/parseablehq/console?tab=readme-ov-file#trophy-development-and-contributing
-## Then create a dist folder in the root of the this directory and copy the contents of the console/dist folder into the dist folder
-ENV LOCAL_ASSETS_PATH=/parseable/dist
+COPY --from=frontend /frontend/dist /parseable/frontend/dist
+ENV NEXT_ASSETS_PATH=/parseable/frontend/dist
 RUN cargo build --release
 
 # final stage

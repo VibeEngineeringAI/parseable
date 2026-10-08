@@ -1,0 +1,53 @@
+{
+  "name": "@parseable/frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build --base=/next/",
+    "package": "node scripts/package.mjs",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "vitest run src",
+    "test:ui": "playwright test",
+    "storybook": "storybook dev -p 6006 --no-open --disable-telemetry",
+    "build-storybook": "storybook build --disable-telemetry",
+    "check": "npm run format:check && npm run build && npm test && npm run test:ui && npm run test:stories",
+    "format": "prettier --write src e2e e2e-live story-tests .storybook *.ts *.json docs README.md",
+    "format:check": "prettier --check src e2e e2e-live story-tests .storybook *.ts *.json docs README.md",
+    "test:stories": "npm run build-storybook && playwright test -c playwright.storybook.config.ts",
+    "test:live": "playwright test -c playwright.live.config.ts"
+  },
+  "dependencies": {
+    "@codemirror/lang-sql": "^6.10.0",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.13",
+    "@lezer/highlight": "^1.2.5",
+    "@radix-ui/react-dialog": "^1.2.0",
+    "@radix-ui/react-tabs": "^1.1.22",
+    "codemirror": "^6.0.2",
+    "lucide-react": "^1.52.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
+    "@playwright/test": "^1.63.0",
+    "@storybook/addon-docs": "^10.6.1",
+    "@storybook/react-vite": "^10.6.1",
+    "@types/node": "^26.6.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "prettier": "^3.9.9",
+    "storybook": "^10.6.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3"
+  }
+}

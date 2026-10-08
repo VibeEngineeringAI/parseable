@@ -7,6 +7,10 @@ on:
       - "**.md"
 
 name: Lint, Test and Coverage Report
+# Cross preserves this absolute workspace path inside its build container.
+env:
+  NEXT_ASSETS_PATH: ${{ github.workspace }}/frontend/dist
+
 jobs:
   community-ui:
     runs-on: ubuntu-latest
@@ -22,6 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

@@ -89,7 +89,7 @@ impl ParseableServer for QueryServer {
                     .service(Server::get_traces_webscope())
                     .service(Server::get_dataset_stats_webscope()),
             )
-            .service(Server::get_generated());
+            .configure(Server::configure_ui);
     }
 
     async fn load_metadata(&self) -> anyhow::Result<Option<Bytes>> {
