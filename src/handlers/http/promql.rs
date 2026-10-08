@@ -511,9 +511,15 @@ async fn execute_query<T: Send + 'static>(
     // even if the caller's timeout expires while this worker is running.
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let rows =
-            record_batches_to_json(&batches).map_err(|e| ApiError::execution(e.to_string()))?;
-        let series = rows_to_series(&plan, rows)?;
+        // Convert one batch at a time so the whole result is never held as
+        // Arrow, a JSON buffer and parsed rows at once.
+        let mut grouped = BTreeMap::new();
+        for batch in batches {
+            let rows = record_batches_to_json(std::slice::from_ref(&batch))
+                .map_err(|e| ApiError::execution(e.to_string()))?;
+            group_rows(&plan, &mut grouped, rows)?;
+        }
+        let series = finish_series(grouped)?;
         let data = match step {
             Some(step) => promql::evaluate_range(&plan, &series, start, end, step),
             None => promql::evaluate(&plan, &series, end),
@@ -691,17 +697,10 @@ async fn load_batches(
         if schema.field_with_name("metric_type").is_err() {
             return Err(ApiError::execution("dataset is missing metric_type"));
         }
-        let fields = schema
-            .fields()
-            .iter()
-            .filter(|f| {
-                is_label_field(f.name())
-                    || ["metric_name", "metric_type", "aggregation_temporality"]
-                        .contains(&f.name().as_str())
-            })
-            .map(|f| sql_ident(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let fields = label_projection(
+            &schema,
+            &["metric_name", "metric_type", "aggregation_temporality"],
+        );
         let types = if schema.field_with_name("aggregation_temporality").is_ok() {
             "(\"metric_type\" = 'gauge' OR (\"metric_type\" = 'sum' AND \"aggregation_temporality\" = 2))"
         } else {
@@ -718,7 +717,23 @@ async fn load_batches(
             promql::MAX_SERIES,
         )
     } else {
-        ("*".to_owned(), String::new(), promql::MAX_INPUT_SAMPLES)
+        // Read only what sample evaluation uses; wide OTLP schemas also carry
+        // exemplars, descriptions and histogram buckets.
+        (
+            label_projection(
+                &schema,
+                &[
+                    "metric_name",
+                    "metric_type",
+                    "aggregation_temporality",
+                    "data_point_flags",
+                    "time_unix_nano",
+                    "data_point_value",
+                ],
+            ),
+            String::new(),
+            promql::MAX_INPUT_SAMPLES,
+        )
     };
     let query = format!(
         "SELECT {projection} FROM {} WHERE CAST(\"time_unix_nano\" AS TIMESTAMP) >= to_timestamp_millis({from}) AND CAST(\"time_unix_nano\" AS TIMESTAMP) < to_timestamp_millis({exclusive_end}){metric_filter}{type_filter} LIMIT {}",
@@ -787,6 +802,17 @@ async fn load_batches(
     Ok(batches)
 }
 
+/// Label columns plus the named known columns that exist in `schema`.
+fn label_projection(schema: &arrow_schema::Schema, columns: &[&str]) -> String {
+    schema
+        .fields()
+        .iter()
+        .filter(|f| is_label_field(f.name()) || columns.contains(&f.name().as_str()))
+        .map(|f| sql_ident(f.name()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn sample_timestamp(value: &Value) -> Result<i64, ApiError> {
     let text = value
         .as_str()
@@ -838,11 +864,11 @@ fn metric_labels(row: &Map<String, Value>) -> Result<Labels, ApiError> {
     Ok(labels)
 }
 
-fn rows_to_series(
+fn group_rows(
     plan: &QueryPlan,
+    grouped: &mut BTreeMap<Labels, Vec<Sample>>,
     rows: Vec<Map<String, Value>>,
-) -> Result<Vec<Series>, ApiError> {
-    let mut grouped: BTreeMap<Labels, Vec<Sample>> = BTreeMap::new();
+) -> Result<(), ApiError> {
     for row in rows {
         let labels = metric_labels(&row)?;
         if !plan
@@ -892,6 +918,10 @@ fn rows_to_series(
             return Err(ApiError::execution("series limit exceeded"));
         }
     }
+    Ok(())
+}
+
+fn finish_series(grouped: BTreeMap<Labels, Vec<Sample>>) -> Result<Vec<Series>, ApiError> {
     let mut series = Vec::with_capacity(grouped.len());
     for (labels, mut samples) in grouped {
         samples.sort_by_key(|sample| sample.timestamp_ms);
@@ -951,6 +981,15 @@ mod tests {
         }
     }
     use actix_web::test::TestRequest;
+
+    fn rows_to_series(
+        plan: &QueryPlan,
+        rows: Vec<Map<String, Value>>,
+    ) -> Result<Vec<Series>, ApiError> {
+        let mut grouped = BTreeMap::new();
+        group_rows(plan, &mut grouped, rows)?;
+        finish_series(grouped)
+    }
 
     #[test]
     fn exact_otlp_names_are_pushed_down_without_changing_selector_semantics() {
@@ -1079,6 +1118,28 @@ mod tests {
         delta.insert("metric_type".into(), json!("sum"));
         delta.insert("aggregation_temporality".into(), json!(1));
         assert!(rows_to_series(&plan, vec![delta]).is_err());
+    }
+
+    #[test]
+    fn projection_keeps_labels_and_requested_columns_only() {
+        use arrow_schema::{DataType, Field, Schema};
+        let schema = Schema::new(
+            [
+                "metric_name",
+                "metric_description",
+                "exemplars",
+                "data_point_bucket_counts",
+                "p_timestamp",
+                "job",
+                "data_point_value",
+            ]
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .to_vec(),
+        );
+        assert_eq!(
+            label_projection(&schema, &["metric_name", "data_point_value", "absent"]),
+            "\"metric_name\", \"job\", \"data_point_value\""
+        );
     }
 
     #[test]
