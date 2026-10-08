@@ -63,6 +63,11 @@ is retained in `promqlRuntime.deliveries` with its attempt count and error, then
 retried on later alert evaluations for up to three attempts. Each evaluation
 makes at most one attempt for a queued delivery. After the third failure, the
 exhausted delivery remains visible for inspection; it is not sent repeatedly.
+Only the 50 most recent exhausted deliveries are kept.
+
+The outbox never blocks state evaluation. It holds at most 1000 queued
+deliveries. If a burst of transitions exceeds that, the oldest queued
+deliveries are dropped and a warning is logged.
 
 Editing a rule resets its instance state and pending timers because its query,
 dataset, threshold, or hold duration may have changed. Disabling a rule clears

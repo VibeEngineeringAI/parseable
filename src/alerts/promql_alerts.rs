@@ -19,6 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub static LIFECYCLE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 const MAX_INSTANCES: usize = 1000;
+const MAX_DELIVERY_ATTEMPTS: u32 = 3;
+/// Retryable deliveries kept in the outbox; the oldest are dropped on overflow.
+const MAX_QUEUED_DELIVERIES: usize = 1000;
+/// Exhausted deliveries kept only so the latest failures stay inspectable.
+const MAX_EXHAUSTED_DELIVERIES: usize = 50;
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Runtime {
@@ -165,16 +170,62 @@ impl Runtime {
             next.deliveries
                 .retain(|delivery| delivery.labels != *labels || delivery.firing == *firing);
         }
-        let reserved_deliveries = if notifications_allowed(&config.notification_state, now) {
-            transitions.len().saturating_mul(config.targets.len())
-        } else {
-            0
-        };
-        if next.deliveries.len().saturating_add(reserved_deliveries) > 1000 {
-            return Err("PromQL notification outbox is full; resolve failed target deliveries before continuing".into());
-        }
         *self = next;
         Ok(transitions)
+    }
+    /// Queue one delivery per transition and target, returning how many queued
+    /// deliveries were dropped to keep the outbox bounded.
+    pub fn enqueue(
+        &mut self,
+        transitions: &[(Labels, f64, bool)],
+        targets: &[ulid::Ulid],
+    ) -> usize {
+        for (labels, value, firing) in transitions {
+            for target in targets {
+                self.deliveries.push(Delivery {
+                    labels: labels.clone(),
+                    value: *value,
+                    firing: *firing,
+                    target: *target,
+                    attempts: 0,
+                    error: None,
+                });
+            }
+        }
+        self.trim_deliveries()
+    }
+    /// Bound the outbox without ever blocking state evaluation: keep the newest
+    /// retryable deliveries, and only the most recent exhausted ones. Returns
+    /// the number of retryable deliveries dropped.
+    fn trim_deliveries(&mut self) -> usize {
+        let mut excess_queued = self
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.attempts < MAX_DELIVERY_ATTEMPTS)
+            .count()
+            .saturating_sub(MAX_QUEUED_DELIVERIES);
+        let dropped = excess_queued;
+        let mut excess_exhausted = self
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.attempts >= MAX_DELIVERY_ATTEMPTS)
+            .count()
+            .saturating_sub(MAX_EXHAUSTED_DELIVERIES);
+        // Deliveries are appended in order, so this drops the oldest first.
+        self.deliveries.retain(|delivery| {
+            let excess = if delivery.attempts < MAX_DELIVERY_ATTEMPTS {
+                &mut excess_queued
+            } else {
+                &mut excess_exhausted
+            };
+            if *excess > 0 {
+                *excess -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        dropped
     }
     pub fn observe(
         &mut self,
@@ -321,17 +372,12 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
     }
     let notify = notifications_allowed(&updated.notification_state, now);
     if notify {
-        for (labels, value, firing) in transitions {
-            for target in &updated.targets {
-                runtime.deliveries.push(Delivery {
-                    labels: labels.clone(),
-                    value,
-                    firing,
-                    target: *target,
-                    attempts: 0,
-                    error: None,
-                });
-            }
+        let dropped = runtime.enqueue(&transitions, &updated.targets);
+        if dropped > 0 {
+            tracing::warn!(
+                "PromQL alert {} dropped {dropped} oldest queued notifications because its outbox is full",
+                updated.id
+            );
         }
     }
     updated
@@ -359,14 +405,11 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
         for delivery in runtime
             .deliveries
             .iter_mut()
-            .filter(|delivery| delivery.attempts < 3)
+            .filter(|delivery| delivery.attempts < MAX_DELIVERY_ATTEMPTS)
             .take(10)
         {
             if tokio::time::Instant::now() >= deadline {
                 break;
-            }
-            if delivery.attempts >= 3 {
-                continue;
             }
             let identity = delivery
                 .labels
@@ -422,6 +465,7 @@ pub async fn evaluate(config: AlertConfig) -> Result<(), AlertError> {
         runtime
             .deliveries
             .retain(|delivery| delivery.error.is_some() || delivery.attempts == 0);
+        runtime.trim_deliveries();
         updated
             .other_fields
             .as_mut()
@@ -572,41 +616,74 @@ mod tests {
         );
     }
     #[test]
-    fn duplicate_labels_and_full_outbox_leave_instance_state_unchanged() {
+    fn duplicate_labels_leave_instance_state_unchanged() {
         let mut config = config();
-        config.targets.push(ulid::Ulid::new());
         config.other_fields.as_mut().unwrap().insert(
             "promqlConfig".into(),
             serde_json::json!({"holdDuration":"0s"}),
         );
         let mut runtime = Runtime::default();
-        let now = Utc::now();
         assert!(
             runtime
-                .observe_transactionally(vec![sample("a", 9.0), sample("a", 10.0)], &config, now)
+                .observe_transactionally(
+                    vec![sample("a", 9.0), sample("a", 10.0)],
+                    &config,
+                    Utc::now()
+                )
                 .is_err()
         );
         assert!(runtime.instances.is_empty());
-        runtime.deliveries = (0..1000)
-            .map(|_| Delivery {
-                labels: Labels::new(),
-                value: 1.0,
-                firing: true,
-                target: config.targets[0],
-                attempts: 3,
-                error: Some("failed".into()),
-            })
-            .collect();
-        assert!(
-            runtime
-                .observe_transactionally(vec![sample("a", 9.0)], &config, now)
-                .is_err()
+    }
+    #[test]
+    fn full_outbox_never_blocks_evaluation() {
+        let mut config = config();
+        config.targets = (0..20).map(|_| ulid::Ulid::new()).collect();
+        config.other_fields.as_mut().unwrap().insert(
+            "promqlConfig".into(),
+            serde_json::json!({"holdDuration":"0s"}),
         );
-        assert!(runtime.instances.is_empty());
+        let failed = |attempts| Delivery {
+            labels: Labels::new(),
+            value: 1.0,
+            firing: true,
+            target: config.targets[0],
+            attempts,
+            error: Some("failed".into()),
+        };
+        let mut runtime = Runtime {
+            deliveries: (0..1000)
+                .map(|_| failed(MAX_DELIVERY_ATTEMPTS))
+                .chain((0..10).map(|_| failed(1)))
+                .collect(),
+            ..Default::default()
+        };
+        // 51 series x 20 targets exceeds the queue limit on its own.
+        let samples = (0..51)
+            .map(|host| sample(&host.to_string(), 9.0))
+            .collect::<Vec<_>>();
+        let transitions = runtime
+            .observe_transactionally(samples, &config, Utc::now())
+            .unwrap();
+        assert_eq!(transitions.len(), 51);
+        assert_eq!(runtime.health, "ok");
+        assert!(runtime.instances.values().all(|i| i.state == "firing"));
+        assert_eq!(runtime.enqueue(&transitions, &config.targets), 30);
+        let (queued, exhausted): (Vec<_>, Vec<_>) = runtime
+            .deliveries
+            .iter()
+            .partition(|delivery| delivery.attempts < MAX_DELIVERY_ATTEMPTS);
+        assert_eq!(queued.len(), MAX_QUEUED_DELIVERIES);
+        assert_eq!(exhausted.len(), MAX_EXHAUSTED_DELIVERIES);
+        // The oldest queued deliveries are dropped first; the newest survive.
+        assert!(queued.iter().all(|delivery| delivery.attempts == 0));
+        assert_eq!(queued.last().unwrap().labels["host"], "50");
+        assert_eq!(
+            queued.last().unwrap().target,
+            *config.targets.last().unwrap()
+        );
         let restored: Runtime =
             serde_json::from_value(serde_json::to_value(&runtime).unwrap()).unwrap();
-        assert_eq!(restored.deliveries.len(), 1000);
-        assert_eq!(restored.deliveries[0].attempts, 3);
+        assert_eq!(restored.deliveries.len(), runtime.deliveries.len());
     }
     #[test]
     fn mute_suppresses_delivery_until_expiry() {
@@ -683,36 +760,6 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.deliveries.len(), 1);
         assert_eq!(runtime.deliveries[0].labels["host"], "b");
-    }
-    #[test]
-    fn muted_new_transition_does_not_reserve_delivery_capacity() {
-        let mut config = config();
-        config.targets.push(ulid::Ulid::new());
-        config.notification_state = NotificationState::Mute("indefinite".into());
-        config.other_fields.as_mut().unwrap().insert(
-            "promqlConfig".into(),
-            serde_json::json!({"holdDuration":"0s"}),
-        );
-        let mut runtime = Runtime::default();
-        runtime.deliveries = (0..1000)
-            .map(|_| Delivery {
-                labels: Labels::new(),
-                value: 1.0,
-                firing: true,
-                target: config.targets[0],
-                attempts: 3,
-                error: Some("failed".into()),
-            })
-            .collect();
-        assert_eq!(
-            runtime
-                .observe_transactionally(vec![sample("a", 9.0)], &config, Utc::now())
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(runtime.health, "ok");
-        assert_eq!(runtime.deliveries.len(), 1000);
     }
     #[test]
     fn disabling_clears_instances_and_requires_fresh_hold_when_enabled() {
