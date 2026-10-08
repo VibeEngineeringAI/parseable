@@ -324,11 +324,11 @@ async fn metadata(req: HttpRequest, name: Option<String>) -> Result<HttpResponse
         .try_acquire_owned()
         .map_err(|_| ApiError::unavailable("unavailable", "PromQL request queue is full"))?;
     let work = async {
+        let tenant = get_tenant_id_from_request(&req);
+        authorize_dataset(&req, &dataset, &tenant).await?;
         let permit = QUERY_SLOTS.clone().acquire_owned().await.map_err(|_| {
             ApiError::unavailable("unavailable", "PromQL query service unavailable")
         })?;
-        let tenant = get_tenant_id_from_request(&req);
-        authorize_dataset(&req, &dataset, &tenant).await?;
         let plan = QueryPlan::parse("{__name__=~\".+\"}").expect("constant selector");
         let batches =
             load_batches(&plan, &dataset, &tenant, start, end, BatchPurpose::Metadata).await?;
