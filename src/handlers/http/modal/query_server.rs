@@ -172,9 +172,14 @@ impl QueryServer {
     pub fn get_user_role_webscope() -> Scope {
         web::scope("/role")
             .service(
-                // PUT and GET Default Role
+                // PUT, GET, DELETE Default Role
                 resource("/default")
                     .route(web::put().to(role::put_default).authorize(Action::PutRole))
+                    .route(
+                        web::delete()
+                            .to(role::delete_default)
+                            .authorize(Action::DeleteRole),
+                    )
                     .route(web::get().to(role::get_default).authorize(Action::GetRole)),
             )
             .service(

@@ -14,6 +14,28 @@ import type { ApiKey } from '../../lib/types';
 import { CredentialSheet } from './CredentialSheet';
 import { InlineError, TeamSearch, useMutation, useTeamCollection, useTeamSearch } from './shared';
 
+export async function copyApiKey(key: Promise<ApiKey>, active: { current: boolean }) {
+  try {
+    if (typeof ClipboardItem !== 'undefined') {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          'text/plain': key.then((result) => new Blob([result.apiKey], { type: 'text/plain' })),
+        }),
+      ]);
+    } else {
+      const result = await key;
+      if (!active.current) return;
+      await navigator.clipboard.writeText(result.apiKey);
+    }
+  } catch {
+    // Preserve fetch errors before translating a clipboard failure.
+    await key;
+    throw new Error(
+      'Unable to copy API key. Check your browser clipboard permissions and try again.',
+    );
+  }
+}
+
 function CopyKey({ apiKey }: { apiKey: ApiKey }) {
   const { client } = useApp();
   const [status, setStatus] = useState('');
@@ -28,9 +50,7 @@ function CopyKey({ apiKey }: { apiKey: ApiKey }) {
   function copy() {
     setStatus('');
     void mutation.run(async () => {
-      const result = await client.getApiKey(apiKey.keyId);
-      if (!active.current) return;
-      await navigator.clipboard.writeText(result.apiKey);
+      await copyApiKey(client.getApiKey(apiKey.keyId), active);
       if (active.current) setStatus('API key copied to clipboard');
     });
   }
