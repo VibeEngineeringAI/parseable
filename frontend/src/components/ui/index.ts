@@ -11,4 +11,6 @@ export { Dialog, type DialogProps } from './Dialog';
 export { Sheet } from './Sheet';
 export { Tabs, type TabsProps } from './Tabs';
 export { Spinner } from './Spinner';
+export { Pagination, PAGE_SIZE } from './Pagination';
+export { TypedConfirmDialog } from './TypedConfirmDialog';
 export { cx } from './utils';

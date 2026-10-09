@@ -192,7 +192,7 @@ test('library dialogs restore focus, contain keyboard navigation, and tabs use a
   expect(results.violations).toEqual([]);
 });
 
-for (const route of ['/logs', '/sql-editor', '/datasets', '/dashboards', '/components']) {
+for (const route of ['/logs', '/sql-editor', '/datasets', '/dashboards', '/team', '/components']) {
   test(`accessibility smoke: ${route}`, async ({ page }) => {
     await demo(page, route);
     await expect(page.locator('main h1')).toBeVisible();
