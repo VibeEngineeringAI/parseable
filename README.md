@@ -89,3 +89,25 @@ Parseable builds are attested for build provenance and integrity using the [atte
 ```sh
 gh attestation verify PATH/TO/YOUR/PARSEABLE/ARTIFACT-BINARY -R parseablehq/parseable
 ```
+
+### Editable frontend
+
+An initial React/TypeScript frontend and reusable component library live in
+[`frontend/`](frontend/README.md), with Logs Explore, SQL, datasets, local
+dashboards, Storybook, and browser tests. Billing and payment collection are
+excluded.
+
+While it reaches parity, Parseable serves it beside the classic UI: the classic
+UI stays at `/` and the new frontend is mounted at `/next/`, sharing the same
+session. Docker images and build/release workflows build it with Node 24 and
+embed `frontend/dist` through `NEXT_ASSETS_PATH`. To build locally from the
+repository root:
+
+```sh
+(cd frontend && npm ci && npm run build)
+NEXT_ASSETS_PATH="$PWD/frontend/dist" cargo build --release
+```
+
+Then open `/next/` for the new frontend and `/` for the classic UI. See the
+[frontend README](frontend/README.md#build-and-embed-in-parseable) for build
+details, PowerShell instructions, and the eventual switch to `/`.

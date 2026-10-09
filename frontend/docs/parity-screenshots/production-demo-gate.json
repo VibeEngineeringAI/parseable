@@ -1,0 +1,24 @@
+{
+  "date": "2026-10-07",
+  "results": [
+    {
+      "build": "VITE_ENABLE_DEMO=false",
+      "checks": [
+        "persisted demo selection ignored",
+        "missing session returns to login",
+        "demo button absent",
+        "component gallery accessible"
+      ],
+      "passed": true
+    },
+    {
+      "build": "VITE_ENABLE_DEMO=true",
+      "checks": [
+        "explicit demo entry available",
+        "selected demo persists in tab",
+        "reload remains demo"
+      ],
+      "passed": true
+    }
+  ]
+}

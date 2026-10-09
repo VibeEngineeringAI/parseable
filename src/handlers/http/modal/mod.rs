@@ -63,6 +63,7 @@ pub static OIDC_CLIENT: OnceCell<Arc<RwLock<Box<dyn OAuthProvider>>>> = OnceCell
 pub const DEFAULT_VERSION: &str = "v4";
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+include!(concat!(env!("OUT_DIR"), "/next_generated.rs"));
 
 #[async_trait]
 pub trait ParseableServer {

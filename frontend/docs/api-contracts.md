@@ -1,0 +1,43 @@
+# Frontend API contracts
+
+The client is React independent and uses the Rust handlers in this repository. `createClient({mode: 'live'})` uses same-origin `/api/v1` requests with `credentials: 'include'`. The Vite development proxy must preserve the frontend origin in `Host`, or the backend must explicitly allow that origin, because the login handler validates the absolute redirect URL.
+
+| Method                                    | HTTP endpoint                                              | Response                                                                                                                                                                                                |
+| ----------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `listDatasets(signal?)`                   | `GET /api/v1/logstream`                                    | `[{name}]`; normalized to `{name,type:'logs'}`                                                                                                                                                          |
+| `schema(dataset, signal?)`                | `GET /api/v1/logstream/{encoded name}/schema`              | Arrow schema `{fields:[{name,...}],metadata:...}`; returns top-level field names                                                                                                                        |
+| `query({sql,startTime,endTime}, signal?)` | `POST /api/v1/query`                                       | JSON array of records                                                                                                                                                                                   |
+| `login(username,password,returnPath?)`    | `GET /api/v1/o/login?redirect=<absolute same-origin path>` | Basic authorization is exchanged for backend session cookies, then a separate cookie-authenticated stream list request verifies the session (403 is retained as an authenticated permission limitation) |
+| `logout()`                                | `GET /api/v1/o/logout?redirect=<origin>/login`             | Top-level browser navigation; backend invalidates the local session and may redirect OAuth users through the provider logout endpoint                                                                   |
+
+`identity(signal?)` requests `GET /api/v1/users/{encoded user_id}` after reading the display cookie as an identity lookup key. The server response (`id`, `username`, optional `method` and `email`) takes precedence. An unavailable profile falls back to the display-only `username`/`user_id` cookies, except that 401 and cancellation propagate. The fallback never claims to be a verified server identity. Missing cookies produce no identity request. Neither cookie content nor the identity label grants permissions; protected backend requests remain authoritative. The endpoint is declared by `get_users_webscope` and handled by `get_prism_user` in `src/handlers/http/rbac.rs`.
+
+## Authentication and session behavior
+
+Native login sends UTF-8 username/password Basic credentials only to the login endpoint, then uses cookies for data requests. Passwords are cleared from the form on success or dismissal and are never persisted or reused for queries. The redirect origin must satisfy `is_valid_redirect_url` in the current Rust handler. Frontend return paths accept local application paths and reject external/protocol-relative destinations, backslashes, control characters and authentication/API routes.
+
+**Sign in with SSO** performs top-level navigation to `/api/v1/o/login?redirect=<absolute same-origin intended path>`. No credential fetch follows the identity provider. The backend owns authorization, provider discovery, callback verification and cookie creation through `/api/v1/o/code`. With no configured provider, it redirects to `/oidc-not-configured`; the frontend explains this state and offers native sign-in. The client stores the intended local path, selects live mode in session storage, and clears stale browser session/display cookies before starting SSO. Selecting live mode prevents an existing demo tab from reopening sample data after a successful provider callback.
+
+When no server identity is available, a stream-list request also probes the session on pages that contain only local content. A live data or identity request returning 401 clears the displayed identity, removes stale local cookie hints and opens login with the intended route retained. A 403 stays a permission-denied state; neither response offers sample results. Network/server errors remain visible request failures. A 403 from the post-login stream-list check does not reject otherwise successful native login, because a restricted account can lack list permission.
+
+Logout uses browser navigation to `/api/v1/o/logout?redirect=<origin>/login`. This checkout removes the backend session and, for OAuth users when configured, redirects to the identity provider logout endpoint before the requested return. Native logout returns directly. The handler currently leaves browser cookies in place; subsequent 401 handling and a new SSO attempt clear stale cookies. The frontend does not claim that provider logout completed merely because the local navigation started. This differs from the previously deployed overlay described in the supplied wiki; that deployment's behavior is not this checkout's contract.
+
+## Query behavior
+
+Query bodies use `{query: sql, startTime, endTime, sendNull: true}`. We deliberately omit the `fields` and streaming query flags, so the response is an unwrapped JSON array, including for aggregate SQL. `ApiError` preserves HTTP status, the backend error message and response detail. Network and cancellation errors remain native errors. Malformed successful payloads raise an explicit contract error.
+
+References: `src/handlers/http/modal/server.rs` (routes), `src/handlers/http/logstream.rs` (list/schema), `src/handlers/http/query.rs` (query serialization), `src/handlers/http/oidc.rs` (native login/logout and redirect validation).
+
+## Current limits
+
+- The stream list returns names without telemetry type. The initial live client labels entries as logs; it does not guess type from stream names. A future typed inventory can use the Prism metadata API.
+- Search targets a `message` field using a literal case-insensitive substring. Other schemas should use field filters or SQL. Sort order defaults to `p_timestamp`; datasets with a different time partition field need explicit SQL until metadata support is added.
+- Filters quote fields and string literals, escape search wildcards, and only allow `=`/`!=`. SQL editor text is sent to the backend SQL engine and its authorization checks; there is no browser-side SQL security boundary.
+- Native and OAuth sign-in use the existing backend authorization behavior. This frontend does not implement the separate OIDC group/provenance changes described in the supplied deployment wiki. Clerk, Stripe, billing and payment collection are absent.
+- Mock HTTP contract tests verify frontend request shape and failure handling. The opt-in `e2e-live` suite exercises a disposable real backend and local mock identity provider; see [validation-review.md](validation-review.md) for actual completed runs. A mock provider does not establish interoperability with a real deployment or identity provider.
+
+## Demo data
+
+Demo mode is enabled only during Vite development or when built with `VITE_ENABLE_DEMO=true`; ordinary production builds ignore a previously stored demo choice. Demo mode makes no network calls and does not authenticate users. It provides three sample datasets with the same schema and the same deterministic 100-row fixture sequence. Times are anchored when the client is created so the initial 15-minute view contains useful data; values and relative ordering are deterministic. Refresh does not simulate ingestion.
+
+The demo SQL evaluator intentionally accepts only `SELECT * FROM <sample dataset>` with optional `AND` filters (`=`/`!=`/`<>`), the query builder's `CAST(field AS VARCHAR) ILIKE ... ESCAPE ...` search expression, one `ORDER BY` column, and `LIMIT`. It applies the requested timestamp bounds. It rejects unsupported SQL, aggregate expressions, joins, projections, OR conditions and multiple statements with an explanation instead of returning misleading results. Use a live backend for full SQL.

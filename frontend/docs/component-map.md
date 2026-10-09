@@ -1,0 +1,38 @@
+# From the recovered UI to editable components
+
+The reference is the repository-pinned Prism v3.2.4 archive (SHA-1 `5e3ec81fbb35b2b8aa6486a2bd38257d46b0264b`). These are proposed and implemented boundaries; original TypeScript names/source were not recovered.
+
+| Recovered concept / hook                                                | Editable implementation                                                             | Responsibility                                                                                  |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Sidebar family, `data-sidebar`, `sidebar-*`                             | `app/Sidebar.tsx`, `app/App.tsx`                                                    | Navigation, active routes, collapse, workspace context                                          |
+| `#main-section`, breadcrumb                                             | `app/App.tsx`                                                                       | Route outlet and shell                                                                          |
+| Button, Input, Badge, Card                                              | `components/ui/`                                                                    | Native semantics, appearance, forwarded props                                                   |
+| Radix Dialog/Sheet, `data-dialog-close`, `data-dialog-confirm`          | `components/ui/Dialog.tsx`, `Sheet.tsx`                                             | Modal anatomy, title, focus containment/restoration; feature-owned forms                        |
+| Tabs                                                                    | `components/ui/Tabs.tsx`                                                            | Keyboard navigation and panel relationships                                                     |
+| LMTSidebar, `data-field-node`, `lmt-sidebar-toggle`                     | `features/logs/FieldSidebar.tsx`                                                    | Searchable fields and visible columns; keep at least one column                                 |
+| Filter, `add-filter-button`, `data-filter-pill-id`, `filter-pill-value` | `features/logs/FilterBar.tsx`                                                       | Exact-match filter form and removable chips                                                     |
+| TimeRange                                                               | `components/explorer/TimeRangePicker.tsx`                                           | Preset and absolute UTC ranges; timezone selection remains deferred                             |
+| LogCountChartCard                                                       | `components/explorer/LogHistogram.tsx`                                              | Dependency-light histogram of returned rows; no invented totals                                 |
+| Table/row/context, `data-index`                                         | `components/explorer/DataTable.tsx`, `RecordSheet.tsx`                              | Sortable/wrappable paginated records, JSON/CSV export, per-event fields and copy/filter actions |
+| CodeMirror SQL module                                                   | `features/sql/SqlEditor.tsx`                                                        | Editor lifecycle, accessible name, syntax colors, run shortcut                                  |
+| Dataset listing/schema                                                  | `features/datasets/DatasetsPage.tsx`                                                | Inventory, search, schema sheet, navigation                                                     |
+| Dashboard tile, `data-tile-id`                                          | `features/dashboards/DashboardTile.tsx`                                             | Query-backed chart tile, stable local identity                                                  |
+| EmptyState/PageError/loading                                            | `components/ui/EmptyState.tsx`, `Spinner.tsx`, `components/explorer/QueryState.tsx` | Distinct empty, loading and recoverable failure states                                          |
+
+The current iteration adds these explicit owners:
+
+| Recovered concept / hook                   | Editable implementation                                 | Responsibility                                                                                        |
+| ------------------------------------------ | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Observed standalone login and reset dialog | `app/LoginPage.tsx`, `app/LoginForm.tsx`, `lib/auth.ts` | Split login layout, password visibility, reset guidance, safe return path and native/OAuth navigation |
+| Column selection / “Add columns”           | `components/explorer/ColumnPicker.tsx`                  | Searchable visible-column controls, independently composed by Logs and SQL                            |
+| `Sort {column}`, wrapping and exports      | `components/explorer/DataTable.tsx`                     | Accessible sorting, bounded pagination, summary rows, wrapping and JSON/CSV serialization             |
+
+Authenticated reference screenshots and completed real-backend checks are recorded in [Prism parity](prism-parity.md) and [validation review](validation-review.md).
+
+Styling uses semantic CSS custom properties and small named classes instead of copying compiled Tailwind strings. The primary light-theme color `#3a3a8c` follows the recovered tokens. Fonts use local system fallbacks for Inter and JetBrains Mono; the app does not fetch fonts from a third party. New React 19 and current build packages were selected for editable development, not to claim exact runtime-version parity with the old bundle.
+
+Feature state belongs in route containers. UI primitives do not import the client. Tables do not fetch data. Charts do not decide query ranges. The React-independent client normalizes backend responses and isolates sample behavior. `QueryState` is an app-aware composite, not a portable primitive.
+
+Future features should extend shared controls first and compose their own query/result surfaces. Prefer stable record/model identifiers to positional selectors when backend identities become available. The current `data-index` is a table position, not event identity. Browser-local dashboard IDs are model IDs and must not be replaced with array indices.
+
+Payment-dependent cloud flows and upsell surfaces from the original bundle were intentionally not carried over. No extracted minified code, credential-like literals, or copied cloud SDK configuration is part of this source.

@@ -15,3 +15,7 @@ parseable_*
 parseable-env-secret
 cache
 .idea
+
+# Local credentials and review notes
+*.pem
+pr-*.md

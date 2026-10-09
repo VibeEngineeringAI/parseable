@@ -26,6 +26,7 @@ use vergen_gitcl::{
 
 pub fn main() -> Result<()> {
     ui::setup()?;
+    ui::setup_next()?;
 
     // Init vergen
     Emitter::default()
@@ -54,6 +55,7 @@ mod ui {
     const CARGO_MANIFEST_DIR: &str = "CARGO_MANIFEST_DIR";
     const OUT_DIR: &str = "OUT_DIR";
     const LOCAL_ASSETS_PATH: &str = "LOCAL_ASSETS_PATH";
+    const NEXT_ASSETS_PATH: &str = "NEXT_ASSETS_PATH";
 
     fn build_resource_from(local_path: impl AsRef<Path>) -> io::Result<()> {
         let local_path = local_path.as_ref();
@@ -67,8 +69,33 @@ mod ui {
         }
     }
 
+    /// Embeds an optional second UI, served under `/next` beside the primary UI so
+    /// both can be compared. Without one, `generate_next` returns no files.
+    pub fn setup_next() -> io::Result<()> {
+        println!("cargo:rerun-if-env-changed={NEXT_ASSETS_PATH}");
+        let out_dir = PathBuf::from(env::var(OUT_DIR).unwrap());
+        let generated = out_dir.join("next_generated.rs");
+        let Ok(path) = env::var(NEXT_ASSETS_PATH) else {
+            return fs::write(
+                generated,
+                "pub fn generate_next() -> ::std::collections::HashMap<&'static str, ::static_files::Resource> {\n    ::std::collections::HashMap::new()\n}\n",
+            );
+        };
+        let path = PathBuf::from(path);
+        if !path.join("index.html").exists() {
+            panic!("Directory specified in NEXT_ASSETS_PATH has no index.html")
+        }
+        println!("cargo:rerun-if-changed={}", path.display());
+        let mut next = resource_dir(path);
+        next.with_generated_filename(generated)
+            .with_generated_fn("generate_next");
+        next.build()
+    }
+
     pub fn setup() -> io::Result<()> {
-        println!("cargo:rerun-if-env-changed=LOCAL_ASSETS_PATH");
+        println!("cargo:rerun-if-env-changed={LOCAL_ASSETS_PATH}");
+        println!("cargo:rerun-if-changed=build.rs");
+        println!("cargo:rerun-if-changed=Cargo.toml");
         let cargo_manifest_dir = PathBuf::from(env::var(CARGO_MANIFEST_DIR).unwrap());
         let cargo_toml = cargo_manifest_dir.join("Cargo.toml");
         let out_dir = PathBuf::from(env::var(OUT_DIR).unwrap());
@@ -95,6 +122,7 @@ mod ui {
         if let Some(ref path) = local_assets_path {
             if path.exists() {
                 println!("cargo:rerun-if-changed={}", path.to_str().unwrap());
+                println!("cargo:rustc-env=UI_VERSION=local");
                 build_resource_from(path).unwrap();
                 return Ok(());
             } else {
@@ -102,15 +130,22 @@ mod ui {
             }
         }
 
+        // Emit this on every upstream build, including a cached asset build.
         let url = metadata["assets-url"].as_str().unwrap();
+        let asset_url = url::Url::parse(url).expect("valid url");
+        let ui_version = asset_url
+            .path_segments()
+            .expect("has segments")
+            .find(|v| v.starts_with('v'))
+            .expect("version segment");
+        println!("cargo:rustc-env=UI_VERSION={ui_version}");
+
         let cached = checksum_path.exists()
             && parseable_ui_path.join("dist").exists()
             && fs::read_to_string(&checksum_path)? == metadata["assets-sha1"].as_str().unwrap();
         if !cached {
             // If there is no UI in the target directory or checksum check failed
             // then we downlaod the UI from given url in cargo.toml metadata
-            let url = metadata["assets-url"].as_str().unwrap();
-
             // See https://docs.rs/ureq/2.5.0/ureq/struct.Response.html#method.into_reader
             let parseable_ui_bytes = get_from_url(url)
                 .call()
@@ -149,17 +184,6 @@ mod ui {
             &community_path,
         )?;
         resource_dir(&community_path).build()?;
-
-        if local_assets_path.is_none() {
-            // emit ui version for asset url
-            let url = url::Url::parse(url).expect("valid url");
-            let ui_version = url
-                .path_segments()
-                .expect("has segemnts")
-                .find(|v| v.starts_with('v'))
-                .expect("version segement");
-            println!("cargo:rustc-env=UI_VERSION={ui_version}");
-        }
 
         Ok(())
     }

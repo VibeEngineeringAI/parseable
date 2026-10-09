@@ -1,0 +1,401 @@
+{
+  "url": "http://127.0.0.1:8270/sql-editor",
+  "viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "text": "Skip to content\nOverview\nANALYZE\nDashboards\nSQL editor\nOBSERVE\nLogs\nDATA\nDatasets\nDEVELOP\nComponent library\nConnection\nCollapse sidebar\nCommunity\nSQL editor\nLive server\nF\nfrontend-smoke\nQuery 1\nSQL editor\nLast 15 minutes\nLast 1 hour\nLast 6 hours\nLast 24 hours\nLast 7 days\nCustom range\nExplorer\n2\npstats\nfrontend_smoke\n1\n\n\nQueries run against your connected Parseable server.\nRun query\nResults\nAdd columns\nExport JSON\nExport CSV\nReady when you are\n\nRun a query to inspect your events.",
+  "issues": [],
+  "boxes": [
+    {
+      "tag": "ASIDE",
+      "hook": "sidebar",
+      "text": "Overview\nANALYZE\nDashboards\nSQL editor\nOBSERVE\nLogs\nDATA\nDatasets\nDEVELOP\nComponent library\nConnection\nCollapse sidebar",
+      "box": {
+        "x": 0,
+        "y": 48,
+        "width": 192,
+        "height": 952,
+        "top": 48,
+        "right": 192,
+        "bottom": 1000,
+        "left": 0
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "header",
+      "text": "",
+      "box": {
+        "x": 8,
+        "y": 60,
+        "width": 175,
+        "height": 28,
+        "top": 60,
+        "right": 183,
+        "bottom": 88,
+        "left": 8
+      }
+    },
+    {
+      "tag": "NAV",
+      "hook": "content",
+      "text": "Overview\nANALYZE\nDashboards\nSQL editor\nOBSERVE\nLogs\nDATA\nDatasets\nDEVELOP\nComponent library",
+      "box": {
+        "x": 8,
+        "y": 98,
+        "width": 175,
+        "height": 352,
+        "top": 98,
+        "right": 183,
+        "bottom": 450,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "Overview",
+      "box": {
+        "x": 8,
+        "y": 98,
+        "width": 175,
+        "height": 28,
+        "top": 98,
+        "right": 183,
+        "bottom": 126,
+        "left": 8
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Overview",
+      "box": {
+        "x": 8,
+        "y": 98,
+        "width": 175,
+        "height": 28,
+        "top": 98,
+        "right": 183,
+        "bottom": 126,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "ANALYZE\nDashboards\nSQL editor",
+      "box": {
+        "x": 8,
+        "y": 131,
+        "width": 175,
+        "height": 97,
+        "top": 131,
+        "right": 183,
+        "bottom": 228,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "ANALYZE",
+      "box": {
+        "x": 16,
+        "y": 149,
+        "width": 159,
+        "height": 15,
+        "top": 149,
+        "right": 175,
+        "bottom": 164,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Dashboards",
+      "box": {
+        "x": 8,
+        "y": 172,
+        "width": 175,
+        "height": 28,
+        "top": 172,
+        "right": 183,
+        "bottom": 200,
+        "left": 8
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "SQL editor",
+      "box": {
+        "x": 8,
+        "y": 200,
+        "width": 175,
+        "height": 28,
+        "top": 200,
+        "right": 183,
+        "bottom": 228,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "OBSERVE\nLogs",
+      "box": {
+        "x": 8,
+        "y": 233,
+        "width": 175,
+        "height": 69,
+        "top": 233,
+        "right": 183,
+        "bottom": 302,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "OBSERVE",
+      "box": {
+        "x": 16,
+        "y": 251,
+        "width": 159,
+        "height": 15,
+        "top": 251,
+        "right": 175,
+        "bottom": 266,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Logs",
+      "box": {
+        "x": 8,
+        "y": 274,
+        "width": 175,
+        "height": 28,
+        "top": 274,
+        "right": 183,
+        "bottom": 302,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "DATA\nDatasets",
+      "box": {
+        "x": 8,
+        "y": 307,
+        "width": 175,
+        "height": 69,
+        "top": 307,
+        "right": 183,
+        "bottom": 376,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "DATA",
+      "box": {
+        "x": 16,
+        "y": 325,
+        "width": 159,
+        "height": 15,
+        "top": 325,
+        "right": 175,
+        "bottom": 340,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Datasets",
+      "box": {
+        "x": 8,
+        "y": 348,
+        "width": 175,
+        "height": 28,
+        "top": 348,
+        "right": 183,
+        "bottom": 376,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "DEVELOP\nComponent library",
+      "box": {
+        "x": 8,
+        "y": 381,
+        "width": 175,
+        "height": 69,
+        "top": 381,
+        "right": 183,
+        "bottom": 450,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "DEVELOP",
+      "box": {
+        "x": 16,
+        "y": 399,
+        "width": 159,
+        "height": 15,
+        "top": 399,
+        "right": 175,
+        "bottom": 414,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Component library",
+      "box": {
+        "x": 8,
+        "y": 422,
+        "width": 175,
+        "height": 28,
+        "top": 422,
+        "right": 183,
+        "bottom": 450,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "footer",
+      "text": "Connection\nCollapse sidebar",
+      "box": {
+        "x": 8,
+        "y": 883,
+        "width": 175,
+        "height": 109,
+        "top": 883,
+        "right": 183,
+        "bottom": 992,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "trigger",
+      "text": "Collapse sidebar",
+      "box": {
+        "x": 8,
+        "y": 956,
+        "width": 175,
+        "height": 36,
+        "top": 956,
+        "right": 183,
+        "bottom": 992,
+        "left": 8
+      }
+    },
+    {
+      "tag": "HEADER",
+      "hook": "",
+      "text": "Community\nSQL editor\nLive server\nF\nfrontend-smoke",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 48,
+        "top": 0,
+        "right": 1440,
+        "bottom": 48,
+        "left": 0
+      }
+    },
+    {
+      "tag": "MAIN",
+      "hook": "main-section",
+      "text": "Query 1\nSQL editor\nLast 15 minutes\nLast 1 hour\nLast 6 hours\nLast 24 hours\nLast 7 days\nCustom range\nExplorer\n2\npstats\nfro",
+      "box": {
+        "x": 192,
+        "y": 48,
+        "width": 1248,
+        "height": 952,
+        "top": 48,
+        "right": 1440,
+        "bottom": 1000,
+        "left": 192
+      }
+    },
+    {
+      "tag": "H1",
+      "hook": "",
+      "text": "SQL editor",
+      "box": {
+        "x": 208,
+        "y": 104.40625,
+        "width": 67.8125,
+        "height": 18.1875,
+        "top": 104.40625,
+        "right": 275.8125,
+        "bottom": 122.59375,
+        "left": 208
+      }
+    },
+    {
+      "tag": "H2",
+      "hook": "",
+      "text": "Explorer",
+      "box": {
+        "x": 208,
+        "y": 150,
+        "width": 56.8125,
+        "height": 21,
+        "top": 150,
+        "right": 264.8125,
+        "bottom": 171,
+        "left": 208
+      }
+    },
+    {
+      "tag": "H2",
+      "hook": "",
+      "text": "Query",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0,
+        "left": 0
+      }
+    },
+    {
+      "tag": "H2",
+      "hook": "",
+      "text": "Results",
+      "box": {
+        "x": 488,
+        "y": 446.5,
+        "width": 50.578125,
+        "height": 21,
+        "top": 446.5,
+        "right": 538.578125,
+        "bottom": 467.5,
+        "left": 488
+      }
+    }
+  ]
+}

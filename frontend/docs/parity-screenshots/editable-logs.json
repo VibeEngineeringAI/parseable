@@ -1,0 +1,431 @@
+{
+  "url": "http://127.0.0.1:8270/logs/explore/frontend_smoke",
+  "viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "text": "Skip to content\nOverview\nANALYZE\nDashboards\nSQL editor\nOBSERVE\nLogs\nDATA\nDatasets\nDEVELOP\nComponent library\nConnection\nCollapse sidebar\nCommunity\nLogs\npstats\nfrontend_smoke\nLive server\nF\nfrontend-smoke\nLogs\nAll Fields\n7\nlevel\n+\nmessage\n+\np_src_ip\n+\np_timestamp\n✓\np_user_agent\n+\nrequest_id\n+\nservice\n+\nLast 15 minutes\nLast 1 hour\nLast 6 hours\nLast 24 hours\nLast 7 days\nCustom range\nAdd filter\nLogs over time\n12 returned events\n1:05:28 PM\nReturned rows · UTC\n2:05:28 PM\n12 records\nHide histogram\nAdd columns\nExport JSON\nExport CSV\nQuery results\nDetails\n\t\nIngestion Time (UTC)\n\tData\n\n\t2026-10-07 14:05:05.232\tlevel=WARN message=Live smoke retry scheduled p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-3 service=frontend-smoke\n\n\t2026-10-07 14:05:05.232\tlevel=ERROR message=Live smoke payment timeout p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-2 service=frontend-smoke\n\n\t2026-10-07 14:05:05.232\tlevel=INFO message=Live smoke request accepted p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-1 service=frontend-smoke\n\n\t2026-10-07 14:05:05.232\tlevel=INFO message=Live smoke request complete p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-4 service=frontend-smoke\n\n\t2026-10-07 14:02:12.607\tlevel=WARN message=Live smoke retry scheduled p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-3 service=frontend-smoke\n\n\t2026-10-07 14:02:12.607\tlevel=ERROR message=Live smoke payment timeout p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-2 service=frontend-smoke\n\n\t2026-10-07 14:02:12.607\tlevel=INFO message=Live smoke request accepted p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-1 service=frontend-smoke\n\n\t2026-10-07 14:02:12.607\tlevel=INFO message=Live smoke request complete p_src_ip=127.0.0.1 p_user_agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36 request_id=smoke-4 service=frontend-smoke\n\n\t2026-10-07 14:00:44.985\tlevel=WARN message=Live smoke retry scheduled p_src_ip=127.0.0.1 p_user_agent=Python-urllib/3.14 request_id=smoke-3 service=frontend-smoke\n\n\t2026-10-07 14:00:44.985\tlevel=ERROR message=Live smoke payment timeout p_src_ip=127.0.0.1 p_user_agent=Python-urllib/3.14 request_id=smoke-2 service=frontend-smoke\n\n\t2026-10-07 14:00:44.985\tlevel=INFO message=Live smoke request accepted p_src_ip=127.0.0.1 p_user_agent=Python-urllib/3.14 request_id=smoke-1 service=frontend-smoke\n\n\t2026-10-07 14:00:44.985\tlevel=INFO message=Live smoke request complete p_src_ip=127.0.0.1 p_user_agent=Python-urllib/3.14 request_id=smoke-4 service=frontend-smoke\n12 rows · 1–12\nPage 1 of 1",
+  "issues": [],
+  "boxes": [
+    {
+      "tag": "ASIDE",
+      "hook": "sidebar",
+      "text": "Overview\nANALYZE\nDashboards\nSQL editor\nOBSERVE\nLogs\nDATA\nDatasets\nDEVELOP\nComponent library\nConnection\nCollapse sidebar",
+      "box": {
+        "x": 0,
+        "y": 48,
+        "width": 192,
+        "height": 952,
+        "top": 48,
+        "right": 192,
+        "bottom": 1000,
+        "left": 0
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "header",
+      "text": "",
+      "box": {
+        "x": 8,
+        "y": 60,
+        "width": 175,
+        "height": 28,
+        "top": 60,
+        "right": 183,
+        "bottom": 88,
+        "left": 8
+      }
+    },
+    {
+      "tag": "NAV",
+      "hook": "content",
+      "text": "Overview\nANALYZE\nDashboards\nSQL editor\nOBSERVE\nLogs\nDATA\nDatasets\nDEVELOP\nComponent library",
+      "box": {
+        "x": 8,
+        "y": 98,
+        "width": 175,
+        "height": 352,
+        "top": 98,
+        "right": 183,
+        "bottom": 450,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "Overview",
+      "box": {
+        "x": 8,
+        "y": 98,
+        "width": 175,
+        "height": 28,
+        "top": 98,
+        "right": 183,
+        "bottom": 126,
+        "left": 8
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Overview",
+      "box": {
+        "x": 8,
+        "y": 98,
+        "width": 175,
+        "height": 28,
+        "top": 98,
+        "right": 183,
+        "bottom": 126,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "ANALYZE\nDashboards\nSQL editor",
+      "box": {
+        "x": 8,
+        "y": 131,
+        "width": 175,
+        "height": 97,
+        "top": 131,
+        "right": 183,
+        "bottom": 228,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "ANALYZE",
+      "box": {
+        "x": 16,
+        "y": 149,
+        "width": 159,
+        "height": 15,
+        "top": 149,
+        "right": 175,
+        "bottom": 164,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Dashboards",
+      "box": {
+        "x": 8,
+        "y": 172,
+        "width": 175,
+        "height": 28,
+        "top": 172,
+        "right": 183,
+        "bottom": 200,
+        "left": 8
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "SQL editor",
+      "box": {
+        "x": 8,
+        "y": 200,
+        "width": 175,
+        "height": 28,
+        "top": 200,
+        "right": 183,
+        "bottom": 228,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "OBSERVE\nLogs",
+      "box": {
+        "x": 8,
+        "y": 233,
+        "width": 175,
+        "height": 69,
+        "top": 233,
+        "right": 183,
+        "bottom": 302,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "OBSERVE",
+      "box": {
+        "x": 16,
+        "y": 251,
+        "width": 159,
+        "height": 15,
+        "top": 251,
+        "right": 175,
+        "bottom": 266,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Logs",
+      "box": {
+        "x": 8,
+        "y": 274,
+        "width": 175,
+        "height": 28,
+        "top": 274,
+        "right": 183,
+        "bottom": 302,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "DATA\nDatasets",
+      "box": {
+        "x": 8,
+        "y": 307,
+        "width": 175,
+        "height": 69,
+        "top": 307,
+        "right": 183,
+        "bottom": 376,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "DATA",
+      "box": {
+        "x": 16,
+        "y": 325,
+        "width": 159,
+        "height": 15,
+        "top": 325,
+        "right": 175,
+        "bottom": 340,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Datasets",
+      "box": {
+        "x": 8,
+        "y": 348,
+        "width": 175,
+        "height": 28,
+        "top": 348,
+        "right": 183,
+        "bottom": 376,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group",
+      "text": "DEVELOP\nComponent library",
+      "box": {
+        "x": 8,
+        "y": 381,
+        "width": 175,
+        "height": 69,
+        "top": 381,
+        "right": 183,
+        "bottom": 450,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "group-label",
+      "text": "DEVELOP",
+      "box": {
+        "x": 16,
+        "y": 399,
+        "width": 159,
+        "height": 15,
+        "top": 399,
+        "right": 175,
+        "bottom": 414,
+        "left": 16
+      }
+    },
+    {
+      "tag": "A",
+      "hook": "menu-button",
+      "text": "Component library",
+      "box": {
+        "x": 8,
+        "y": 422,
+        "width": 175,
+        "height": 28,
+        "top": 422,
+        "right": 183,
+        "bottom": 450,
+        "left": 8
+      }
+    },
+    {
+      "tag": "DIV",
+      "hook": "footer",
+      "text": "Connection\nCollapse sidebar",
+      "box": {
+        "x": 8,
+        "y": 883,
+        "width": 175,
+        "height": 109,
+        "top": 883,
+        "right": 183,
+        "bottom": 992,
+        "left": 8
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "trigger",
+      "text": "Collapse sidebar",
+      "box": {
+        "x": 8,
+        "y": 956,
+        "width": 175,
+        "height": 36,
+        "top": 956,
+        "right": 183,
+        "bottom": 992,
+        "left": 8
+      }
+    },
+    {
+      "tag": "HEADER",
+      "hook": "",
+      "text": "Community\nLogs\npstats\nfrontend_smoke\nLive server\nF\nfrontend-smoke",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 48,
+        "top": 0,
+        "right": 1440,
+        "bottom": 48,
+        "left": 0
+      }
+    },
+    {
+      "tag": "MAIN",
+      "hook": "main-section",
+      "text": "Logs\nAll Fields\n7\nlevel\n+\nmessage\n+\np_src_ip\n+\np_timestamp\n✓\np_user_agent\n+\nrequest_id\n+\nservice\n+\nLast 15 minutes\nLast ",
+      "box": {
+        "x": 192,
+        "y": 48,
+        "width": 1248,
+        "height": 952,
+        "top": 48,
+        "right": 1440,
+        "bottom": 1000,
+        "left": 192
+      }
+    },
+    {
+      "tag": "H1",
+      "hook": "",
+      "text": "Logs",
+      "box": {
+        "x": 191,
+        "y": 47,
+        "width": 1,
+        "height": 1,
+        "top": 47,
+        "right": 192,
+        "bottom": 48,
+        "left": 191
+      }
+    },
+    {
+      "tag": "H2",
+      "hook": "",
+      "text": "All Fields",
+      "box": {
+        "x": 208,
+        "y": 114,
+        "width": 48.6875,
+        "height": 18,
+        "top": 114,
+        "right": 256.6875,
+        "bottom": 132,
+        "left": 208
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "lmt-sidebar-toggle",
+      "text": "",
+      "box": {
+        "x": 448,
+        "y": 54.5,
+        "width": 34,
+        "height": 34,
+        "top": 54.5,
+        "right": 482,
+        "bottom": 88.5,
+        "left": 448
+      }
+    },
+    {
+      "tag": "BUTTON",
+      "hook": "add-filter-button",
+      "text": "Add filter",
+      "box": {
+        "x": 1283.328125,
+        "y": 108,
+        "width": 100.671875,
+        "height": 36,
+        "top": 108,
+        "right": 1384,
+        "bottom": 144,
+        "left": 1283.328125
+      }
+    },
+    {
+      "tag": "H2",
+      "hook": "",
+      "text": "Logs over time",
+      "box": {
+        "x": 448,
+        "y": 160,
+        "width": 85.359375,
+        "height": 18,
+        "top": 160,
+        "right": 533.359375,
+        "bottom": 178,
+        "left": 448
+      }
+    },
+    {
+      "tag": "H2",
+      "hook": "",
+      "text": "12 records",
+      "box": {
+        "x": 448,
+        "y": 315.5,
+        "width": 56.71875,
+        "height": 18,
+        "top": 315.5,
+        "right": 504.71875,
+        "bottom": 333.5,
+        "left": 448
+      }
+    }
+  ]
+}
