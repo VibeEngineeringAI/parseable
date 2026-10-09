@@ -1,9 +1,9 @@
 {
-  "version": "prism-v3.2.4-community-promql-v3-oidc-v1-error-account-v1",
+  "version": "prism-v3.2.5-community-promql-v3-oidc-v1-error-account-v1",
   "files": [
     {
-      "path": "assets/DashboardView-B1EWEcGo.js",
-      "sha256": "74d6efb43716ce02d83f795ef48916a807473afd405f384f1b4a492180c4781a",
+      "path": "assets/DashboardView-D_vQBxV5.js",
+      "sha256": "e42a2b76151190937d244309a83196ed15fa1319cd1ff2b4fc73d0f0052f7bfc",
       "replacements": [
         {
           "from": "import{o as e,t}",
@@ -11,43 +11,43 @@
           "count": 1
         },
         {
-          "from": "T=J(u),E=J(",
-          "to": "T=J(u),communityDashboardEnabled=J(communityPromqlDashboard),communityVariableValues=J(e=>e.dashboard.variableValues),communityPreviewStream=(0,Q.useMemo)(()=>communityResolvePreviewDataset(s??``,communityVariableValues),[s,communityVariableValues]),E=J(",
+          "from": "T=G(u),E=G(",
+          "to": "T=G(u),communityDashboardEnabled=G(communityPromqlDashboard),communityVariableValues=G(e=>e.dashboard.variableValues),communityPreviewStream=(0,Q.useMemo)(()=>communityResolvePreviewDataset(s??``,communityVariableValues),[s,communityVariableValues]),E=G(",
           "count": 1
         },
         {
-          "from": "et=!T&&C?.tileType===`promql`",
-          "to": "et=!communityDashboardEnabled&&C?.tileType===`promql`",
+          "from": "$e=!T&&C?.tileType===`promql`",
+          "to": "$e=!communityDashboardEnabled&&C?.tileType===`promql`",
           "count": 1
         },
         {
-          "from": "let t=T&&Ze?`promql`",
-          "to": "let t=communityDashboardEnabled&&Ze?`promql`",
+          "from": "let t=T&&Xe?`promql`",
+          "to": "let t=communityDashboardEnabled&&Xe?`promql`",
           "count": 1
         },
         {
-          "from": "[s,r,C,T,Ze,P,e]",
-          "to": "[s,r,C,T,communityDashboardEnabled,Ze,P,e]",
+          "from": "[s,r,C,T,Xe,N,e]",
+          "to": "[s,r,C,T,communityDashboardEnabled,Xe,N,e]",
           "count": 1
         },
         {
-          "from": "l=J(u),d=(0,Q.useMemo)",
-          "to": "l=J(communityPromqlDashboard),d=(0,Q.useMemo)",
+          "from": "l=G(u),d=(0,Q.useMemo)",
+          "to": "l=G(communityPromqlDashboard),d=(0,Q.useMemo)",
           "count": 1
         },
         {
-          "from": "import{a as cn,f as ln,l as un,n as dn,s as fn}",
-          "to": "import{a as cn,f as ln,l as un,n as dn,s as fn,t as communityInterpolatePromql}",
+          "from": "import{a as on,f as sn,l as cn,n as ln,s as un}",
+          "to": "import{a as on,f as sn,l as cn,n as ln,s as un,t as communityInterpolatePromql}",
           "count": 1
         },
         {
-          "from": "query:e.trim()})).filter(({query:e})=>e.length>0),[Ue])",
-          "to": "query:communityInterpolatePromql(e.trim(),communityVariableValues)})).filter(({query:e})=>e.length>0),[Ue,communityVariableValues])",
+          "from": "query:e.trim()})).filter(({query:e})=>e.length>0),[We])",
+          "to": "query:communityInterpolatePromql(e.trim(),communityVariableValues)})).filter(({query:e})=>e.length>0),[We,communityVariableValues])",
           "count": 1
         },
         {
-          "from": "Lt=(P===`promql`||P===`ai`&&pt===`promql`)&&!!s&&!!Pt",
-          "to": "Lt=(P===`promql`||P===`ai`&&pt===`promql`)&&!!communityPreviewStream&&!!Pt",
+          "from": "Lt=(N===`promql`||N===`ai`&&ht===`promql`)&&!!s&&!!Pt",
+          "to": "Lt=(N===`promql`||N===`ai`&&ht===`promql`)&&!!communityPreviewStream&&!!Pt",
           "count": 1
         },
         {
@@ -56,8 +56,8 @@
           "count": 1
         },
         {
-          "from": "queryFn:async({signal:t})=>!s||!Pt?null:(await Tn({query:e,stream:s,time:Pt.endSec},t)).data",
-          "to": "queryFn:async({signal:t})=>!communityPreviewStream||!Pt?null:(await Tn({query:e,stream:communityPreviewStream,time:Pt.endSec},t)).data",
+          "from": "queryFn:async({signal:t})=>!s||!Pt?null:(await Cn({query:e,stream:s,time:Pt.endSec},t)).data",
+          "to": "queryFn:async({signal:t})=>!communityPreviewStream||!Pt?null:(await Cn({query:e,stream:communityPreviewStream,time:Pt.endSec},t)).data",
           "count": 1
         },
         {
@@ -66,30 +66,30 @@
           "count": 1
         },
         {
-          "from": "queryFn:async({signal:t})=>{if(!s||!Pt)return null;let n=`${jn(Pt.startSec,Pt.endSec,{query:e,maxDataPoints:600})}s`;return(await En({query:e,stream:s,start:Pt.startSec,end:Pt.endSec,step:n},t)).data",
-          "to": "queryFn:async({signal:t})=>{if(!communityPreviewStream||!Pt)return null;let n=`${jn(Pt.startSec,Pt.endSec,{query:e,maxDataPoints:600})}s`;return(await En({query:e,stream:communityPreviewStream,start:Pt.startSec,end:Pt.endSec,step:n},t)).data",
+          "from": "queryFn:async({signal:t})=>{if(!s||!Pt)return null;let n=`${kn(Pt.startSec,Pt.endSec,{query:e,maxDataPoints:600})}s`;return(await wn({query:e,stream:s,start:Pt.startSec,end:Pt.endSec,step:n},t)).data",
+          "to": "queryFn:async({signal:t})=>{if(!communityPreviewStream||!Pt)return null;let n=`${kn(Pt.startSec,Pt.endSec,{query:e,maxDataPoints:600})}s`;return(await wn({query:e,stream:communityPreviewStream,start:Pt.startSec,end:Pt.endSec,step:n},t)).data",
           "count": 1
         },
         {
-          "from": "Xt=D.find(e=>e.id===O?.providerId),",
-          "to": "communityPreviewError=(P===`promql`||P===`ai`&&pt===`promql`)?communityPromqlPreviewError(It?[...Rt,...zt]:(ze===`instant`||ze===`both`&&Ve===`instant`?Rt:zt),s,communityPreviewStream):null,Xt=D.find(e=>e.id===O?.providerId),",
+          "from": "Qt=D.find(e=>e.id===O?.providerId),",
+          "to": "communityPreviewError=(N===`promql`||N===`ai`&&ht===`promql`)?communityPromqlPreviewError(It?[...zt,...Vt]:(Re===`instant`||Re===`both`&&Ve===`instant`?zt:Vt),s,communityPreviewStream):null,Qt=D.find(e=>e.id===O?.providerId),",
           "count": 1
         },
         {
-          "from": "}):m===`table`&&gt?(0,$.jsx)(wn,{queryData:gt}):tn?",
-          "to": "}):communityPreviewError?(0,$.jsx)(`div`,{role:`alert`,className:`max-w-full p-3 text-sm text-semRed-600 break-words`,children:communityPreviewError}):m===`table`&&gt?(0,$.jsx)(wn,{queryData:gt}):tn?",
+          "from": "}):m===`table`&&xt?(0,$.jsx)(Sn,{queryData:xt}):rn?",
+          "to": "}):communityPreviewError?(0,$.jsx)(`div`,{role:`alert`,className:`max-w-full p-3 text-sm text-semRed-600 break-words`,children:communityPreviewError}):m===`table`&&xt?(0,$.jsx)(Sn,{queryData:xt}):rn?",
           "count": 1
         },
         {
-          "from": "import{n as gn,t as _n}from\"./datasetVariables-BLemIFd9.js\"",
-          "to": "import{n as gn,t as _n,n as communityResolvePreviewDataset}from\"./datasetVariables-BLemIFd9.js\"",
+          "from": "import{n as mn,t as hn}from\"./datasetVariables-C8KXo21Y.js\"",
+          "to": "import{n as mn,t as hn,n as communityResolvePreviewDataset}from\"./datasetVariables-C8KXo21Y.js\"",
           "count": 1
         }
       ]
     },
     {
-      "path": "assets/VariablesBar-DUQkJr3a.js",
-      "sha256": "944c9b7b27947479b281cc93a09afa14dc5281d5342edc9b995c1bd52b68e34d",
+      "path": "assets/VariablesBar-JOl70RO6.js",
+      "sha256": "a4bbe235a3feaf9042175b070d818cf371bb4bf87a0758b665c3ab082710dfaf",
       "replacements": [
         {
           "from": "import{o as e}",
@@ -97,38 +97,38 @@
           "count": 1
         },
         {
-          "from": "let y=t===`promql`&&!n;return",
-          "to": "let communityDashboardEnabled=C(communityPromqlDashboard),communityAlertsLocked=t===`promql`&&!C(communityPromqlAlerts),y=t===`promql`&&!communityDashboardEnabled;return",
+          "from": "let b=t===`promql`&&!n;return",
+          "to": "let communityDashboardEnabled=x(communityPromqlDashboard),communityAlertsLocked=t===`promql`&&!x(communityPromqlAlerts),b=t===`promql`&&!communityDashboardEnabled;return",
           "count": 1
         },
         {
-          "from": "}),y||!d?(0,X.jsx)",
+          "from": "}),b||!d?(0,X.jsx)",
           "to": "}),communityAlertsLocked||!d?(0,X.jsx)",
           "count": 1
         },
         {
-          "from": "children:y?`Available on Enterprise plans.`",
+          "from": "children:b?`Available on Enterprise plans.`",
           "to": "children:communityAlertsLocked?`Available on Enterprise plans.`",
           "count": 1
         },
         {
-          "from": "_=C(o),v=C(",
-          "to": "_=C(o),communityDashboardEnabled=C(communityPromqlDashboard),communityAlertsEnabled=C(communityPromqlAlerts),v=C(",
+          "from": "g=x(o),_=x(",
+          "to": "g=x(o),communityDashboardEnabled=x(communityPromqlDashboard),communityAlertsEnabled=x(communityPromqlAlerts),_=x(",
           "count": 1
         },
         {
-          "from": "Se=()=>{T===`promql`&&!_||",
-          "to": "Se=()=>{T===`promql`&&!communityDashboardEnabled||",
+          "from": "be=()=>{(D!==`promql`||g)&&",
+          "to": "be=()=>{(D!==`promql`||communityDashboardEnabled)&&",
           "count": 1
         },
         {
-          "from": "p=C(o),m=Array.isArray(e.dbName)",
-          "to": "p=C(communityPromqlDashboard),m=Array.isArray(e.dbName)",
+          "from": "p=x(o),m=Array.isArray(e.dbName)",
+          "to": "p=x(communityPromqlDashboard),m=Array.isArray(e.dbName)",
           "count": 1
         },
         {
-          "from": "ye=T!==`promql`||!Array.isArray(e.chartQuery)||e.chartQuery.length<=1",
-          "to": "ye=T!==`promql`||se.length===1&&communityConcretePromqlAlert({dbName:se,chartQuery:(Array.isArray(e.chartQuery)?e.chartQuery:[e.chartQuery]).map(query=>Me(query||``,j))})",
+          "from": "_e=D!==`promql`||!Array.isArray(e.chartQuery)||e.chartQuery.length<=1",
+          "to": "_e=D!==`promql`||I.length===1&&communityConcretePromqlAlert({dbName:I,chartQuery:(Array.isArray(e.chartQuery)?e.chartQuery:[e.chartQuery]).map(query=>Ne(query||``,M))})",
           "count": 1
         },
         {
@@ -137,15 +137,15 @@
           "count": 1
         },
         {
-          "from": "we=()=>{if(!ye||T===`promql`&&!_)return;",
-          "to": "we=()=>{if(!ye||T===`promql`&&!communityAlertsEnabled)return;",
+          "from": "Se=()=>{if(!_e||D===`promql`&&!g)return;",
+          "to": "Se=()=>{if(!_e||D===`promql`&&!communityAlertsEnabled)return;",
           "count": 1
         }
       ]
     },
     {
-      "path": "assets/Metrics-ewM4cMwk.js",
-      "sha256": "b7c1f82ff1daa79ce4eaade786bae020ca1416fdcd5232b6fb4ec8447e68eec0",
+      "path": "assets/Metrics-DYr03wWH.js",
+      "sha256": "5d18a0a472c78eee65c05fe759abe6b34a7988cc3569ccd1620e9f6e381e81fa",
       "replacements": [
         {
           "from": "import{o as e}",
@@ -153,29 +153,29 @@
           "count": 1
         },
         {
-          "from": "let l=oe(),u=I(d),f=I(",
-          "to": "let l=oe(),u=I(communityPromql),f=I(",
+          "from": "let l=z(),u=F(d),f=F(",
+          "to": "let l=z(),u=F(communityPromql),f=F(",
           "count": 1
         },
         {
-          "from": "n=_(),r=I(d),i=I(",
-          "to": "n=_(),r=I(d),communityPromqlEnabled=I(communityPromql),i=I(",
+          "from": "n=_(),r=F(d),i=F(",
+          "to": "n=_(),r=F(d),communityPromqlEnabled=F(communityPromql),i=F(",
           "count": 1
         },
         {
-          "from": "o===`explorer`&&(r?(0,$.jsx)(Lt,{})",
-          "to": "o===`explorer`&&(communityPromqlEnabled?(0,$.jsx)(Lt,{})",
+          "from": "o===`explorer`&&(r?(0,$.jsx)(It,{})",
+          "to": "o===`explorer`&&(communityPromqlEnabled?(0,$.jsx)(It,{})",
           "count": 1
         }
       ]
     },
     {
-      "path": "assets/TableToggle-Bijf4bkq.js",
-      "sha256": "14e851245fcd8826ec2a0bb8085f84eb6a15ea2fe3589a1c2b4b49371f3a8436",
+      "path": "assets/TableToggle-Dol5YimG.js",
+      "sha256": "b71912544f055f83d87220f055149ff5ba354c1a7d45ecb4a67440c07f0b7baa",
       "replacements": [
         {
           "from": "import{o as e}",
-          "to": "import{CommunityPromqlAlertDetails as CommunityAlertDetails}from\"./community-promql-capabilities.js\";import{lr as communitySetAlert}from\"./index-BLF851sq.js\";import{f as communityInstantQuery}from\"./utils-C7n1bOe_.js\";import{o as e}",
+          "to": "import{CommunityPromqlAlertDetails as CommunityAlertDetails}from\"./community-promql-capabilities.js\";import{cr as communitySetAlert}from\"./index-CaJv0zbb.js\";import{f as communityInstantQuery}from\"./utils-TP0BRL-8.js\";import{o as e}",
           "count": 1
         },
         {
@@ -184,20 +184,20 @@
           "count": 1
         },
         {
-          "from": "Nt=()=>{let e=A(),t=v(),n=O(",
-          "to": "Nt=()=>{let communityAlertStream=O(e=>e.app.currentStream),e=A(),t=v(),n=O(",
+          "from": "Pt=()=>{let e=F(),t=v(),n=E(",
+          "to": "Pt=()=>{let communityAlertStream=E(e=>e.app.currentStream),e=F(),t=v(),n=E(",
           "count": 1
         },
         {
-          "from": "St=()=>{let e=O(e=>e.alerts.queryBuilderType),[t,n]=(0,q.useState)(`builder`)",
-          "to": "St=()=>{let e=O(e=>e.alerts.queryBuilderType),[t,n]=(0,q.useState)(`promql`)",
+          "from": "wt=()=>{let e=E(e=>e.alerts.queryBuilderType),[t,n]=(0,q.useState)(`builder`)",
+          "to": "wt=()=>{let e=E(e=>e.alerts.queryBuilderType),[t,n]=(0,q.useState)(`promql`)",
           "count": 1
         }
       ]
     },
     {
-      "path": "assets/AlertView-DeeBQjhO.js",
-      "sha256": "dce31e8754a4305cf0b3ae29015aef53cf049c258d06114ce0a7c8f34574b319",
+      "path": "assets/AlertView-d1-iHWZy.js",
+      "sha256": "c3906102dd3b7b1c3394efe3d71a80563b87a9f1d76f203b6b6be0119fe44b3b",
       "replacements": [
         {
           "from": "import{o as e}",
@@ -212,22 +212,22 @@
       ]
     },
     {
-      "path": "assets/EditAlerts-BvP4Cbwc.js",
-      "sha256": "6445c5a9cf41af0bb6cc82c8da69fd6587717cbfcc4dae0fb12f58cf46abb3be",
+      "path": "assets/EditAlerts-AWbBqph7.js",
+      "sha256": "8826756e785d696a29333f155e3ce4c9e33a19a396bc0ffb6fb011e4d2f41af7",
       "replacements": [
         {
-          "from": "if(!B||V!==``||!a.query)return;",
-          "to": "if(Pe||!B||V!==``||!a.query)return;",
+          "from": "if(!V||H!==``||!a.query)return;",
+          "to": "if(Pe||!V||H!==``||!a.query)return;",
           "count": 1
         },
         {
-          "from": "if(!B||V!==``||D){R===`threshold`&&D&&q();",
-          "to": "if(!Pe&&(!B||V!==``||D)){R===`threshold`&&D&&q();",
+          "from": "if(!V||H!==``||D){z===`threshold`&&D&&J();",
+          "to": "if(!Pe&&(!V||H!==``||D)){z===`threshold`&&D&&J();",
           "count": 1
         },
         {
-          "from": "a.notificationConfig.interval>0),He=",
-          "to": "a.notificationConfig.interval>0&&(!Pe||a.query.trim()!==``&&Number.isFinite(Number(a.thresholdConfig.value))&&a.thresholdConfig.value!==``)),He=",
+          "from": "a.notificationConfig.interval>0),Ue=",
+          "to": "a.notificationConfig.interval>0&&(!Pe||a.query.trim()!==``&&Number.isFinite(Number(a.thresholdConfig.value))&&a.thresholdConfig.value!==``)),Ue=",
           "count": 1
         },
         {
@@ -238,23 +238,23 @@
       ]
     },
     {
-      "path": "assets/CreateAlerts-BWbM5YaA.js",
-      "sha256": "fe2793882d1185e5c99c1bac1f20f8348c7058880f951cfeae967dc44f86597d",
+      "path": "assets/CreateAlerts-B_cxTj1T.js",
+      "sha256": "95f1cfe75fe5aa33d7aa2efec9e6e5e4d561f0285106b2310b68d4e0c85fb555",
       "replacements": [
         {
-          "from": "C.targets.length>0&&C.targets.every(e=>e)",
-          "to": "(I||C.targets.length>0)&&C.targets.every(e=>e)",
+          "from": "w.targets.length>0&&w.targets.every(e=>e)",
+          "to": "(I||w.targets.length>0)&&w.targets.every(e=>e)",
           "count": 1
         }
       ]
     },
     {
-      "path": "assets/Team-DjnIdab9.js",
-      "sha256": "30c1946a50662ea8f321def6d2916f1cee0c86756a24e92f913a381bb0b4fe17",
+      "path": "assets/Team-Cj0VOh5p.js",
+      "sha256": "e4450dab80d03545c65eaed712ac9207fd8be7e124260f99a6e8de21068b1692",
       "replacements": [
         {
           "from": "import{o as e}",
-          "to": "import{oidcRoleMapping as communityOidcRoleMapping,CommunityOidcDefaultRole,CommunityOidcGroups,CommunityOidcRoleInspector}from\"./community-promql-capabilities.js\";import{D as communityOidcApi}from\"./utils-d72tcMCs.js\";import{o as e}",
+          "to": "import{oidcRoleMapping as communityOidcRoleMapping,CommunityOidcDefaultRole,CommunityOidcGroups,CommunityOidcRoleInspector}from\"./community-promql-capabilities.js\";import{D as communityOidcApi}from\"./utils-BRcBEE6T.js\";import{o as e}",
           "count": 1
         },
         {
@@ -264,7 +264,7 @@
         },
         {
           "from": "},lt=[`admin`,`editor`]",
-          "to": "},ct=props=>{let enabled=g(communityOidcRoleMapping),roles=g(e=>e.app.roles);return enabled?(0,$.jsx)(K,{open:props.open,onOpenChange:props.onClose,children:(0,$.jsxs)(W,{children:[(0,$.jsx)(H,{children:(0,$.jsx)(G,{children:`Default OIDC role`})}),props.open&&(0,$.jsx)(CommunityOidcDefaultRole,{react:Q,api:communityOidcApi(),roles,onClose:props.onClose})]})}):(0,$.jsx)(communityNativeDefaultRole,props)},communityOidcGroupView=({searchQuery:e})=>{let{getRolesData:r,getRolesIsLoading:i,getRolesIsError:a}=Z(),sync=g(e=>e.app.instanceConfig?.capabilities?.oidcRoleSync===!0);return i?(0,$.jsx)(Te,{}):a?(0,$.jsx)(Pe,{}):(0,$.jsx)(CommunityOidcGroups,{react:Q,roles:r?.data,search:e,roleSync:sync})},lt=[`admin`,`editor`]",
+          "to": "},ct=props=>{let enabled=h(communityOidcRoleMapping),roles=h(e=>e.app.roles);return enabled?(0,$.jsx)(K,{open:props.open,onOpenChange:props.onClose,children:(0,$.jsxs)(W,{children:[(0,$.jsx)(H,{children:(0,$.jsx)(G,{children:`Default OIDC role`})}),props.open&&(0,$.jsx)(CommunityOidcDefaultRole,{react:Q,api:communityOidcApi(),roles,onClose:props.onClose})]})}):(0,$.jsx)(communityNativeDefaultRole,props)},communityOidcGroupView=({searchQuery:e})=>{let{getRolesData:r,getRolesIsLoading:i,getRolesIsError:a}=Z(),sync=h(e=>e.app.instanceConfig?.capabilities?.oidcRoleSync===!0);return i?(0,$.jsx)(Te,{}):a?(0,$.jsx)(Pe,{}):(0,$.jsx)(CommunityOidcGroups,{react:Q,roles:r?.data,search:e,roleSync:sync})},lt=[`admin`,`editor`]",
           "count": 1
         },
         {
@@ -274,12 +274,12 @@
         },
         {
           "from": "o=!!e?.hasGroupAccess,[s,c]=l()",
-          "to": "communityOidcEnabled=g(communityOidcRoleMapping),o=!!e?.hasGroupAccess||communityOidcEnabled,[s,c]=l()",
+          "to": "communityOidcEnabled=h(communityOidcRoleMapping),o=!!e?.hasGroupAccess||communityOidcEnabled,[s,c]=l()",
           "count": 1
         },
         {
-          "from": "k===`groups`&&(0,$.jsxs)(ge,{open:_",
-          "to": "k===`groups`&&!communityOidcEnabled&&(0,$.jsxs)(ge,{open:_",
+          "from": "O===`groups`&&(0,$.jsxs)(ge,{open:v",
+          "to": "O===`groups`&&!communityOidcEnabled&&(0,$.jsxs)(ge,{open:v",
           "count": 1
         },
         {
@@ -293,13 +293,13 @@
           "count": 1
         },
         {
-          "from": "k===`groups`&&o&&(0,$.jsx)(yt,{searchQuery:m})",
-          "to": "k===`groups`&&o&&(communityOidcEnabled?(0,$.jsx)(communityOidcGroupView,{searchQuery:m}):(0,$.jsx)(yt,{searchQuery:m}))",
+          "from": "O===`groups`&&o&&(0,$.jsx)(yt,{searchQuery:p})",
+          "to": "O===`groups`&&o&&(communityOidcEnabled?(0,$.jsx)(communityOidcGroupView,{searchQuery:p}):(0,$.jsx)(yt,{searchQuery:p}))",
           "count": 1
         },
         {
           "from": "Je=({user:e,open:t,onClose:n,type:r,role:i=``})=>{let[a,o]",
-          "to": "Je=({user:e,open:t,onClose:n,type:r,role:i=``})=>{let communityOidcEnabled=g(communityOidcRoleMapping),[communityCanRemove,communitySetCanRemove]=(0,Q.useState)(!1),[a,o]",
+          "to": "Je=({user:e,open:t,onClose:n,type:r,role:i=``})=>{let communityOidcEnabled=h(communityOidcRoleMapping),[communityCanRemove,communitySetCanRemove]=(0,Q.useState)(!1),[a,o]",
           "count": 1
         },
         {
@@ -315,8 +315,8 @@
       ]
     },
     {
-      "path": "assets/index-BLF851sq.js",
-      "sha256": "5baf82b1804c5069d71b8df4f2de1e6e2d2cccd0318a5c5f782b9cfa82b01822",
+      "path": "assets/index-CaJv0zbb.js",
+      "sha256": "001c6d194e58a66a6969ff02b34a0e10bcb3eab00466e972aef3d0752f40a803",
       "replacements": [
         {
           "from": "import{o as e,t}",
@@ -329,8 +329,8 @@
           "count": 1
         },
         {
-          "from": "children:[(0,D.jsx)(`img`,{src:R,alt:`Parseable Error Icon`",
-          "to": "children:[(0,D.jsx)(CommunityErrorAccountMenu,{react:E,position:`absolute`}),(0,D.jsx)(`img`,{src:R,alt:`Parseable Error Icon`",
+          "from": "children:[(0,D.jsx)(`img`,{src:at,alt:`Parseable Error Icon`",
+          "to": "children:[(0,D.jsx)(CommunityErrorAccountMenu,{react:E,position:`absolute`}),(0,D.jsx)(`img`,{src:at,alt:`Parseable Error Icon`",
           "count": 1
         },
         {
@@ -341,19 +341,19 @@
       ]
     },
     {
-      "path": "assets/App-BaXntU9S.js",
-      "sha256": "22d0efcbe258a990ff0ce229f8935188d74aef63dc34043dadd6cbf826a5de07",
+      "path": "assets/App-BxBNJE52.js",
+      "sha256": "add1a3f62064b2677d18bb2be3b0affb953203f02129aa7d1648961a4134eedb",
       "replacements": [
         {
-          "from": "children:[(0,J.jsx)(`img`,{src:je,alt:`Parseable Error Icon`",
-          "to": "children:[(0,J.jsx)(`div`,{className:`fixed right-4 top-4 z-50`,children:(0,J.jsx)($n,{})}),(0,J.jsx)(`img`,{src:je,alt:`Parseable Error Icon`",
+          "from": "children:[(0,K.jsx)(`img`,{src:Ie,alt:`Parseable Error Icon`",
+          "to": "children:[(0,K.jsx)(`div`,{className:`fixed right-4 top-4 z-50`,children:(0,K.jsx)(fs,{})}),(0,K.jsx)(`img`,{src:Ie,alt:`Parseable Error Icon`",
           "count": 1
         }
       ]
     },
     {
-      "path": "assets/NoAccessPage-BiZpLDSB.js",
-      "sha256": "49b734228a340786ec1a1f8c622f287aa0f753ee71f68dd520f9006e0443e5c4",
+      "path": "assets/NoAccessPage-DRLjzMIJ.js",
+      "sha256": "8a6f4e32507212c7db21b1bb02ff8bcb0b2c7304a5caad81b2eb0fa8b63690e3",
       "replacements": [
         {
           "from": "import{o as e}",
@@ -368,12 +368,12 @@
       ]
     },
     {
-      "path": "assets/NotFoundPage-q_LZqNzB.js",
-      "sha256": "281a0a79f47a8a03a399e0ae1b21520faf7148791376720ab072f42d123edfb2",
+      "path": "assets/NotFoundPage-B7nyns2j.js",
+      "sha256": "08e498f3183f79b16b7aeede2b005f7b1effdd8f5c0ea1c9da3cebf2fd767cfd",
       "replacements": [
         {
-          "from": "import{S as e}",
-          "to": "import{CommunityErrorAccountMenu}from\"./community-promql-capabilities.js\";import{o as communityInterop}from\"./rolldown-runtime-CMxvf4Kt.js\";import{r as communityReactModule}from\"./apexcharts-CtzYX57T.js\";const communityErrorReact=communityInterop(communityReactModule(),1);import{S as e}",
+          "from": "import{b as e}",
+          "to": "import{CommunityErrorAccountMenu}from\"./community-promql-capabilities.js\";import{o as communityInterop}from\"./rolldown-runtime-C0FnF6B9.js\";import{r as communityReactModule}from\"./apexcharts-DTx-NY1B.js\";const communityErrorReact=communityInterop(communityReactModule(),1);import{b as e}",
           "count": 1
         },
         {

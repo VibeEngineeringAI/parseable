@@ -6,7 +6,7 @@ capabilities for metric exploration, dashboard tile creation/editing/querying, a
 PromQL dashboard variables. The server remains licensed as `OSS`; Enterprise AI,
 summarization, and unrelated features keep their existing checks.
 
-Prism v3.2.4 is supplied as compiled assets. The public
+Prism v3.2.5 (the `assets-url` pinned in `Cargo.toml`) is supplied as compiled assets. The public
 [parseablehq/console](https://github.com/parseablehq/console) source is an older UI
 from May 2025 and does not contain the current PromQL dashboard implementation.
 The supplied distribution has no source maps. This change therefore uses a small,
@@ -63,7 +63,34 @@ node --test scripts/test-community-ui.mjs
 
 The preparation tool verifies the original bytes and exact transformation counts
 before creating the output. A different Prism release or altered stock module
-fails closed and requires review of a new manifest. Source and output directories
+fails closed and requires review of a new manifest.
+
+Hashes and counts alone cannot detect a stale manifest: the upstream `build.zip`
+also contains hashed chunks from earlier Prism builds (the v3.2.5 archive still
+ships every v3.2.4 chunk), so patches to an old chunk verify but never run.
+Both the Rust build and the Node tool therefore also check that:
+
+- the manifest `version` names the pinned release (`prism-v3.2.5-...` for
+  `.../v3.2.5/build.zip`);
+- every patched file is reachable from `index.html` in the stock UI, following
+  `<script>`/`modulepreload` tags, static imports and re-exports, dynamic
+  `import()` calls, and the Vite `__vite__mapDeps` preload list;
+- every addition is reachable from `index.html` after patching; and
+- patches do not pull in a module the stock UI does not load, such as a stale
+  chunk named in an added import specifier.
+
+A failure names the unreachable or foreign files.
+
+When the pinned Prism release changes, port the manifest by locating the
+reachable successor of each patched chunk, re-deriving each `from` anchor, and
+renaming identifiers in `to` (the minifier renames them between builds). Export
+aliases used by added imports, such as `cr` for `setCreateAlertObjFromExisting`
+in the entry chunk, must be looked up again in the new build. The v3.2.5 port
+keeps all 62 replacements in the same 12 modules. In v3.2.5 the navigation user
+menu is bundled into `App` rather than a separate `nav-user` chunk, so the
+application error page uses that local component.
+
+Source and output directories
 must be separate; an existing output directory is never overwritten. The same
 manifest can be applied by the Rust build without installing Node.
 The standalone Node tool also writes a `community-ui-overlay.json` marker in its
@@ -78,14 +105,22 @@ entry reference that complete versioned graph. Changing either the manifest or
 helper changes all JavaScript URLs, preventing reuse of a cached stock module.
 Original filenames are not shipped, so tabs opened before a deploy must reload.
 
-Verification passed: fifteen Node tests cover capability fallback, disabled capability
+Verification passed: the Node tests cover capability fallback, disabled capability
 precedence, preview errors and unresolved datasets, bundled-name collision handling,
 unsupported assets, ambiguous edits, identity framing, and executable static/dynamic
-import graphs. Alert coverage includes capability independence, concrete dashboard
+import graphs, module reachability (including stale and foreign chunks), and the
+pinned release check. Alert coverage includes capability independence, concrete dashboard
 inputs, numeric conditions, hold edits preserving native targets, notification-free
 preview requests, No Data, unsupported result types, and backend error reporting. Rust and Node preparation produced identical bytes
-for all 647 shared output files. Docker COPY ordering and availability of the
+for all 844 shared output files of the v3.2.5 distribution. Docker COPY ordering and availability of the
 build inputs were checked; Docker images were not rebuilt.
+
+After the v3.2.5 port, headless Chromium against a local-store server with one
+OTLP gauge showed the classic Metrics Explore tab rendering the PromQL builder
+(metric discovered, raw query populated) from the versioned overlay module, with no
+page errors and no unversioned chunk requests. The stock v3.2.5 assets served against
+the same server showed the "Explore every metric with PromQL" Enterprise upsell.
+The checks below were made with the earlier v3.2.4 overlay.
 
 The live community service was also checked in the browser over its Tailscale URL.
 The metrics Explore builder discovered eight supported metric names in the real
