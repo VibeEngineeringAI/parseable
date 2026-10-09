@@ -11,6 +11,7 @@ export interface DialogProps {
   description?: string;
   children: ReactNode;
   className?: string;
+  dismissible?: boolean;
 }
 
 /** Shared modal anatomy; feature forms own submit and cancel actions. */
@@ -21,17 +22,29 @@ export function ModalFrame({
   description,
   children,
   className,
+  dismissible = true,
   side,
 }: DialogProps & { side?: 'right' }) {
   const returnFocus = useRef<HTMLElement | null>(null);
   return (
-    <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
+    <DialogPrimitive.Root
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (nextOpen || dismissible) onOpenChange(nextOpen);
+      }}
+    >
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="ui-dialog-overlay" />
         <DialogPrimitive.Content
           className={cx(side ? 'ui-sheet' : 'ui-dialog', className)}
           data-side={side}
           {...(!description ? { 'aria-describedby': undefined } : {})}
+          onEscapeKeyDown={(event) => {
+            if (!dismissible) event.preventDefault();
+          }}
+          onInteractOutside={(event) => {
+            if (!dismissible) event.preventDefault();
+          }}
           onOpenAutoFocus={() => {
             returnFocus.current =
               document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -53,7 +66,13 @@ export function ModalFrame({
               )}
             </div>
             <DialogPrimitive.Close asChild>
-              <Button size="icon" variant="ghost" aria-label="Close dialog" data-dialog-close>
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="Close dialog"
+                data-dialog-close
+                disabled={!dismissible}
+              >
                 <X size={18} aria-hidden="true" />
               </Button>
             </DialogPrimitive.Close>

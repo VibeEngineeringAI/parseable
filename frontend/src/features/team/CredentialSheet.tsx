@@ -41,6 +41,7 @@ export function CredentialSheet({
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
+      dismissible={!mutation.pending}
       title={native ? 'Create new user' : 'Add API key'}
       description={
         native ? 'Create a native user and assign roles.' : 'Choose a name and roles for this key.'

@@ -34,6 +34,7 @@ export function TypedConfirmDialog({
     <Dialog
       open={open}
       onOpenChange={onOpenChange}
+      dismissible={!pending}
       title={title}
       description={complete ? undefined : `Type ${name} to confirm.`}
     >

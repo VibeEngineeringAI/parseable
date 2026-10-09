@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 
 async function demo(page: Page, path = '/team') {
@@ -10,6 +10,11 @@ async function demo(page: Page, path = '/team') {
 const namedRow = (page: Page, name: string) =>
   page.getByRole('row').filter({ has: page.getByText(name, { exact: true }) });
 async function axe(page: Page) {
+  await page.locator('.ui-dialog, .ui-sheet, .ui-dialog-overlay').evaluateAll(async (elements) => {
+    await Promise.all(
+      elements.flatMap((element) => element.getAnimations().map((animation) => animation.finished)),
+    );
+  });
   expect(
     (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
       .violations,
@@ -578,34 +583,126 @@ test('Escape cancels typed deletion and returns focus to row actions', async ({ 
   await expect(opener).toBeFocused();
 });
 
-test('closing a pending creation cannot reveal its password in the next sheet', async ({
-  page,
-}) => {
-  await live(page);
-  let release = () => {};
-  const held = new Promise<void>((done) => {
-    release = done;
-  });
-  await page.route('**/api/v1/user/new-user', async (route) => {
-    await held;
-    await route.fulfill({ contentType: 'text/plain', body: 'late-test-password' });
-  });
-  await page.goto('/team?tab=user');
-  await page.getByRole('button', { name: 'Add user', exact: true }).click();
-  const sheet = page.getByRole('dialog', { name: 'Create new user', exact: true });
-  await sheet.getByLabel('Username', { exact: true }).fill('new-user');
-  await sheet.getByRole('checkbox', { name: 'readers', exact: true }).check();
-  const request = page.waitForRequest(
-    (entry) => entry.method() === 'POST' && entry.url().endsWith('/user/new-user'),
-  );
-  await sheet.locator('[data-dialog-confirm]').click();
-  await request;
+async function expectPendingDialog(page: Page, dialog: Locator) {
   await page.keyboard.press('Escape');
-  await expect(sheet).toHaveCount(0);
-  await page.getByRole('button', { name: 'Add user', exact: true }).click();
-  const response = page.waitForResponse((entry) => entry.url().endsWith('/user/new-user'));
-  release();
-  await response;
-  await expect(sheet.getByLabel('Username', { exact: true })).toHaveValue('');
-  await expect(sheet.getByLabel('One-time password')).toHaveCount(0);
-});
+  await expect(dialog).toBeVisible();
+  const close = dialog.getByRole('button', { name: 'Close dialog', exact: true });
+  await expect(close).toBeDisabled();
+  await close.click({ force: true });
+  await expect(dialog).toBeVisible();
+  await page.locator('.ui-dialog-overlay').click({ position: { x: 5, y: 5 } });
+  await expect(dialog).toBeVisible();
+}
+
+for (const kind of ['user', 'apikey']) {
+  test(`pending ${kind} creation keeps its secret visible until dismissed`, async ({ page }) => {
+    await live(page);
+    const native = kind === 'user';
+    const endpoint = native ? '/api/v1/user/new-user' : '/api/prism/v1/apikeys';
+    const secret = 'late-test-secret';
+    let release = () => {};
+    const held = new Promise<void>((done) => {
+      release = done;
+    });
+    await page.route(`**${endpoint}`, async (route) => {
+      if (route.request().method() !== 'POST') return route.fulfill({ json: [] });
+      await held;
+      await route.fulfill(
+        native
+          ? { contentType: 'text/plain', body: secret }
+          : {
+              json: {
+                keyId: 'new-key',
+                keyName: 'new-user',
+                apiKey: secret,
+                roles: ['readers'],
+                createdBy: 'admin',
+                createdAt: '2026-10-09T00:00:00Z',
+                modifiedAt: '2026-10-09T00:00:00Z',
+              },
+            },
+      );
+    });
+    await page.goto(`/team?tab=${native ? 'user' : 'apikeys'}`);
+    const opener = page.getByRole('button', {
+      name: native ? 'Add user' : 'Add API key',
+      exact: true,
+    });
+    await opener.click();
+    const sheet = page.getByRole('dialog', {
+      name: native ? 'Create new user' : 'Add API key',
+      exact: true,
+    });
+    const name = sheet.getByLabel(native ? 'Username' : 'API key name', { exact: true });
+    const result = sheet.getByLabel(native ? 'One-time password' : 'API key', { exact: true });
+    await name.fill('new-user');
+    await sheet.getByRole('checkbox', { name: 'readers', exact: true }).check();
+    const request = page.waitForRequest(
+      (entry) => entry.method() === 'POST' && entry.url().endsWith(endpoint),
+    );
+    await sheet.locator('[data-dialog-confirm]').click();
+    await request;
+    await expectPendingDialog(page, sheet);
+    release();
+    await expect(result).toHaveValue(secret);
+    await sheet.getByRole('button', { name: 'Done', exact: true }).click();
+    await expect(sheet).toHaveCount(0);
+    await opener.click();
+    await expect(name).toHaveValue('');
+    await expect(result).toHaveCount(0);
+  });
+}
+
+for (const fails of [false, true]) {
+  test(`pending password reset allows dismissal only after ${fails ? 'failure' : 'showing the password'}`, async ({
+    page,
+  }) => {
+    await live(page);
+    await page.route('**/api/v1/users', (route) =>
+      route.fulfill({
+        json: [
+          {
+            id: 'reset-user',
+            username: 'reset-user',
+            method: 'native',
+            roles: { readers: [] },
+            groupRoles: {},
+            userGroups: [],
+          },
+        ],
+      }),
+    );
+    let release = () => {};
+    const held = new Promise<void>((done) => {
+      release = done;
+    });
+    const endpoint = '/api/v1/user/reset-user/generate-new-password';
+    await page.route(`**${endpoint}`, async (route) => {
+      await held;
+      await route.fulfill({
+        status: fails ? 503 : 200,
+        contentType: 'text/plain',
+        body: fails ? 'Reset failed' : 'new-test-password',
+      });
+    });
+    await page.goto('/team?tab=user');
+    const opener = page.getByRole('button', { name: 'Reset password for reset-user', exact: true });
+    await opener.click();
+    const dialog = page.getByRole('dialog', { name: 'Reset password', exact: true });
+    await dialog.getByLabel('Confirmation name').fill('reset-user');
+    const request = page.waitForRequest((entry) => entry.url().endsWith(endpoint));
+    await dialog.locator('[data-dialog-confirm]').click();
+    await request;
+    await expect(dialog.getByRole('button', { name: 'Cancel', exact: true })).toBeDisabled();
+    await expectPendingDialog(page, dialog);
+    release();
+    if (fails) await expect(dialog.getByRole('alert')).toHaveText('Reset failed');
+    else await expect(dialog.getByLabel('One-time password')).toHaveValue('new-test-password');
+    await expect(dialog.getByRole('button', { name: 'Close dialog', exact: true })).toBeEnabled();
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await opener.click();
+    await expect(dialog.getByLabel('Confirmation name')).toHaveValue('');
+    await expect(dialog.getByLabel('One-time password')).toHaveCount(0);
+  });
+}
