@@ -11,10 +11,19 @@ function Example() {
       <ActionsMenu
         label="Actions for Host load"
         items={[
-          { label: 'Evaluate now', onSelect: () => setAction('Evaluation requested') },
-          { label: 'Disable', disabled: true, onSelect: () => {} },
-          { label: 'Mute…', onSelect: () => setAction('Mute selected') },
-          { label: 'Delete', destructive: true, onSelect: () => setAction('Delete selected') },
+          {
+            id: 'evaluate',
+            label: 'Evaluate now',
+            onSelect: () => setAction('Evaluation requested'),
+          },
+          { id: 'toggle', label: 'Disable', disabled: true, onSelect: () => setAction('Disabled') },
+          { id: 'mute', label: 'Mute…', onSelect: () => setAction('Mute selected') },
+          {
+            id: 'delete',
+            label: 'Delete',
+            destructive: true,
+            onSelect: () => setAction('Delete selected'),
+          },
         ]}
       />
       <button type="button">Next control</button>

@@ -9,6 +9,7 @@ import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
 import { matcher } from '../../lib/promql';
+import { alert as isAlert } from '../../lib/alertsContract';
 import type { Alert } from '../../lib/types';
 import { AlertPreview } from './AlertPreview';
 import { TagEditor } from './TagEditor';
@@ -32,8 +33,19 @@ export function AlertForm({ original }: { original?: Alert }) {
     [params] = useSearchParams();
   const about = useAsync(useCallback((signal) => client.about(signal), [client]));
   const canWrite = useAlertAccess();
-  const duplicate = location.state?.duplicate as Alert | undefined;
+  const duplicateValue: unknown = location.state?.duplicate;
+  const duplicate =
+    isAlert(duplicateValue) && duplicateValue.queryType !== 'builder' ? duplicateValue : undefined;
   const source = original ?? duplicate;
+  const promqlEnabled = about.data?.capabilities.promqlAlerts === true;
+  // Keep draft row IDs stable when the shell re-renders (for example on a theme change).
+  const initial = useMemo(
+    () =>
+      source
+        ? { ...alertDraft(source), title: duplicate ? `${source.title} (Copy)` : source.title }
+        : newAlertDraft(promqlEnabled, params),
+    [source, duplicate, promqlEnabled, params],
+  );
   return (
     <div className="page alerts-page">
       <PageHeader
@@ -41,6 +53,9 @@ export function AlertForm({ original }: { original?: Alert }) {
         description="Trigger a threshold rule for each query value."
       />
       <QueryState loading={about.loading} error={about.error} retry={about.reload} />
+      {duplicateValue !== undefined && !duplicate && (
+        <p className="notice">This alert cannot be duplicated. Create a new rule.</p>
+      )}
       {about.data &&
         (!canWrite ? (
           <EmptyState
@@ -57,15 +72,8 @@ export function AlertForm({ original }: { original?: Alert }) {
             key={source?.id ?? location.key}
             original={original}
             source={source}
-            promqlEnabled={about.data.capabilities.promqlAlerts === true}
-            initial={
-              source
-                ? {
-                    ...alertDraft(source),
-                    title: duplicate ? `${source.title} (Copy)` : source.title,
-                  }
-                : newAlertDraft(about.data.capabilities.promqlAlerts === true, params)
-            }
+            promqlEnabled={promqlEnabled}
+            initial={initial}
             onSaved={(id) => navigate(`/alerts/${encodeURIComponent(id)}`)}
           />
         ))}
@@ -89,7 +97,7 @@ function AlertFormFields({
   const { client } = useApp();
   const navigate = useNavigate();
   const [draft, setDraft] = useState(initial),
-    [touched, setTouched] = useState(false),
+    [status, setStatus] = useState(''),
     [newTarget, setNewTarget] = useState(false);
   const mutation = useMutation();
   const markSaved = useLeaveGuard(JSON.stringify(draft) !== JSON.stringify(initial));
@@ -147,7 +155,6 @@ function AlertFormFields({
     [client, draft.dataset],
   );
   function update<K extends keyof AlertDraft>(key: K, value: AlertDraft[K]) {
-    setTouched(true);
     setDraft((current) => ({ ...current, [key]: value }));
   }
   const datasetError =
@@ -183,7 +190,6 @@ function AlertFormFields({
       noValidate
       onSubmit={(event) => {
         event.preventDefault();
-        setTouched(true);
         if (!canSubmit) return;
         void mutation.run(async () => {
           const body = buildAlertPayload(draft, source);
@@ -227,7 +233,7 @@ function AlertFormFields({
                 label="Dataset"
                 value={draft.dataset}
                 disabled={Boolean(original) || mutation.pending}
-                error={touched || draft.dataset ? datasetError : undefined}
+                error={datasetError}
                 hint={
                   draft.type === 'promql'
                     ? 'Only OTLP metrics datasets support PromQL.'
@@ -274,7 +280,7 @@ function AlertFormFields({
                 value={draft.query}
                 onChange={(value) => update('query', value)}
                 metadata={draft.dataset ? metadata : undefined}
-                invalid={Boolean(touched && errors.query)}
+                invalid={Boolean(errors.query)}
                 describedBy={queryMessage}
                 readOnly={mutation.pending}
                 onRun={() => previewButton.current?.click()}
@@ -283,7 +289,7 @@ function AlertFormFields({
               <SqlEditor
                 value={draft.query}
                 onChange={(value) => update('query', value)}
-                invalid={Boolean(touched && errors.query)}
+                invalid={Boolean(errors.query)}
                 describedBy={queryMessage}
                 readOnly={mutation.pending}
                 onRun={() => previewButton.current?.click()}
@@ -291,10 +297,10 @@ function AlertFormFields({
             )}
             <p
               id={queryMessage}
-              className={touched && errors.query ? 'error-text' : 'muted'}
-              role={touched && errors.query ? 'alert' : undefined}
+              className={errors.query ? 'error-text' : 'muted'}
+              role={errors.query ? 'alert' : undefined}
             >
-              {touched && errors.query
+              {errors.query
                 ? errors.query
                 : draft.type === 'promql'
                   ? 'Use an instant-vector expression. Each series is evaluated independently.'
@@ -312,7 +318,7 @@ function AlertFormFields({
                 label="Threshold operator"
                 value={draft.operator}
                 disabled={mutation.pending}
-                error={touched ? errors.operator : undefined}
+                error={errors.operator}
                 onChange={(event) =>
                   update('operator', event.target.value as AlertDraft['operator'])
                 }
@@ -329,7 +335,7 @@ function AlertFormFields({
                 step="any"
                 value={draft.threshold}
                 disabled={mutation.pending}
-                error={touched ? errors.threshold : undefined}
+                error={errors.threshold}
                 onChange={(event) => update('threshold', event.target.value)}
               />
               <Input
@@ -340,7 +346,7 @@ function AlertFormFields({
                 step={1}
                 value={draft.frequency}
                 disabled={mutation.pending}
-                error={touched ? errors.frequency : undefined}
+                error={errors.frequency}
                 onChange={(event) => update('frequency', event.target.value)}
               />
               <Input
@@ -352,7 +358,7 @@ function AlertFormFields({
                     ? 'Required by the server; PromQL evaluates the current instant.'
                     : 'Query the last duration, for example 10m or 1h.'
                 }
-                error={touched ? errors.window : undefined}
+                error={errors.window}
                 onChange={(event) => update('window', event.target.value)}
               />
             </div>
@@ -363,7 +369,7 @@ function AlertFormFields({
                   value={draft.hold}
                   disabled={mutation.pending}
                   hint="Continuous breach duration; 0s fires immediately. Maximum 30 days."
-                  error={touched ? errors.hold : undefined}
+                  error={errors.hold}
                   onChange={(event) => update('hold', event.target.value)}
                 />
                 <p className="muted">
@@ -461,7 +467,7 @@ function AlertFormFields({
               label="Title"
               value={draft.title}
               disabled={mutation.pending}
-              error={touched ? errors.title : undefined}
+              error={errors.title}
               onChange={(event) => update('title', event.target.value)}
             />
             <Select
@@ -484,6 +490,9 @@ function AlertFormFields({
           </CardBody>
         </Card>
         <InlineError error={mutation.error} />
+        <p role="status" className="muted alerts-status">
+          {status}
+        </p>
         <div className="alerts-form-footer">
           {original?.queryType === 'promql' && (
             <p className="muted">
@@ -505,6 +514,7 @@ function AlertFormFields({
           </div>
         </div>
       </div>
+      {/* Changing query inputs clears stale preview results and cancels any pending request. */}
       <AlertPreview
         key={JSON.stringify([
           draft.type,
@@ -522,6 +532,7 @@ function AlertFormFields({
         <TargetSheet
           onClose={() => setNewTarget(false)}
           onSaved={(target) => {
+            setStatus(`${target.name}: Target created and selected.`);
             update('targets', [...draft.targets, target.id]);
             targets.reload();
           }}

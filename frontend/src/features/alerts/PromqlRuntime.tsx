@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Badge, Card, CardHeader, CardBody } from '../../components/ui';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { QueryState } from '../../components/explorer/QueryState';
@@ -23,10 +23,11 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
       [client, alert.datasets[0], alert.query, end],
     ),
   );
-  const chart = range.data && toChartSeries(range.data);
-  if (chart) {
+  const chart = useMemo(() => {
+    if (!range.data) return;
+    const chart = toChartSeries(range.data);
     const varying = varyingLabelKeys(chart.series.map((series) => series.metric));
-    chart.series = chart.series.map((series) => {
+    const series = chart.series.map((series) => {
       const labels = series.metric;
       const name = varying.length
         ? varying
@@ -42,7 +43,13 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
             .join(' · '));
       return { ...series, label: name || labels.__name__ || 'Expression' };
     });
-  }
+    return { ...chart, series };
+  }, [range.data]);
+  const thresholds = useMemo(
+    () => [{ value: alert.thresholdConfig.value, label: 'Threshold' }],
+    [alert.thresholdConfig.value],
+  );
+  const xRange = useMemo(() => [end - 3600, end] as const, [end]);
   const runtime = alert.promqlRuntime;
   const instances = Object.entries(runtime?.instances ?? {});
   const targetName = (id: string) =>
@@ -65,8 +72,8 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
               height={220}
               title="Expression over the last hour"
               showTitle={false}
-              xRange={[end - 3600, end]}
-              thresholds={[{ value: alert.thresholdConfig.value, label: 'Threshold' }]}
+              xRange={xRange}
+              thresholds={thresholds}
               timeZone="UTC"
               emptyMessage="No data for this expression in the last hour."
             />
@@ -94,7 +101,7 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                         : 'success'
                   }
                 >
-                  {runtime.health}
+                  {{ ok: 'OK', noData: 'No data', error: 'Error' }[runtime.health]}
                 </Badge>
                 <span data-testid="last-evaluated">
                   Last evaluated: <DateText value={runtime.lastEvaluatedAt} />
@@ -106,7 +113,12 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                 </p>
               )}
               {instances.length ? (
-                <div className="table-scroll">
+                <div
+                  className="table-scroll"
+                  role="region"
+                  aria-label="Alert instances"
+                  tabIndex={0}
+                >
                   <table>
                     <caption className="sr-only">Alert instances</caption>
                     <thead>
@@ -133,7 +145,11 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                                     : 'success'
                               }
                             >
-                              {instance.state}
+                              {
+                                { pending: 'Pending', firing: 'Firing', resolved: 'Resolved' }[
+                                  instance.state
+                                ]
+                              }
                             </Badge>
                           </td>
                           <td>{instance.value}</td>
@@ -149,12 +165,20 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                 <p className="muted">No alert instances</p>
               )}
               {runtime.deliveries.length > 0 && (
-                <div
-                  className="stack"
-                  role={runtime.deliveries.some((delivery) => delivery.error) ? 'alert' : undefined}
-                >
+                <div className="stack">
                   <h3>Notification deliveries</h3>
-                  <div className="table-scroll">
+                  {runtime.deliveries.some((delivery) => delivery.error) && (
+                    <p className="error-text">
+                      Some notifications could not be delivered. Check the attempts and errors
+                      below.
+                    </p>
+                  )}
+                  <div
+                    className="table-scroll"
+                    role="region"
+                    aria-label="Notification deliveries"
+                    tabIndex={0}
+                  >
                     <table>
                       <caption className="sr-only">Notification deliveries</caption>
                       <thead>
@@ -172,7 +196,7 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                           >
                             <td className="alerts-labels">
                               <LabelChips labels={delivery.labels} />
-                              <span>{delivery.firing ? 'firing' : 'resolved'}</span>
+                              <span>{delivery.firing ? 'Firing' : 'Resolved'}</span>
                             </td>
                             <td>{targetName(delivery.target)}</td>
                             <td>

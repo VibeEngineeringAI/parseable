@@ -10,10 +10,13 @@ async function demo(page: Page, path = '/team') {
 const namedRow = (page: Page, name: string) =>
   page.getByRole('row').filter({ has: page.getByText(name, { exact: true }) });
 async function axe(page: Page) {
-  await page.locator('.ui-dialog, .ui-sheet, .ui-dialog-overlay').evaluateAll(async (elements) => {
-    await Promise.all(
-      elements.flatMap((element) => element.getAnimations().map((animation) => animation.finished)),
-    );
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  // Disable caret loops and the global 0.01ms transitions for a settled axe snapshot.
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
   });
   expect(
     (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
@@ -435,6 +438,7 @@ for (const [tab, label] of [
     );
     await axe(page);
     await page.getByRole('button', { name: 'Use dark theme', exact: true }).click();
+    await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
     await axe(page);
   });
 }

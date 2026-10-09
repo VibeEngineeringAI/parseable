@@ -87,16 +87,9 @@ export function AlertsList({
           ))}
         </Select>
       </div>
-      {status && (
-        <p role="status" className="muted">
-          {status}
-        </p>
-      )}
-      {refreshing && (
-        <p role="status" className="muted">
-          Refreshing alerts…
-        </p>
-      )}
+      <p role="status" className="muted alerts-status">
+        {status || (refreshing ? 'Refreshing alerts…' : '')}
+      </p>
       {!rows.length ? (
         <EmptyState
           title="No alerts yet"

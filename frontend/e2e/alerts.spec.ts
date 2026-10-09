@@ -14,10 +14,13 @@ async function demo(page: Page, path = '/alerts') {
     await expect(page.getByRole('table', { name: 'Alerts', exact: true })).toBeVisible();
 }
 async function axe(page: Page) {
-  await page.locator('.ui-dialog, .ui-sheet, .ui-dialog-overlay').evaluateAll(async (elements) => {
-    await Promise.all(
-      elements.flatMap((element) => element.getAnimations().map((animation) => animation.finished)),
-    );
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  // Disable caret loops and the global 0.01ms transitions for a settled axe snapshot.
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
   });
   expect(
     (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
@@ -134,6 +137,16 @@ async function mocked(
       return route.fulfill({ json: current });
     }
     if (path === '/api/v1/query') return route.fulfill({ json: [{ total: 8 }] });
+    if (
+      path === `/api/v1/alerts/${current.id}/update_notification_state` &&
+      request.method() === 'PATCH'
+    ) {
+      current = {
+        ...current,
+        notificationState: body.state === 'notify' ? 'notify' : { mute: body.state },
+      };
+      return route.fulfill({ json: current });
+    }
     return route.fulfill({ status: 404, body: 'Not found' });
   });
   await page.route('**/prometheus/**', (route) => {
@@ -194,6 +207,9 @@ test('PromQL CRUD, inline target creation, preview, edit, duplicate and typed de
   await sheet.getByLabel('Endpoint URL').fill('https://example.com/alerts');
   await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
   await expect(page.getByRole('checkbox', { name: 'Inline hook', exact: true })).toBeChecked();
+  await expect(
+    page.getByRole('status').filter({ hasText: 'Inline hook: Target created and selected.' }),
+  ).toBeVisible();
   await page.getByRole('button', { name: 'Create alert', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Test threshold', exact: true })).toBeVisible();
   await expect(page.getByText('Inline hook', { exact: true })).toBeVisible();
@@ -237,7 +253,7 @@ test('SQL create and preview use the existing editor with optional targets', asy
       .nth(1)
       .getByRole('cell')
       .nth(1),
-  ).toHaveText(/^[1-9]\d*$/);
+  ).toHaveText(/^[1-9]\d*(?:\.00)?$/);
   await page.getByRole('button', { name: 'Create alert', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'SQL test', exact: true })).toBeVisible();
   await expect(page.getByText('SQL', { exact: true })).toBeVisible();
@@ -249,10 +265,15 @@ test('list menus evaluate, mute/unmute, disable/enable, and return focus after c
   await demo(page);
   const row = namedRow(page, 'High host load');
   const opener = row.getByRole('button', { name: 'Actions for High host load' });
+  const status = page.locator('section[aria-label="Alerts list"] > .alerts-status');
+  await expect(status).toBeAttached();
+  await expect(status).toHaveText('');
+  await status.evaluate((element) => element.setAttribute('data-live-region', 'existing'));
   await rowAction(page, 'High host load', 'Evaluate now');
   await expect(
     page.getByRole('status').filter({ hasText: 'High host load: Evaluation requested' }),
   ).toBeVisible();
+  await expect(status).toHaveAttribute('data-live-region', 'existing');
   await expect(opener).toBeFocused();
   await rowAction(page, 'High host load', 'Mute…');
   await page
@@ -260,7 +281,13 @@ test('list menus evaluate, mute/unmute, disable/enable, and return focus after c
     .getByRole('button', { name: 'Indefinitely', exact: true })
     .click();
   await expect(opener).toBeFocused();
+  await expect(row.locator('.alerts-muted')).toHaveAttribute('title', 'Muted indefinitely');
   await rowAction(page, 'High host load', 'Unmute');
+  await expect(row.locator('.alerts-muted')).toHaveCount(0);
+  await expect(
+    (await rowMenu(page, 'High host load')).getByRole('menuitem', { name: 'Mute…', exact: true }),
+  ).toBeEnabled();
+  await page.keyboard.press('Escape');
   await rowAction(page, 'High host load', 'Disable');
   const menu = await rowMenu(page, 'High host load');
   await expect(menu.getByRole('menuitem', { name: 'Evaluate now' })).toBeDisabled();
@@ -274,7 +301,10 @@ test('detail shows firing instances, delivery attempts, disabled banner and cust
   page,
 }) => {
   await demo(page, detailPath);
-  await expect(page.getByRole('table', { name: 'Alert instances' })).toContainText('firing');
+  const status = page.locator('.alerts-action-block > .alerts-status');
+  await expect(status).toHaveText('');
+  await status.evaluate((element) => element.setAttribute('data-live-region', 'existing'));
+  await expect(page.getByRole('table', { name: 'Alert instances' })).toContainText('Firing');
   await expect(page.getByRole('table', { name: 'Alert instances' }).getByRole('row')).toHaveCount(
     3,
   );
@@ -286,10 +316,16 @@ test('detail shows firing instances, delivery attempts, disabled banner and cust
   await dialog.getByLabel('Mute until (UTC)').fill('2099-01-01T12:00');
   await dialog.getByRole('button', { name: 'Mute until date' }).click();
   await expect(page.locator('.alerts-metadata')).toContainText('Muted until');
+  await expect(page.getByRole('button', { name: 'Unmute', exact: true })).toBeFocused();
+  await expect(status).toHaveText('Notifications muted.');
+  await expect(status).toHaveAttribute('data-live-region', 'existing');
   await page.getByRole('button', { name: 'Unmute', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Mute', exact: true })).toBeFocused();
   await page.getByRole('button', { name: 'Disable', exact: true }).click();
   await expect(page.getByText('This alert is disabled.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Enable', exact: true })).toBeFocused();
   await page.getByRole('button', { name: 'Enable', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disable', exact: true })).toBeFocused();
   await expect(page.getByRole('button', { name: 'Evaluate now', exact: true })).toBeEnabled();
 });
 test('builder rules are read-only with SQL and no Edit action', async ({ page }) => {
@@ -299,6 +335,7 @@ test('builder rules are read-only with SQL and no Edit action', async ({ page })
   ).toBeVisible();
   await expect(page.locator('.alerts-query')).toContainText('SELECT COUNT(*)');
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Duplicate', exact: true })).toHaveCount(0);
 });
 test('title search, tag filtering and sorting distinguish empty searches', async ({ page }) => {
   await demo(page);
@@ -320,6 +357,9 @@ test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the
   page,
 }) => {
   await demo(page, '/alerts/targets');
+  const status = page.locator('.alerts-page > .alerts-status');
+  await expect(status).toHaveText('');
+  await status.evaluate((element) => element.setAttribute('data-live-region', 'existing'));
   await page.getByRole('button', { name: 'New target', exact: true }).click();
   let sheet = page.getByRole('dialog', { name: 'New target', exact: true });
   await sheet.getByLabel('Target name').fill('Test hook');
@@ -329,6 +369,10 @@ test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the
   await sheet.getByLabel('Header 1 value').fill('header-secret');
   await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
   const row = namedRow(page, 'Test hook');
+  await expect(
+    page.getByRole('status').filter({ hasText: 'Test hook: Target created.' }),
+  ).toBeVisible();
+  await expect(status).toHaveAttribute('data-live-region', 'existing');
   await expect(row).toContainText('https://********');
   await expect(row).not.toContainText('secret-token');
   await rowAction(page, 'Test hook', 'Edit');
@@ -656,6 +700,202 @@ test('untouched tags with commas and whitespace round-trip through edit and dupl
   ).toBeVisible();
   expect(api.writes[1].tags).toEqual(tags);
 });
+
+test('tag inputs keep their identity, focus neighbours after removal, focus additions and omit blanks on save', async ({
+  page,
+}) => {
+  const api = await mocked(page, {
+    original: { ...alertFixture, tags: ['first', 'second', 'third'] },
+  });
+  await page.goto(`${detailPath}/edit`);
+  await page
+    .getByLabel('Tag 2', { exact: true })
+    .evaluate((element) => element.setAttribute('data-original', 'second'));
+  await page
+    .getByLabel('Tag 3', { exact: true })
+    .evaluate((element) => element.setAttribute('data-original', 'third'));
+  await page.getByRole('button', { name: 'Remove tag 1', exact: true }).click();
+  await expect(page.getByLabel('Tag 1', { exact: true })).toBeFocused();
+  await expect(page.getByLabel('Tag 1', { exact: true })).toHaveAttribute(
+    'data-original',
+    'second',
+  );
+  await expect(page.getByLabel('Tag 2', { exact: true })).toHaveAttribute('data-original', 'third');
+  await page.getByRole('button', { name: 'Remove tag 2', exact: true }).click();
+  await expect(page.getByLabel('Tag 1', { exact: true })).toBeFocused();
+  await page.getByRole('button', { name: 'Remove tag 1', exact: true }).click();
+  const add = page.getByRole('button', { name: 'Add tag', exact: true });
+  await expect(add).toBeFocused();
+  for (const [index, tag] of ['team,west', ' padded ', '', ' \t '].entries()) {
+    await add.click();
+    const input = page.getByLabel(`Tag ${index + 1}`, { exact: true });
+    await expect(input).toBeFocused();
+    await input.fill(tag);
+  }
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: alertFixture.title, exact: true })).toBeVisible();
+  expect(api.writes[0].tags).toEqual(['team,west', ' padded ']);
+});
+
+test('an untouched edit keeps tag inputs stable across theme changes and leaves without a dirty prompt', async ({
+  page,
+}) => {
+  await mocked(page);
+  let prompts = 0;
+  page.on('dialog', async (dialog) => {
+    prompts++;
+    await dialog.dismiss();
+  });
+  await page.goto(`${detailPath}/edit`);
+  const tag = page.getByLabel('Tag 1', { exact: true });
+  await expect(tag).toHaveValue('production');
+  await tag.evaluate((element) => element.setAttribute('data-retained', 'true'));
+  await page.getByRole('button', { name: 'Use dark theme', exact: true }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await expect(tag).toHaveAttribute('data-retained', 'true');
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(page).toHaveURL(detailPath);
+  expect(prompts).toBe(0);
+});
+
+test('header inputs focus additions, surviving neighbours and Add after the last removal', async ({
+  page,
+}) => {
+  await demo(page, '/alerts/targets');
+  await page.getByRole('button', { name: 'New target', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+  await expect(sheet.getByRole('button', { name: 'Create target', exact: true })).toBeDisabled();
+  await expect(sheet.getByLabel('Target name')).toHaveAccessibleDescription('Enter a target name.');
+  await expect(sheet.getByLabel('Endpoint URL')).toHaveAccessibleDescription(
+    /Enter a complete HTTP or HTTPS endpoint URL\./,
+  );
+  const add = sheet.getByRole('button', { name: 'Add header', exact: true });
+  for (let index = 1; index <= 3; index++) {
+    await add.click();
+    await expect(sheet.getByLabel(`Header ${index} name`, { exact: true })).toBeFocused();
+    await sheet.getByLabel(`Header ${index} name`, { exact: true }).fill(`X-${index}`);
+    await sheet.getByLabel(`Header ${index} value`, { exact: true }).fill(String(index));
+  }
+  await sheet
+    .getByLabel('Header 2 name', { exact: true })
+    .evaluate((element) => element.setAttribute('data-original', 'second'));
+  await sheet.getByRole('button', { name: 'Remove header 1', exact: true }).click();
+  await expect(sheet.getByLabel('Header 1 name', { exact: true })).toBeFocused();
+  await expect(sheet.getByLabel('Header 1 name', { exact: true })).toHaveAttribute(
+    'data-original',
+    'second',
+  );
+  await sheet.getByRole('button', { name: 'Remove header 2', exact: true }).click();
+  await expect(sheet.getByLabel('Header 1 name', { exact: true })).toBeFocused();
+  await sheet.getByRole('button', { name: 'Remove header 1', exact: true }).click();
+  await expect(add).toBeFocused();
+});
+
+test('trailing-slash alert routes reach the intended list, targets, form, detail and edit views', async ({
+  page,
+}) => {
+  const api = await mocked(page);
+  for (const [path, title] of [
+    ['/alerts/', 'Alerts'],
+    ['/alerts/targets/', 'Alert targets'],
+    ['/alerts/new/', 'New alert'],
+    [`${detailPath}/`, alertFixture.title],
+    [`${detailPath}/edit/`, 'Edit alert'],
+  ]) {
+    await page.goto(path);
+    await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  }
+  await expect(page.getByRole('button', { name: 'Save alert', exact: true })).toBeEnabled();
+  expect(
+    api.calls.some(({ path }) => ['/api/v1/alerts/targets', '/api/v1/alerts/new'].includes(path)),
+  ).toBe(false);
+});
+
+for (const type of ['sql', 'code'])
+  test(`${type} handoff selects SQL and saves the prefilled query`, async ({ page }) => {
+    const api = await mocked(page);
+    const query = 'SELECT COUNT(*) FROM "logs"';
+    await page.goto(
+      `/alerts/new?${new URLSearchParams({ queryBuilderType: type, dataset: 'logs', alertQuery: query, title: 'SQL handoff' })}`,
+    );
+    await expect(page.getByLabel('Alert type')).toHaveValue('code');
+    await expect(page.getByRole('textbox', { name: 'SQL query', exact: true })).toHaveText(query);
+    await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'SQL handoff', exact: true })).toBeVisible();
+    expect(api.writes[0]).toMatchObject({ queryType: 'code', query, datasets: ['logs'] });
+  });
+
+test('an untouched invalid handoff and blank new form explain why Create is disabled', async ({
+  page,
+}) => {
+  await mocked(page);
+  await page.goto(
+    `/alerts/new?${new URLSearchParams({ dataset: 'metrics', alertQuery: 'sum by (host.name) (up)', title: 'Invalid handoff' })}`,
+  );
+  await expect(page.getByRole('button', { name: 'Create alert', exact: true })).toBeDisabled();
+  await expect(page.getByRole('textbox', { name: 'PromQL query', exact: true })).toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await expect(
+    page.getByRole('textbox', { name: 'PromQL query', exact: true }),
+  ).toHaveAccessibleDescription('Enter a valid PromQL expression.');
+  await expect(page.getByText('Enter a valid PromQL expression.', { exact: true })).toBeVisible();
+  await page.goto('/alerts/new');
+  await expect(page.getByLabel('Title', { exact: true })).toHaveAccessibleDescription(
+    'Enter an alert title.',
+  );
+  await expect(page.getByLabel('Dataset', { exact: true })).toHaveAccessibleDescription(
+    /Select a dataset\./,
+  );
+  await expect(
+    page.getByRole('textbox', { name: 'PromQL query', exact: true }),
+  ).toHaveAccessibleDescription('Enter a query.');
+});
+
+for (const duplicate of [
+  { id: 'stale', title: 'Stale' },
+  { ...alertFixture, queryType: 'builder' },
+])
+  test(`invalid or builder duplicate history is ignored safely: ${duplicate.id}`, async ({
+    page,
+  }) => {
+    await mocked(page);
+    await page.addInitScript((duplicate) => {
+      history.replaceState({ ...history.state, usr: { duplicate } }, '');
+    }, duplicate);
+    await page.goto('/alerts/new');
+    await expect(
+      page.getByText('This alert cannot be duplicated. Create a new rule.', { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByLabel('Title', { exact: true })).toHaveValue('');
+    await expect(page.getByRole('button', { name: 'Create alert', exact: true })).toBeDisabled();
+  });
+
+test('editing an alert preserves server-accepted long duration aliases unchanged', async ({
+  page,
+}) => {
+  const api = await mocked(page, {
+    original: {
+      ...alertFixture,
+      evalConfig: {
+        rollingWindow: { ...alertFixture.evalConfig.rollingWindow, evalStart: '10mins' },
+      },
+      promqlConfig: { holdDuration: '2hrs' },
+    },
+  });
+  await page.goto(`${detailPath}/edit`);
+  await expect(page.getByLabel('Evaluation window')).toHaveValue('10mins');
+  await expect(page.getByLabel('Hold duration')).toHaveValue('2hrs');
+  await expect(page.getByRole('button', { name: 'Save alert', exact: true })).toBeEnabled();
+  await page.getByLabel('Threshold value').fill('4');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: alertFixture.title, exact: true })).toBeVisible();
+  expect(api.writes[0]).toMatchObject({
+    evalConfig: { rollingWindow: { evalStart: '10mins' } },
+    promqlConfig: { holdDuration: '2hrs' },
+  });
+});
 test('deleting alert rows focuses the next row, previous row, then search for an empty list', async ({
   page,
 }) => {
@@ -715,6 +955,140 @@ test('delivery errors redact credential-bearing URLs', async ({ page }) => {
   const deliveries = page.getByRole('table', { name: 'Notification deliveries' });
   await expect(deliveries).toContainText('[redacted endpoint]');
   await expect(deliveries).not.toContainText('secret-token');
+  await expect(deliveries.locator('xpath=ancestor::*[@role="alert"]')).toHaveCount(0);
+});
+
+for (const health of ['ok', 'noData', 'error'] as const)
+  test(`runtime health ${health} and every instance/delivery state use human labels`, async ({
+    page,
+  }) => {
+    const runtime = alertFixture.promqlRuntime!;
+    await mocked(page, {
+      original: {
+        ...alertFixture,
+        promqlRuntime: {
+          ...runtime,
+          health,
+          instances: Object.fromEntries(
+            ['pending', 'firing', 'resolved'].map((state) => [
+              state,
+              { ...runtime.instances.a, state },
+            ]),
+          ),
+          deliveries: [
+            { ...runtime.deliveries[0], firing: true },
+            { ...runtime.deliveries[0], firing: false },
+          ],
+        },
+      } as Alert,
+    });
+    await page.goto(detailPath);
+    const card = page
+      .locator('.ui-card')
+      .filter({ has: page.getByRole('heading', { name: 'PromQL runtime', exact: true }) });
+    await expect(card.locator('.inline > .ui-badge')).toHaveText(
+      { ok: 'OK', noData: 'No data', error: 'Error' }[health],
+    );
+    await expect(
+      page
+        .getByRole('table', { name: 'Alert instances' })
+        .locator('tbody td:nth-child(2) .ui-badge'),
+    ).toHaveText(['Pending', 'Firing', 'Resolved']);
+    await expect(
+      page
+        .getByRole('table', { name: 'Notification deliveries' })
+        .locator('tbody td:first-child > span'),
+    ).toHaveText(['Firing', 'Resolved']);
+  });
+
+for (const type of ['promql', 'code'])
+  test(`${type} preview rounds displayed values, preserves raw values and announces completion in an existing region`, async ({
+    page,
+  }) => {
+    await mocked(page);
+    const value = 0.6462820502768744;
+    await page.route('**/prometheus/api/v1/query', (route) =>
+      route.fulfill({
+        json: {
+          status: 'success',
+          data: {
+            resultType: 'vector',
+            result: [{ metric: { host: 'node-a' }, value: [1, String(value)] }],
+          },
+        },
+      }),
+    );
+    await page.route(
+      (url) => url.pathname === '/api/v1/query',
+      (route) => route.fulfill({ json: [{ total: value }] }),
+    );
+    await page.goto(
+      `/alerts/new?${new URLSearchParams({ queryBuilderType: type, dataset: type === 'promql' ? 'metrics' : 'logs', alertQuery: type === 'promql' ? 'up' : 'SELECT SUM(total) FROM "logs"', title: 'Rounded preview' })}`,
+    );
+    const status = page.locator('.alerts-preview [role="status"]');
+    await expect(status).toHaveText('');
+    await status.evaluate((element) => element.setAttribute('data-live-region', 'existing'));
+    await page.getByRole('button', { name: /^Preview .*\(no notifications\)$/ }).click();
+    const cell = page
+      .getByRole('table', { name: 'Preview values' })
+      .locator('tbody td:nth-child(2)');
+    await expect(cell).toHaveText('0.6463');
+    await expect(cell).toHaveAttribute('title', String(value));
+    await expect(status).toHaveText(
+      `Preview completed: 1 ${type === 'promql' ? 'series' : 'rows'}. No notifications sent.`,
+    );
+    await expect(status).toHaveAttribute('data-live-region', 'existing');
+  });
+
+test('runtime and preview tables can be scrolled by keyboard and pass axe at 390px', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await demo(page, detailPath);
+  for (const name of ['Alert instances', 'Notification deliveries']) {
+    const region = page.getByRole('region', { name, exact: true });
+    await expect(region).toHaveAttribute('tabindex', '0');
+    expect(await region.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(
+      true,
+    );
+    await region.focus();
+    await expect(region).toBeFocused();
+    await region.press('ArrowRight');
+    await expect.poll(() => region.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+  }
+  await axe(page);
+  await page.getByRole('button', { name: 'Duplicate', exact: true }).click();
+  await page
+    .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
+    .click();
+  const preview = page.getByRole('region', { name: 'Preview values', exact: true });
+  await expect(preview).toHaveAttribute('tabindex', '0');
+  expect(await preview.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+  await preview.focus();
+  await preview.press('ArrowRight');
+  await expect.poll(() => preview.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+  await axe(page);
+});
+
+test('all Tags chips fit their cell at 1024px without being obscured by Actions', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1024, height: 844 });
+  await demo(page);
+  const row = namedRow(page, 'High host load');
+  await expect(row.locator('td:nth-child(6) .ui-badge')).toHaveText(['production', 'metrics']);
+  const region = page.getByRole('region', { name: 'Alerts table' });
+  await region.evaluate((element) => {
+    element.scrollLeft = element.scrollWidth;
+  });
+  const tags = (await row.locator('td:nth-child(6)').boundingBox())!;
+  const actions = (await row.locator('td:last-child').boundingBox())!;
+  for (const chip of await row.locator('td:nth-child(6) .ui-badge').all()) {
+    const box = (await chip.boundingBox())!;
+    expect(box.x).toBeGreaterThanOrEqual(tags.x);
+    expect(box.x + box.width).toBeLessThanOrEqual(tags.x + tags.width);
+    expect(box.x + box.width).toBeLessThanOrEqual(actions.x);
+  }
 });
 test('detail, preview and target sheet have padded cards, readable labels, UTC times and aligned fields', async ({
   page,
@@ -746,14 +1120,26 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   ).toBeVisible();
   await expect(page.locator('.charts-title')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'host-a', exact: true })).toBeVisible();
+  const plot = page.locator('.uplot');
+  await expect(plot).toBeVisible();
+  await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
+  await page.getByRole('button', { name: 'Mute', exact: true }).click();
+  await page
+    .getByRole('dialog', { name: 'Mute notifications' })
+    .getByRole('button', { name: 'Indefinitely', exact: true })
+    .click();
+  await expect(page.getByRole('button', { name: 'Unmute', exact: true })).toBeVisible();
+  await expect(plot).toHaveAttribute('data-retained', 'true');
   await expect(
     page.getByRole('table', { name: 'Alert instances' }).locator('.alerts-label-chip'),
   ).toHaveText('host=node-a');
   await expect(
     page.getByRole('table', { name: 'Notification deliveries' }).locator('.alerts-label-chip'),
   ).toHaveText('host=node-a');
+  await expect(page.locator('.alerts-page time').first()).toBeVisible();
   for (const time of await page.locator('.alerts-page time').all())
     await expect(time).toHaveText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$/);
+  await expect(page.locator('.ui-card-body').first()).toBeVisible();
   for (const body of await page.locator('.ui-card-body').all())
     expect(
       await body.evaluate((element) => parseFloat(getComputedStyle(element).paddingLeft)),
@@ -811,6 +1197,9 @@ test('preview never evaluates a saved rule, clears stale results and shows No da
     .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
     .click();
   await expect(page.getByRole('heading', { name: 'No data', exact: true })).toBeVisible();
+  await expect(page.locator('.alerts-preview [role="status"]')).toHaveText(
+    'Preview completed: No data. No notifications sent.',
+  );
   expect(queries).toBe(2);
   expect(api.writes).toHaveLength(0);
   expect(api.calls.some((call) => call.path.endsWith('/evaluate_alert'))).toBe(false);
@@ -903,7 +1292,10 @@ for (const theme of ['light', 'dark'])
               ? '/alerts/new'
               : '/alerts/targets';
       await demo(page, path);
-      if (theme === 'dark') await page.getByRole('button', { name: 'Use dark theme' }).click();
+      if (theme === 'dark') {
+        await page.getByRole('button', { name: 'Use dark theme' }).click();
+        await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+      }
       if (view === 'sheet') {
         await page.getByRole('button', { name: 'New target', exact: true }).click();
         await expect(page.getByRole('dialog', { name: 'New target', exact: true })).toBeVisible();

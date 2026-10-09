@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import type { Meta, StoryObj } from '@storybook/react-vite';
 import { TimeSeriesChart, type ChartSeries, type TimeSeriesChartProps } from './TimeSeriesChart';
 
@@ -20,6 +20,25 @@ function DarkChart(args: TimeSeriesChartProps) {
     };
   }, []);
   return <TimeSeriesChart {...args} />;
+}
+
+function RerenderingChart(args: TimeSeriesChartProps) {
+  const [revision, setRevision] = useState(0);
+  const [threshold, setThreshold] = useState(2);
+  const [end, setEnd] = useState(timestamps[0] + 3000);
+  return (
+    <>
+      <button onClick={() => setRevision((value) => value + 1)}>Render again</button>
+      <button onClick={() => setThreshold((value) => value + 1)}>Raise threshold</button>
+      <button onClick={() => setEnd((value) => value + 600)}>Extend range</button>
+      <p role="status">Render {revision}</p>
+      <TimeSeriesChart
+        {...args}
+        thresholds={[{ value: threshold, label: 'Threshold' }]}
+        xRange={[timestamps[0] - 600, end]}
+      />
+    </>
+  );
 }
 
 const meta = {
@@ -76,6 +95,7 @@ export const GapsAndNaN: Story = {
 };
 export const Empty: Story = { args: { timestamps: [], series: [] } };
 export const DarkTheme: Story = { render: (args) => <DarkChart {...args} /> };
+export const Rerendering: Story = { render: (args) => <RerenderingChart {...args} /> };
 export const WithThresholds: Story = {
   args: {
     series: [

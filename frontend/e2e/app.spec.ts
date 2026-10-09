@@ -186,6 +186,14 @@ test('library dialogs restore focus, contain keyboard navigation, and tabs use a
   await expect(page.getByRole('tabpanel')).toContainText('Each panel has a clear purpose.');
   await page.getByRole('button', { name: 'Use dark theme' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  // Disable caret loops and the global 0.01ms transitions for a settled axe snapshot.
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+  });
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21aa'])
     .analyze();
@@ -277,6 +285,15 @@ test('dark SQL editor retains accessible syntax contrast', async ({ page }) => {
   await demo(page, '/sql-editor');
   await page.getByRole('textbox', { name: 'SQL query' }).waitFor();
   await page.getByRole('button', { name: 'Use dark theme' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  // Disable caret loops and the global 0.01ms transitions for a settled axe snapshot.
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+  });
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21aa'])
     .analyze();

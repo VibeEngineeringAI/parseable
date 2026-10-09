@@ -4,10 +4,16 @@ import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { parseSampleValue } from '../../lib/promql';
+import { formatChartValue } from '../../components/charts/format';
 import { LabelChips } from './LabelChips';
 import { compareThreshold, type AlertDraft } from './helpers';
 
-type PreviewRow = { labels: Record<string, string>; value: number | string; breached?: boolean };
+type PreviewRow = {
+  labels: Record<string, string>;
+  value: number | string;
+  rawValue?: string;
+  breached?: boolean;
+};
 export function AlertPreview({
   draft,
   disabled,
@@ -47,15 +53,16 @@ export function AlertPreview({
           { sql: snapshot.query, startTime: snapshot.window.trim(), endTime: 'now' },
           signal,
         );
-        return rows.map((row) => ({
-          labels: Object.fromEntries(
-            Object.entries(row).map(([key, value]) => [key, String(value)]),
-          ),
-          value:
-            Object.values(row)
-              .filter((value) => typeof value === 'number')
-              .join(', ') || 'No numeric values',
-        }));
+        return rows.map((row) => {
+          const values = Object.values(row).filter((value) => typeof value === 'number');
+          return {
+            labels: Object.fromEntries(
+              Object.entries(row).map(([key, value]) => [key, String(value)]),
+            ),
+            value: values.map(formatChartValue).join(', ') || 'No numeric values',
+            rawValue: values.join(', '),
+          };
+        });
       },
       [client, snapshot],
     ),
@@ -83,10 +90,15 @@ export function AlertPreview({
         {snapshot && (
           <QueryState loading={result.loading} error={result.error} retry={result.reload} />
         )}
+        <p role="status" className="muted alerts-status">
+          {snapshot && result.data
+            ? `Preview completed: ${result.data.length ? `${result.data.length} ${draft.type === 'promql' ? 'series' : 'rows'}` : 'No data'}. No notifications sent.`
+            : ''}
+        </p>
         {snapshot &&
           result.data &&
           (result.data.length ? (
-            <div className="table-scroll">
+            <div className="table-scroll" role="region" aria-label="Preview values" tabIndex={0}>
               <table>
                 <caption className="sr-only">Preview values</caption>
                 <thead>
@@ -102,7 +114,9 @@ export function AlertPreview({
                       <td className="alerts-labels">
                         <LabelChips labels={row.labels} />
                       </td>
-                      <td>{row.value}</td>
+                      <td title={row.rawValue ?? String(row.value)}>
+                        {typeof row.value === 'number' ? formatChartValue(row.value) : row.value}
+                      </td>
                       {draft.type === 'promql' && (
                         <td>
                           <Badge tone={row.breached ? 'danger' : 'success'}>

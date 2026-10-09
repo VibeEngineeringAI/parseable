@@ -25,6 +25,7 @@ export function TargetsPage() {
     canWrite = useAlertAccess();
   const targets = useCollection(useCallback((signal) => client.listAlertTargets(signal), [client]));
   const [search, setSearch] = useState(''),
+    [status, setStatus] = useState(''),
     [creating, setCreating] = useState(false),
     [editing, setEditing] = useState<AlertTarget>(),
     [removing, setRemoving] = useState<AlertTarget>();
@@ -89,11 +90,9 @@ export function TargetsPage() {
         error={targets.error}
         retry={targets.reload}
       />
-      {targets.loading && targets.data && (
-        <p role="status" className="muted">
-          Refreshing targets…
-        </p>
-      )}
+      <p role="status" className="muted alerts-status">
+        {status || (targets.loading && targets.data ? 'Refreshing targets…' : '')}
+      </p>
       {targets.data &&
         (!targets.data.length ? (
           <EmptyState
@@ -172,11 +171,13 @@ export function TargetsPage() {
                               data-row-action={target.id}
                               items={[
                                 {
+                                  id: 'edit',
                                   label: 'Edit',
                                   onSelect: () => setEditing(target),
                                   disabled: mutation.pending,
                                 },
                                 {
+                                  id: 'delete',
                                   label: 'Delete',
                                   destructive: true,
                                   disabled: mutation.pending,
@@ -206,7 +207,10 @@ export function TargetsPage() {
             setCreating(false);
             setEditing(undefined);
           }}
-          onSaved={targets.reload}
+          onSaved={(target) => {
+            setStatus(`${target.name}: Target ${editing ? 'saved' : 'created'}.`);
+            targets.reload();
+          }}
         />
       )}
       {removing && (

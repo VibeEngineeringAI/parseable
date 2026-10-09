@@ -84,7 +84,9 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
       threshold: queryType === 'promql' ? '1' : '5',
       frequency: queryType === 'promql' ? '1' : '5',
       targets: [target1],
-      tags: queryType === 'promql' ? ['production', 'metrics'] : ['production', 'logs'],
+      tags: (queryType === 'promql' ? ['production', 'metrics'] : ['production', 'logs']).map(
+        (value) => ({ id: createId(), value }),
+      ),
       hold: '5m',
     }),
     queryType,

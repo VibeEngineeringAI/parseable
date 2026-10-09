@@ -134,13 +134,13 @@ test('requested range leaves space before and after samples without repeating a 
   const plot = (await page.locator('.u-over').boundingBox())!;
   // The first sample is 10 minutes into the requested hour; the last is 21 minutes in.
   // Cursor positions verify the actual x scale, rather than only its accessible label.
-  expect(Math.abs((await cursor.boundingBox())!.x - plot.x - plot.width / 6)).toBeLessThanOrEqual(
-    1,
-  );
+  await expect
+    .poll(async () => Math.abs((await cursor.boundingBox())!.x - plot.x - plot.width / 6))
+    .toBeLessThanOrEqual(1);
   for (let index = 0; index < 11; index++) await chart.press('ArrowRight');
-  expect(
-    Math.abs((await cursor.boundingBox())!.x - plot.x - plot.width * 0.35),
-  ).toBeLessThanOrEqual(1);
+  await expect
+    .poll(async () => Math.abs((await cursor.boundingBox())!.x - plot.x - plot.width * 0.35))
+    .toBeLessThanOrEqual(1);
   await expect(page.getByRole('tooltip').locator('time')).toHaveAttribute(
     'datetime',
     new Date((1_700_000_000 + 660) * 1000).toISOString(),
@@ -213,12 +213,31 @@ test('empty chart reserves its height and shows No data', async ({ page }) => {
   await expect(page.locator('canvas')).toHaveCount(0);
 });
 
+test('inline thresholds and ranges retain the plot across renders and update when their values change', async ({
+  page,
+}) => {
+  await story(page, 'timeserieschart', 'rerendering');
+  const plot = page.locator('.uplot');
+  await expect(plot).toBeVisible();
+  await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
+  await page.getByRole('button', { name: 'Render again' }).click();
+  await expect(page.getByRole('status')).toHaveText('Render 1');
+  await expect(plot).toHaveAttribute('data-retained', 'true');
+  await page.getByRole('button', { name: 'Raise threshold' }).click();
+  await expect(page.locator('.charts-thresholds')).toHaveText('Threshold: 3.00');
+  await expect(plot).not.toHaveAttribute('data-retained');
+  await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
+  await page.getByRole('button', { name: 'Extend range' }).click();
+  await expect(plot).not.toHaveAttribute('data-retained');
+});
+
 for (const [component, name] of [
   ['promqleditor', 'empty'],
   ['promqleditor', 'with-metadata'],
   ['promqleditor', 'invalid'],
   ['timeserieschart', 'three-series'],
   ['timeserieschart', 'requested-range'],
+  ['timeserieschart', 'with-thresholds'],
   ['timeserieschart', 'many-series'],
   ['timeserieschart', 'gaps-and-na-n'],
   ['timeserieschart', 'empty'],
@@ -232,3 +251,19 @@ for (const [component, name] of [
     expect(result.violations).toEqual([]);
   });
 }
+
+test('WCAG accessibility: timeserieschart/with-thresholds in dark', async ({ page }) => {
+  await story(page, 'timeserieschart', 'with-thresholds');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = 'dark';
+  });
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+  });
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
+});

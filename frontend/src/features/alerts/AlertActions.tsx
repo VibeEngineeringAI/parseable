@@ -48,47 +48,47 @@ export function AlertActions({
     });
   }
   if (!canWrite) return <span className="muted">Read-only</span>;
-  const items: ActionsMenuItem[] = [
-    {
-      label: 'Evaluate now',
-      disabled: mutation.pending || alert.state === 'disabled',
-      onSelect: () =>
-        run(
-          () => client.evaluateAlert(alert.id),
-          'Evaluation requested. Results refresh shortly.',
-          true,
-        ),
+  const evaluate: ActionsMenuItem = {
+    id: 'evaluate',
+    label: 'Evaluate now',
+    disabled: mutation.pending || alert.state === 'disabled',
+    onSelect: () =>
+      run(
+        () => client.evaluateAlert(alert.id),
+        'Evaluation requested. Results refresh shortly.',
+        true,
+      ),
+  };
+  const toggle: ActionsMenuItem = {
+    id: 'toggle',
+    label: alert.state === 'disabled' ? 'Enable' : 'Disable',
+    disabled: mutation.pending,
+    onSelect: () =>
+      run(
+        () =>
+          alert.state === 'disabled' ? client.enableAlert(alert.id) : client.disableAlert(alert.id),
+        alert.state === 'disabled' ? 'Alert enabled.' : 'Alert disabled.',
+      ),
+  };
+  const mute: ActionsMenuItem = {
+    id: 'mute',
+    label: muted ? 'Unmute' : 'Mute…',
+    disabled: mutation.pending,
+    onSelect: () =>
+      muted
+        ? run(() => client.muteAlert(alert.id, 'notify'), 'Notifications unmuted.')
+        : setMuting(true),
+  };
+  const remove: ActionsMenuItem = {
+    id: 'delete',
+    label: 'Delete',
+    destructive: true,
+    disabled: mutation.pending,
+    onSelect: () => {
+      mutation.reset();
+      setRemoving(true);
     },
-    {
-      label: alert.state === 'disabled' ? 'Enable' : 'Disable',
-      disabled: mutation.pending,
-      onSelect: () =>
-        run(
-          () =>
-            alert.state === 'disabled'
-              ? client.enableAlert(alert.id)
-              : client.disableAlert(alert.id),
-          alert.state === 'disabled' ? 'Alert enabled.' : 'Alert disabled.',
-        ),
-    },
-    {
-      label: muted ? 'Unmute' : 'Mute…',
-      disabled: mutation.pending,
-      onSelect: () =>
-        muted
-          ? run(() => client.muteAlert(alert.id, 'notify'), 'Notifications unmuted.')
-          : setMuting(true),
-    },
-    {
-      label: 'Delete',
-      destructive: true,
-      disabled: mutation.pending,
-      onSelect: () => {
-        mutation.reset();
-        setRemoving(true);
-      },
-    },
-  ];
+  };
   return (
     <div className="alerts-action-block">
       {detail ? (
@@ -102,42 +102,40 @@ export function AlertActions({
               Edit
             </Button>
           )}
-          {items.slice(0, 3).map((item) => (
-            <Button key={item.label} size="sm" disabled={item.disabled} onClick={item.onSelect}>
-              {item.label === 'Mute…' ? 'Mute' : item.label}
+          {[evaluate, toggle, { ...mute, label: muted ? 'Unmute' : 'Mute' }].map((item) => (
+            <Button key={item.id} size="sm" disabled={item.disabled} onClick={item.onSelect}>
+              {item.label}
             </Button>
           ))}
-          <Button
-            size="sm"
-            disabled={mutation.pending}
-            onClick={() => {
-              void mutation.run(async () => {
-                const source = await client.getAlert(alert.id);
-                if (mutation.isActive()) navigate('/alerts/new', { state: { duplicate: source } });
-              });
-            }}
-          >
-            Duplicate
-          </Button>
-          <Button
-            size="sm"
-            variant="danger"
-            disabled={mutation.pending}
-            onClick={items[3].onSelect}
-          >
+          {alert.queryType !== 'builder' && (
+            <Button
+              size="sm"
+              disabled={mutation.pending}
+              onClick={() => {
+                void mutation.run(async () => {
+                  const source = await client.getAlert(alert.id);
+                  if (mutation.isActive())
+                    navigate('/alerts/new', { state: { duplicate: source } });
+                });
+              }}
+            >
+              Duplicate
+            </Button>
+          )}
+          <Button size="sm" variant="danger" disabled={mutation.pending} onClick={remove.onSelect}>
             Delete
           </Button>
         </div>
       ) : (
         <ActionsMenu
           label={`Actions for ${alert.title}`}
-          items={items}
+          items={[evaluate, toggle, mute, remove]}
           data-row-action={alert.id}
         />
       )}
       {!removing && <InlineError error={mutation.error} />}
-      {status && (
-        <p role="status" className="muted">
+      {detail && (
+        <p role="status" className="muted alerts-status">
           {status}
         </p>
       )}

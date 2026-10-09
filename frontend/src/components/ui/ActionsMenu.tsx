@@ -4,6 +4,7 @@ import { MoreHorizontal } from 'lucide-react';
 import { Button, type ButtonProps } from './Button';
 
 export type ActionsMenuItem = {
+  id: string;
   label: string;
   onSelect: () => void;
   disabled?: boolean;
@@ -149,7 +150,7 @@ export function ActionsMenu({
           >
             {items.map((item) => (
               <button
-                key={item.label}
+                key={item.id}
                 type="button"
                 role="menuitem"
                 tabIndex={-1}

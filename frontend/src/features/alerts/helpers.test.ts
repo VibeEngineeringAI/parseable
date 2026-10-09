@@ -18,6 +18,7 @@ import {
 } from './helpers';
 import { buildTargetPayload, targetDraft, targetType, validateTarget } from './targetHelpers';
 import type { Alert, AlertSummary, ParseableClient } from '../../lib/types';
+import humantime from './__fixtures__/humantime.json';
 
 const draft = (): AlertDraft => ({
   ...newAlertDraft(true),
@@ -74,7 +75,7 @@ describe('alert forms and payloads', () => {
   });
   it('defaults and round-trips hold duration, preserves targets and tags', () => {
     const form = draft();
-    form.tags = ['prod', 'metrics'];
+    form.tags = ['prod', 'metrics'].map((value) => ({ id: value, value }));
     form.targets = ['one', 'two'];
     const payload = buildAlertPayload(form);
     expect(payload.promqlConfig).toEqual({ holdDuration: '0s' });
@@ -83,20 +84,24 @@ describe('alert forms and payloads', () => {
     payload.targets.push('three');
     expect(form.targets).toEqual(['one', 'two']);
   });
-  it.each(['edit', 'duplicate'])('preserves every untouched tag byte through %s', (mode) => {
-    const source = {
-      ...original(),
-      tags: ['team,west', ' padded ', '', 'team,west', 'with\tspace'],
-    };
-    const form = alertDraft(source);
-    if (mode === 'edit') form.threshold = '3';
-    else form.title = `${source.title} (Copy)`;
-    const payload = buildAlertPayload(form, source);
-    expect(payload.tags).toEqual(source.tags);
-    form.tags[0] = 'changed';
-    expect(source.tags[0]).toBe('team,west');
-    expect(payload.tags![0]).toBe('team,west');
-  });
+  it.each(['edit', 'duplicate'])(
+    'preserves nonblank tag bytes and omits blank tags through %s',
+    (mode) => {
+      const source = {
+        ...original(),
+        tags: ['team,west', ' padded ', '', 'team,west', 'with\tspace', '  \t '],
+      };
+      const form = alertDraft(source);
+      if (mode === 'edit') form.threshold = '3';
+      else form.title = `${source.title} (Copy)`;
+      const payload = buildAlertPayload(form, source);
+      expect(payload.tags).toEqual(['team,west', ' padded ', 'team,west', 'with\tspace']);
+      expect(new Set(form.tags.map(({ id }) => id)).size).toBe(form.tags.length);
+      form.tags[0].value = 'changed';
+      expect(source.tags[0]).toBe('team,west');
+      expect(payload.tags![0]).toBe('team,west');
+    },
+  );
   it('builds code SQL without PromQL config and accepts state-tracking-only SQL', () => {
     const form = {
       ...draft(),
@@ -126,6 +131,33 @@ describe('alert forms and payloads', () => {
       title: 'Availability',
     });
   });
+  it.each(['sql', 'code'])('honours the %s dashboard handoff even with PromQL enabled', (type) => {
+    expect(
+      newAlertDraft(
+        true,
+        new URLSearchParams({
+          queryBuilderType: type,
+          dataset: 'logs',
+          alertQuery: 'SELECT COUNT(*) FROM "logs"',
+        }),
+      ),
+    ).toMatchObject({ type: 'code', dataset: 'logs', query: 'SELECT COUNT(*) FROM "logs"' });
+  });
+  it.each(['10mins', '2hrs', '30secs', '0', '5millis'])(
+    'saves existing duration %s unchanged in both fields',
+    (duration) => {
+      const source = original();
+      source.evalConfig.rollingWindow.evalStart = duration;
+      source.promqlConfig = { holdDuration: duration };
+      const form = alertDraft(source);
+      form.threshold = '4';
+      expect(validateAlert(form, true)).toEqual({});
+      expect(buildAlertPayload(form, source)).toMatchObject({
+        evalConfig: { rollingWindow: { evalStart: duration } },
+        promqlConfig: { holdDuration: duration },
+      });
+    },
+  );
   it.each([
     ['title', ' ', 'title'],
     ['dataset', '', 'dataset'],
@@ -165,6 +197,9 @@ describe('alert forms and payloads', () => {
   );
 });
 describe('durations, thresholds and mute states', () => {
+  it.each(humantime.cases)('matches Rust humantime for "$input"', ({ input, seconds }) => {
+    expect(alertDuration(input)).toBe(seconds ?? undefined);
+  });
   it.each([
     ['0s', 0],
     ['1h30m', 5400],
@@ -306,6 +341,7 @@ describe('list filtering, sorting and bounded type discovery', () => {
       signal,
     );
     expect(max).toBeLessThanOrEqual(6);
+    expect(max).toBeGreaterThan(1);
     expect(result.rows).toHaveLength(20);
     expect(result.unchecked).toHaveLength(1);
     expect(getAlert.mock.calls.every(([, value]) => value === signal)).toBe(true);

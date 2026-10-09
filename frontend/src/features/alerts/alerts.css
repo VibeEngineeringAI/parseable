@@ -90,6 +90,14 @@
 .alerts-list-table table {
   min-width: 850px;
 }
+.alerts-list-table th:nth-child(6),
+.alerts-list-table td:nth-child(6) {
+  min-width: 130px;
+}
+.alerts-tags .ui-badge {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .alerts-table th:last-child,
 .alerts-table td:last-child {
   position: sticky;
@@ -108,12 +116,15 @@
 .alerts-table td:nth-child(3) {
   white-space: nowrap;
 }
-.alerts-table .table-scroll:focus-visible {
+.alerts-page .table-scroll:focus-visible {
   outline: 2px solid var(--color-focus);
   outline-offset: -2px;
 }
 .alerts-action-block p {
   max-width: 300px;
+}
+.alerts-status:empty {
+  margin: 0;
 }
 .alerts-toolbar {
   flex-wrap: wrap;

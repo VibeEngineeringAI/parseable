@@ -1,5 +1,5 @@
 import { useCallback } from 'react';
-import { Link, useLocation, useParams } from 'react-router-dom';
+import { Link, useLocation, useMatch } from 'react-router-dom';
 import { Button } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
@@ -13,14 +13,15 @@ import { useAlertAccess, useCollection } from './shared';
 import './alerts.css';
 
 export function AlertsPage() {
-  const { id } = useParams(),
-    location = useLocation();
-  if (location.pathname === '/alerts/targets') return <TargetsPage />;
-  if (location.pathname === '/alerts/new') return <AlertForm key={location.key} />;
-  if (id)
-    return (
-      <LoadedAlert key={location.pathname} id={id} editing={location.pathname.endsWith('/edit')} />
-    );
+  const location = useLocation();
+  const targets = useMatch('/alerts/targets');
+  const creating = useMatch('/alerts/new');
+  const editing = useMatch('/alerts/:id/edit');
+  const detail = useMatch('/alerts/:id');
+  if (targets) return <TargetsPage />;
+  if (creating) return <AlertForm key={location.key} />;
+  const id = (editing ?? detail)?.params.id;
+  if (id) return <LoadedAlert key={location.pathname} id={id} editing={Boolean(editing)} />;
   return <AlertsIndex />;
 }
 function AlertsIndex() {

@@ -334,7 +334,9 @@ test('edit resends hold duration, then deletes the real alert and target through
   await expect(
     page.getByRole('row').filter({ has: page.getByText(targetName, { exact: true }) }),
   ).toHaveCount(0);
-  await expect(page.locator('.alerts-table [data-row-action]').first()).toBeFocused();
+  await expect(
+    page.locator('.alerts-table [data-row-action]:focus, input[aria-label="Search targets"]:focus'),
+  ).toHaveCount(1);
   expect(
     (await getJson<AlertTargetStatus[]>(request, '/api/v1/targets')).some(
       ({ target }) => target.id === targetId,

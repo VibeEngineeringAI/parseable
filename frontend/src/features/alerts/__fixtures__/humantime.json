@@ -1,0 +1,377 @@
+{
+  "parser": "humantime 2.3.0 parse_duration, verified against the cached Cargo.lock dependency",
+  "cases": [
+    {
+      "input": "10ns",
+      "seconds": 1e-8
+    },
+    {
+      "input": "10nsec",
+      "seconds": 1e-8
+    },
+    {
+      "input": "10nanos",
+      "seconds": 1e-8
+    },
+    {
+      "input": "10us",
+      "seconds": 1e-5
+    },
+    {
+      "input": "10usec",
+      "seconds": 1e-5
+    },
+    {
+      "input": "10µs",
+      "seconds": 1e-5
+    },
+    {
+      "input": "10ms",
+      "seconds": 0.01
+    },
+    {
+      "input": "10msec",
+      "seconds": 0.01
+    },
+    {
+      "input": "10millis",
+      "seconds": 0.01
+    },
+    {
+      "input": "10s",
+      "seconds": 10.0
+    },
+    {
+      "input": "10sec",
+      "seconds": 10.0
+    },
+    {
+      "input": "10secs",
+      "seconds": 10.0
+    },
+    {
+      "input": "10second",
+      "seconds": 10.0
+    },
+    {
+      "input": "10seconds",
+      "seconds": 10.0
+    },
+    {
+      "input": "10m",
+      "seconds": 600.0
+    },
+    {
+      "input": "10min",
+      "seconds": 600.0
+    },
+    {
+      "input": "10mins",
+      "seconds": 600.0
+    },
+    {
+      "input": "10minute",
+      "seconds": 600.0
+    },
+    {
+      "input": "10minutes",
+      "seconds": 600.0
+    },
+    {
+      "input": "10h",
+      "seconds": 36000.0
+    },
+    {
+      "input": "10hr",
+      "seconds": 36000.0
+    },
+    {
+      "input": "10hrs",
+      "seconds": 36000.0
+    },
+    {
+      "input": "10hour",
+      "seconds": 36000.0
+    },
+    {
+      "input": "10hours",
+      "seconds": 36000.0
+    },
+    {
+      "input": "10d",
+      "seconds": 864000.0
+    },
+    {
+      "input": "10day",
+      "seconds": 864000.0
+    },
+    {
+      "input": "10days",
+      "seconds": 864000.0
+    },
+    {
+      "input": "10w",
+      "seconds": 6048000.0
+    },
+    {
+      "input": "10wk",
+      "seconds": 6048000.0
+    },
+    {
+      "input": "10wks",
+      "seconds": 6048000.0
+    },
+    {
+      "input": "10week",
+      "seconds": 6048000.0
+    },
+    {
+      "input": "10weeks",
+      "seconds": 6048000.0
+    },
+    {
+      "input": "10M",
+      "seconds": 26300160.0
+    },
+    {
+      "input": "10month",
+      "seconds": 26300160.0
+    },
+    {
+      "input": "10months",
+      "seconds": 26300160.0
+    },
+    {
+      "input": "10y",
+      "seconds": 315576000.0
+    },
+    {
+      "input": "10yr",
+      "seconds": 315576000.0
+    },
+    {
+      "input": "10yrs",
+      "seconds": 315576000.0
+    },
+    {
+      "input": "10year",
+      "seconds": 315576000.0
+    },
+    {
+      "input": "10years",
+      "seconds": 315576000.0
+    },
+    {
+      "input": "0",
+      "seconds": 0.0
+    },
+    {
+      "input": "0s",
+      "seconds": 0.0
+    },
+    {
+      "input": "10mins",
+      "seconds": 600.0
+    },
+    {
+      "input": "2hrs",
+      "seconds": 7200.0
+    },
+    {
+      "input": "30secs",
+      "seconds": 30.0
+    },
+    {
+      "input": "1h30m",
+      "seconds": 5400.0
+    },
+    {
+      "input": "1 day 2 hours",
+      "seconds": 93600.0
+    },
+    {
+      "input": " 10 minutes ",
+      "seconds": 600.0
+    },
+    {
+      "input": "1\t2s",
+      "seconds": 12.0
+    },
+    {
+      "input": "1. 5s",
+      "seconds": 1.5
+    },
+    {
+      "input": "0.5s",
+      "seconds": 0.5
+    },
+    {
+      "input": "0.001us",
+      "seconds": 1e-9
+    },
+    {
+      "input": "0.000000001s",
+      "seconds": 1e-9
+    },
+    {
+      "input": "0.5mins",
+      "seconds": 30.0
+    },
+    {
+      "input": "0.5hrs",
+      "seconds": 1800.0
+    },
+    {
+      "input": "0.0001hrs",
+      "seconds": null
+    },
+    {
+      "input": "0.5ns",
+      "seconds": null
+    },
+    {
+      "input": "1.0ns",
+      "seconds": null
+    },
+    {
+      "input": "1.5nsec",
+      "seconds": null
+    },
+    {
+      "input": "0.0001us",
+      "seconds": null
+    },
+    {
+      "input": "0.0000000001s",
+      "seconds": null
+    },
+    {
+      "input": "1.1234567890s",
+      "seconds": 1.123456789
+    },
+    {
+      "input": "0.00000000000000000001s",
+      "seconds": null
+    },
+    {
+      "input": "18446744073709551615s",
+      "seconds": 1.8446744073709552e19
+    },
+    {
+      "input": "18446744073709551616s",
+      "seconds": null
+    },
+    {
+      "input": "18446744073709551615s1s",
+      "seconds": null
+    },
+    {
+      "input": "18446744073709551615ms",
+      "seconds": null
+    },
+    {
+      "input": "18446744073709551615ns",
+      "seconds": 18446744073.709553
+    },
+    {
+      "input": "18446744073709551615ns1ns",
+      "seconds": 18446744073.709553
+    },
+    {
+      "input": "",
+      "seconds": null
+    },
+    {
+      "input": " ",
+      "seconds": null
+    },
+    {
+      "input": " 0 ",
+      "seconds": null
+    },
+    {
+      "input": "00",
+      "seconds": null
+    },
+    {
+      "input": "5",
+      "seconds": null
+    },
+    {
+      "input": "-1m",
+      "seconds": null
+    },
+    {
+      "input": "+1m",
+      "seconds": null
+    },
+    {
+      "input": ".5s",
+      "seconds": null
+    },
+    {
+      "input": "1.s",
+      "seconds": null
+    },
+    {
+      "input": "1. s",
+      "seconds": null
+    },
+    {
+      "input": "1m garbage",
+      "seconds": null
+    },
+    {
+      "input": "Infinitys",
+      "seconds": null
+    },
+    {
+      "input": "1e3s",
+      "seconds": null
+    },
+    {
+      "input": "1m,2s",
+      "seconds": null
+    },
+    {
+      "input": "1m 2",
+      "seconds": null
+    },
+    {
+      "input": "1 m sec",
+      "seconds": null
+    },
+    {
+      "input": "10MIN",
+      "seconds": null
+    },
+    {
+      "input": "10μs",
+      "seconds": null
+    },
+    {
+      "input": "1nanosecond",
+      "seconds": null
+    },
+    {
+      "input": "1nanoseconds",
+      "seconds": null
+    },
+    {
+      "input": "1microsecond",
+      "seconds": null
+    },
+    {
+      "input": "1microseconds",
+      "seconds": null
+    },
+    {
+      "input": "1millisecond",
+      "seconds": null
+    },
+    {
+      "input": "1milliseconds",
+      "seconds": null
+    }
+  ]
+}

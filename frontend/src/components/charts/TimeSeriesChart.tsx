@@ -159,9 +159,11 @@ export function TimeSeriesChart({
   const xMin = xRange?.[0];
   const xMax = xRange?.[1];
   const limit = Math.max(1, Math.floor(maxSeries));
+  // Callers can use inline arrays without replacing the plot on unrelated renders.
+  const thresholdsKey = JSON.stringify(thresholds.map(({ value, label }) => [value, label]));
   const references = useMemo(
     () => thresholds.filter(({ value }) => Number.isFinite(value)),
-    [thresholds],
+    [thresholdsKey],
   );
   const slotHistory = useRef(new Map<string, number>());
   const entries = useMemo<PositionedSeries[]>(() => {
