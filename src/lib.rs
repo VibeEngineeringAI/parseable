@@ -59,6 +59,7 @@ pub mod sync;
 pub mod telemetry;
 pub mod tenants;
 pub mod tool_catalog;
+pub mod tool_executor;
 pub mod users;
 pub mod utils;
 pub mod validator;
