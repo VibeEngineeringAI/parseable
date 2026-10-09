@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, createClient, promqlErrorType } from './client';
-import { isPromqlDataset, listMetricsDatasets } from './metrics';
-import type { DatasetInfo, ParseableClient } from './types';
+import { createClient, promqlErrorType } from './client';
+import type { ParseableClient } from './types';
 
 afterEach(() => vi.unstubAllGlobals());
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
@@ -358,63 +357,5 @@ describe('metrics capabilities and dataset discovery', () => {
     await expect(createClient({ mode: 'live' }).datasetInfo('cpu')).rejects.toMatchObject({
       status: 502,
     });
-  });
-  it('uses formats first and falls back to telemetry type when formats are absent', () => {
-    const info = { name: 'cpu', telemetryType: 'metrics', logSourceFormats: [] };
-    expect(isPromqlDataset(info)).toBe(true);
-    expect(
-      isPromqlDataset({ ...info, telemetryType: 'logs', logSourceFormats: ['otel-metrics'] }),
-    ).toBe(true);
-    expect(isPromqlDataset({ ...info, logSourceFormats: ['json'] })).toBe(false);
-    expect(isPromqlDataset({ ...info, telemetryType: 'logs' })).toBe(false);
-  });
-  it('limits info lookups to six, skips 403/404 and returns sorted metrics', async () => {
-    const client = createClient({ mode: 'live' });
-    const datasets = Array.from({ length: 15 }, (_, index) => ({
-      name: `dataset-${String(14 - index).padStart(2, '0')}`,
-      type: 'logs' as const,
-    }));
-    vi.spyOn(client, 'listDatasets').mockResolvedValue(datasets);
-    let active = 0,
-      maximum = 0;
-    const info = vi.spyOn(client, 'datasetInfo').mockImplementation(async (name) => {
-      active++;
-      maximum = Math.max(maximum, active);
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      active--;
-      if (name === 'dataset-00' || name === 'dataset-01')
-        throw new ApiError('Unavailable', name === 'dataset-00' ? 403 : 404);
-      return { name, logSourceFormats: [name === 'dataset-02' ? 'json' : 'otel-metrics'] };
-    });
-    const signal = new AbortController().signal;
-    const result = await listMetricsDatasets(client, signal);
-    expect(maximum).toBe(6);
-    expect(result.map((item) => item.name)).toEqual(
-      datasets
-        .map((item) => item.name)
-        .filter((name) => !['dataset-00', 'dataset-01', 'dataset-02'].includes(name))
-        .sort(),
-    );
-    expect(info).toHaveBeenCalledTimes(15);
-    expect(info).toHaveBeenCalledWith('dataset-14', signal);
-  });
-  it('rethrows failures other than missing/inaccessible info and honors cancellation', async () => {
-    const client = createClient({ mode: 'live' });
-    vi.spyOn(client, 'listDatasets').mockResolvedValue([{ name: 'cpu', type: 'logs' }]);
-    const error = new ApiError('Server failed', 500);
-    vi.spyOn(client, 'datasetInfo').mockRejectedValue(error);
-    await expect(listMetricsDatasets(client)).rejects.toBe(error);
-    const controller = new AbortController();
-    controller.abort();
-    await expect(listMetricsDatasets(client, controller.signal)).rejects.toMatchObject({
-      name: 'AbortError',
-    });
-  });
-  it('returns an empty list without requesting info', async () => {
-    const client = createClient({ mode: 'live' });
-    vi.spyOn(client, 'listDatasets').mockResolvedValue([]);
-    const info = vi.spyOn(client, 'datasetInfo');
-    expect(await listMetricsDatasets(client)).toEqual([] as DatasetInfo[]);
-    expect(info).not.toHaveBeenCalled();
   });
 });

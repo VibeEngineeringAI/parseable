@@ -56,7 +56,10 @@ describe('demo metric inventory and metadata', () => {
       });
       expect(Number.isFinite(Date.parse(info.latestEventAt!))).toBe(true);
     }
-    expect((await listMetricsDatasets(client)).map((info) => info.name)).toEqual([stream]);
+    expect(await listMetricsDatasets(client)).toMatchObject({
+      datasets: [{ name: stream }],
+      unchecked: [],
+    });
     expect(fetch).not.toHaveBeenCalled();
     await expect(client.datasetInfo('missing')).rejects.toMatchObject({ status: 404 });
   });

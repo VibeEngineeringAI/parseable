@@ -10,6 +10,7 @@ import {
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import { formatChartValue } from './format';
+import { PALETTE_SIZE, assignSeriesSlots, rankSeries, selectTopSeries } from './seriesSelection';
 import './charts.css';
 
 export type ChartSeries = { id: string; label: string; values: (number | null)[] };
@@ -19,6 +20,7 @@ export interface TimeSeriesChartProps {
   series: ChartSeries[];
   height?: number;
   title?: string;
+  /** Series drawn before "Show all"; the ones with the highest peak value win. */
   maxSeries?: number;
   timeZone?: 'UTC' | 'local';
   formatValue?: (value: number) => string;
@@ -26,6 +28,7 @@ export interface TimeSeriesChartProps {
 }
 
 type Cursor = { index: number; left: number; top: number };
+// `slot` is the colour slot, which follows the series id; the plot index is its position in `entries`.
 type PositionedSeries = { series: ChartSeries; slot: number };
 
 // 24-hour ticks matching the tooltip; columns follow uPlot's time-axis format table:
@@ -40,7 +43,7 @@ const timeAxisFormats: uPlot.Axis.Values = [
 ];
 
 function seriesColor(slot: number): string {
-  return slot < 8 ? `var(--chart-series-${slot + 1})` : 'var(--color-border-strong)';
+  return slot < PALETTE_SIZE ? `var(--chart-series-${slot + 1})` : 'var(--color-border-strong)';
 }
 
 function formatTime(timestamp: number, timeZone: 'UTC' | 'local'): string {
@@ -143,11 +146,16 @@ export function TimeSeriesChart({
   const instructionsId = useId();
   const tooltipId = useId();
   const limit = Math.max(1, Math.floor(maxSeries));
-  const drawCount = showAll ? series.length : Math.min(limit, series.length);
-  const entries = useMemo(
-    () => series.slice(0, drawCount).map((entry, slot) => ({ series: entry, slot })),
-    [series, drawCount],
-  );
+  const slotHistory = useRef(new Map<string, number>());
+  const entries = useMemo<PositionedSeries[]>(() => {
+    const drawn = showAll ? series : selectTopSeries(series, limit);
+    const { slots, history } = assignSeriesSlots(
+      slotHistory.current,
+      rankSeries(drawn).map((entry) => entry.id),
+    );
+    slotHistory.current = history;
+    return drawn.map((entry) => ({ series: entry, slot: slots.get(entry.id)! }));
+  }, [series, showAll, limit]);
   const visibleEntries = useMemo(
     () => entries.filter((entry) => !hidden.has(entry.series.id)),
     [entries, hidden],
@@ -186,7 +194,7 @@ export function TimeSeriesChart({
     const styles = getComputedStyle(host);
     const neutral = styles.getPropertyValue('--color-border-strong').trim();
     const colors = entries.map(({ slot }) =>
-      slot < 8 ? styles.getPropertyValue(`--chart-series-${slot + 1}`).trim() : neutral,
+      slot < PALETTE_SIZE ? styles.getPropertyValue(`--chart-series-${slot + 1}`).trim() : neutral,
     );
     const grid = styles.getPropertyValue('--color-border').trim();
     const muted = styles.getPropertyValue('--color-muted').trim();
@@ -225,7 +233,7 @@ export function TimeSeriesChart({
             ...entries.map(({ series: entry, slot }, index) => ({
               label: entry.label,
               stroke: colors[index],
-              width: highlighted.current === entry.id ? 2 : slot < 8 ? 1.5 : 1,
+              width: highlighted.current === entry.id ? 2 : slot < PALETTE_SIZE ? 1.5 : 1,
               show: !hiddenRef.current.has(entry.id),
               spanGaps: false,
               points: { show: false },
@@ -284,7 +292,7 @@ export function TimeSeriesChart({
                   entry.width =
                     positioned.series.id === highlighted.current
                       ? 2
-                      : positioned.slot < 8
+                      : positioned.slot < PALETTE_SIZE
                         ? 1.5
                         : 1;
                 });
@@ -361,8 +369,8 @@ export function TimeSeriesChart({
     });
   }
 
-  function emphasize(slot: number | null) {
-    plot.current?.setSeries(slot == null ? null : slot + 1, { focus: true });
+  function emphasize(index: number | null) {
+    plot.current?.setSeries(index == null ? null : index + 1, { focus: true });
   }
 
   return (
@@ -410,6 +418,7 @@ export function TimeSeriesChart({
           <button
             type="button"
             className="charts-toggle"
+            title={`Series are ranked by their highest value; the top ${limit} are drawn`}
             onClick={() => setShowAll((previous) => !previous)}
           >
             {showAll ? `Show top ${limit}` : `Show all ${series.length}`}
@@ -418,7 +427,7 @@ export function TimeSeriesChart({
       </div>
       {series.length > 1 && (
         <ul className="charts-legend" aria-label="Series visibility">
-          {entries.map(({ series: entry, slot }) => (
+          {entries.map(({ series: entry, slot }, index) => (
             <li key={entry.id}>
               <button
                 type="button"
@@ -427,9 +436,9 @@ export function TimeSeriesChart({
                 title="Click to toggle; Alt-click or double-click to show only this series"
                 onClick={(event) => toggleSeries(entry.id, event.altKey)}
                 onDoubleClick={() => toggleSeries(entry.id, true)}
-                onMouseEnter={() => emphasize(slot)}
+                onMouseEnter={() => emphasize(index)}
                 onMouseLeave={() => emphasize(null)}
-                onFocus={() => emphasize(slot)}
+                onFocus={() => emphasize(index)}
                 onBlur={() => emphasize(null)}
               >
                 <span

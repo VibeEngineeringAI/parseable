@@ -52,6 +52,7 @@ export function QueryPanel({
   onChange,
   active,
   onFocus,
+  onRemove,
   onRun,
   metadata,
   history,
@@ -64,6 +65,7 @@ export function QueryPanel({
   onChange: (change: (current: ExplorerState) => ExplorerState) => void;
   active: number;
   onFocus: (index: number) => void;
+  onRemove: (index: number) => void;
   onRun: () => void;
   metadata: PromqlMetadataSource;
   history: string[];
@@ -119,14 +121,7 @@ export function QueryPanel({
                     aria-label={`Remove query ${id}`}
                     disabled={state.queries.length === 1}
                     onClick={() => {
-                      onChange((current) =>
-                        current.queries.length === 1
-                          ? current
-                          : {
-                              ...current,
-                              queries: current.queries.filter((_, row) => row !== index),
-                            },
-                      );
+                      onRemove(index);
                       onFocus(Math.min(index, state.queries.length - 2));
                     }}
                   >

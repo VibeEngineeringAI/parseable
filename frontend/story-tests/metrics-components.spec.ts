@@ -121,26 +121,37 @@ test('legend toggle updates aria-pressed and the count, and Alt-click isolates',
   await expect(page.getByText('1 of 3 series', { exact: true })).toBeVisible();
 });
 
-test('chart draws the top 20 series and can show all 25 with stable colour slots', async ({
+test('chart draws the 20 highest-peaking series and keeps colours when showing all 25', async ({
   page,
 }) => {
   await story(page, 'timeserieschart', 'many-series');
   await expect(page.getByText('20 of 25 series', { exact: true })).toBeVisible();
-  const firstKey = page
-    .getByRole('button', { name: '{host="node-1"}', exact: true })
+  const legend = page.locator('.charts-legend-item');
+  await expect(legend).toHaveCount(20);
+  // Peaks rise with the node number, so node-1..5 are the ones left out.
+  await expect(page.getByRole('button', { name: '{host="node-5"}', exact: true })).toHaveCount(0);
+  const topKey = page
+    .getByRole('button', { name: '{host="node-25"}', exact: true })
     .locator('.charts-line-key');
-  await expect(firstKey).toHaveCSS('border-top-color', 'rgb(42, 120, 214)');
-  await page.getByRole('button', { name: 'Show all 25', exact: true }).click();
-  await expect(page.getByText('25 series', { exact: true })).toBeVisible();
-  await expect(page.locator('.charts-legend-item')).toHaveCount(25);
+  await expect(topKey).toHaveCSS('border-top-color', 'rgb(42, 120, 214)');
+  const eighthKey = page
+    .getByRole('button', { name: '{host="node-18"}', exact: true })
+    .locator('.charts-line-key');
+  await expect(eighthKey).toHaveCSS('border-top-color', 'rgb(227, 73, 72)');
   const ninthKey = page
-    .getByRole('button', { name: '{host="node-9"}', exact: true })
+    .getByRole('button', { name: '{host="node-17"}', exact: true })
     .locator('.charts-line-key');
   await expect(ninthKey).toHaveCSS('border-top-color', 'rgb(199, 203, 215)');
-  await page.getByRole('button', { name: '{host="node-2"}', exact: true }).click();
-  await expect(firstKey).toHaveCSS('border-top-color', 'rgb(42, 120, 214)');
+  await page.getByRole('button', { name: 'Show all 25', exact: true }).click();
+  await expect(page.getByText('25 series', { exact: true })).toBeVisible();
+  await expect(legend).toHaveCount(25);
+  await expect(topKey).toHaveCSS('border-top-color', 'rgb(42, 120, 214)');
+  await expect(eighthKey).toHaveCSS('border-top-color', 'rgb(227, 73, 72)');
+  await page.getByRole('button', { name: '{host="node-24"}', exact: true }).click();
+  await expect(topKey).toHaveCSS('border-top-color', 'rgb(42, 120, 214)');
   await page.getByRole('button', { name: 'Show top 20', exact: true }).click();
   await expect(page.getByText('19 of 25 series', { exact: true })).toBeVisible();
+  await expect(legend).toHaveCount(20);
 });
 
 test('null and non-finite samples stay missing in the tooltip', async ({ page }) => {
@@ -156,7 +167,7 @@ test('null and non-finite samples stay missing in the tooltip', async ({ page })
 test('theme changes recolour the chart without reloading', async ({ page }) => {
   await story(page, 'timeserieschart', 'dark-theme');
   const key = page
-    .getByRole('button', { name: '{host="alpha"}', exact: true })
+    .getByRole('button', { name: '{host="gamma"}', exact: true })
     .locator('.charts-line-key');
   await expect(key).toHaveCSS('border-top-color', 'rgb(57, 135, 229)');
   await page

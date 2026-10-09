@@ -93,6 +93,11 @@ export function ResultsCard({
                 title="The chart needs a range query."
                 description="Choose Range or Both to plot results."
               />
+            ) : pending && !chart.series.length ? (
+              <div className="loading-state">
+                <Spinner label="Loading results" />
+                Loading results…
+              </div>
             ) : (
               <TimeSeriesChart
                 timestamps={chart.timestamps}
@@ -114,6 +119,7 @@ export function ResultsCard({
                     rows={instant}
                     columns={['Series', 'Value']}
                     empty="No instant results"
+                    loading={Boolean(pending)}
                   />
                 )}
                 {snapshot.type !== 'instant' && (
@@ -122,6 +128,7 @@ export function ResultsCard({
                     rows={range}
                     columns={['Series', 'Last', 'Min', 'Max', 'Avg']}
                     empty="No data"
+                    loading={Boolean(pending)}
                   />
                 )}
               </>

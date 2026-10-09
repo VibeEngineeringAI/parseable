@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Input } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useAsync } from '../../hooks/useAsync';
@@ -60,6 +60,21 @@ function MetadataList({
   );
 }
 
+// Keep showing a list while it reloads for new bounds, so its search, page, selection and scroll
+// survive. A different key (another metric or label) never shows the previous list.
+function useStaleWhileReloading<T>(
+  result: { data?: T; error?: Error; loading: boolean; reload: () => void },
+  key: string,
+) {
+  const last = useRef<{ key: string; data: T }>(undefined);
+  useEffect(() => {
+    if (result.data !== undefined) last.current = { key, data: result.data };
+  });
+  const stale = result.loading && last.current?.key === key ? last.current.data : undefined;
+  const data = result.data ?? stale;
+  return { ...result, data, loading: result.loading && data === undefined };
+}
+
 function TruncationWarning({ truncated }: { truncated?: boolean }) {
   return truncated ? (
     <p className="metrics-metadata-warning" role="status">
@@ -85,38 +100,47 @@ export function LabelBrowser({
 }) {
   const [metric, setMetric] = useState('');
   const [label, setLabel] = useState('');
-  const metrics = useAsync(
-    useCallback(
-      (signal) => {
-        const request = metadataRequest(dataset, bounds);
-        return request
-          ? client.promqlLabelValues('__name__', request, signal)
-          : Promise.resolve({ data: [], truncated: false });
-      },
-      [client, dataset, bounds],
+  const metrics = useStaleWhileReloading(
+    useAsync(
+      useCallback(
+        (signal) => {
+          const request = metadataRequest(dataset, bounds);
+          return request
+            ? client.promqlLabelValues('__name__', request, signal)
+            : Promise.resolve({ data: [], truncated: false });
+        },
+        [client, dataset, bounds],
+      ),
     ),
+    '',
   );
-  const labels = useAsync(
-    useCallback(
-      (signal) => {
-        const request = metric ? metadataRequest(dataset, bounds, [metric]) : undefined;
-        return request
-          ? client.promqlLabels(request, signal)
-          : Promise.resolve({ data: [], truncated: false });
-      },
-      [client, dataset, bounds, metric],
+  const labels = useStaleWhileReloading(
+    useAsync(
+      useCallback(
+        (signal) => {
+          const request = metric ? metadataRequest(dataset, bounds, [metric]) : undefined;
+          return request
+            ? client.promqlLabels(request, signal)
+            : Promise.resolve({ data: [], truncated: false });
+        },
+        [client, dataset, bounds, metric],
+      ),
     ),
+    metric,
   );
-  const values = useAsync(
-    useCallback(
-      (signal) => {
-        const request = metric && label ? metadataRequest(dataset, bounds, [metric]) : undefined;
-        return request
-          ? client.promqlLabelValues(label, request, signal)
-          : Promise.resolve({ data: [], truncated: false });
-      },
-      [client, dataset, bounds, metric, label],
+  const values = useStaleWhileReloading(
+    useAsync(
+      useCallback(
+        (signal) => {
+          const request = metric && label ? metadataRequest(dataset, bounds, [metric]) : undefined;
+          return request
+            ? client.promqlLabelValues(label, request, signal)
+            : Promise.resolve({ data: [], truncated: false });
+        },
+        [client, dataset, bounds, metric, label],
+      ),
     ),
+    JSON.stringify([metric, label]),
   );
   return (
     <aside id="metrics-label-browser" className="metrics-label-browser" aria-label="Label browser">

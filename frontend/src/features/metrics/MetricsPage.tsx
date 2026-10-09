@@ -8,16 +8,18 @@ import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
 import type { PromqlMetadataSource } from '../../components/promql/PromqlEditor';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
-import { listMetricsDatasets } from '../../lib/metrics';
+import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
 import { autoStep, formatStep, loadHistory } from '../../lib/promql';
 import type { DatasetInfo } from '../../lib/types';
 import {
   createRunSnapshot,
   insertBrowserQuery,
   maxQueries,
+  metadataAnchor,
   metadataRequest,
   parseExplorerSearch,
   rangeBounds,
+  removeSnapshotQuery,
   serializeExplorerState,
   snapshotState,
   stepError,
@@ -39,35 +41,58 @@ export function MetricsPage() {
   const navigate = useNavigate();
   const about = useAsync(useCallback((signal) => client.about(signal), [client]));
   const enabled = about.data?.capabilities.promql === true;
-  const datasets = useAsync(
+  const discovery = useAsync(
     useCallback(
-      (signal) => (enabled ? listMetricsDatasets(client, signal) : Promise.resolve([])),
+      (signal) =>
+        enabled
+          ? discoverMetricsDatasets(client, signal)
+          : Promise.resolve({ datasets: [], unchecked: [] }),
       [client, enabled],
     ),
   );
-  if (enabled && datasets.data?.length && !dataset)
-    return <Navigate replace to={`${datasetPath(datasets.data[0].name)}${location.search}`} />;
-  if (enabled && datasets.data?.some((entry) => entry.name === dataset))
-    return <MetricsExplorer dataset={dataset!} datasets={datasets.data} />;
+  const datasets = discovery.data?.datasets;
+  // The discovery is reused across visits, so retries must bypass it.
+  const rescan = () => {
+    forgetMetricsDatasets(client);
+    discovery.reload();
+  };
+  const warning = discovery.data?.unchecked.length ? (
+    <DiscoveryWarning unchecked={discovery.data.unchecked} retry={rescan} />
+  ) : null;
+  if (enabled && datasets?.length && !dataset)
+    return <Navigate replace to={`${datasetPath(datasets[0].name)}${location.search}`} />;
+  if (enabled && datasets?.some((entry) => entry.name === dataset))
+    return (
+      <>
+        {warning && <div className="page metrics-discovery">{warning}</div>}
+        <MetricsExplorer dataset={dataset!} datasets={datasets} />
+      </>
+    );
   return (
     <div className="page metrics-page">
       <PageHeader title="Metrics" />
       <QueryState
-        loading={about.loading || (enabled && datasets.loading)}
-        error={about.error || (enabled ? datasets.error : undefined)}
-        retry={about.error ? about.reload : datasets.reload}
+        loading={about.loading || (enabled && discovery.loading)}
+        error={about.error || (enabled ? discovery.error : undefined)}
+        retry={about.error ? about.reload : rescan}
       />
+      {enabled && warning}
       {about.data && !enabled && (
         <EmptyState
           title="PromQL is not available on this server"
           description="The server must run in All or Query mode to explore metrics with PromQL."
         />
       )}
-      {enabled && datasets.data && !datasets.data.length && (
+      {enabled && datasets && !datasets.length && (
         <>
           <EmptyState
             title="No metrics ingested yet"
             description="Add metrics to monitor performance, track trends, and catch regressions at a glance."
+            action={
+              <Button variant="secondary" onClick={rescan}>
+                Check again
+              </Button>
+            }
           />
           <p className="metrics-ingestion-hint muted">
             Send OTLP metrics to <code>/v1/metrics</code> with the <code>X-P-Stream</code> header
@@ -75,23 +100,42 @@ export function MetricsPage() {
           </p>
         </>
       )}
-      {enabled && Boolean(datasets.data?.length) && dataset && (
+      {enabled && datasets && datasets.length > 0 && dataset && (
         <EmptyState
           title="The selected dataset could not be found."
           action={
-            <Button
-              onClick={() =>
-                navigate(`${datasetPath(datasets.data![0].name)}${location.search}`, {
-                  replace: true,
-                })
-              }
-            >
-              Open {datasets.data![0].name}
-            </Button>
+            <div className="inline">
+              <Button
+                onClick={() =>
+                  navigate(`${datasetPath(datasets[0].name)}${location.search}`, {
+                    replace: true,
+                  })
+                }
+              >
+                Open {datasets[0].name}
+              </Button>
+              <Button variant="secondary" onClick={rescan}>
+                Check again
+              </Button>
+            </div>
           }
         />
       )}
     </div>
+  );
+}
+
+function DiscoveryWarning({ unchecked, retry }: { unchecked: string[]; retry: () => void }) {
+  const more = unchecked.length > 5 ? ` and ${unchecked.length - 5} more` : '';
+  return (
+    <p role="status" className="notice metrics-discovery-warning">
+      Could not check {unchecked.length} {unchecked.length === 1 ? 'dataset' : 'datasets'}:{' '}
+      {unchecked.slice(0, 5).join(', ')}
+      {more}.{' '}
+      <Button size="sm" variant="ghost" onClick={retry}>
+        Check again
+      </Button>
+    </p>
   );
 }
 
@@ -109,11 +153,16 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
   const [snapshot, setSnapshot] = useState<RunSnapshot>();
   const appliedSnapshot = useRef<RunSnapshot | undefined>(undefined);
   const [runError, setRunError] = useState<string>();
-  const [clock, setClock] = useState(() => Date.now());
   const resultElement = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(800);
   const rangeKey = JSON.stringify(state.range);
-  const bounds = useMemo(() => rangeBounds(state.range, clock), [rangeKey, clock]);
+  // Metadata bounds follow the dataset and range, not each run. Re-anchor during render so a
+  // dataset or range change requests metadata once, with the new bounds.
+  const [anchor, setAnchor] = useState(() => ({ dataset, rangeKey, time: Date.now() }));
+  if (anchor.dataset !== dataset || anchor.rangeKey !== rangeKey)
+    setAnchor({ dataset, rangeKey, time: Date.now() });
+  const { start, end } = rangeBounds(state.range, anchor.time);
+  const bounds = useMemo(() => ({ start, end }), [start, end]);
   const previous = useRef({ dataset, rangeKey });
   const currentSnapshot = snapshot?.stream === dataset ? snapshot : undefined;
   const currentApplied =
@@ -123,7 +172,6 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
   function update(change: (current: ExplorerState) => ExplorerState) {
     // Navigation can defer a render. Combine edits with the latest draft rather than old props.
     const next = change(draft.current);
-    if (JSON.stringify(next.range) !== JSON.stringify(draft.current.range)) setClock(Date.now());
     draft.current = next;
     setState(next);
     setRunError(undefined);
@@ -132,10 +180,21 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
     navigate({ pathname: location.pathname, search: writtenSearch.current }, { replace: true });
   }
 
+  function removeQuery(index: number) {
+    if (draft.current.queries.length === 1) return;
+    update((current) => ({
+      ...current,
+      queries: current.queries.filter((_, row) => row !== index),
+    }));
+    // Query IDs are positional: relabel applied results to match the panel.
+    setSnapshot((current) => current && removeSnapshotQuery(current, index));
+    if (appliedSnapshot.current)
+      appliedSnapshot.current = removeSnapshotQuery(appliedSnapshot.current, index);
+  }
+
   function apply(next: ExplorerState) {
     const now = Date.now();
     const run = createRunSnapshot(next, dataset, width, now);
-    setClock(now);
     setRunError(run.error);
     // Clearing the active snapshot cancels requests; keep the applied configuration for recovery.
     setSnapshot(run.snapshot);
@@ -173,7 +232,6 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
       appliedSnapshot.current = undefined;
       setSnapshot(undefined);
       setRunError(undefined);
-      setClock(Date.now());
     } else if (previous.current.rangeKey !== rangeKey && appliedSnapshot.current) {
       apply(snapshotState(appliedSnapshot.current, state.range));
     }
@@ -204,7 +262,7 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
     }),
     [client, dataset, bounds],
   );
-  const preview = createRunSnapshot(state, dataset, width, clock);
+  const preview = createRunSnapshot(state, dataset, width, anchor.time);
   const validation =
     preview.error === 'Enter a PromQL query to run.' || stepError(state.step)
       ? undefined
@@ -244,7 +302,11 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
               size="icon"
               aria-label="Refresh metrics"
               disabled={!currentApplied}
-              onClick={() => currentApplied && apply(snapshotState(currentApplied, state.range))}
+              onClick={() => {
+                if (!currentApplied) return;
+                setAnchor((current) => ({ ...current, time: Date.now() }));
+                apply(snapshotState(currentApplied, state.range));
+              }}
             >
               <RefreshCw size={15} aria-hidden="true" />
             </Button>
@@ -257,8 +319,14 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
           onChange={update}
           active={activeIndex}
           onFocus={setActive}
+          onRemove={removeQuery}
           onRun={() => {
-            if (!createRunSnapshot(draft.current, dataset, width).error) apply(draft.current);
+            if (createRunSnapshot(draft.current, dataset, width).error) return;
+            setAnchor((current) => {
+              const time = metadataAnchor(draft.current.range, current.time);
+              return time === current.time ? current : { ...current, time };
+            });
+            apply(draft.current);
           }}
           metadata={metadata}
           history={loadHistory(dataset)}

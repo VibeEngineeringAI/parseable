@@ -38,7 +38,7 @@ async function mockLive(
     enabled?: boolean;
     empty?: boolean;
     aboutError?: boolean;
-    infoError?: boolean;
+    listError?: boolean;
     malformedAbout?: boolean;
     promql?: (route: Route, call: Call) => Promise<void> | undefined;
   } = {},
@@ -56,6 +56,8 @@ async function mockLive(
                 : { capabilities: { promql: options.enabled ?? true } },
             },
       );
+    if (path === '/api/v1/logstream' && options.listError)
+      return route.fulfill({ status: 500, body: 'Dataset list unavailable' });
     if (path === '/api/v1/logstream')
       return route.fulfill({
         json: [
@@ -68,18 +70,14 @@ async function mockLive(
     if (path.endsWith('/restricted_metrics/info'))
       return route.fulfill({ status: 403, body: 'Cannot inspect this dataset' });
     if (path.endsWith('/info'))
-      return route.fulfill(
-        options.infoError
-          ? { status: 500, body: 'Dataset info unavailable' }
-          : {
-              json:
-                path.includes('/web_logs/') || options.empty
-                  ? { telemetryType: 'logs', logSource: [{ log_source_format: 'json' }] }
-                  : path.includes('/metrics_b/')
-                    ? { telemetryType: 'metrics' }
-                    : { logSource: [{ log_source_format: 'otel-metrics' }] },
-            },
-      );
+      return route.fulfill({
+        json:
+          path.includes('/web_logs/') || options.empty
+            ? { telemetryType: 'logs', logSource: [{ log_source_format: 'json' }] }
+            : path.includes('/metrics_b/')
+              ? { telemetryType: 'metrics' }
+              : { logSource: [{ log_source_format: 'otel-metrics' }] },
+      });
     return route.fulfill({ status: 404, body: 'Not found' });
   });
   await page.route('**/prometheus/**', (route) => {
@@ -242,6 +240,84 @@ test('the label browser inserts selectors predictably into the active query', as
   await expect(panel).toHaveCount(0);
   await page.getByRole('button', { name: 'Show label browser' }).click();
   await expect(panel).toBeVisible();
+});
+
+test('removing a query relabels applied results to match the panel', async ({ page }) => {
+  const running = page.getByRole('status').filter({ hasText: 'Running queries…' });
+  await mockLive(page, {
+    promql: (route, call) =>
+      call.params.get('query') === 'failing_b'
+        ? route.fulfill({ status: 500, body: 'b exploded' })
+        : undefined,
+  });
+  await openLive(page);
+  await editor(page).fill(cpuQuery);
+  await page.getByRole('button', { name: 'Add query', exact: true }).click();
+  await editor(page, 'B').fill('failing_b');
+  await page.getByRole('radio', { name: 'Range', exact: true }).check();
+  await run(page);
+  const alerts = page.locator('.metrics-query-error');
+  await expect(alerts).toHaveCount(1);
+  await expect(alerts).toContainText('B ·');
+  await expect(legend(page).getByRole('button')).toHaveCount(2);
+  await expect(legend(page)).toContainText('A:');
+  await page.getByRole('button', { name: 'Remove query A' }).click();
+  await expect(page.getByRole('textbox', { name: /PromQL query/ })).toHaveCount(1);
+  await expect(editor(page, 'A')).toHaveText('failing_b');
+  // Results follow the panel: the failing query is now A, and no stale B or series remain.
+  await expect(alerts).toHaveCount(1);
+  await expect(alerts).toContainText('A ·');
+  await expect(alerts).not.toContainText('B ·');
+  await expect(legend(page)).toHaveCount(0);
+  await expect(running).toHaveCount(0);
+});
+
+test('the first run shows a loading state instead of "No data" until requests settle', async ({
+  page,
+}) => {
+  const running = page.getByRole('status').filter({ hasText: 'Running queries…' });
+  const loading = page.locator('.loading-state');
+  let release = () => {};
+  const held = new Promise<void>((done) => {
+    release = done;
+  });
+  await mockLive(page, {
+    promql: (route, call) =>
+      /\/query(?:_range)?$/.test(call.path)
+        ? held
+            .then(() =>
+              route.fulfill({
+                json: {
+                  status: 'success',
+                  data: call.path.endsWith('/query_range')
+                    ? {
+                        resultType: 'matrix',
+                        result: [{ metric: { host: 'a' }, values: [[1, '2']] }],
+                      }
+                    : {
+                        resultType: 'vector',
+                        result: [{ metric: { host: 'a' }, value: [1, '2'] }],
+                      },
+                },
+              }),
+            )
+            .catch(() => {})
+        : undefined,
+  });
+  await openLive(page);
+  await editor(page).fill(cpuQuery);
+  await run(page);
+  await expect(running).toBeVisible();
+  await expect(loading).toBeVisible();
+  await expect(page.getByText('No data', { exact: true })).toHaveCount(0);
+  await page.getByRole('tab', { name: 'Table', exact: true }).click();
+  await expect(loading).toHaveCount(2);
+  await expect(page.getByText('No instant results', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('No data', { exact: true })).toHaveCount(0);
+  release();
+  await expect(loading).toHaveCount(0);
+  await expect(page.getByRole('table', { name: 'Range summary' })).toContainText('host="a"');
+  await expect(running).toHaveCount(0);
 });
 
 test('successful queries enter per-dataset history and selecting one does not run', async ({
@@ -506,6 +582,64 @@ test('time changes and refresh use the applied query, type and step until the ne
   expect(queries(calls)[6].params.get('query')).toBe(`rate({"${counter}"}[5m])`);
 });
 
+test('Run keeps the label browser and its metadata while the range is unchanged', async ({
+  page,
+}) => {
+  const calls = await mockLive(page);
+  const metadata = () => calls.filter((call) => !/\/query(?:_range)?$/.test(call.path));
+  const names = () => metadata().filter((call) => call.path.endsWith('/label/__name__/values'));
+  await page.clock.install({ time: new Date('2026-10-09T12:00:00Z') });
+  await openLive(
+    page,
+    `/metrics?${new URLSearchParams({ start: '2026-10-09T10:00:00Z', end: '2026-10-09T11:00:00Z' })}`,
+  );
+  const panel = browser(page);
+  const search = panel.getByLabel('Search metrics', { exact: true });
+  await panel.getByRole('button', { name: cpu, exact: true }).click();
+  await panel.getByRole('button', { name: 'host', exact: true }).click();
+  await expect(panel.getByRole('button', { name: 'a', exact: true })).toBeVisible();
+  await search.fill('cpu');
+  await panel.getByLabel('Search values', { exact: true }).fill('b');
+  const fetched = metadata().length;
+  const named = names().length;
+  await editor(page).fill(cpuQuery);
+  await run(page);
+  await expect(legend(page).getByRole('button')).toHaveCount(2);
+  await page.clock.fastForward(5 * 60_000);
+  await editor(page).press('ControlOrMeta+Enter');
+  await expect.poll(() => queries(calls).length).toBe(4);
+  // An absolute range never refetches metadata, so the browser keeps its state.
+  expect(metadata()).toHaveLength(fetched);
+  await expect(search).toHaveValue('cpu');
+  await expect(panel.getByLabel('Search values', { exact: true })).toHaveValue('b');
+  await expect(panel.getByRole('button', { name: cpu, exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
+  await expect(panel.getByRole('button', { name: 'b', exact: true })).toBeVisible();
+  // A range change requests metadata once and keeps the lists mounted while it reloads.
+  await page.getByLabel('Time range', { exact: true }).selectOption('1h');
+  await expect.poll(() => queries(calls).length).toBe(6);
+  await expect.poll(() => names().length).toBe(named + 1);
+  await expect(search).toHaveValue('cpu');
+  await expect(panel.getByRole('button', { name: 'b', exact: true })).toBeVisible();
+  const relative = metadata().length;
+  expect(relative).toBe(fetched + 3);
+  await page.clock.fastForward(5000);
+  await run(page);
+  await expect.poll(() => queries(calls).length).toBe(8);
+  expect(metadata()).toHaveLength(relative);
+  // A relative range re-anchors on Run once completion caches would have expired.
+  await page.clock.fastForward(60_000);
+  await run(page);
+  await expect.poll(() => names().length).toBe(named + 2);
+  expect(Number(names().at(-1)!.params.get('end'))).toBeGreaterThan(
+    Number(names().at(-2)!.params.get('end')),
+  );
+  await expect(search).toHaveValue('cpu');
+  await expect(panel.getByLabel('Search values', { exact: true })).toHaveValue('b');
+});
+
 for (const [status, errorType, message] of [
   [400, 'bad_data', 'parse error: expected expression'],
   [422, 'execution', 'topk is not supported'],
@@ -625,7 +759,7 @@ test('unknown dataset offers the first available dataset and keeps the shared qu
   await expect(page).toHaveURL('/metrics/explore/metrics_a?query=1&type=instant');
 });
 
-for (const option of ['aboutError', 'infoError', 'malformedAbout'] as const) {
+for (const option of ['aboutError', 'listError', 'malformedAbout'] as const) {
   test(`${option} uses a readable page-level error with retry`, async ({ page }) => {
     await mockLive(page, { [option]: true });
     await page.goto('/metrics');
@@ -633,13 +767,42 @@ for (const option of ['aboutError', 'infoError', 'malformedAbout'] as const) {
     await expect(page.getByRole('alert')).toContainText(
       option === 'aboutError'
         ? 'About unavailable'
-        : option === 'infoError'
-          ? 'Dataset info unavailable'
+        : option === 'listError'
+          ? 'Dataset list unavailable'
           : 'Unexpected response from /api/v1/about',
     );
     await expect(page.getByRole('button', { name: 'Try again', exact: true })).toBeVisible();
   });
 }
+
+test('a failing dataset info warns without blocking metrics and is reused until retried', async ({
+  page,
+}) => {
+  await mockLive(page);
+  let broken = true;
+  let infoRequests = 0;
+  await page.route('**/api/v1/logstream/*/info', (route) => {
+    infoRequests++;
+    return broken && route.request().url().includes('/metrics_b/')
+      ? route.fulfill({ status: 500, body: 'Dataset info unavailable' })
+      : route.fallback();
+  });
+  await openLive(page);
+  const warning = page.getByText('Could not check 1 dataset: metrics_b.');
+  await expect(warning).toBeVisible();
+  await expect(page.getByLabel('Metrics dataset').locator('option')).toHaveCount(1);
+  const scanned = infoRequests;
+  await page.getByTestId('sidebar-logs').click();
+  await page.getByTestId('sidebar-metrics').click();
+  await expect(editor(page)).toBeVisible();
+  await expect(warning).toBeVisible();
+  expect(infoRequests).toBe(scanned);
+  broken = false;
+  await page.getByRole('button', { name: 'Check again', exact: true }).click();
+  await expect(page.getByLabel('Metrics dataset').locator('option')).toHaveCount(2);
+  await expect(warning).toHaveCount(0);
+  expect(infoRequests).toBe(scanned + 4);
+});
 
 test('a malformed PromQL success is a readable query error', async ({ page }) => {
   await mockLive(page, {
@@ -845,7 +1008,7 @@ test('an invalid range change aborts pending work and retains applied configurat
   await expect(page.getByRole('alert')).toContainText('11000 steps');
   await cancelled;
   expect(queries(calls)).toHaveLength(1);
-  await expect(page.getByText('Running queries…', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('status').filter({ hasText: 'Running queries…' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: prompt, exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Refresh metrics' })).toBeEnabled();
   release();

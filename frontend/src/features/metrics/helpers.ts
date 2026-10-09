@@ -137,6 +137,19 @@ export function snapshotState(snapshot: RunSnapshot, range: TimeRange): Explorer
   return { queries, type: snapshot.type, step: snapshot.step, range };
 }
 
+/**
+ * Mirror removing the query at `index` from the panel. Query IDs are positional, so the
+ * remaining snapshot rows are relabelled to match the panel and the removed row's results go away.
+ */
+export function removeSnapshotQuery(snapshot: RunSnapshot, index: number): RunSnapshot | undefined {
+  const queries = snapshot.queries.flatMap((row) => {
+    const position = row.id.charCodeAt(0) - 65;
+    if (position === index) return [];
+    return [{ ...row, id: queryId(position > index ? position - 1 : position) }];
+  });
+  return queries.length ? { ...snapshot, queries } : undefined;
+}
+
 export function requestsForSnapshot(
   snapshot: RunSnapshot,
 ): Array<
@@ -183,6 +196,15 @@ export function metadataRequest(
     limit: 1000,
     ...(metrics.length ? { match: metrics.map((name) => `{${matcher('__name__', name)}}`) } : {}),
   };
+}
+
+// Metadata bounds hold still across runs, so Run keeps the label browser and completion caches.
+// Absolute ranges never move. A relative range re-anchors on Run only after the completion
+// cache's lifetime, so new series still appear without a request on every Run.
+export const metadataMaxAge = 60_000;
+
+export function metadataAnchor(range: TimeRange, anchor: number, now = Date.now()): number {
+  return typeof range === 'string' && now - anchor >= metadataMaxAge ? now : anchor;
 }
 
 export function selectorWithValue(metric: string, label: string, value: string): string {

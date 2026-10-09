@@ -351,3 +351,16 @@
     padding: 12px;
   }
 }
+
+/* The discovery warning sits above the explorer page and shares its gutters. */
+.page.metrics-discovery {
+  padding-bottom: 0;
+}
+
+.page.metrics-discovery + .page {
+  padding-top: 0;
+}
+
+.metrics-discovery .notice {
+  margin: 0 0 20px;
+}

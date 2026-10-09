@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ArrowDown, ArrowUp, ArrowUpDown, Download } from 'lucide-react';
-import { Button, EmptyState } from '../../components/ui';
+import { Button, EmptyState, Spinner } from '../../components/ui';
 import { exportRecords } from '../../components/explorer/DataTable';
 import { Pagination, PAGE_SIZE } from '../../components/ui/Pagination';
 import { formatValue } from '../../lib/promql';
@@ -11,11 +11,14 @@ export function ResultTable({
   rows,
   columns,
   empty,
+  loading = false,
 }: {
   title: string;
   rows: LogRecord[];
   columns: string[];
   empty: string;
+  /** Requests are still pending and nothing has arrived yet, so "empty" would be misleading. */
+  loading?: boolean;
 }) {
   const [sort, setSort] = useState<{ field: string; descending: boolean }>();
   const ordered = sort
@@ -29,7 +32,6 @@ export function ResultTable({
         return sort.descending ? -result : result;
       })
     : rows;
-  // The matrix sample hint needs a custom two-column table.
   const [page, setPage] = useState(0);
   const pageSize = PAGE_SIZE;
   const pages = Math.max(1, Math.ceil(rows.length / pageSize));
@@ -64,7 +66,14 @@ export function ResultTable({
         </div>
       </div>
       {!rows.length ? (
-        <EmptyState title={empty} />
+        loading ? (
+          <div className="loading-state">
+            <Spinner label="Loading results" />
+            Loading results…
+          </div>
+        ) : (
+          <EmptyState title={empty} />
+        )
       ) : (
         <>
           <div className="table-scroll">

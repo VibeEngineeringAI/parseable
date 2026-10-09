@@ -4,9 +4,12 @@ import {
   createRunSnapshot,
   insertBrowserQuery,
   instantRows,
+  metadataAnchor,
+  metadataMaxAge,
   metadataRequest,
   parseExplorerSearch,
   rangeRows,
+  removeSnapshotQuery,
   requestsForSnapshot,
   selectorWithValue,
   serializeExplorerState,
@@ -128,6 +131,30 @@ describe('Applied query snapshots', () => {
       range: '24h',
     });
   });
+  it('relabels applied rows when a panel query is removed', () => {
+    const { snapshot } = createRunSnapshot(
+      { ...state, queries: ['a', '', 'c', 'd'] },
+      'metrics',
+      800,
+      now,
+    );
+    expect(snapshot!.queries.map(({ id }) => id)).toEqual(['A', 'C', 'D']);
+    // Removing a blank row shifts later rows up; removing an applied row drops it.
+    expect(removeSnapshotQuery(snapshot!, 1)!.queries.map(({ id, query }) => [id, query])).toEqual([
+      ['A', 'a'],
+      ['B', 'c'],
+      ['C', 'd'],
+    ]);
+    expect(removeSnapshotQuery(snapshot!, 0)!.queries.map(({ id, query }) => [id, query])).toEqual([
+      ['B', 'c'],
+      ['C', 'd'],
+    ]);
+    expect(removeSnapshotQuery(snapshot!, 3)!.queries.map(({ id }) => id)).toEqual(['A', 'C']);
+    const single = createRunSnapshot({ ...state, queries: ['a'] }, 'metrics', 800, now).snapshot!;
+    expect(removeSnapshotQuery(single, 0)).toBeUndefined();
+    expect(removeSnapshotQuery(single, 1)).toEqual(single);
+  });
+
   it('refreshes applied configuration with fresh bounds', () => {
     const applied = createRunSnapshot(state, 'metrics_a', 800, now).snapshot!;
     const refreshed = createRunSnapshot(
@@ -398,5 +425,16 @@ describe('Metrics result presentation', () => {
   it('does not lose successful results when another query fails', () => {
     const failed = result('B', { errors: [{ kind: 'range', error: new Error('failure') }] });
     expect(chartResults([a, failed], 2).series).toHaveLength(2);
+  });
+});
+
+describe('metadata anchor', () => {
+  const range = { startTime: '2026-10-09T10:00:00.000Z', endTime: '2026-10-09T11:00:00.000Z' };
+  it('never moves for an absolute range', () => {
+    expect(metadataAnchor(range, now, now + 10 * metadataMaxAge)).toBe(now);
+  });
+  it('holds a relative range until the completion cache would expire', () => {
+    expect(metadataAnchor('15m', now, now + metadataMaxAge - 1)).toBe(now);
+    expect(metadataAnchor('15m', now, now + metadataMaxAge)).toBe(now + metadataMaxAge);
   });
 });
