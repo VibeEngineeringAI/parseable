@@ -69,3 +69,18 @@ export const GapsAndNaN: Story = {
 };
 export const Empty: Story = { args: { timestamps: [], series: [] } };
 export const DarkTheme: Story = { render: (args) => <DarkChart {...args} /> };
+export const WithThresholds: Story = {
+  args: {
+    series: [
+      {
+        id: 'host-a',
+        label: 'host-a',
+        values: timestamps.map((_, index) => 3.75 + Math.sin(index / 2) / 2),
+      },
+    ],
+    thresholds: [
+      { value: 2, label: 'Lower threshold' },
+      { value: 6, label: 'Upper threshold' },
+    ],
+  },
+};

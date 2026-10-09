@@ -41,6 +41,15 @@ async function remove(page: Page, kind: 'alert' | 'target', name: string) {
   await dialog.locator('[data-dialog-confirm]').click();
   await expect(dialog).toBeHidden();
 }
+async function rowMenu(page: Page, name: string) {
+  await namedRow(page, name)
+    .getByRole('button', { name: `Actions for ${name}`, exact: true })
+    .click();
+  return page.getByRole('menu', { name: `Actions for ${name}`, exact: true });
+}
+async function rowAction(page: Page, name: string, action: string) {
+  await (await rowMenu(page, name)).getByRole('menuitem', { name: action, exact: true }).click();
+}
 type Call = { path: string; method: string; body?: unknown };
 async function mocked(
   page: Page,
@@ -52,11 +61,12 @@ async function mocked(
     missingType?: boolean;
     empty?: boolean;
     failCreate?: boolean;
+    original?: Alert;
   } = {},
 ) {
   const calls: Call[] = [],
     writes: AlertRequest[] = [];
-  let current = structuredClone(alertFixture);
+  let current = structuredClone(options.original ?? alertFixture);
   await page.route('**/api/**', (route) => {
     const request = route.request(),
       path = new URL(request.url()).pathname;
@@ -167,7 +177,10 @@ test('PromQL CRUD, inline target creation, preview, edit, duplicate and typed de
 }) => {
   await demo(page);
   await createPromql(page);
-  await page.getByLabel('Tags', { exact: true }).fill('test, production');
+  for (const [index, tag] of ['test', 'production'].entries()) {
+    await page.getByRole('button', { name: 'Add tag', exact: true }).click();
+    await page.getByLabel(`Tag ${index + 1}`, { exact: true }).fill(tag);
+  }
   await page
     .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
     .click();
@@ -216,7 +229,7 @@ test('SQL create and preview use the existing editor with optional targets', asy
     .fill('SELECT COUNT(*) AS errors FROM "application_logs" WHERE level = \'ERROR\'');
   await page.getByLabel('Title', { exact: true }).fill('SQL test');
   await page.getByRole('button', { name: 'Preview SQL (no notifications)', exact: true }).click();
-  await expect(page.getByRole('table', { name: 'Preview values' })).toContainText('errors:');
+  await expect(page.getByRole('table', { name: 'Preview values' })).toContainText('errors=');
   await expect(
     page
       .getByRole('table', { name: 'Preview values' })
@@ -230,26 +243,30 @@ test('SQL create and preview use the existing editor with optional targets', asy
   await expect(page.getByText('SQL', { exact: true })).toBeVisible();
   await expect(page.getByText('No targets. State tracking only.', { exact: true })).toBeVisible();
 });
-test('list actions evaluate, mute/unmute, disable/enable, and preserve focus after cancelling delete', async ({
+test('list menus evaluate, mute/unmute, disable/enable, and return focus after cancelling delete', async ({
   page,
 }) => {
   await demo(page);
   const row = namedRow(page, 'High host load');
-  await row.getByRole('button', { name: 'Evaluate now High host load' }).click();
-  await expect(row).toContainText('Evaluation requested');
-  await row.getByRole('button', { name: 'Mute High host load' }).click();
+  const opener = row.getByRole('button', { name: 'Actions for High host load' });
+  await rowAction(page, 'High host load', 'Evaluate now');
+  await expect(
+    page.getByRole('status').filter({ hasText: 'High host load: Evaluation requested' }),
+  ).toBeVisible();
+  await expect(opener).toBeFocused();
+  await rowAction(page, 'High host load', 'Mute…');
   await page
     .getByRole('dialog', { name: 'Mute notifications' })
     .getByRole('button', { name: 'Indefinitely', exact: true })
     .click();
-  await expect(row.getByRole('button', { name: 'Unmute High host load' })).toBeVisible();
-  await row.getByRole('button', { name: 'Unmute High host load' }).click();
-  await row.getByRole('button', { name: 'Disable High host load' }).click();
-  await expect(row.getByRole('button', { name: 'Evaluate now High host load' })).toBeDisabled();
-  await row.getByRole('button', { name: 'Enable High host load' }).click();
+  await expect(opener).toBeFocused();
+  await rowAction(page, 'High host load', 'Unmute');
+  await rowAction(page, 'High host load', 'Disable');
+  const menu = await rowMenu(page, 'High host load');
+  await expect(menu.getByRole('menuitem', { name: 'Evaluate now' })).toBeDisabled();
+  await menu.getByRole('menuitem', { name: 'Enable' }).click();
   await expect(row).toContainText('Not triggered');
-  const opener = row.getByRole('button', { name: 'Delete High host load' });
-  await opener.click();
+  await rowAction(page, 'High host load', 'Delete');
   await page.keyboard.press('Escape');
   await expect(opener).toBeFocused();
 });
@@ -314,7 +331,7 @@ test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the
   const row = namedRow(page, 'Test hook');
   await expect(row).toContainText('https://********');
   await expect(row).not.toContainText('secret-token');
-  await row.getByRole('button', { name: 'Edit target Test hook' }).click();
+  await rowAction(page, 'Test hook', 'Edit');
   sheet = page.getByRole('dialog', { name: 'Edit target', exact: true });
   await expect(sheet.getByLabel('Endpoint URL')).toHaveValue('');
   await expect(sheet.getByLabel('Header 1 value')).toHaveValue('');
@@ -326,13 +343,16 @@ test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the
   await sheet.getByLabel('Endpoint URL').fill('https://example.com/new');
   await sheet.getByLabel('Header 1 value').fill('new-secret');
   await sheet.getByRole('button', { name: 'Save target' }).click();
-  await expect(row.getByRole('button', { name: 'Edit target Test hook' })).toBeFocused();
-  await row.getByRole('button', { name: 'Delete target Test hook' }).click();
+  await expect(row.getByRole('button', { name: 'Actions for Test hook' })).toBeFocused();
+  await rowAction(page, 'Test hook', 'Delete');
   await remove(page, 'target', 'Test hook');
   await expect(row).toHaveCount(0);
-  await namedRow(page, 'Operations Slack')
-    .getByRole('button', { name: 'Delete target Operations Slack' })
-    .click();
+  await expect(
+    namedRow(page, 'Operations Slack').getByRole('button', {
+      name: 'Actions for Operations Slack',
+    }),
+  ).toBeFocused();
+  await rowAction(page, 'Operations Slack', 'Delete');
   const dialog = page.getByRole('dialog', { name: 'Delete target' });
   await dialog.getByLabel('Confirmation name').fill('Operations Slack');
   await dialog.locator('[data-dialog-confirm]').click();
@@ -495,12 +515,271 @@ test('save failure stays in the dirty form with the plain-text server error', as
   );
   await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Failure');
 });
+for (const type of ['promql', 'code'] as const) {
+  test(`${type} dataset-permission 401 keeps the session, draft and dirty guard on failed save`, async ({
+    page,
+  }) => {
+    const query = type === 'promql' ? 'up' : 'SELECT COUNT(*) FROM "logs"';
+    const source = {
+      ...alertFixture,
+      queryType: type,
+      query,
+      datasets: [type === 'promql' ? 'metrics' : 'logs'],
+    };
+    await mocked(page, { original: source });
+    await page.context().addCookies([
+      { name: 'user_id', value: 'writer', url: 'http://127.0.0.1:5173' },
+      { name: 'session', value: 'valid-session', url: 'http://127.0.0.1:5173' },
+    ]);
+    const body =
+      type === 'promql'
+        ? 'ActixError: User does not have access to stream- private_metrics'
+        : 'ActixError: User does not have access to stream- private_logs';
+    await page.route(`**/api/v1/alerts/${alertFixture.id}`, (route) =>
+      route.request().method() === 'PUT'
+        ? route.fulfill({ status: 401, contentType: 'text/plain', body })
+        : route.fallback(),
+    );
+    await page.goto(`${detailPath}/edit`);
+    await page.getByLabel('Title', { exact: true }).fill('Keep this draft');
+    await page.getByLabel('Threshold value').fill('9');
+    await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+    await expect(page.getByRole('alert')).toContainText(
+      'Permission denied: User does not have access to stream-',
+    );
+    await expect(page).toHaveURL(new RegExp(`${detailPath}/edit$`));
+    await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Keep this draft');
+    await expect(page.getByLabel('Threshold value')).toHaveValue('9');
+    await expect(
+      page.getByRole('textbox', {
+        name: type === 'promql' ? 'PromQL query' : 'SQL query',
+        exact: true,
+      }),
+    ).toHaveText(query);
+    expect(
+      (await page.context().cookies()).find((cookie) => cookie.name === 'session')?.value,
+    ).toBe('valid-session');
+    const confirmation = page.waitForEvent('dialog');
+    const leaving = page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await (await confirmation).dismiss();
+    await leaving;
+    await expect(page).toHaveURL(new RegExp(`${detailPath}/edit$`));
+  });
+  test(`${type} query is dynamically read-only during a held save and editable after failure`, async ({
+    page,
+  }) => {
+    const api = await mocked(page, { enabled: type === 'promql' });
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let first = true;
+    await page.route('**/api/v1/alerts', async (route) => {
+      if (route.request().method() !== 'POST' || !first) return route.fallback();
+      first = false;
+      await held;
+      await route.fulfill({ status: 400, body: 'Temporary save failure' });
+    });
+    const query = type === 'promql' ? 'up' : 'SELECT COUNT(*) FROM "logs"';
+    const edited = type === 'promql' ? 'sum(up)' : 'SELECT SUM(total) FROM "logs"';
+    await page.goto(
+      `/alerts/new?dataset=${type === 'promql' ? 'metrics' : 'logs'}&alertQuery=${encodeURIComponent(query)}&title=Held`,
+    );
+    const editor = page.getByRole('textbox', {
+      name: type === 'promql' ? 'PromQL query' : 'SQL query',
+      exact: true,
+    });
+    const started = page.waitForRequest(
+      (request) =>
+        new URL(request.url()).pathname === '/api/v1/alerts' && request.method() === 'POST',
+    );
+    try {
+      await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+      const submission = await started;
+      expect(submission.postDataJSON().query).toBe(query);
+      await expect(editor).toHaveAttribute('aria-readonly', 'true');
+      await expect(editor).not.toBeEditable();
+      await editor.click();
+      await page.keyboard.type(' + 1');
+      await expect(editor).toHaveText(query);
+    } finally {
+      release();
+    }
+    await expect(page.getByRole('alert')).toContainText('Temporary save failure');
+    await expect(editor).toHaveAttribute('aria-readonly', 'false');
+    await expect(editor).toBeEditable();
+    await editor.fill(edited);
+    await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Held', exact: true })).toBeVisible();
+    expect(api.writes[0].query).toBe(edited);
+  });
+}
+test('a real Rust session-expiry 401 still clears cookies and returns a failed save to login', async ({
+  page,
+}) => {
+  await mocked(page);
+  await page
+    .context()
+    .addCookies([{ name: 'session', value: 'expired-session', url: 'http://127.0.0.1:5173' }]);
+  await page.route('**/api/v1/alerts', (route) =>
+    route.request().method() === 'POST'
+      ? route.fulfill({
+          status: 401,
+          body: 'Your session has expired or is no longer valid. Please re-authenticate to access this resource.',
+        })
+      : route.fallback(),
+  );
+  await page.goto('/alerts/new?dataset=metrics&alertQuery=up&title=Expired');
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(page).toHaveURL(/\/login\?/);
+  await expect(page.getByRole('button', { name: 'Login', exact: true })).toBeVisible();
+  expect((await page.context().cookies()).some((cookie) => cookie.name === 'session')).toBe(false);
+});
+test('untouched tags with commas and whitespace round-trip through edit and duplicate', async ({
+  page,
+}) => {
+  const tags = ['team,west', ' padded ', 'multiple  spaces'];
+  const api = await mocked(page, { original: { ...alertFixture, tags } });
+  await page.goto(`${detailPath}/edit`);
+  for (const [index, tag] of tags.entries())
+    await expect(page.getByLabel(`Tag ${index + 1}`, { exact: true })).toHaveValue(tag);
+  await page.getByLabel('Threshold value').fill('4');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: alertFixture.title, exact: true })).toBeVisible();
+  expect(api.writes[0].tags).toEqual(tags);
+  await page.getByRole('button', { name: 'Duplicate', exact: true }).click();
+  for (const [index, tag] of tags.entries())
+    await expect(page.getByLabel(`Tag ${index + 1}`, { exact: true })).toHaveValue(tag);
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: `${alertFixture.title} (Copy)`, exact: true }),
+  ).toBeVisible();
+  expect(api.writes[1].tags).toEqual(tags);
+});
+test('deleting alert rows focuses the next row, previous row, then search for an empty list', async ({
+  page,
+}) => {
+  await demo(page);
+  for (const [name, next] of [
+    ['High host load', 'Muted memory warning'],
+    ['Muted memory warning', 'Checkout errors (builder)'],
+    ['Checkout errors (builder)', 'Application errors'],
+    ['Application errors', undefined],
+  ] as const) {
+    await rowAction(page, name, 'Delete');
+    await remove(page, 'alert', name);
+    await expect(namedRow(page, name)).toHaveCount(0);
+    await expect(
+      next
+        ? namedRow(page, next).getByRole('button', { name: `Actions for ${next}` })
+        : page.getByLabel('Search alerts'),
+    ).toBeFocused();
+  }
+  await expect(page.getByRole('heading', { name: 'No alerts yet' })).toBeVisible();
+});
+test('deleting target rows focuses the next row, previous row, then search for an empty list', async ({
+  page,
+}) => {
+  await mocked(page);
+  let targets = ['Alpha', 'Bravo', 'Charlie'].map((name) => ({
+    target: { ...targetFixture, id: name, name },
+    enabled: true,
+  }));
+  await page.route('**/api/v1/targets', (route) => route.fulfill({ json: targets }));
+  await page.route('**/api/v1/targets/*', (route) => {
+    const id = new URL(route.request().url()).pathname.split('/').at(-1)!;
+    const target = targets.find((row) => row.target.id === id)!.target;
+    targets = targets.filter((row) => row.target.id !== id);
+    return route.fulfill({ json: target });
+  });
+  await page.goto('/alerts/targets');
+  for (const [name, next] of [
+    ['Bravo', 'Charlie'],
+    ['Charlie', 'Alpha'],
+    ['Alpha', undefined],
+  ] as const) {
+    await rowAction(page, name, 'Delete');
+    await remove(page, 'target', name);
+    await expect(namedRow(page, name)).toHaveCount(0);
+    await expect(
+      next
+        ? namedRow(page, next).getByRole('button', { name: `Actions for ${next}` })
+        : page.getByLabel('Search targets'),
+    ).toBeFocused();
+  }
+  await expect(page.getByRole('heading', { name: 'No targets yet' })).toBeVisible();
+});
 test('delivery errors redact credential-bearing URLs', async ({ page }) => {
   await mocked(page);
   await page.goto(detailPath);
   const deliveries = page.getByRole('table', { name: 'Notification deliveries' });
   await expect(deliveries).toContainText('[redacted endpoint]');
   await expect(deliveries).not.toContainText('secret-token');
+});
+test('detail, preview and target sheet have padded cards, readable labels, UTC times and aligned fields', async ({
+  page,
+}) => {
+  await mocked(page);
+  await page.route('**/prometheus/api/v1/query_range', (route) =>
+    route.fulfill({
+      json: {
+        status: 'success',
+        data: {
+          resultType: 'matrix',
+          result: [
+            {
+              metric: { 'host.name': 'host-a', job: 'shots' },
+              values: [
+                [1, '3.25'],
+                [31, '4.25'],
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  );
+  await page.goto(detailPath);
+  await expect(
+    page.getByRole('heading', { name: 'Expression over the last hour', exact: true }),
+  ).toBeVisible();
+  await expect(page.locator('.charts-title')).toContainText('host-a');
+  await expect(page.locator('.charts-title')).not.toContainText('{');
+  await expect(
+    page.getByRole('table', { name: 'Alert instances' }).locator('.alerts-label-chip'),
+  ).toHaveText('host=node-a');
+  await expect(
+    page.getByRole('table', { name: 'Notification deliveries' }).locator('.alerts-label-chip'),
+  ).toHaveText('host=node-a');
+  for (const time of await page.locator('.alerts-page time').all())
+    await expect(time).toHaveText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$/);
+  for (const body of await page.locator('.ui-card-body').all())
+    expect(
+      await body.evaluate((element) => parseFloat(getComputedStyle(element).paddingLeft)),
+    ).toBeGreaterThanOrEqual(12);
+  await page.getByRole('button', { name: 'Duplicate', exact: true }).click();
+  await page
+    .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
+    .click();
+  await expect(
+    page.getByRole('table', { name: 'Preview values' }).locator('.alerts-label-chip'),
+  ).toHaveText('host=node-a');
+  const preview = (await page.locator('.alerts-preview').boundingBox())!;
+  const button = (await page
+    .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
+    .boundingBox())!;
+  expect(button.x - preview.x).toBeGreaterThanOrEqual(12);
+  expect(button.width).toBeLessThan(preview.width - 24);
+  await page.getByRole('button', { name: 'New target', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+  await sheet.getByRole('button', { name: 'Add header', exact: true }).click();
+  const name = (await sheet.getByLabel('Header 1 name').boundingBox())!;
+  const value = (await sheet.getByLabel('Header 1 value').boundingBox())!;
+  expect(Math.abs(name.width - value.width)).toBeLessThanOrEqual(1);
+  const endpoint = (await sheet.getByLabel('Endpoint URL').boundingBox())!;
+  const fieldset = (await sheet.getByRole('group', { name: 'Custom headers' }).boundingBox())!;
+  expect(Math.abs(endpoint.x - fieldset.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(endpoint.width - fieldset.width)).toBeLessThanOrEqual(1);
 });
 test('preview never evaluates a saved rule, clears stale results and shows No data', async ({
   page,
@@ -642,6 +921,26 @@ test('list, detail, form, targets and an open sheet fit 390px without horizontal
   await page.setViewportSize({ width: 390, height: 844 });
   for (const path of ['/alerts', detailPath, '/alerts/new', '/alerts/targets']) {
     await demo(page, path);
+    if (path === '/alerts') {
+      const region = page.getByRole('region', { name: 'Alerts table' });
+      expect(await region.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(
+        true,
+      );
+      expect((await namedRow(page, 'High host load').boundingBox())!.height).toBeLessThanOrEqual(
+        60,
+      );
+      await namedRow(page, 'High host load')
+        .getByRole('button', { name: 'Actions for High host load' })
+        .focus();
+      await page.keyboard.press('ArrowDown');
+      await expect(page.getByRole('menuitem', { name: 'Evaluate now' })).toBeFocused();
+      await page.keyboard.press('Escape');
+      await expect(
+        namedRow(page, 'High host load').getByRole('button', {
+          name: 'Actions for High host load',
+        }),
+      ).toBeFocused();
+    }
     if (path.endsWith('/new'))
       await expect(page.getByRole('textbox', { name: 'PromQL query', exact: true })).toBeVisible();
     if (path === detailPath)

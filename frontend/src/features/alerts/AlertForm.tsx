@@ -1,6 +1,6 @@
 import { useCallback, useId, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { Button, Card, EmptyState, Input, Select } from '../../components/ui';
+import { Button, Card, CardHeader, CardBody, EmptyState, Input, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { PromqlEditor, type PromqlMetadataSource } from '../../components/promql/PromqlEditor';
@@ -11,6 +11,7 @@ import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metric
 import { matcher } from '../../lib/promql';
 import type { Alert } from '../../lib/types';
 import { AlertPreview } from './AlertPreview';
+import { TagEditor } from './TagEditor';
 import { TargetSheet } from './TargetSheet';
 import {
   alertDraft,
@@ -197,270 +198,290 @@ function AlertFormFields({
       }}
     >
       <div className="stack">
-        <Card className="stack">
-          <h2>Rule</h2>
-          <div className="alerts-fields">
-            <Select
-              label="Alert type"
-              value={draft.type}
-              disabled={Boolean(original) || mutation.pending}
-              error={errors.type}
-              onChange={(event) => {
-                update('type', event.target.value as AlertDraft['type']);
-                update('dataset', '');
-                update('query', '');
-              }}
-            >
-              {promqlEnabled && <option value="promql">PromQL threshold</option>}
-              {!promqlEnabled && draft.type === 'promql' && (
-                <option value="promql" disabled>
-                  PromQL (unavailable)
-                </option>
-              )}
-              <option value="code">SQL threshold</option>
-            </Select>
-            <Select
-              label="Dataset"
-              value={draft.dataset}
-              disabled={Boolean(original) || mutation.pending}
-              error={touched || draft.dataset ? datasetError : undefined}
-              hint={
-                draft.type === 'promql'
-                  ? 'Only OTLP metrics datasets support PromQL.'
-                  : 'SQL can query any accessible dataset.'
-              }
-              onChange={(event) => update('dataset', event.target.value)}
-            >
-              <option value="">Select a dataset</option>
-              {draft.dataset && !choices.some((item) => item.name === draft.dataset) && (
-                <option value={draft.dataset}>{draft.dataset}</option>
-              )}
-              {choices.map((item) => (
-                <option key={item.name} value={item.name}>
-                  {item.name}
-                </option>
-              ))}
-            </Select>
-          </div>
-          <QueryState
-            loading={datasets.loading || metrics.loading}
-            error={datasets.error ?? metrics.error}
-            retry={() => {
-              forgetMetricsDatasets(client);
-              datasets.reload();
-              metrics.reload();
-            }}
-          />
-          {metrics.data?.unchecked.length ? (
-            <p className="notice" role="status">
-              Some datasets could not be checked: {metrics.data.unchecked.join(', ')}.{' '}
-              <Button
-                size="sm"
-                onClick={() => {
-                  forgetMetricsDatasets(client);
-                  metrics.reload();
+        <Card>
+          <CardHeader>
+            <h2>Rule</h2>
+          </CardHeader>
+          <CardBody className="stack">
+            <div className="alerts-fields">
+              <Select
+                label="Alert type"
+                value={draft.type}
+                disabled={Boolean(original) || mutation.pending}
+                error={errors.type}
+                onChange={(event) => {
+                  update('type', event.target.value as AlertDraft['type']);
+                  update('dataset', '');
+                  update('query', '');
                 }}
               >
-                Check again
-              </Button>
-            </p>
-          ) : null}
-          {draft.type === 'promql' ? (
-            <PromqlEditor
-              value={draft.query}
-              onChange={(value) => update('query', value)}
-              metadata={draft.dataset ? metadata : undefined}
-              invalid={Boolean(touched && errors.query)}
-              describedBy={queryMessage}
-              onRun={() => previewButton.current?.click()}
+                {promqlEnabled && <option value="promql">PromQL threshold</option>}
+                {!promqlEnabled && draft.type === 'promql' && (
+                  <option value="promql" disabled>
+                    PromQL (unavailable)
+                  </option>
+                )}
+                <option value="code">SQL threshold</option>
+              </Select>
+              <Select
+                label="Dataset"
+                value={draft.dataset}
+                disabled={Boolean(original) || mutation.pending}
+                error={touched || draft.dataset ? datasetError : undefined}
+                hint={
+                  draft.type === 'promql'
+                    ? 'Only OTLP metrics datasets support PromQL.'
+                    : 'SQL can query any accessible dataset.'
+                }
+                onChange={(event) => update('dataset', event.target.value)}
+              >
+                <option value="">Select a dataset</option>
+                {draft.dataset && !choices.some((item) => item.name === draft.dataset) && (
+                  <option value={draft.dataset}>{draft.dataset}</option>
+                )}
+                {choices.map((item) => (
+                  <option key={item.name} value={item.name}>
+                    {item.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <QueryState
+              loading={datasets.loading || metrics.loading}
+              error={datasets.error ?? metrics.error}
+              retry={() => {
+                forgetMetricsDatasets(client);
+                datasets.reload();
+                metrics.reload();
+              }}
             />
-          ) : (
-            <SqlEditor
-              value={draft.query}
-              onChange={(value) => update('query', value)}
-              invalid={Boolean(touched && errors.query)}
-              describedBy={queryMessage}
-              onRun={() => previewButton.current?.click()}
-            />
-          )}
-          <p
-            id={queryMessage}
-            className={touched && errors.query ? 'error-text' : 'muted'}
-            role={touched && errors.query ? 'alert' : undefined}
-          >
-            {touched && errors.query
-              ? errors.query
-              : draft.type === 'promql'
-                ? 'Use an instant-vector expression. Each series is evaluated independently.'
-                : 'Use exactly one numeric aggregate expression, optionally with GROUP BY; subqueries are not supported. The server validates the query on save.'}
-          </p>
-        </Card>
-        <Card className="stack">
-          <h2>Threshold and evaluation</h2>
-          <div className="alerts-fields">
-            <Select
-              label="Threshold operator"
-              value={draft.operator}
-              disabled={mutation.pending}
-              error={touched ? errors.operator : undefined}
-              onChange={(event) => update('operator', event.target.value as AlertDraft['operator'])}
+            {metrics.data?.unchecked.length ? (
+              <p className="notice" role="status">
+                Some datasets could not be checked: {metrics.data.unchecked.join(', ')}.{' '}
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    forgetMetricsDatasets(client);
+                    metrics.reload();
+                  }}
+                >
+                  Check again
+                </Button>
+              </p>
+            ) : null}
+            {draft.type === 'promql' ? (
+              <PromqlEditor
+                value={draft.query}
+                onChange={(value) => update('query', value)}
+                metadata={draft.dataset ? metadata : undefined}
+                invalid={Boolean(touched && errors.query)}
+                describedBy={queryMessage}
+                readOnly={mutation.pending}
+                onRun={() => previewButton.current?.click()}
+              />
+            ) : (
+              <SqlEditor
+                value={draft.query}
+                onChange={(value) => update('query', value)}
+                invalid={Boolean(touched && errors.query)}
+                describedBy={queryMessage}
+                readOnly={mutation.pending}
+                onRun={() => previewButton.current?.click()}
+              />
+            )}
+            <p
+              id={queryMessage}
+              className={touched && errors.query ? 'error-text' : 'muted'}
+              role={touched && errors.query ? 'alert' : undefined}
             >
-              {operators.map((operator) => (
-                <option key={operator} value={operator}>
-                  {operator}
+              {touched && errors.query
+                ? errors.query
+                : draft.type === 'promql'
+                  ? 'Use an instant-vector expression. Each series is evaluated independently.'
+                  : 'Use exactly one numeric aggregate expression, optionally with GROUP BY; subqueries are not supported. The server validates the query on save.'}
+            </p>
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader>
+            <h2>Threshold and evaluation</h2>
+          </CardHeader>
+          <CardBody className="stack">
+            <div className="alerts-fields">
+              <Select
+                label="Threshold operator"
+                value={draft.operator}
+                disabled={mutation.pending}
+                error={touched ? errors.operator : undefined}
+                onChange={(event) =>
+                  update('operator', event.target.value as AlertDraft['operator'])
+                }
+              >
+                {operators.map((operator) => (
+                  <option key={operator} value={operator}>
+                    {operator}
+                  </option>
+                ))}
+              </Select>
+              <Input
+                label="Threshold value"
+                type="number"
+                step="any"
+                value={draft.threshold}
+                disabled={mutation.pending}
+                error={touched ? errors.threshold : undefined}
+                onChange={(event) => update('threshold', event.target.value)}
+              />
+              <Input
+                label="Evaluation frequency (minutes)"
+                type="number"
+                min={1}
+                max={draft.type === 'promql' ? 1440 : undefined}
+                step={1}
+                value={draft.frequency}
+                disabled={mutation.pending}
+                error={touched ? errors.frequency : undefined}
+                onChange={(event) => update('frequency', event.target.value)}
+              />
+              <Input
+                label="Evaluation window"
+                value={draft.window}
+                disabled={mutation.pending}
+                hint={
+                  draft.type === 'promql'
+                    ? 'Required by the server; PromQL evaluates the current instant.'
+                    : 'Query the last duration, for example 10m or 1h.'
+                }
+                error={touched ? errors.window : undefined}
+                onChange={(event) => update('window', event.target.value)}
+              />
+            </div>
+            {draft.type === 'promql' && (
+              <>
+                <Input
+                  label="Hold duration"
+                  value={draft.hold}
+                  disabled={mutation.pending}
+                  hint="Continuous breach duration; 0s fires immediately. Maximum 30 days."
+                  error={touched ? errors.hold : undefined}
+                  onChange={(event) => update('hold', event.target.value)}
+                />
+                <p className="muted">
+                  Missing data retains firing state and resets pending duration. Evaluation errors
+                  do not report recovery. Notifications are sent on firing and recovery transitions,
+                  with at most three delivery attempts.
+                </p>
+              </>
+            )}
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader>
+            <h2>Targets</h2>
+          </CardHeader>
+          <CardBody className="stack">
+            <QueryState
+              loading={targets.loading && !targets.data}
+              error={targets.error}
+              retry={targets.reload}
+            />
+            <fieldset
+              className="alerts-fieldset"
+              disabled={mutation.pending}
+              aria-describedby={targetsMessage}
+            >
+              <legend>Notification targets</legend>
+              <div className="alerts-target-picker">
+                {targets.data?.map(({ target, enabled, error }) => (
+                  <label className="alerts-checkbox" key={target.id}>
+                    <input
+                      type="checkbox"
+                      checked={draft.targets.includes(target.id)}
+                      disabled={!enabled && !draft.targets.includes(target.id)}
+                      onChange={(event) =>
+                        update(
+                          'targets',
+                          event.target.checked
+                            ? [...draft.targets, target.id]
+                            : draft.targets.filter((id) => id !== target.id),
+                        )
+                      }
+                    />{' '}
+                    <span>
+                      {target.name}
+                      {!enabled && <span className="muted"> — Disabled: {error}</span>}
+                    </span>
+                  </label>
+                ))}
+                {draft.targets
+                  .filter(
+                    (id) => targets.data && !targets.data.some(({ target }) => target.id === id),
+                  )
+                  .map((id) => (
+                    <label className="alerts-checkbox" key={id}>
+                      <input
+                        type="checkbox"
+                        checked
+                        onChange={() =>
+                          update(
+                            'targets',
+                            draft.targets.filter((value) => value !== id),
+                          )
+                        }
+                      />
+                      Unavailable target {id}
+                    </label>
+                  ))}
+                {targets.data && !targets.data.length && <p className="muted">No targets yet.</p>}
+              </div>
+            </fieldset>
+            <p
+              id={targetsMessage}
+              className={errors.targets ? 'error-text' : 'muted'}
+              role={errors.targets ? 'alert' : undefined}
+            >
+              {errors.targets ??
+                (!draft.targets.length
+                  ? 'State tracking only: no notifications until a target is selected.'
+                  : 'Notify the selected targets when the threshold rule triggers.')}
+            </p>
+            <div>
+              <Button onClick={() => setNewTarget(true)} disabled={mutation.pending}>
+                New target
+              </Button>
+            </div>
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader>
+            <h2>Alert information</h2>
+          </CardHeader>
+          <CardBody className="stack">
+            <Input
+              label="Title"
+              value={draft.title}
+              disabled={mutation.pending}
+              error={touched ? errors.title : undefined}
+              onChange={(event) => update('title', event.target.value)}
+            />
+            <Select
+              label="Severity"
+              value={draft.severity}
+              disabled={mutation.pending}
+              onChange={(event) => update('severity', event.target.value as AlertDraft['severity'])}
+            >
+              {severities.map((severity) => (
+                <option key={severity} value={severity}>
+                  {severityLabel(severity)}
                 </option>
               ))}
             </Select>
-            <Input
-              label="Threshold value"
-              type="number"
-              step="any"
-              value={draft.threshold}
+            <TagEditor
+              tags={draft.tags}
               disabled={mutation.pending}
-              error={touched ? errors.threshold : undefined}
-              onChange={(event) => update('threshold', event.target.value)}
+              onChange={(tags) => update('tags', tags)}
             />
-            <Input
-              label="Evaluation frequency (minutes)"
-              type="number"
-              min={1}
-              max={draft.type === 'promql' ? 1440 : undefined}
-              step={1}
-              value={draft.frequency}
-              disabled={mutation.pending}
-              error={touched ? errors.frequency : undefined}
-              onChange={(event) => update('frequency', event.target.value)}
-            />
-            <Input
-              label="Evaluation window"
-              value={draft.window}
-              disabled={mutation.pending}
-              hint={
-                draft.type === 'promql'
-                  ? 'Required by the server; PromQL evaluates the current instant.'
-                  : 'Query the last duration, for example 10m or 1h.'
-              }
-              error={touched ? errors.window : undefined}
-              onChange={(event) => update('window', event.target.value)}
-            />
-          </div>
-          {draft.type === 'promql' && (
-            <>
-              <Input
-                label="Hold duration"
-                value={draft.hold}
-                disabled={mutation.pending}
-                hint="Continuous breach duration; 0s fires immediately. Maximum 30 days."
-                error={touched ? errors.hold : undefined}
-                onChange={(event) => update('hold', event.target.value)}
-              />
-              <p className="muted">
-                Missing data retains firing state and resets pending duration. Evaluation errors do
-                not report recovery. Notifications are sent on firing and recovery transitions, with
-                at most three delivery attempts.
-              </p>
-            </>
-          )}
-        </Card>
-        <Card className="stack">
-          <h2>Targets</h2>
-          <QueryState
-            loading={targets.loading && !targets.data}
-            error={targets.error}
-            retry={targets.reload}
-          />
-          <fieldset
-            className="alerts-fieldset"
-            disabled={mutation.pending}
-            aria-describedby={targetsMessage}
-          >
-            <legend>Notification targets</legend>
-            <div className="alerts-target-picker">
-              {targets.data?.map(({ target, enabled, error }) => (
-                <label className="alerts-checkbox" key={target.id}>
-                  <input
-                    type="checkbox"
-                    checked={draft.targets.includes(target.id)}
-                    disabled={!enabled && !draft.targets.includes(target.id)}
-                    onChange={(event) =>
-                      update(
-                        'targets',
-                        event.target.checked
-                          ? [...draft.targets, target.id]
-                          : draft.targets.filter((id) => id !== target.id),
-                      )
-                    }
-                  />{' '}
-                  <span>
-                    {target.name}
-                    {!enabled && <span className="muted"> — Disabled: {error}</span>}
-                  </span>
-                </label>
-              ))}
-              {draft.targets
-                .filter(
-                  (id) => targets.data && !targets.data.some(({ target }) => target.id === id),
-                )
-                .map((id) => (
-                  <label className="alerts-checkbox" key={id}>
-                    <input
-                      type="checkbox"
-                      checked
-                      onChange={() =>
-                        update(
-                          'targets',
-                          draft.targets.filter((value) => value !== id),
-                        )
-                      }
-                    />
-                    Unavailable target {id}
-                  </label>
-                ))}
-              {targets.data && !targets.data.length && <p className="muted">No targets yet.</p>}
-            </div>
-          </fieldset>
-          <p
-            id={targetsMessage}
-            className={errors.targets ? 'error-text' : 'muted'}
-            role={errors.targets ? 'alert' : undefined}
-          >
-            {errors.targets ??
-              (!draft.targets.length
-                ? 'State tracking only: no notifications until a target is selected.'
-                : 'Notify the selected targets when the threshold rule triggers.')}
-          </p>
-          <Button onClick={() => setNewTarget(true)} disabled={mutation.pending}>
-            New target
-          </Button>
-        </Card>
-        <Card className="stack">
-          <h2>Alert information</h2>
-          <Input
-            label="Title"
-            value={draft.title}
-            disabled={mutation.pending}
-            error={touched ? errors.title : undefined}
-            onChange={(event) => update('title', event.target.value)}
-          />
-          <Select
-            label="Severity"
-            value={draft.severity}
-            disabled={mutation.pending}
-            onChange={(event) => update('severity', event.target.value as AlertDraft['severity'])}
-          >
-            {severities.map((severity) => (
-              <option key={severity} value={severity}>
-                {severityLabel(severity)}
-              </option>
-            ))}
-          </Select>
-          <Input
-            label="Tags"
-            value={draft.tags}
-            disabled={mutation.pending}
-            hint="Separate tags with commas."
-            onChange={(event) => update('tags', event.target.value)}
-          />
+          </CardBody>
         </Card>
         {original?.queryType === 'promql' && (
           <p className="notice">

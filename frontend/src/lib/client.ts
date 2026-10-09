@@ -74,17 +74,30 @@ async function readJson(
 
 async function request(endpoint: string, init: RequestInit, onUnauthorized?: () => void) {
   const response = await fetch(endpoint, { ...init, credentials: 'include' });
-  if (response.status === 401 && endpoint.startsWith('/prometheus/api/v1/')) {
+  if (response.status === 401) {
     try {
       return await checked(response);
     } catch (error) {
-      if (error instanceof ApiError && promqlErrorType(error) === 'forbidden')
-        throw new ApiError(error.message, 403, error.detail);
+      if (error instanceof ApiError) {
+        if (endpoint.startsWith('/prometheus/api/v1/') && promqlErrorType(error) === 'forbidden')
+          throw new ApiError(error.message, 403, error.detail);
+        if (/^\/api\/v1\/(alerts|targets)(?:[/?]|$)/.test(endpoint)) {
+          // AlertError wraps actix errors on the wire. These are dataset authorization
+          // failures from user_auth_for_alert_config/user_auth_for_datasets, not session expiry.
+          const message = error.message.replace(/^ActixError: /, '');
+          if (
+            message.startsWith('User does not have access to stream- ') ||
+            message === 'User does not have access to PromQL alert stream'
+          )
+            throw new ApiError(`Permission denied: ${message}`, 403, error.detail);
+          if (message.startsWith('Stream not found: '))
+            throw new ApiError(message, 404, error.detail);
+        }
+      }
       onUnauthorized?.();
       throw error;
     }
   }
-  if (response.status === 401) onUnauthorized?.();
   return checked(response);
 }
 

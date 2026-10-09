@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Button, TypedConfirmDialog } from '../../components/ui';
+import { ActionsMenu, Button, TypedConfirmDialog, type ActionsMenuItem } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import type { AlertSummary } from '../../lib/types';
 import { muteState } from './helpers';
@@ -13,12 +13,14 @@ export function AlertActions({
   detail = false,
   onChanged,
   onDeleted,
+  onStatus,
 }: {
   alert: AlertSummary;
   canWrite: boolean;
   detail?: boolean;
   onChanged: () => void;
   onDeleted?: () => void;
+  onStatus?: (message: string) => void;
 }) {
   const { client } = useApp();
   const navigate = useNavigate();
@@ -29,12 +31,15 @@ export function AlertActions({
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(timer.current), []);
   const muted = muteState(alert.notificationState).muted;
-  const label = (action: string) => (detail ? action : `${action} ${alert.title}`);
+  function announce(message: string) {
+    if (detail) setStatus(message);
+    else onStatus?.(message);
+  }
   function run(operation: () => Promise<unknown>, message: string, evaluate = false) {
     void mutation.run(async () => {
       await operation();
       if (!mutation.isActive()) return;
-      setStatus(message);
+      announce(message);
       onChanged();
       if (evaluate) {
         clearTimeout(timer.current);
@@ -43,61 +48,65 @@ export function AlertActions({
     });
   }
   if (!canWrite) return <span className="muted">Read-only</span>;
+  const items: ActionsMenuItem[] = [
+    {
+      label: 'Evaluate now',
+      disabled: mutation.pending || alert.state === 'disabled',
+      onSelect: () =>
+        run(
+          () => client.evaluateAlert(alert.id),
+          'Evaluation requested. Results refresh shortly.',
+          true,
+        ),
+    },
+    {
+      label: alert.state === 'disabled' ? 'Enable' : 'Disable',
+      disabled: mutation.pending,
+      onSelect: () =>
+        run(
+          () =>
+            alert.state === 'disabled'
+              ? client.enableAlert(alert.id)
+              : client.disableAlert(alert.id),
+          alert.state === 'disabled' ? 'Alert enabled.' : 'Alert disabled.',
+        ),
+    },
+    {
+      label: muted ? 'Unmute' : 'Mute…',
+      disabled: mutation.pending,
+      onSelect: () =>
+        muted
+          ? run(() => client.muteAlert(alert.id, 'notify'), 'Notifications unmuted.')
+          : setMuting(true),
+    },
+    {
+      label: 'Delete',
+      destructive: true,
+      disabled: mutation.pending,
+      onSelect: () => {
+        mutation.reset();
+        setRemoving(true);
+      },
+    },
+  ];
   return (
-    <div className="stack alerts-action-block">
-      <div className="alerts-actions">
-        {detail && alert.queryType !== 'builder' && (
-          <Button
-            size="sm"
-            disabled={mutation.pending}
-            onClick={() => navigate(`/alerts/${encodeURIComponent(alert.id)}/edit`)}
-          >
-            Edit
-          </Button>
-        )}
-        <Button
-          size="sm"
-          disabled={mutation.pending || alert.state === 'disabled'}
-          aria-label={label('Evaluate now')}
-          onClick={() =>
-            run(
-              () => client.evaluateAlert(alert.id),
-              'Evaluation requested. Results refresh shortly.',
-              true,
-            )
-          }
-        >
-          Evaluate now
-        </Button>
-        <Button
-          size="sm"
-          disabled={mutation.pending}
-          aria-label={label(alert.state === 'disabled' ? 'Enable' : 'Disable')}
-          onClick={() =>
-            run(
-              () =>
-                alert.state === 'disabled'
-                  ? client.enableAlert(alert.id)
-                  : client.disableAlert(alert.id),
-              alert.state === 'disabled' ? 'Alert enabled.' : 'Alert disabled.',
-            )
-          }
-        >
-          {alert.state === 'disabled' ? 'Enable' : 'Disable'}
-        </Button>
-        <Button
-          size="sm"
-          disabled={mutation.pending}
-          aria-label={label(muted ? 'Unmute' : 'Mute')}
-          onClick={() =>
-            muted
-              ? run(() => client.muteAlert(alert.id, 'notify'), 'Notifications unmuted.')
-              : setMuting(true)
-          }
-        >
-          {muted ? 'Unmute' : 'Mute'}
-        </Button>
-        {detail && (
+    <div className="alerts-action-block">
+      {detail ? (
+        <div className="alerts-actions">
+          {alert.queryType !== 'builder' && (
+            <Button
+              size="sm"
+              disabled={mutation.pending}
+              onClick={() => navigate(`/alerts/${encodeURIComponent(alert.id)}/edit`)}
+            >
+              Edit
+            </Button>
+          )}
+          {items.slice(0, 3).map((item) => (
+            <Button key={item.label} size="sm" disabled={item.disabled} onClick={item.onSelect}>
+              {item.label === 'Mute…' ? 'Mute' : item.label}
+            </Button>
+          ))}
           <Button
             size="sm"
             disabled={mutation.pending}
@@ -110,20 +119,22 @@ export function AlertActions({
           >
             Duplicate
           </Button>
-        )}
-        <Button
-          size="sm"
-          variant="danger"
-          disabled={mutation.pending}
-          aria-label={label('Delete')}
-          onClick={() => {
-            mutation.reset();
-            setRemoving(true);
-          }}
-        >
-          Delete
-        </Button>
-      </div>
+          <Button
+            size="sm"
+            variant="danger"
+            disabled={mutation.pending}
+            onClick={items[3].onSelect}
+          >
+            Delete
+          </Button>
+        </div>
+      ) : (
+        <ActionsMenu
+          label={`Actions for ${alert.title}`}
+          items={items}
+          data-row-action={alert.id}
+        />
+      )}
       {!removing && <InlineError error={mutation.error} />}
       {status && (
         <p role="status" className="muted">
@@ -136,7 +147,7 @@ export function AlertActions({
           onMute={async (state) => {
             await client.muteAlert(alert.id, state);
             if (mutation.isActive()) {
-              setStatus('Notifications muted.');
+              announce('Notifications muted.');
               onChanged();
             }
           }}

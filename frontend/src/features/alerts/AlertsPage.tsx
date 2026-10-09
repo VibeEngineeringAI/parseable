@@ -39,7 +39,7 @@ function AlertsIndex() {
         description="Track thresholds in metrics and SQL query results."
         actions={
           <>
-            <Link className="ui-button" to="/alerts/targets">
+            <Link className="ui-button" data-variant="secondary" to="/alerts/targets">
               Targets
             </Link>
             <Button onClick={list.reload} disabled={list.loading}>

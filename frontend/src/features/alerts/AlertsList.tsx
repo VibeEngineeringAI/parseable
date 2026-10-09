@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ArrowDown, ArrowUp, BellOff } from 'lucide-react';
+import { ArrowDown, ArrowUp, BellOff, Search } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -13,6 +13,7 @@ import {
 } from '../../components/ui';
 import type { AlertSummary } from '../../lib/types';
 import { AlertActions } from './AlertActions';
+import { useRowDeletionFocus } from './shared';
 import {
   filterSortAlerts,
   muteState,
@@ -33,12 +34,17 @@ export function AlertsList({
   onChanged: () => void;
   canWrite: boolean;
 }) {
+  const [status, setStatus] = useState('');
   const [search, setSearch] = useState(''),
     [tag, setTag] = useState(''),
     [sort, setSort] = useState<AlertSort>('title'),
     [descending, setDescending] = useState(false),
     [requestedPage, setPage] = useState(0);
   const filtered = filterSortAlerts(rows, search, tag, sort, descending);
+  const deletionFocus = useRowDeletionFocus(
+    rows.map((row) => row.id),
+    refreshing,
+  );
   const page = Math.min(requestedPage, Math.max(0, Math.ceil(filtered.length / PAGE_SIZE) - 1));
   const tags = [...new Set(rows.flatMap((row) => row.tags ?? []))].sort();
   const columns: [AlertSort, string][] = [
@@ -50,10 +56,12 @@ export function AlertsList({
     ['tags', 'Tags'],
   ];
   return (
-    <section aria-label="Alerts list" className="stack">
+    <section ref={deletionFocus.root} aria-label="Alerts list" className="stack">
       <div className="list-toolbar alerts-toolbar">
         <div className="search-field">
+          <Search size={16} aria-hidden="true" />
           <Input
+            data-list-search
             aria-label="Search alerts"
             placeholder="Search by title"
             value={search}
@@ -79,6 +87,11 @@ export function AlertsList({
           ))}
         </Select>
       </div>
+      {status && (
+        <p role="status" className="muted">
+          {status}
+        </p>
+      )}
       {refreshing && (
         <p role="status" className="muted">
           Refreshing alerts…
@@ -99,8 +112,9 @@ export function AlertsList({
       ) : !filtered.length ? (
         <EmptyState title="No matching alerts" description="Try another title or tag." />
       ) : (
-        <Card className="alerts-table" aria-busy={refreshing}>
-          <div className="table-scroll">
+        <Card className="alerts-table alerts-list-table" aria-busy={refreshing}>
+          <p className="alerts-scroll-hint muted">Scroll horizontally for more columns.</p>
+          <div className="table-scroll" role="region" aria-label="Alerts table" tabIndex={0}>
             <table>
               <caption className="sr-only">Alerts</caption>
               <thead>
@@ -187,7 +201,13 @@ export function AlertsList({
                         </div>
                       </td>
                       <td>
-                        <AlertActions alert={row} canWrite={canWrite} onChanged={onChanged} />
+                        <AlertActions
+                          alert={row}
+                          canWrite={canWrite}
+                          onChanged={onChanged}
+                          onDeleted={() => deletionFocus.onDeleted(row.id)}
+                          onStatus={(message) => setStatus(`${row.title}: ${message}`)}
+                        />
                       </td>
                     </tr>
                   );

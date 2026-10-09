@@ -6,6 +6,7 @@ import {
   compareThreshold,
   displayDate,
   filterSortAlerts,
+  formatAlertDate,
   muteState,
   newAlertDraft,
   promqlSyntaxError,
@@ -71,9 +72,9 @@ describe('alert forms and payloads', () => {
       evalFrequency: 1,
     });
   });
-  it('defaults and round-trips hold duration, preserves targets and de-duplicates tags', () => {
+  it('defaults and round-trips hold duration, preserves targets and tags', () => {
     const form = draft();
-    form.tags = 'prod, metrics, prod, ';
+    form.tags = ['prod', 'metrics'];
     form.targets = ['one', 'two'];
     const payload = buildAlertPayload(form);
     expect(payload.promqlConfig).toEqual({ holdDuration: '0s' });
@@ -81,6 +82,20 @@ describe('alert forms and payloads', () => {
     expect(alertDraft(payload).targets).toEqual(form.targets);
     payload.targets.push('three');
     expect(form.targets).toEqual(['one', 'two']);
+  });
+  it.each(['edit', 'duplicate'])('preserves every untouched tag byte through %s', (mode) => {
+    const source = {
+      ...original(),
+      tags: ['team,west', ' padded ', '', 'team,west', 'with\tspace'],
+    };
+    const form = alertDraft(source);
+    if (mode === 'edit') form.threshold = '3';
+    else form.title = `${source.title} (Copy)`;
+    const payload = buildAlertPayload(form, source);
+    expect(payload.tags).toEqual(source.tags);
+    form.tags[0] = 'changed';
+    expect(source.tags[0]).toBe('team,west');
+    expect(payload.tags![0]).toBe('team,west');
   });
   it('builds code SQL without PromQL config and accepts state-tracking-only SQL', () => {
     const form = {
@@ -204,6 +219,13 @@ describe('durations, thresholds and mute states', () => {
     expect(displayDate('bad')).toBeUndefined();
     expect(safeDeliveryError('failed (https://hooks.slack.com/token-secret)')).toBe(
       'failed ([redacted endpoint])',
+    );
+  });
+  it('formats runtime and mute timestamps as 24-hour UTC, including offset input', () => {
+    expect(formatAlertDate('2026-10-09T12:07:22-05:00')).toBe('2026-10-09 17:07:22 UTC');
+    expect(formatAlertDate('2026-10-09 17:07:22.123456789 UTC')).toBe('2026-10-09 17:07:22 UTC');
+    expect(muteState('2026-10-10T17:07:22Z', Date.parse('2026-10-09T00:00:00Z')).label).toBe(
+      'Muted until 2026-10-10 17:07:22 UTC',
     );
   });
 });

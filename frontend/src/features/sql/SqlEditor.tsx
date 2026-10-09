@@ -11,12 +11,14 @@ export function SqlEditor({
   onRun,
   invalid = false,
   describedBy,
+  readOnly = false,
 }: {
   value: string;
   onChange: (value: string) => void;
   onRun: () => void;
   invalid?: boolean;
   describedBy?: string;
+  readOnly?: boolean;
 }) {
   const element = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
@@ -88,14 +90,17 @@ export function SqlEditor({
   }, [value]);
   useEffect(() => {
     view.current?.dispatch({
-      effects: attributes.current.reconfigure(
+      effects: attributes.current.reconfigure([
+        EditorState.readOnly.of(readOnly),
+        EditorView.editable.of(!readOnly),
         EditorView.contentAttributes.of({
           'aria-label': 'SQL query',
           'aria-invalid': String(invalid),
+          'aria-readonly': String(readOnly),
           ...(describedBy ? { 'aria-describedby': describedBy } : {}),
         }),
-      ),
+      ]),
     });
-  }, [invalid, describedBy]);
+  }, [invalid, describedBy, readOnly]);
   return <div className="sql-editor" data-invalid={invalid || undefined} ref={element} />;
 }

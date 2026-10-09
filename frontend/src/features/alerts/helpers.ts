@@ -91,7 +91,7 @@ export type AlertDraft = {
   targets: string[];
   severity: AlertSeverity;
   title: string;
-  tags: string;
+  tags: string[];
 };
 export function newAlertDraft(promql: boolean, params = new URLSearchParams()): AlertDraft {
   return {
@@ -106,7 +106,7 @@ export function newAlertDraft(promql: boolean, params = new URLSearchParams()): 
     targets: [],
     severity: 'high',
     title: params.get('title') ?? '',
-    tags: '',
+    tags: [],
   };
 }
 export function alertDraft(alert: AlertRequest): AlertDraft {
@@ -122,7 +122,7 @@ export function alertDraft(alert: AlertRequest): AlertDraft {
     targets: [...alert.targets],
     severity: alert.severity,
     title: alert.title,
-    tags: (alert.tags ?? []).join(', '),
+    tags: [...(alert.tags ?? [])],
   };
 }
 export function promqlSyntaxError(query: string): string | undefined {
@@ -230,14 +230,7 @@ export function buildAlertPayload(draft: AlertDraft, original?: AlertRequest): A
           : Math.min(original?.notificationConfig.interval ?? 1, Number(draft.frequency)),
     },
     targets: [...draft.targets],
-    tags: [
-      ...new Set(
-        draft.tags
-          .split(',')
-          .map((tag) => tag.trim())
-          .filter(Boolean),
-      ),
-    ],
+    tags: [...draft.tags],
     ...(draft.type === 'promql'
       ? { promqlConfig: { ...original?.promqlConfig, holdDuration: draft.hold.trim() } }
       : {}),
@@ -278,7 +271,7 @@ export function muteState(
     return date > now
       ? {
           muted: true,
-          label: `Muted until ${new Date(date).toLocaleString(undefined, { timeZone: 'UTC' })} UTC`,
+          label: `Muted until ${formatAlertDate(value)}`,
         }
       : { muted: false, label: 'Notifications on' };
   return { muted: true, label: 'Muted (unknown end time)' };
@@ -296,6 +289,10 @@ export function displayDate(value?: string | null) {
   if (!value) return undefined;
   const iso = value.includes(' UTC') ? value.replace(' ', 'T').replace(' UTC', 'Z') : value;
   return Number.isFinite(Date.parse(iso)) ? new Date(iso).toISOString() : undefined;
+}
+export function formatAlertDate(value: string) {
+  const iso = displayDate(value);
+  return iso ? `${iso.slice(0, 19).replace('T', ' ')} UTC` : 'Never';
 }
 // Reqwest errors may embed credential-bearing target URLs.
 export const safeDeliveryError = (value: string) =>

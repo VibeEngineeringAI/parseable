@@ -1,7 +1,8 @@
 import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ArrowDown, ArrowUp } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowLeft, Search } from 'lucide-react';
 import {
+  ActionsMenu,
   Badge,
   Button,
   Card,
@@ -17,7 +18,7 @@ import { useApp } from '../../app/AppProvider';
 import type { AlertTarget } from '../../lib/types';
 import { TargetSheet } from './TargetSheet';
 import { targetType, targetTypeLabel } from './targetHelpers';
-import { useAlertAccess, useCollection, useMutation } from './shared';
+import { useAlertAccess, useCollection, useMutation, useRowDeletionFocus } from './shared';
 
 export function TargetsPage() {
   const { client } = useApp(),
@@ -47,10 +48,16 @@ export function TargetsPage() {
         (descending ? -1 : 1)
       );
     });
+  const deletionFocus = useRowDeletionFocus(
+    (targets.data ?? []).map(({ target }) => target.id),
+    targets.loading,
+  );
   const page = Math.min(requestedPage, Math.max(0, Math.ceil(filtered.length / PAGE_SIZE) - 1));
   return (
-    <div className="page alerts-page stack">
-      <Link to="/alerts">Back to alerts</Link>
+    <div ref={deletionFocus.root} className="page alerts-page stack">
+      <Link className="alerts-back" to="/alerts">
+        <ArrowLeft size={14} aria-hidden="true" /> Back to alerts
+      </Link>
       <PageHeader
         title="Alert targets"
         description="Manage notification destinations. Endpoints and secrets are masked by the server."
@@ -62,9 +69,11 @@ export function TargetsPage() {
           )
         }
       />
-      <div className="list-toolbar">
+      <div className="list-toolbar alerts-toolbar">
         <div className="search-field">
+          <Search size={16} aria-hidden="true" />
           <Input
+            data-list-search
             aria-label="Search targets"
             placeholder="Search by name"
             value={search}
@@ -102,7 +111,8 @@ export function TargetsPage() {
           <EmptyState title="No matching targets" description="Try another name." />
         ) : (
           <Card className="alerts-table" aria-busy={targets.loading}>
-            <div className="table-scroll">
+            <p className="alerts-scroll-hint muted">Scroll horizontally for more columns.</p>
+            <div className="table-scroll" role="region" aria-label="Targets table" tabIndex={0}>
               <table>
                 <caption className="sr-only">Alert targets</caption>
                 <thead>
@@ -157,26 +167,26 @@ export function TargetsPage() {
                         </td>
                         <td>
                           {canWrite ? (
-                            <div className="alerts-actions">
-                              <Button
-                                size="sm"
-                                aria-label={`Edit target ${target.name}`}
-                                onClick={() => setEditing(target)}
-                              >
-                                Edit
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="danger"
-                                aria-label={`Delete target ${target.name}`}
-                                onClick={() => {
-                                  mutation.reset();
-                                  setRemoving(target);
-                                }}
-                              >
-                                Delete
-                              </Button>
-                            </div>
+                            <ActionsMenu
+                              label={`Actions for ${target.name}`}
+                              data-row-action={target.id}
+                              items={[
+                                {
+                                  label: 'Edit',
+                                  onSelect: () => setEditing(target),
+                                  disabled: mutation.pending,
+                                },
+                                {
+                                  label: 'Delete',
+                                  destructive: true,
+                                  disabled: mutation.pending,
+                                  onSelect: () => {
+                                    mutation.reset();
+                                    setRemoving(target);
+                                  },
+                                },
+                              ]}
+                            />
                           ) : (
                             <span className="muted">Read-only</span>
                           )}
@@ -214,6 +224,7 @@ export function TargetsPage() {
             void mutation.run(async () => {
               await client.deleteAlertTarget(removing.id);
               if (mutation.isActive()) {
+                deletionFocus.onDeleted(removing.id);
                 setRemoving(undefined);
                 targets.reload();
               }

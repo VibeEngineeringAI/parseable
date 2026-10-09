@@ -27,6 +27,22 @@
   background: var(--color-surface);
   font: 12px/1.5 var(--font-sans);
 }
+.charts-thresholds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 8px 12px;
+  color: var(--color-warning);
+}
+.charts-thresholds > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.charts-threshold-key {
+  width: 20px;
+  border-top: 1px dashed currentColor;
+}
 
 .charts-title {
   padding: 12px 12px 8px;

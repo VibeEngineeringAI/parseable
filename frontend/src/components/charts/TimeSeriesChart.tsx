@@ -14,6 +14,8 @@ import { PALETTE_SIZE, assignSeriesSlots, rankSeries, selectTopSeries } from './
 import './charts.css';
 
 export type ChartSeries = { id: string; label: string; values: (number | null)[] };
+export type ChartThreshold = { value: number; label?: string };
+const noThresholds: ChartThreshold[] = [];
 
 export interface TimeSeriesChartProps {
   timestamps: number[];
@@ -25,6 +27,8 @@ export interface TimeSeriesChartProps {
   timeZone?: 'UTC' | 'local';
   formatValue?: (value: number) => string;
   emptyMessage?: string;
+  /** Horizontal reference lines, included in the automatic y range. */
+  thresholds?: readonly ChartThreshold[];
 }
 
 type Cursor = { index: number; left: number; top: number };
@@ -133,6 +137,7 @@ export function TimeSeriesChart({
   timeZone = 'UTC',
   formatValue = formatChartValue,
   emptyMessage = 'No data',
+  thresholds = noThresholds,
 }: TimeSeriesChartProps) {
   const container = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
@@ -146,6 +151,10 @@ export function TimeSeriesChart({
   const instructionsId = useId();
   const tooltipId = useId();
   const limit = Math.max(1, Math.floor(maxSeries));
+  const references = useMemo(
+    () => thresholds.filter(({ value }) => Number.isFinite(value)),
+    [thresholds],
+  );
   const slotHistory = useRef(new Map<string, number>());
   const entries = useMemo<PositionedSeries[]>(() => {
     const drawn = showAll ? series : selectTopSeries(series, limit);
@@ -199,6 +208,7 @@ export function TimeSeriesChart({
     const grid = styles.getPropertyValue('--color-border').trim();
     const muted = styles.getPropertyValue('--color-muted').trim();
     const surface = styles.getPropertyValue('--color-surface').trim();
+    const thresholdColor = styles.getPropertyValue('--color-warning').trim();
     const font = `11px ${styles.getPropertyValue('--font-sans').trim()}`;
     const data: uPlot.AlignedData = [
       timestamps,
@@ -228,6 +238,21 @@ export function TimeSeriesChart({
             timeZone === 'UTC'
               ? uPlot.tzDate(new Date(timestamp * 1000), 'UTC')
               : new Date(timestamp * 1000),
+          ...(references.length
+            ? {
+                scales: {
+                  y: {
+                    range: (_, min, max) =>
+                      uPlot.rangeNum(
+                        Math.min(min, ...references.map(({ value }) => value)),
+                        Math.max(max, ...references.map(({ value }) => value)),
+                        0.1,
+                        true,
+                      ),
+                  },
+                },
+              }
+            : {}),
           series: [
             {},
             ...entries.map(({ series: entry, slot }, index) => ({
@@ -266,6 +291,27 @@ export function TimeSeriesChart({
               left < 0 ? [left, top] : [self.valToPos(timestamps[self.posToIdx(left)], 'x'), top],
           },
           hooks: {
+            draw: [
+              (self) => {
+                if (!references.length) return;
+                const { ctx, bbox } = self;
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(bbox.left, bbox.top, bbox.width, bbox.height);
+                ctx.clip();
+                ctx.strokeStyle = thresholdColor;
+                ctx.lineWidth = uPlot.pxRatio;
+                ctx.setLineDash([6 * uPlot.pxRatio, 4 * uPlot.pxRatio]);
+                for (const { value } of references) {
+                  const y = self.valToPos(value, 'y', true);
+                  ctx.beginPath();
+                  ctx.moveTo(bbox.left, y);
+                  ctx.lineTo(bbox.left + bbox.width, y);
+                  ctx.stroke();
+                }
+                ctx.restore();
+              },
+            ],
             setCursor: [
               (self) => {
                 const index = self.cursor.idx;
@@ -316,7 +362,7 @@ export function TimeSeriesChart({
       plot.current = null;
       chart?.destroy();
     };
-  }, [timestamps, entries, height, timeZone, formatValue, hasData, themeRevision]);
+  }, [timestamps, entries, height, timeZone, formatValue, hasData, themeRevision, references]);
 
   useEffect(() => {
     const chart = plot.current;
@@ -408,6 +454,16 @@ export function TimeSeriesChart({
           />
         )}
       </div>
+      {references.length > 0 && (
+        <div className="charts-thresholds">
+          {references.map(({ value, label }, index) => (
+            <span key={index}>
+              <span className="charts-threshold-key" aria-hidden="true" />
+              {label ?? 'Threshold'}: {formatValue(value)}
+            </span>
+          ))}
+        </div>
+      )}
       <div className="charts-count-row">
         <span aria-live="polite">
           {visibleEntries.length === series.length

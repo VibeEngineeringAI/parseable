@@ -165,6 +165,7 @@ test('create a real masked webhook target and PromQL alert through the UI; previ
   await page.getByRole('textbox', { name: 'PromQL query', exact: true }).fill(query);
   await page.getByLabel('Threshold value').fill('100');
   await page.getByLabel('Hold duration').fill('5m');
+  await page.getByLabel('Evaluation frequency (minutes)').fill('1440');
   await page.getByLabel('Title', { exact: true }).fill(title);
   await page.getByRole('checkbox', { name: targetName, exact: true }).check();
   const previewed = page.waitForResponse(
@@ -205,6 +206,7 @@ test('create a real masked webhook target and PromQL alert through the UI; previ
     query,
     datasets: [dataset],
     promqlConfig: { holdDuration: '5m' },
+    evalConfig: { rollingWindow: { evalFrequency: 1440 } },
     targets: [targetId],
   });
 });
@@ -213,15 +215,58 @@ test('evaluate, mute/unmute and disable/enable update the real rule and its runt
   request,
 }) => {
   await signIn(page, `/alerts/${alertId}`);
+  let before: Alert | undefined;
+  await expect
+    .poll(
+      async () => {
+        before = await getJson<Alert>(request, `/api/v1/alerts/${alertId}`);
+        return before.promqlRuntime?.lastEvaluatedAt ?? null;
+      },
+      { timeout: 15_000, intervals: [500, 1000] },
+    )
+    .not.toBeNull();
+  expect(before!.evalConfig.rollingWindow.evalFrequency).toBe(1440);
+  const previous = Date.parse(before!.promqlRuntime!.lastEvaluatedAt!);
+  expect(Number.isFinite(previous)).toBe(true);
+  const evaluated = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === `/api/v1/alerts/${alertId}/evaluate_alert` &&
+      response.request().method() === 'PUT',
+  );
+  const refreshed = page.waitForResponse(async (response) => {
+    if (
+      new URL(response.url()).pathname !== `/api/v1/alerts/${alertId}` ||
+      response.request().method() !== 'GET' ||
+      !response.ok()
+    )
+      return false;
+    const updated = (await response.json()) as Alert;
+    return Date.parse(updated.promqlRuntime?.lastEvaluatedAt ?? '') > previous;
+  });
   await page.getByRole('button', { name: 'Evaluate now', exact: true }).click();
+  const evaluationResponse = await evaluated;
+  expect(evaluationResponse.status(), await evaluationResponse.text()).toBe(200);
   await expect(page.getByRole('status').filter({ hasText: 'Evaluation requested' })).toBeVisible();
   await expect
     .poll(
-      async () =>
-        (await getJson<Alert>(request, `/api/v1/alerts/${alertId}`)).promqlRuntime?.health,
+      async () => {
+        const rule = await getJson<Alert>(request, `/api/v1/alerts/${alertId}`);
+        return (
+          rule.promqlRuntime?.health === 'ok' &&
+          Date.parse(rule.promqlRuntime.lastEvaluatedAt ?? '') > previous
+        );
+      },
       { timeout: 15_000, intervals: [500, 1000] },
     )
-    .toBe('ok');
+    .toBe(true);
+  const uiRuntime = ((await (await refreshed).json()) as Alert).promqlRuntime!;
+  expect(uiRuntime.health).toBe('ok');
+  expect(Date.parse(uiRuntime.lastEvaluatedAt!)).toBeGreaterThan(previous);
+  const iso = new Date(uiRuntime.lastEvaluatedAt!).toISOString();
+  await expect(page.getByTestId('last-evaluated').locator('time')).toHaveAttribute('datetime', iso);
+  await expect(page.getByTestId('last-evaluated')).toContainText(
+    `${iso.slice(0, 19).replace('T', ' ')} UTC`,
+  );
   await page.getByRole('button', { name: 'Mute', exact: true }).click();
   await page
     .getByRole('dialog', { name: 'Mute notifications' })
@@ -280,14 +325,16 @@ test('edit resends hold duration, then deletes the real alert and target through
   await page
     .getByRole('row')
     .filter({ has: page.getByText(targetName, { exact: true }) })
-    .getByRole('button', { name: `Delete target ${targetName}` })
+    .getByRole('button', { name: `Actions for ${targetName}` })
     .click();
+  await page.getByRole('menuitem', { name: 'Delete', exact: true }).click();
   dialog = page.getByRole('dialog', { name: 'Delete target', exact: true });
   await dialog.getByLabel('Confirmation name').fill(targetName);
   await dialog.locator('[data-dialog-confirm]').click();
   await expect(
     page.getByRole('row').filter({ has: page.getByText(targetName, { exact: true }) }),
   ).toHaveCount(0);
+  await expect(page.locator('.alerts-table [data-row-action]').first()).toBeFocused();
   expect(
     (await getJson<AlertTargetStatus[]>(request, '/api/v1/targets')).some(
       ({ target }) => target.id === targetId,

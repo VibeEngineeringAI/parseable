@@ -171,6 +171,56 @@ describe('alerts client requests', () => {
       expect(onUnauthorized).toHaveBeenCalledTimes(status === 401 ? 1 : 0);
     }
   });
+  it.each(cases)(
+    '$name maps Rust dataset-permission 401s without session recovery',
+    async (entry) => {
+      // src/alerts/mod.rs and src/utils/mod.rs; AlertError::Error prefixes actix errors.
+      for (const message of [
+        'User does not have access to stream- private_metrics',
+        'ActixError: User does not have access to stream- private_logs',
+        'User does not have access to PromQL alert stream',
+        'ActixError: User does not have access to PromQL alert stream',
+      ]) {
+        const onUnauthorized = vi.fn();
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(message, { status: 401 })));
+        await expect(
+          entry.run(createClient({ mode: 'live', onUnauthorized }), new AbortController().signal),
+        ).rejects.toMatchObject({
+          status: 403,
+          message: `Permission denied: ${message.replace(/^ActixError: /, '')}`,
+          detail: message,
+        });
+        expect(onUnauthorized).not.toHaveBeenCalled();
+      }
+    },
+  );
+  it.each(cases)('$name recovers the real Rust expired/missing-session 401s', async (entry) => {
+    for (const message of [
+      'Your session has expired or is no longer valid. Please re-authenticate to access this resource.',
+      'ActixError: No authentication method supplied',
+      'No authentication method supplied',
+    ]) {
+      const onUnauthorized = vi.fn();
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(message, { status: 401 })));
+      await expect(
+        entry.run(createClient({ mode: 'live', onUnauthorized }), new AbortController().signal),
+      ).rejects.toMatchObject({ status: 401, message });
+      expect(onUnauthorized).toHaveBeenCalledOnce();
+    }
+  });
+  it('maps the SQL authorization helper missing-stream 401 without expiring the session', async () => {
+    const onUnauthorized = vi.fn();
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(new Response('ActixError: Stream not found: missing', { status: 401 })),
+    );
+    await expect(
+      createClient({ mode: 'live', onUnauthorized }).updateAlert(id, alertRequest),
+    ).rejects.toMatchObject({ status: 404, message: 'Stream not found: missing' });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
   it.each(cases.filter((entry) => !entry.text))(
     '$name rejects malformed success payloads',
     async (entry) => {

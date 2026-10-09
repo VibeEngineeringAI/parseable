@@ -1,12 +1,13 @@
 import { useCallback, useState, type Ref } from 'react';
-import { Button, Badge, Card, EmptyState } from '../../components/ui';
+import { Button, Badge, Card, CardHeader, CardBody, EmptyState } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
-import { seriesLabel, parseSampleValue } from '../../lib/promql';
+import { parseSampleValue } from '../../lib/promql';
+import { LabelChips } from './LabelChips';
 import { compareThreshold, type AlertDraft } from './helpers';
 
-type PreviewRow = { labels: string; value: number | string; breached?: boolean };
+type PreviewRow = { labels: Record<string, string>; value: number | string; breached?: boolean };
 export function AlertPreview({
   draft,
   disabled,
@@ -36,7 +37,7 @@ export function AlertPreview({
             if (!Number.isFinite(number))
               throw new Error('Preview requires finite numeric values.');
             return {
-              labels: seriesLabel(metric, { keepName: true }),
+              labels: metric,
               value: number,
               breached: compare(number),
             };
@@ -47,9 +48,9 @@ export function AlertPreview({
           signal,
         );
         return rows.map((row) => ({
-          labels: Object.entries(row)
-            .map(([key, value]) => `${key}: ${String(value)}`)
-            .join(', '),
+          labels: Object.fromEntries(
+            Object.entries(row).map(([key, value]) => [key, String(value)]),
+          ),
           value:
             Object.values(row)
               .filter((value) => typeof value === 'number')
@@ -60,56 +61,64 @@ export function AlertPreview({
     ),
   );
   return (
-    <Card className="alerts-preview stack">
-      <h2>Preview</h2>
-      <p className="muted">Current query values only. This preview never sends notifications.</p>
-      <Button
-        ref={buttonRef}
-        onClick={() => setSnapshot({ ...draft, targets: [...draft.targets] })}
-        disabled={disabled || (result.loading && Boolean(snapshot))}
-      >
-        {snapshot && result.loading
-          ? 'Previewing…'
-          : draft.type === 'promql'
-            ? 'Preview current values (no notifications)'
-            : 'Preview SQL (no notifications)'}
-      </Button>
-      {snapshot && (
-        <QueryState loading={result.loading} error={result.error} retry={result.reload} />
-      )}
-      {snapshot &&
-        result.data &&
-        (result.data.length ? (
-          <div className="table-scroll">
-            <table>
-              <caption className="sr-only">Preview values</caption>
-              <thead>
-                <tr>
-                  <th scope="col">{draft.type === 'promql' ? 'Series labels' : 'Result'}</th>
-                  <th scope="col">Value</th>
-                  {draft.type === 'promql' && <th scope="col">Threshold</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {result.data.map((row, index) => (
-                  <tr key={`${row.labels}-${index}`}>
-                    <td className="alerts-labels">{row.labels}</td>
-                    <td>{row.value}</td>
-                    {draft.type === 'promql' && (
-                      <td>
-                        <Badge tone={row.breached ? 'danger' : 'success'}>
-                          {row.breached ? 'Threshold breached' : 'Within threshold'}
-                        </Badge>
-                      </td>
-                    )}
+    <Card className="alerts-preview">
+      <CardHeader>
+        <h2>Preview</h2>
+      </CardHeader>
+      <CardBody className="stack">
+        <p className="muted">Current query values only. This preview never sends notifications.</p>
+        <div>
+          <Button
+            ref={buttonRef}
+            onClick={() => setSnapshot({ ...draft, targets: [...draft.targets] })}
+            disabled={disabled || (result.loading && Boolean(snapshot))}
+          >
+            {snapshot && result.loading
+              ? 'Previewing…'
+              : draft.type === 'promql'
+                ? 'Preview current values (no notifications)'
+                : 'Preview SQL (no notifications)'}
+          </Button>
+        </div>
+        {snapshot && (
+          <QueryState loading={result.loading} error={result.error} retry={result.reload} />
+        )}
+        {snapshot &&
+          result.data &&
+          (result.data.length ? (
+            <div className="table-scroll">
+              <table>
+                <caption className="sr-only">Preview values</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">{draft.type === 'promql' ? 'Series labels' : 'Result'}</th>
+                    <th scope="col">Value</th>
+                    {draft.type === 'promql' && <th scope="col">Threshold</th>}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <EmptyState title="No data" description="No series or rows returned for this query." />
-        ))}
+                </thead>
+                <tbody>
+                  {result.data.map((row, index) => (
+                    <tr key={index}>
+                      <td className="alerts-labels">
+                        <LabelChips labels={row.labels} />
+                      </td>
+                      <td>{row.value}</td>
+                      {draft.type === 'promql' && (
+                        <td>
+                          <Badge tone={row.breached ? 'danger' : 'success'}>
+                            {row.breached ? 'Threshold breached' : 'Within threshold'}
+                          </Badge>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState title="No data" description="No series or rows returned for this query." />
+          ))}
+      </CardBody>
     </Card>
   );
 }
