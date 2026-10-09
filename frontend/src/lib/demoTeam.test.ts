@@ -6,7 +6,7 @@ describe('per-client Team demo', () => {
     const client = createDemoClient();
     expect(await client.about()).toEqual({
       oidcActive: true,
-      capabilities: { oidcRoleMapping: true, oidcRoleSync: true },
+      capabilities: { oidcRoleMapping: true, oidcRoleSync: true, promql: true },
     });
     expect(
       new Set(

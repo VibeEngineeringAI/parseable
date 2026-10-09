@@ -1,0 +1,77 @@
+.promql-editor {
+  min-width: 0;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.promql-editor:focus-within {
+  border-color: var(--color-focus);
+  box-shadow: 0 0 0 1px var(--color-focus);
+}
+
+.promql-editor[data-invalid] {
+  border-color: var(--color-danger);
+}
+
+.promql-editor .cm-editor {
+  border-radius: inherit;
+}
+
+.promql-editor .cm-editor.cm-focused {
+  outline: none;
+}
+
+.promql-editor .cm-scroller {
+  font-family: var(--font-mono);
+}
+
+.promql-editor .cm-line {
+  padding-inline: 12px;
+}
+
+.promql-editor .cm-content {
+  min-height: var(--promql-min-height);
+  caret-color: var(--color-text);
+}
+
+.promql-editor .cm-placeholder {
+  color: var(--color-muted);
+}
+
+.promql-editor .cm-tooltip,
+[data-theme='dark'] .promql-editor .cm-tooltip {
+  color: var(--color-text);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-panel);
+  font: 12px/1.5 var(--font-mono);
+}
+
+.promql-editor .cm-tooltip-autocomplete > ul {
+  max-height: 240px;
+  max-width: min(560px, 85vw);
+}
+
+.promql-editor .cm-tooltip-autocomplete > ul > li {
+  padding: 4px 8px;
+}
+
+.promql-editor .cm-tooltip-autocomplete > ul > li[aria-selected],
+[data-theme='dark'] .promql-editor .cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: var(--color-primary-soft);
+  color: var(--color-text);
+}
+
+.promql-editor .cm-completionDetail {
+  color: var(--color-muted);
+}
+
+.promql-editor .cm-diagnostic-error {
+  border-color: var(--color-danger);
+}
+
+.promql-editor .cm-tooltip-lint {
+  max-width: min(480px, 85vw);
+}
