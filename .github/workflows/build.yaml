@@ -1,12 +1,8 @@
 name: Ensure parseable builds on all release targets
 
 on:
-  pull_request:
-    paths-ignore:
-      - docs/**
-      - helm/**
-      - assets/**
-      - "**.md"
+  # Temporarily pause automatic builds for the release target matrix.
+  workflow_dispatch:
 
 # Cross preserves this absolute workspace path inside its build container.
 env:
