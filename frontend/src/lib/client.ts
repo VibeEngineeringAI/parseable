@@ -3,7 +3,14 @@ import { authEndpoint, cookieIdentity } from './auth';
 import { demoEnabled } from './config';
 import { apiKey, groupRoles, object, roles, roleSources, strings, userRoles } from './teamContract';
 import { instantResult, rangeResult, successEnvelope } from './promqlContract';
-import type { Dataset, LogRecord, ParseableClient, PromqlMetadataRequest } from './types';
+import { alert, alertSummary, alertTarget, alertTargetStatus } from './alertsContract';
+import type {
+  AlertSeverity,
+  Dataset,
+  LogRecord,
+  ParseableClient,
+  PromqlMetadataRequest,
+} from './types';
 
 export class ApiError extends Error {
   constructor(
@@ -114,6 +121,8 @@ export function createClient({
   const base = '/api/v1';
   const prometheus = '/prometheus/api/v1';
   const keys = '/api/prism/v1/apikeys';
+  const alertPath = (id: string) => `${base}/alerts/${encodeURIComponent(id)}`;
+  const targetPath = (id: string) => `${base}/targets/${encodeURIComponent(id)}`;
   const user = (id: string) => `${base}/user/${encodeURIComponent(id)}`;
   const role = (name: string) => {
     if (name.toLowerCase() === 'default')
@@ -153,7 +162,63 @@ export function createClient({
       truncated: data.warnings?.some((warning) => warning.includes('truncated')) ?? false,
     };
   };
+  const readAlert = async (endpoint: string, init: RequestInit) => {
+    const data = await readJson(endpoint, init, onUnauthorized);
+    if (!alert(data)) return malformed(endpoint);
+    return data;
+  };
+  const readTarget = async (endpoint: string, init: RequestInit) => {
+    const data = await readJson(endpoint, init, onUnauthorized);
+    if (!alertTarget(data)) return malformed(endpoint);
+    return data;
+  };
   return {
+    async listAlerts(signal) {
+      // The server caps each page at 1000 and returns no total. Never silently truncate.
+      const result = [];
+      for (let offset = 0; ; offset += 1000) {
+        const endpoint = `${base}/alerts?limit=1000&offset=${offset}`;
+        const data = await readJson(endpoint, { signal }, onUnauthorized);
+        if (!Array.isArray(data) || !data.every(alertSummary)) return malformed(endpoint);
+        result.push(
+          ...data.map((item) => ({
+            ...item,
+            severity: item.severity.toLowerCase() as AlertSeverity,
+          })),
+        );
+        if (data.length < 1000) return result;
+      }
+    },
+    getAlert: (id, signal) => readAlert(alertPath(id), { signal }),
+    createAlert: (body) => readAlert(`${base}/alerts`, jsonBody('POST', body)),
+    updateAlert: (id, body) => readAlert(alertPath(id), jsonBody('PUT', body)),
+    deleteAlert: (id) => mutate(alertPath(id), { method: 'DELETE' }),
+    enableAlert: (id) => readAlert(`${alertPath(id)}/enable`, { method: 'PATCH' }),
+    disableAlert: (id) => readAlert(`${alertPath(id)}/disable`, { method: 'PATCH' }),
+    muteAlert: (id, state) =>
+      readAlert(`${alertPath(id)}/update_notification_state`, jsonBody('PATCH', { state })),
+    evaluateAlert: (id) => readAlert(`${alertPath(id)}/evaluate_alert`, { method: 'PUT' }),
+    async listAlertTags(signal) {
+      const endpoint = `${base}/alerts/list_tags`;
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (!strings(data)) return malformed(endpoint);
+      return data;
+    },
+    async listAlertTargets(signal) {
+      const endpoint = `${base}/targets`;
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (!Array.isArray(data) || !data.every(alertTargetStatus)) return malformed(endpoint);
+      return data;
+    },
+    async getAlertTarget(id, signal) {
+      const endpoint = targetPath(id);
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (!alertTargetStatus(data)) return malformed(endpoint);
+      return data;
+    },
+    createAlertTarget: (body) => readTarget(`${base}/targets`, jsonBody('POST', body)),
+    updateAlertTarget: (id, body) => readTarget(targetPath(id), jsonBody('PUT', body)),
+    deleteAlertTarget: (id) => readTarget(targetPath(id), { method: 'DELETE' }),
     async about(signal) {
       const endpoint = `${base}/about`;
       const data = await readJson(endpoint, { signal }, onUnauthorized);
@@ -165,7 +230,7 @@ export function createClient({
         return malformed(endpoint);
       const capabilities = object(data.capabilities) ? data.capabilities : {};
       if (
-        ['oidcRoleMapping', 'oidcRoleSync', 'promql'].some(
+        ['oidcRoleMapping', 'oidcRoleSync', 'promql', 'promqlAlerts'].some(
           (field) => capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean',
         )
       )
@@ -175,6 +240,7 @@ export function createClient({
         capabilities: {
           oidcRoleMapping: capabilities.oidcRoleMapping === true,
           oidcRoleSync: capabilities.oidcRoleSync === true,
+          promqlAlerts: capabilities.promqlAlerts === true,
           promql:
             typeof capabilities.promql === 'boolean'
               ? capabilities.promql

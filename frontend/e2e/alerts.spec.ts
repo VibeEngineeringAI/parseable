@@ -1,0 +1,658 @@
+import { expect, test, type Page } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+import { alertFixture, alertSummaryFixture, targetFixture } from '../src/lib/__fixtures__/alerts';
+import type { Alert, AlertRequest } from '../src/lib/types';
+
+const detailPath = `/alerts/${alertFixture.id}`;
+const namedRow = (page: Page, name: string) =>
+  page.getByRole('row').filter({ has: page.getByText(name, { exact: true }) });
+async function demo(page: Page, path = '/alerts') {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  await page.goto(path);
+  if (path.startsWith('/alerts')) await expect(page.locator('.alerts-page')).toBeVisible();
+  if (path === '/alerts')
+    await expect(page.getByRole('table', { name: 'Alerts', exact: true })).toBeVisible();
+}
+async function axe(page: Page) {
+  await page.locator('.ui-dialog, .ui-sheet, .ui-dialog-overlay').evaluateAll(async (elements) => {
+    await Promise.all(
+      elements.flatMap((element) => element.getAnimations().map((animation) => animation.finished)),
+    );
+  });
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
+}
+async function createPromql(page: Page, title = 'Test threshold') {
+  await page.getByRole('link', { name: 'New alert', exact: true }).first().click();
+  await page.getByLabel('Dataset', { exact: true }).selectOption('demo_metrics');
+  await page
+    .getByRole('textbox', { name: 'PromQL query', exact: true })
+    .fill('{__name__="system.cpu.load_average.1m"}');
+  await page.getByLabel('Threshold value').fill('1');
+  await page.getByLabel('Title', { exact: true }).fill(title);
+  await page.getByLabel('Hold duration').fill('5m');
+}
+async function remove(page: Page, kind: 'alert' | 'target', name: string) {
+  const dialog = page.getByRole('dialog', { name: `Delete ${kind}`, exact: true });
+  await expect(dialog.locator('[data-dialog-confirm]')).toBeDisabled();
+  await dialog.getByLabel('Confirmation name').fill(name);
+  await dialog.locator('[data-dialog-confirm]').click();
+  await expect(dialog).toBeHidden();
+}
+type Call = { path: string; method: string; body?: unknown };
+async function mocked(
+  page: Page,
+  options: {
+    enabled?: boolean;
+    about?: unknown;
+    denied?: string;
+    count?: number;
+    missingType?: boolean;
+    empty?: boolean;
+    failCreate?: boolean;
+  } = {},
+) {
+  const calls: Call[] = [],
+    writes: AlertRequest[] = [];
+  let current = structuredClone(alertFixture);
+  await page.route('**/api/**', (route) => {
+    const request = route.request(),
+      path = new URL(request.url()).pathname;
+    const body = request.postData() ? request.postDataJSON() : undefined;
+    calls.push({ path, method: request.method(), body });
+    if (path === options.denied)
+      return route.fulfill({
+        status: 403,
+        contentType: 'text/plain',
+        body: 'You do not have permission to manage alerts',
+      });
+    if (path === '/api/v1/about')
+      return route.fulfill({
+        json: options.about ?? { capabilities: { promqlAlerts: options.enabled ?? true } },
+      });
+    if (path === '/api/v1/logstream')
+      return route.fulfill({ json: [{ name: 'metrics' }, { name: 'logs' }] });
+    if (path.endsWith('/info'))
+      return route.fulfill({
+        json: {
+          logSource: [{ log_source_format: path.includes('/metrics/') ? 'otel-metrics' : 'json' }],
+        },
+      });
+    if (path === '/api/v1/targets')
+      return route.fulfill({ json: [{ target: targetFixture, enabled: true }] });
+    if (path === '/api/v1/alerts/list_tags') return route.fulfill({ json: ['production'] });
+    if (path === '/api/v1/alerts') {
+      if (request.method() === 'POST') {
+        if (options.failCreate)
+          return route.fulfill({
+            status: 400,
+            body: 'Invalid alert query: exactly one aggregate required',
+          });
+        writes.push(body);
+        current = {
+          ...structuredClone(current),
+          ...body,
+          promqlRuntime: undefined,
+          targets: body.targets,
+        } as Alert;
+        return route.fulfill({ json: current });
+      }
+      return route.fulfill({
+        json: options.empty
+          ? []
+          : options.count
+            ? Array.from({ length: options.count }, (_, index) => ({
+                ...alertSummaryFixture,
+                id: String(index),
+                title: `Rule ${String(index).padStart(2, '0')}`,
+                severity: 'High',
+              }))
+            : [{ ...alertSummaryFixture, id: current.id, title: current.title, severity: 'High' }],
+      });
+    }
+    if (/^\/api\/v1\/alerts\/[^/]+$/.test(path)) {
+      if (path.endsWith('/missing'))
+        return route.fulfill({ status: 400, body: 'Alert does not exist' });
+      if (options.missingType && path.endsWith('/0'))
+        return route.fulfill({ status: 400, body: 'Missing alert' });
+      if (request.method() === 'PUT') {
+        writes.push(body);
+        current = { ...current, ...body, promqlRuntime: undefined } as Alert;
+      }
+      return route.fulfill({ json: current });
+    }
+    if (path === '/api/v1/query') return route.fulfill({ json: [{ total: 8 }] });
+    return route.fulfill({ status: 404, body: 'Not found' });
+  });
+  await page.route('**/prometheus/**', (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith('/query'))
+      return route.fulfill({
+        json: {
+          status: 'success',
+          data: {
+            resultType: 'vector',
+            result: [{ metric: { host: 'node-a' }, value: [1, '3.25'] }],
+          },
+        },
+      });
+    if (path.endsWith('/query_range'))
+      return route.fulfill({
+        json: { status: 'success', data: { resultType: 'matrix', result: [] } },
+      });
+    return route.fulfill({ json: { status: 'success', data: ['up'] } });
+  });
+  return { calls, writes };
+}
+
+test('Alerts is reachable after Metrics in Observe, with no Classic UI sidebar group', async ({
+  page,
+}) => {
+  await demo(page, '/datasets');
+  await page.getByTestId('sidebar-alerts').click();
+  await expect(page).toHaveURL(/\/alerts$/);
+  await expect(page.getByRole('heading', { name: 'Alerts', exact: true })).toBeVisible();
+  const observe = page
+    .locator('.sidebar-group')
+    .filter({ has: page.getByText('Observe', { exact: true }) });
+  await expect(observe.getByRole('link')).toHaveText(['Logs', 'Metrics', 'Alerts']);
+  await expect(page.locator('.sidebar-group-label').filter({ hasText: 'Classic UI' })).toHaveCount(
+    0,
+  );
+});
+test('PromQL CRUD, inline target creation, preview, edit, duplicate and typed deletion', async ({
+  page,
+}) => {
+  await demo(page);
+  await createPromql(page);
+  await page.getByLabel('Tags', { exact: true }).fill('test, production');
+  await page
+    .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
+    .click();
+  const preview = page.getByRole('table', { name: 'Preview values' });
+  await expect(preview.getByRole('row')).toHaveCount(5);
+  await expect(preview).toContainText('Threshold breached');
+  await expect(preview).toContainText('Within threshold');
+  await page.getByRole('button', { name: 'New target', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+  await sheet.getByLabel('Target name').fill('Inline hook');
+  await sheet.getByLabel('Endpoint URL').fill('https://example.com/alerts');
+  await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
+  await expect(page.getByRole('checkbox', { name: 'Inline hook', exact: true })).toBeChecked();
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Test threshold', exact: true })).toBeVisible();
+  await expect(page.getByText('Inline hook', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await expect(page.getByLabel('Dataset', { exact: true })).toBeDisabled();
+  await expect(page.getByLabel('Alert type')).toBeDisabled();
+  await expect(page.getByLabel('Hold duration')).toHaveValue('5m');
+  await page.getByLabel('Hold duration').fill('1h30m');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByText('1h30m', { exact: true }).first()).toBeVisible();
+  await page.getByRole('button', { name: 'Duplicate', exact: true }).click();
+  await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Test threshold (Copy)');
+  await expect(page.getByLabel('Hold duration')).toHaveValue('1h30m');
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Test threshold (Copy)', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await remove(page, 'alert', 'Test threshold (Copy)');
+  await expect(page.getByRole('heading', { name: 'Alerts', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Test threshold', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await remove(page, 'alert', 'Test threshold');
+  await expect(namedRow(page, 'Test threshold')).toHaveCount(0);
+});
+test('SQL create and preview use the existing editor with optional targets', async ({ page }) => {
+  await demo(page);
+  await page.getByRole('link', { name: 'New alert', exact: true }).click();
+  await page.getByLabel('Alert type').selectOption('code');
+  await page.getByLabel('Dataset', { exact: true }).selectOption('application_logs');
+  await page
+    .getByRole('textbox', { name: 'SQL query', exact: true })
+    .fill('SELECT COUNT(*) AS errors FROM "application_logs" WHERE level = \'ERROR\'');
+  await page.getByLabel('Title', { exact: true }).fill('SQL test');
+  await page.getByRole('button', { name: 'Preview SQL (no notifications)', exact: true }).click();
+  await expect(page.getByRole('table', { name: 'Preview values' })).toContainText('errors:');
+  await expect(
+    page
+      .getByRole('table', { name: 'Preview values' })
+      .getByRole('row')
+      .nth(1)
+      .getByRole('cell')
+      .nth(1),
+  ).toHaveText(/^[1-9]\d*$/);
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'SQL test', exact: true })).toBeVisible();
+  await expect(page.getByText('SQL', { exact: true })).toBeVisible();
+  await expect(page.getByText('No targets. State tracking only.', { exact: true })).toBeVisible();
+});
+test('list actions evaluate, mute/unmute, disable/enable, and preserve focus after cancelling delete', async ({
+  page,
+}) => {
+  await demo(page);
+  const row = namedRow(page, 'High host load');
+  await row.getByRole('button', { name: 'Evaluate now High host load' }).click();
+  await expect(row).toContainText('Evaluation requested');
+  await row.getByRole('button', { name: 'Mute High host load' }).click();
+  await page
+    .getByRole('dialog', { name: 'Mute notifications' })
+    .getByRole('button', { name: 'Indefinitely', exact: true })
+    .click();
+  await expect(row.getByRole('button', { name: 'Unmute High host load' })).toBeVisible();
+  await row.getByRole('button', { name: 'Unmute High host load' }).click();
+  await row.getByRole('button', { name: 'Disable High host load' }).click();
+  await expect(row.getByRole('button', { name: 'Evaluate now High host load' })).toBeDisabled();
+  await row.getByRole('button', { name: 'Enable High host load' }).click();
+  await expect(row).toContainText('Not triggered');
+  const opener = row.getByRole('button', { name: 'Delete High host load' });
+  await opener.click();
+  await page.keyboard.press('Escape');
+  await expect(opener).toBeFocused();
+});
+test('detail shows firing instances, delivery attempts, disabled banner and custom UTC mute', async ({
+  page,
+}) => {
+  await demo(page, detailPath);
+  await expect(page.getByRole('table', { name: 'Alert instances' })).toContainText('firing');
+  await expect(page.getByRole('table', { name: 'Alert instances' }).getByRole('row')).toHaveCount(
+    3,
+  );
+  await expect(page.getByRole('table', { name: 'Notification deliveries' })).toContainText(
+    '2 of 3',
+  );
+  await page.getByRole('button', { name: 'Mute', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Mute notifications' });
+  await dialog.getByLabel('Mute until (UTC)').fill('2099-01-01T12:00');
+  await dialog.getByRole('button', { name: 'Mute until date' }).click();
+  await expect(page.locator('.alerts-metadata')).toContainText('Muted until');
+  await page.getByRole('button', { name: 'Unmute', exact: true }).click();
+  await page.getByRole('button', { name: 'Disable', exact: true }).click();
+  await expect(page.getByText('This alert is disabled.', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Enable', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Evaluate now', exact: true })).toBeEnabled();
+});
+test('builder rules are read-only with SQL and no Edit action', async ({ page }) => {
+  await demo(page, '/alerts/01M4H000000000000000000012');
+  await expect(
+    page.getByText('Editing builder alerts is not supported yet.', { exact: false }),
+  ).toBeVisible();
+  await expect(page.locator('.alerts-query')).toContainText('SELECT COUNT(*)');
+  await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
+});
+test('title search, tag filtering and sorting distinguish empty searches', async ({ page }) => {
+  await demo(page);
+  await page.getByLabel('Search alerts').fill('HIGH HOST');
+  await expect(
+    page.getByRole('table', { name: 'Alerts', exact: true }).getByRole('row'),
+  ).toHaveCount(2);
+  await page.getByLabel('Search alerts').fill('missing');
+  await expect(page.getByRole('heading', { name: 'No matching alerts' })).toBeVisible();
+  await page.getByLabel('Search alerts').fill('');
+  await page.getByLabel('Filter by tag').selectOption('logs');
+  await expect(
+    page.getByRole('table', { name: 'Alerts', exact: true }).getByRole('row'),
+  ).toHaveCount(3);
+  await page.getByRole('button', { name: 'Sort by title' }).click();
+  await expect(page.getByRole('columnheader').first()).toHaveAttribute('aria-sort', 'descending');
+});
+test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the delete dialog', async ({
+  page,
+}) => {
+  await demo(page, '/alerts/targets');
+  await page.getByRole('button', { name: 'New target', exact: true }).click();
+  let sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+  await sheet.getByLabel('Target name').fill('Test hook');
+  await sheet.getByLabel('Endpoint URL').fill('https://example.com/secret-token');
+  await sheet.getByRole('button', { name: 'Add header' }).click();
+  await sheet.getByLabel('Header 1 name').fill('X-Key');
+  await sheet.getByLabel('Header 1 value').fill('header-secret');
+  await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
+  const row = namedRow(page, 'Test hook');
+  await expect(row).toContainText('https://********');
+  await expect(row).not.toContainText('secret-token');
+  await row.getByRole('button', { name: 'Edit target Test hook' }).click();
+  sheet = page.getByRole('dialog', { name: 'Edit target', exact: true });
+  await expect(sheet.getByLabel('Endpoint URL')).toHaveValue('');
+  await expect(sheet.getByLabel('Header 1 value')).toHaveValue('');
+  await expect(sheet.getByLabel('Target name')).toHaveAttribute('readonly', '');
+  await expect(
+    sheet.getByText('Endpoints are masked by the server.', { exact: false }),
+  ).toBeVisible();
+  await expect(sheet.getByRole('button', { name: 'Save target' })).toBeDisabled();
+  await sheet.getByLabel('Endpoint URL').fill('https://example.com/new');
+  await sheet.getByLabel('Header 1 value').fill('new-secret');
+  await sheet.getByRole('button', { name: 'Save target' }).click();
+  await expect(row.getByRole('button', { name: 'Edit target Test hook' })).toBeFocused();
+  await row.getByRole('button', { name: 'Delete target Test hook' }).click();
+  await remove(page, 'target', 'Test hook');
+  await expect(row).toHaveCount(0);
+  await namedRow(page, 'Operations Slack')
+    .getByRole('button', { name: 'Delete target Operations Slack' })
+    .click();
+  const dialog = page.getByRole('dialog', { name: 'Delete target' });
+  await dialog.getByLabel('Confirmation name').fill('Operations Slack');
+  await dialog.locator('[data-dialog-confirm]').click();
+  await expect(dialog.getByRole('alert')).toContainText(
+    "Can't delete a Target which is being used",
+  );
+  await page.keyboard.press('Escape');
+  await page.getByLabel('Search targets').fill('missing');
+  await expect(page.getByRole('heading', { name: 'No matching targets' })).toBeVisible();
+});
+test('Slack and Alertmanager targets retain their distinct fields', async ({ page }) => {
+  await demo(page, '/alerts/targets');
+  for (const kind of ['slack', 'alertManager']) {
+    await page.getByRole('button', { name: 'New target', exact: true }).click();
+    const sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+    await sheet.getByLabel('Target type').selectOption(kind);
+    await sheet.getByLabel('Target name').fill(`Test ${kind}`);
+    await sheet
+      .getByLabel('Endpoint URL')
+      .fill(
+        kind === 'slack'
+          ? 'https://hooks.slack.com/services/test'
+          : 'https://example.com/api/v2/alerts',
+      );
+    if (kind === 'alertManager') {
+      await sheet.getByLabel('Username', { exact: true }).fill('svc');
+      await sheet.getByLabel('Password', { exact: true }).fill('secret');
+    }
+    await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
+    await expect(namedRow(page, `Test ${kind}`)).toContainText(
+      kind === 'slack' ? 'Slack' : 'Alertmanager',
+    );
+  }
+});
+test('validation errors describe their controls and block invalid thresholds, frequency and hold', async ({
+  page,
+}) => {
+  await demo(page);
+  await createPromql(page);
+  await page.getByLabel('Threshold value').fill('');
+  await expect(page.getByLabel('Threshold value')).toHaveAccessibleDescription(
+    'Enter a finite threshold value.',
+  );
+  await page.getByLabel('Evaluation frequency (minutes)').fill('1441');
+  await expect(page.getByLabel('Evaluation frequency (minutes)')).toHaveAccessibleDescription(
+    'Use 1–1440 whole minutes.',
+  );
+  await page.getByLabel('Hold duration').fill('31d');
+  await expect(page.getByLabel('Hold duration')).toHaveAccessibleDescription(
+    'Hold duration cannot exceed 30 days.',
+  );
+  await page.getByRole('textbox', { name: 'PromQL query', exact: true }).fill('up[5m]');
+  await expect(
+    page.getByRole('textbox', { name: 'PromQL query', exact: true }),
+  ).toHaveAccessibleDescription('Alerts require an instant vector of numeric samples.');
+  await expect(page.getByRole('button', { name: 'Create alert', exact: true })).toBeDisabled();
+});
+test('dirty form blocks sidebar navigation and browser Back until confirmed', async ({ page }) => {
+  await demo(page);
+  await createPromql(page);
+  const dismiss = (dialog: import('@playwright/test').Dialog) => dialog.dismiss();
+  page.on('dialog', dismiss);
+  await page.getByTestId('sidebar-metrics').click();
+  await expect(page).toHaveURL(/\/alerts\/new$/);
+  await page.goBack();
+  await expect(page).toHaveURL(/\/alerts\/new$/);
+  await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Test threshold');
+  page.off('dialog', dismiss);
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByTestId('sidebar-metrics').click();
+  await expect(page).toHaveURL(/\/metrics/);
+});
+test('mocked create and update resend promqlConfig without runtime or ownership', async ({
+  page,
+}) => {
+  const api = await mocked(page);
+  await page.goto(
+    '/alerts/new?dataset=metrics&queryBuilderType=promql&alertQuery=up&title=Dashboard%20handoff',
+  );
+  await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Dashboard handoff');
+  await expect(page.getByRole('textbox', { name: 'PromQL query', exact: true })).toHaveText('up');
+  await page.getByLabel('Hold duration').fill('7m');
+  await page.getByLabel('Threshold value').fill('2.5');
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Dashboard handoff', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByLabel('Title', { exact: true }).fill('Edited handoff');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Edited handoff', exact: true })).toBeVisible();
+  expect(api.writes).toHaveLength(2);
+  for (const body of api.writes) {
+    expect(body.promqlConfig).toEqual({ holdDuration: '7m' });
+    expect(body).toMatchObject({
+      queryType: 'promql',
+      datasets: ['metrics'],
+      query: 'up',
+      thresholdConfig: { operator: '>', value: 2.5 },
+      evalConfig: { rollingWindow: { evalStart: '10m', evalEnd: 'now', evalFrequency: 1 } },
+      notificationConfig: { interval: 1 },
+      targets: [],
+    });
+    expect(body).not.toHaveProperty('promqlRuntime');
+    expect(body).not.toHaveProperty('executionIdentity');
+  }
+  expect(
+    api.calls.some(
+      (call) => call.method === 'PUT' && call.path === `/api/v1/alerts/${alertFixture.id}`,
+    ),
+  ).toBe(true);
+});
+for (const about of [
+  { capabilities: { promqlAlerts: false }, license: { plan: 'Enterprise' } },
+  { license: { plan: 'Enterprise' } },
+])
+  test(`PromQL requires explicit capability: ${JSON.stringify(about)}`, async ({ page }) => {
+    await mocked(page, { about });
+    await page.goto('/alerts/new');
+    await expect(page.getByLabel('Alert type')).toHaveValue('code');
+    await expect(
+      page.getByLabel('Alert type').getByRole('option', { name: 'PromQL threshold' }),
+    ).toHaveCount(0);
+    await expect(page.getByRole('textbox', { name: 'SQL query', exact: true })).toBeVisible();
+  });
+for (const path of ['/api/v1/alerts', '/api/v1/targets'])
+  test(`403 stays in live mode for ${path}`, async ({ page }) => {
+    await mocked(page, { denied: path });
+    await page.goto(path.endsWith('/targets') ? '/alerts/targets' : '/alerts');
+    await expect(page.getByRole('heading', { name: 'Permission denied' })).toBeVisible();
+    await expect(page.getByText('Live server', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Explore demo data' })).toHaveCount(0);
+  });
+test('empty list has a creation CTA, missing detail keeps the HTTP 400 message', async ({
+  page,
+}) => {
+  await mocked(page, { empty: true });
+  await page.goto('/alerts');
+  await expect(page.getByRole('heading', { name: 'No alerts yet' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'New alert', exact: true })).toHaveCount(2);
+  await page.goto('/alerts/missing');
+  await expect(page.getByRole('alert')).toContainText('Alert does not exist');
+});
+test('25-row pagination and a failed type lookup preserve all other alerts', async ({ page }) => {
+  await mocked(page, { count: 27, missingType: true });
+  await page.goto('/alerts');
+  const table = page.getByRole('table', { name: 'Alerts', exact: true });
+  await expect(table.getByRole('row')).toHaveCount(26);
+  await expect(page.getByRole('status').filter({ hasText: 'Could not resolve' })).toBeVisible();
+  await expect(namedRow(page, 'Rule 00')).toContainText('Unavailable');
+  await page.getByRole('button', { name: 'Next page' }).click();
+  await expect(table.getByRole('row')).toHaveCount(3);
+  await page.getByLabel('Search alerts').fill('Rule 00');
+  await expect(table.getByRole('row')).toHaveCount(2);
+});
+test('save failure stays in the dirty form with the plain-text server error', async ({ page }) => {
+  await mocked(page, { failCreate: true });
+  await page.goto('/alerts/new?dataset=metrics&alertQuery=up&title=Failure');
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText(
+    'Invalid alert query: exactly one aggregate required',
+  );
+  await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Failure');
+});
+test('delivery errors redact credential-bearing URLs', async ({ page }) => {
+  await mocked(page);
+  await page.goto(detailPath);
+  const deliveries = page.getByRole('table', { name: 'Notification deliveries' });
+  await expect(deliveries).toContainText('[redacted endpoint]');
+  await expect(deliveries).not.toContainText('secret-token');
+});
+test('preview never evaluates a saved rule, clears stale results and shows No data', async ({
+  page,
+}) => {
+  const api = await mocked(page);
+  let queries = 0;
+  await page.route('**/prometheus/api/v1/query', (route) => {
+    queries++;
+    return route.fulfill({
+      json: {
+        status: 'success',
+        data: {
+          resultType: 'vector',
+          result: queries === 1 ? [{ metric: { host: 'preview-host' }, value: [1, '3.25'] }] : [],
+        },
+      },
+    });
+  });
+  await page.goto('/alerts/new?dataset=metrics&alertQuery=up&title=Preview');
+  await page
+    .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
+    .click();
+  const table = page.getByRole('table', { name: 'Preview values' });
+  await expect(table).toContainText('preview-host');
+  await page.getByLabel('Threshold value').fill('4');
+  await expect(table).toHaveCount(0);
+  await page
+    .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
+    .click();
+  await expect(page.getByRole('heading', { name: 'No data', exact: true })).toBeVisible();
+  expect(queries).toBe(2);
+  expect(api.writes).toHaveLength(0);
+  expect(api.calls.some((call) => call.path.endsWith('/evaluate_alert'))).toBe(false);
+});
+test('leaving the form aborts its pending preview', async ({ page }) => {
+  await mocked(page);
+  let release = () => {};
+  const held = new Promise<void>((done) => {
+    release = done;
+  });
+  await page.route('**/prometheus/api/v1/query', (route) =>
+    held
+      .then(() =>
+        route.fulfill({ json: { status: 'success', data: { resultType: 'vector', result: [] } } }),
+      )
+      .catch(() => {}),
+  );
+  await page.goto('/alerts/new?dataset=metrics&alertQuery=up&title=Preview');
+  const started = page.waitForRequest('**/prometheus/api/v1/query');
+  await page
+    .getByRole('button', { name: 'Preview current values (no notifications)', exact: true })
+    .click();
+  await started;
+  const cancelled = page.waitForEvent('requestfailed', (request) =>
+    request.url().endsWith('/query'),
+  );
+  await page.getByTestId('sidebar-alerts').click();
+  await cancelled;
+  release();
+  await expect(page).toHaveURL(/\/alerts$/);
+  await expect(page.getByRole('table', { name: 'Alerts', exact: true })).toBeVisible();
+});
+test('SQL preview uses the same rolling-window request as alert evaluation', async ({ page }) => {
+  const api = await mocked(page, { enabled: false });
+  await page.goto('/alerts/new');
+  await page.getByLabel('Dataset', { exact: true }).selectOption('logs');
+  await page
+    .getByRole('textbox', { name: 'SQL query', exact: true })
+    .fill('SELECT COUNT(*) FROM "logs"');
+  await page.getByLabel('Evaluation window').fill('1h30m');
+  await page.getByRole('button', { name: 'Preview SQL (no notifications)', exact: true }).click();
+  await expect(page.getByRole('table', { name: 'Preview values' })).toContainText('8');
+  expect(api.calls.find((call) => call.path === '/api/v1/query')).toMatchObject({
+    method: 'POST',
+    body: {
+      query: 'SELECT COUNT(*) FROM "logs"',
+      startTime: '1h30m',
+      endTime: 'now',
+      sendNull: true,
+    },
+  });
+});
+test('known reader privileges make list actions and create form read-only', async ({ page }) => {
+  await mocked(page);
+  await page
+    .context()
+    .addCookies([{ name: 'user_id', value: 'reader', url: 'http://127.0.0.1:5173' }]);
+  await page.route('**/api/v1/users/reader', (route) =>
+    route.fulfill({ json: { id: 'reader', username: 'Reader' } }),
+  );
+  await page.route('**/api/v1/user/reader/role', (route) =>
+    route.fulfill({
+      json: {
+        roles: {
+          readers: {
+            actions: [{ privilege: 'reader', resource: { stream: 'metrics' } }],
+            roleType: 'user',
+          },
+        },
+        groupRoles: {},
+      },
+    }),
+  );
+  await page.goto('/alerts');
+  await expect(page.getByRole('table', { name: 'Alerts', exact: true })).toContainText('Read-only');
+  await expect(page.getByRole('link', { name: 'New alert', exact: true })).toHaveCount(0);
+  await page.goto('/alerts/new');
+  await expect(page.getByRole('heading', { name: 'Permission denied', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create alert', exact: true })).toHaveCount(0);
+});
+for (const theme of ['light', 'dark'])
+  for (const view of ['list', 'detail', 'form', 'targets', 'sheet'])
+    test(`${view} passes axe in ${theme}`, async ({ page }) => {
+      const path =
+        view === 'list'
+          ? '/alerts'
+          : view === 'detail'
+            ? detailPath
+            : view === 'form'
+              ? '/alerts/new'
+              : '/alerts/targets';
+      await demo(page, path);
+      if (theme === 'dark') await page.getByRole('button', { name: 'Use dark theme' }).click();
+      if (view === 'sheet') {
+        await page.getByRole('button', { name: 'New target', exact: true }).click();
+        await expect(page.getByRole('dialog', { name: 'New target', exact: true })).toBeVisible();
+      }
+      if (view === 'form')
+        await expect(
+          page.getByRole('textbox', { name: 'PromQL query', exact: true }),
+        ).toBeVisible();
+      if (view === 'detail')
+        await expect(page.getByRole('table', { name: 'Alert instances' })).toBeVisible();
+      await axe(page);
+    });
+test('list, detail, form, targets and an open sheet fit 390px without horizontal overflow', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const path of ['/alerts', detailPath, '/alerts/new', '/alerts/targets']) {
+    await demo(page, path);
+    if (path.endsWith('/new'))
+      await expect(page.getByRole('textbox', { name: 'PromQL query', exact: true })).toBeVisible();
+    if (path === detailPath)
+      await expect(page.getByRole('table', { name: 'Alert instances' })).toBeVisible();
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+    ).toBeLessThanOrEqual(1);
+  }
+  await page.getByRole('button', { name: 'New target', exact: true }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+  ).toBeLessThanOrEqual(1);
+});

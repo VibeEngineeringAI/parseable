@@ -10,6 +10,8 @@ import type {
 } from './types';
 import { ApiError } from './client';
 import { createDemoMetrics } from './demoMetrics';
+import { createDemoAlerts } from './demoAlerts';
+import { alertDuration } from '../features/alerts/helpers';
 import { validateName } from '../features/team/helpers';
 
 export const demoDatasets: Dataset[] = [
@@ -103,6 +105,35 @@ function likeRegex(pattern: string, escape: string): RegExp {
 }
 
 export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): LogRecord[] {
+  const aggregate =
+    /^\s*SELECT\s+(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(\*|[a-zA-Z_][\w]*|"[^"]+")\s*\)\s*(?:AS\s+([\w]+|"[^"]+"))?\s+FROM\s+([\s\S]+)$/i.exec(
+      request.sql,
+    );
+  if (aggregate) {
+    const [, fn, rawField, alias, tail] = aggregate;
+    const field = rawField.replace(/^"|"$/g, '');
+    if (/\b(?:GROUP\s+BY|ORDER\s+BY|LIMIT)\b/i.test(tail)) throw unsupported();
+    if (field !== '*' && records.length && !Object.hasOwn(records[0], field))
+      throw new Error(`Unknown demo field: ${field}`);
+    if (field === '*' && fn.toUpperCase() !== 'COUNT') throw unsupported();
+    const rows = executeDemoQuery({ ...request, sql: `SELECT * FROM ${tail}` }, records);
+    const values = rows
+      .map((row) => row[field])
+      .filter((value): value is number => typeof value === 'number');
+    let value: number | null = null;
+    if (fn.toUpperCase() === 'COUNT')
+      value = field === '*' ? rows.length : rows.filter((row) => row[field] != null).length;
+    else if (values.length)
+      value =
+        fn.toUpperCase() === 'SUM'
+          ? values.reduce((a, b) => a + b, 0)
+          : fn.toUpperCase() === 'AVG'
+            ? values.reduce((a, b) => a + b, 0) / values.length
+            : fn.toUpperCase() === 'MIN'
+              ? Math.min(...values)
+              : Math.max(...values);
+    return [{ [alias?.replace(/^"|"$/g, '') ?? `${fn.toLowerCase()}(${field})`]: value }];
+  }
   const tokens = tokenize(request.sql);
   let position = 0;
   const peek = (value: string) =>
@@ -193,8 +224,14 @@ export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): L
   }
   if (peek(';')) position++;
   if (position !== tokens.length) throw unsupported();
-  const start = Date.parse(request.startTime),
-    end = Date.parse(request.endTime);
+  const now = Date.now(),
+    duration = alertDuration(request.startTime);
+  const start =
+      duration !== undefined
+        ? Math.floor((now - duration * 1000) / 60_000) * 60_000
+        : Date.parse(request.startTime),
+    end =
+      request.endTime === 'now' ? Math.floor(now / 60_000) * 60_000 : Date.parse(request.endTime);
   if (!Number.isFinite(start) || !Number.isFinite(end) || start > end)
     throw new Error('Invalid query time range');
   const result = records.filter((row) => {
@@ -220,6 +257,7 @@ export function createDemoClient(): ParseableClient {
   const fixtureTime = Date.now();
   const records = createDemoRecords(fixtureTime - 1_000);
   const metrics = createDemoMetrics(fixtureTime);
+  const alerts = createDemoAlerts(fixtureTime);
   const roles: Roles = {
     administrators: [{ privilege: 'admin' }],
     analysts: [{ privilege: 'reader', resource: { stream: 'application_logs' } }],
@@ -381,11 +419,17 @@ export function createDemoClient(): ParseableClient {
   }
   return {
     ...metrics,
+    ...alerts,
     async about(signal) {
       await ready(signal);
       return {
         oidcActive: true,
-        capabilities: { oidcRoleMapping: true, oidcRoleSync: true, promql: true },
+        capabilities: {
+          oidcRoleMapping: true,
+          oidcRoleSync: true,
+          promql: true,
+          promqlAlerts: true,
+        },
       };
     },
     async listRoles(signal) {

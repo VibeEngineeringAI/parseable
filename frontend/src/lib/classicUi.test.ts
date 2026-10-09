@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classicOnlyPages, classicUiPath } from './classicUi';
+import { classicUiPath } from './classicUi';
 import { appPath } from './config';
 
 describe('side-by-side classic UI', () => {
@@ -14,6 +14,11 @@ describe('side-by-side classic UI', () => {
     ['/datasets', '/datasets'],
     ['/dashboards', '/dashboards'],
     ['/team', '/team'],
+    ['/alerts', '/alerts'],
+    ['/alerts/new', '/alerts'],
+    ['/alerts/targets', '/alerts'],
+    ['/alerts/abc', '/alerts'],
+    ['/alerts/abc/edit', '/alerts'],
     ['/components', '/'],
   ])('maps %s to the classic page %s', (route, classic) => {
     expect(classicUiPath(route)).toBe(classic);
@@ -21,8 +26,5 @@ describe('side-by-side classic UI', () => {
   it('prefixes document navigations with the mount path', () => {
     expect(appPath('/login', '/next')).toBe('/next/login');
     expect(appPath('/login', '')).toBe('/login');
-  });
-  it('keeps only Alerts in the classic-only navigation', () => {
-    expect(classicOnlyPages).toEqual([{ href: '/alerts', label: 'Alerts', id: 'alerts' }]);
   });
 });

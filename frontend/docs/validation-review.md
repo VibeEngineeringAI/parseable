@@ -2,6 +2,37 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Alerts validation (2026-10-09)
+
+| Check                      | Actual result                                                                   | Scope                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run check`            | **666 unit tests (22 files), 146 app browser tests, 33 Storybook tests passed** | Formatting, TypeScript, production build, Vitest, demo/mocked HTTP browser tests and Storybook build/tests in one command                                                                                                                                                                                                                                                        |
+| Alerts app browser suite   | **35 passed** as part of the default check                                      | Alert and target CRUD, request shapes including `promqlConfig` on PUT, UTC mute, dirty-form navigation/Back, empty/error/403 states, capability off, preview cancellation and reader controls                                                                                                                                                                                    |
+| Alerts accessibility       | **10 light/dark axe cases passed**                                              | List, detail, form, targets and open target sheet; WCAG 2 A/AA and 2.1 AA smoke checks                                                                                                                                                                                                                                                                                           |
+| Alerts mobile              | **No horizontal overflow at 390 × 844**                                         | List, detail, form, targets and open sheet                                                                                                                                                                                                                                                                                                                                       |
+| Alerts live suite via Vite | **3 passed in 9.9s**                                                            | Final `e2e-live/alerts.spec.ts` at `http://127.0.0.1:8270`, proxying only to the disposable v3.2.5 server on port 8010, native admin session                                                                                                                                                                                                                                     |
+| Contract probes            | Confirmed against port 8010                                                     | Frequency is minutes; PromQL accepts 1 and 1440, rejects 1441; `10m`, `10 minutes` and compound human-time windows parse; mute returns `{mute:timestamp}` or `{mute:"indefinite"}`; endpoints/header values are masked; Alertmanager returns `type:"webhook"` with auth keys even without credentials; SQL accepts no targets; missing alerts/targets return plain-text HTTP 400 |
+
+The live spec ingests two gauge series (3.25 and 7.5) into a unique `alerts_live_*` OTLP dataset, creates a public webhook target and a PromQL rule through the UI, compares preview values with the API, evaluates, mutes/unmutes, disables/enables, edits while resending `promqlConfig.holdDuration`, and deletes through typed confirmation. `afterAll` attempts alert, target and dataset cleanup even after failures and discovers resources by name if ID capture failed. The server's outbound policy is not changed. Separate authenticated reads after the passing run confirmed empty alert, target and dataset lists.
+
+An initial browser pass exposed nested-sheet submit bubbling, stale detail data after edit, and a browser Back guard gap. The fixes have regression coverage; route blocking now uses React Router's data-router blocker. No new UI primitives or Storybook stories were needed. No embedded-server run or classic Alerts pixel comparison was performed for this feature.
+
+The first complete check reached 666 passing unit tests and 145 passing browser tests, with one older SQL browser test expecting `COUNT(*)` to be unsupported. The demo now supports simple numeric aggregates for Alerts previews, so that test's error case uses unsupported grouped SQL instead. The complete command then passed, including the unchanged Storybook suite.
+
+Commands, from `frontend` (the live command uses Vite started with `PARSEABLE_PROXY_TARGET=http://127.0.0.1:8010 npx vite --host 127.0.0.1 --port 8270`):
+
+```sh
+TMPDIR=/home/ajs/.cache/alerts-tmp \
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+PARSEABLE_PROXY_TARGET=http://127.0.0.1:8010 npm run check
+
+TMPDIR=/home/ajs/.cache/alerts-tmp \
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+PARSEABLE_LIVE_URL=http://127.0.0.1:8270 PARSEABLE_LIVE_BASE= \
+PARSEABLE_LIVE_USERNAME=admin PARSEABLE_LIVE_PASSWORD=admin \
+npx playwright test -c playwright.live.config.ts e2e-live/alerts.spec.ts
+```
+
 ## Metrics explorer validation (2026-10-09)
 
 | Check                  | Actual result                                            | Scope                                                                                                                                                                                                                                             |

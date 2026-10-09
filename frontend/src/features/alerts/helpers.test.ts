@@ -1,0 +1,345 @@
+import { describe, expect, it, vi } from 'vitest';
+import {
+  alertDraft,
+  alertDuration,
+  buildAlertPayload,
+  compareThreshold,
+  displayDate,
+  filterSortAlerts,
+  muteState,
+  newAlertDraft,
+  promqlSyntaxError,
+  resolveAlertTypes,
+  safeDeliveryError,
+  utcMuteDate,
+  validateAlert,
+  type AlertDraft,
+} from './helpers';
+import { buildTargetPayload, targetDraft, targetType, validateTarget } from './targetHelpers';
+import type { Alert, AlertSummary, ParseableClient } from '../../lib/types';
+
+const draft = (): AlertDraft => ({
+  ...newAlertDraft(true),
+  dataset: 'metrics',
+  query: 'up',
+  title: 'Host load',
+  threshold: '2.5',
+});
+const original = (): Alert => ({
+  ...buildAlertPayload(draft()),
+  id: 'alert',
+  version: 'v2',
+  state: 'triggered',
+  notificationState: { mute: 'indefinite' },
+  created: '2026-10-09T00:00:00Z',
+  lastTriggeredAt: null,
+  promqlConfig: { holdDuration: '5m', custom: 'keep' },
+  executionIdentity: { userId: 'old', tenantId: 'DEFAULT_TENANT' },
+  promqlRuntime: {
+    health: 'ok',
+    error: null,
+    lastEvaluatedAt: null,
+    instances: {},
+    deliveries: [],
+  },
+  units: 'bytes',
+});
+describe('alert forms and payloads', () => {
+  it('resends PromQL config while excluding runtime and managed response fields', () => {
+    const alert = original(),
+      form = alertDraft(alert);
+    form.title = 'Edited';
+    form.hold = '1h30m';
+    const payload = buildAlertPayload(form, alert);
+    expect(payload.promqlConfig).toEqual({ holdDuration: '1h30m', custom: 'keep' });
+    expect(payload.units).toBe('bytes');
+    for (const key of [
+      'id',
+      'version',
+      'state',
+      'notificationState',
+      'created',
+      'lastTriggeredAt',
+      'promqlRuntime',
+      'executionIdentity',
+    ])
+      expect(payload).not.toHaveProperty(key);
+    expect(payload.notificationConfig).toEqual({ interval: 1 });
+    expect(payload.evalConfig.rollingWindow).toEqual({
+      evalStart: '10m',
+      evalEnd: 'now',
+      evalFrequency: 1,
+    });
+  });
+  it('defaults and round-trips hold duration, preserves targets and de-duplicates tags', () => {
+    const form = draft();
+    form.tags = 'prod, metrics, prod, ';
+    form.targets = ['one', 'two'];
+    const payload = buildAlertPayload(form);
+    expect(payload.promqlConfig).toEqual({ holdDuration: '0s' });
+    expect(payload.tags).toEqual(['prod', 'metrics']);
+    expect(alertDraft(payload).targets).toEqual(form.targets);
+    payload.targets.push('three');
+    expect(form.targets).toEqual(['one', 'two']);
+  });
+  it('builds code SQL without PromQL config and accepts state-tracking-only SQL', () => {
+    const form = {
+      ...draft(),
+      type: 'code' as const,
+      query: 'SELECT COUNT(*) FROM "logs"',
+      dataset: 'logs',
+    };
+    expect(validateAlert(form, false)).toEqual({});
+    expect(buildAlertPayload(form)).toMatchObject({ queryType: 'code', targets: [] });
+    expect(buildAlertPayload(form)).not.toHaveProperty('promqlConfig');
+  });
+  it('accepts the dashboard URL handoff', () => {
+    expect(
+      newAlertDraft(
+        true,
+        new URLSearchParams({
+          dataset: 'otel metrics',
+          queryBuilderType: 'promql',
+          alertQuery: 'sum(up)',
+          title: 'Availability',
+        }),
+      ),
+    ).toMatchObject({
+      type: 'promql',
+      dataset: 'otel metrics',
+      query: 'sum(up)',
+      title: 'Availability',
+    });
+  });
+  it.each([
+    ['title', ' ', 'title'],
+    ['dataset', '', 'dataset'],
+    ['query', '', 'query'],
+    ['query', 'up{', 'query'],
+    ['query', 'up[5m]', 'query'],
+    ['threshold', '', 'threshold'],
+    ['threshold', 'Infinity', 'threshold'],
+    ['threshold', 'NaN', 'threshold'],
+    ['frequency', '0', 'frequency'],
+    ['frequency', '1.5', 'frequency'],
+    ['frequency', '1441', 'frequency'],
+    ['hold', '31d', 'hold'],
+    ['hold', '5 elephants', 'hold'],
+    ['window', 'now-10m', 'window'],
+  ])('rejects %s=%s', (field, value, error) => {
+    expect(validateAlert({ ...draft(), [field]: value }, true)).toHaveProperty(error);
+  });
+  it('uses explicit capability and the 20-target limit', () => {
+    expect(validateAlert(draft(), false)).toHaveProperty('type');
+    expect(
+      validateAlert({ ...draft(), targets: Array.from({ length: 21 }, (_, i) => String(i)) }, true),
+    ).toHaveProperty('targets');
+    expect(validateAlert({ ...draft(), hold: '30d', frequency: '1440' }, true)).toEqual({});
+  });
+  it('rejects selector history beyond 31 days', () => {
+    expect(promqlSyntaxError('rate(up[32d])')).toContain('31 days');
+    expect(promqlSyntaxError('rate(up[31d])')).toBeUndefined();
+  });
+  it.each(['up', 'sum(up)', 'vector(1)', 'up + 1', '(up)', 'rate(up[5m])'])(
+    'accepts instant vector %s',
+    (query) => expect(promqlSyntaxError(query)).toBeUndefined(),
+  );
+  it.each(['1', '1 + 2', '(1)', 'scalar(up)', 'time()', 'up[5m]', 'up[5m:1m]'])(
+    'rejects non-vector %s',
+    (query) => expect(promqlSyntaxError(query)).toContain('instant vector'),
+  );
+});
+describe('durations, thresholds and mute states', () => {
+  it.each([
+    ['0s', 0],
+    ['1h30m', 5400],
+    ['10 minutes', 600],
+    ['1 day 2 hours', 93600],
+    ['2w', 1209600],
+    ['0.5s', 0.5],
+    ['500ms', 0.5],
+  ])('parses %s', (value, expected) => expect(alertDuration(value as string)).toBe(expected));
+  it.each(['', '-1m', '1m garbage', '5', 'Infinitys', '1e3s'])(
+    'rejects invalid duration %s',
+    (value) => expect(alertDuration(value)).toBeUndefined(),
+  );
+  it.each([
+    ['>', 3, 2, true],
+    ['>', 2, 2, false],
+    ['>=', 2, 2, true],
+    ['<', 1, 2, true],
+    ['<=', 2, 2, true],
+    ['=', 2, 2, true],
+    ['!=', 2, 2, false],
+  ])('compares %s', (operator, value, threshold, expected) =>
+    expect(
+      compareThreshold(value as number, operator as AlertDraft['operator'], threshold as number),
+    ).toBe(expected),
+  );
+  it('rejects non-finite preview values', () =>
+    expect(compareThreshold(NaN, '>', 1)).toBeUndefined());
+  it.each(['notify', { mute: '2026-10-08T00:00:00Z' }])(
+    'recognizes unmuted or expired mute',
+    (state) => expect(muteState(state, Date.parse('2026-10-09T00:00:00Z')).muted).toBe(false),
+  );
+  it.each(['+262142-12-31T23:59:59.999999999+00:00', { mute: 'indefinite' }, 'indefinite'])(
+    'recognizes indefinite mute',
+    (state) => expect(muteState(state).label).toBe('Muted indefinitely'),
+  );
+  it('recognizes summary and detail timestamp mutes', () => {
+    const date = '2026-10-10T00:00:00Z',
+      now = Date.parse('2026-10-09T00:00:00Z');
+    expect(muteState(date, now)).toEqual(muteState({ mute: date }, now));
+    expect(muteState(date, now).muted).toBe(true);
+  });
+  it('uses UTC for custom mute and requires a future time', () => {
+    const now = Date.parse('2026-10-09T00:00:00Z');
+    expect(utcMuteDate('2026-10-10T12:00', now)).toEqual({ state: '2026-10-10T12:00:00.000Z' });
+    expect(utcMuteDate('2026-10-08T12:00', now).error).toContain('future');
+    expect(utcMuteDate('', now).error).toBeDefined();
+    expect(utcMuteDate('2099-02-31T12:00', now).error).toContain('valid');
+  });
+  it('normalizes chrono summary timestamps and redacts delivery URLs', () => {
+    expect(displayDate('2026-10-09 12:00:00.123456789 UTC')).toBe('2026-10-09T12:00:00.123Z');
+    expect(displayDate('bad')).toBeUndefined();
+    expect(safeDeliveryError('failed (https://hooks.slack.com/token-secret)')).toBe(
+      'failed ([redacted endpoint])',
+    );
+  });
+});
+describe('list filtering, sorting and bounded type discovery', () => {
+  const rows: AlertSummary[] = [
+    {
+      ...original(),
+      id: 'a',
+      title: 'Zulu',
+      severity: 'critical',
+      datasets: ['b'],
+      queryType: 'promql',
+      tags: ['prod'],
+    },
+    {
+      ...original(),
+      id: 'b',
+      title: 'Alpha',
+      severity: 'low',
+      datasets: ['a'],
+      queryType: 'builder',
+      tags: ['dev'],
+      state: 'disabled',
+    },
+    {
+      ...original(),
+      id: 'c',
+      title: 'Bravo',
+      severity: 'high',
+      datasets: ['c'],
+      queryType: 'code',
+      tags: ['prod'],
+      state: 'not-triggered',
+    },
+  ];
+  it('filters title case-insensitively and tags exactly', () => {
+    expect(filterSortAlerts(rows, 'BRAVO', 'prod', 'title', false).map((row) => row.id)).toEqual([
+      'c',
+    ]);
+    expect(filterSortAlerts(rows, '', 'pro', 'title', false)).toEqual([]);
+    expect(rows[0].title).toBe('Zulu');
+  });
+  it.each([
+    ['title', ['b', 'c', 'a']],
+    ['severity', ['a', 'c', 'b']],
+    ['state', ['b', 'c', 'a']],
+    ['type', ['b', 'a', 'c']],
+    ['dataset', ['b', 'a', 'c']],
+    ['tags', ['b', 'a', 'c']],
+  ])('sorts %s and reverses direction', (sort, ids) => {
+    const ascending = filterSortAlerts(rows, '', '', sort as 'title', false).map((row) => row.id);
+    expect(ascending).toEqual(ids);
+    expect(filterSortAlerts(rows, '', '', sort as 'title', true).map((row) => row.id)).toEqual(
+      [...ids].reverse(),
+    );
+  });
+  it('tolerates individual errors, uses at most six workers and passes the signal', async () => {
+    let active = 0,
+      max = 0;
+    const getAlert = vi.fn(async (id, signal) => {
+      signal.throwIfAborted();
+      active++;
+      max = Math.max(max, active);
+      await Promise.resolve();
+      active--;
+      if (id === 'bad') throw new Error('missing');
+      return { queryType: 'code' };
+    });
+    const signal = new AbortController().signal;
+    const input = Array.from({ length: 20 }, (_, index) => ({
+      ...rows[0],
+      id: index ? String(index) : 'bad',
+      queryType: undefined,
+    }));
+    const result = await resolveAlertTypes(
+      { getAlert } as unknown as ParseableClient,
+      input,
+      signal,
+    );
+    expect(max).toBeLessThanOrEqual(6);
+    expect(result.rows).toHaveLength(20);
+    expect(result.unchecked).toHaveLength(1);
+    expect(getAlert.mock.calls.every(([, value]) => value === signal)).toBe(true);
+    expect(input.every((row) => row.queryType === undefined)).toBe(true);
+  });
+});
+describe('target forms', () => {
+  it('recognizes masked Alertmanager, requires re-entry and builds top-level credentials', () => {
+    const target = {
+      id: 'am',
+      name: 'AM',
+      type: 'webhook' as const,
+      endpoint: 'https://********',
+      username: 'svc',
+      password: '********',
+    };
+    expect(targetType(target)).toBe('alertManager');
+    const form = targetDraft(target);
+    expect(form.endpoint).toBe('');
+    expect(form.password).toBe('');
+    expect(validateTarget(form)).toHaveProperty('endpoint');
+    form.endpoint = 'https://example.com/api/v2/alerts';
+    form.password = 'secret';
+    expect(buildTargetPayload(form)).toMatchObject({
+      type: 'alertManager',
+      username: 'svc',
+      password: 'secret',
+    });
+    expect(buildTargetPayload(form)).not.toHaveProperty('auth');
+  });
+  it('omits TLS and auth fields for Slack', () => {
+    const form = {
+      ...targetDraft(),
+      type: 'slack' as const,
+      name: 'Slack',
+      endpoint: 'https://hooks.slack.com/services/test',
+    };
+    expect(validateTarget(form)).toEqual({});
+    expect(buildTargetPayload(form)).toEqual({
+      name: 'Slack',
+      type: 'slack',
+      endpoint: form.endpoint,
+    });
+    expect(validateTarget({ ...form, endpoint: 'http://example.com' })).toHaveProperty('endpoint');
+  });
+  it('rejects masked endpoints, denied, duplicate and incomplete headers', () => {
+    const form = { ...targetDraft(), name: 'hook', endpoint: 'https://example.com' };
+    expect(validateTarget({ ...form, endpoint: 'https://********' })).toHaveProperty('endpoint');
+    for (const headers of [
+      [{ id: 'a', key: 'Cookie', value: 'a' }],
+      [{ id: 'a', key: 'X-Key', value: '' }],
+      [
+        { id: 'a', key: 'X-Key', value: 'a' },
+        { id: 'b', key: 'x-key', value: 'b' },
+      ],
+    ])
+      expect(validateTarget({ ...form, headers })).toHaveProperty('headers');
+  });
+});

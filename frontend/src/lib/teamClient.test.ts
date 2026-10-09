@@ -278,7 +278,12 @@ describe('Team HTTP contracts', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({ oidcActive: true })));
     expect(await createClient({ mode: 'live' }).about()).toEqual({
       oidcActive: true,
-      capabilities: { oidcRoleMapping: false, oidcRoleSync: false, promql: false },
+      capabilities: {
+        oidcRoleMapping: false,
+        oidcRoleSync: false,
+        promql: false,
+        promqlAlerts: false,
+      },
     });
   });
 

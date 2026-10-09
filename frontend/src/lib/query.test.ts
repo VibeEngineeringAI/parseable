@@ -68,7 +68,8 @@ describe('demo query semantics', () => {
   it('rejects unsupported statements rather than silently approximating them', () => {
     for (const sql of [
       'DELETE FROM application_logs',
-      'SELECT count(*) FROM application_logs',
+      'SELECT count(*) FROM application_logs GROUP BY service',
+      'SELECT count(*) FROM application_logs LIMIT 1',
       "SELECT * FROM application_logs WHERE level = 'ERROR' OR 1=1",
       'SELECT * FROM application_logs; SELECT * FROM api_logs',
       'SELECT * FROM application_logs LIMIT 1 trailing',

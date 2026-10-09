@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { EditorView, keymap } from '@codemirror/view';
-import { EditorState, Prec } from '@codemirror/state';
+import { Compartment, EditorState, Prec } from '@codemirror/state';
 import { sql } from '@codemirror/lang-sql';
 import { basicSetup } from 'codemirror';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
@@ -9,13 +9,18 @@ export function SqlEditor({
   value,
   onChange,
   onRun,
+  invalid = false,
+  describedBy,
 }: {
   value: string;
   onChange: (value: string) => void;
   onRun: () => void;
+  invalid?: boolean;
+  describedBy?: string;
 }) {
   const element = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
+  const attributes = useRef(new Compartment());
   const callbacks = useRef({ onChange, onRun });
   callbacks.current = { onChange, onRun };
   useEffect(() => {
@@ -45,7 +50,8 @@ export function SqlEditor({
               { tag: tags.comment, color: 'var(--color-muted)' },
             ]),
           ),
-          EditorView.contentAttributes.of({ 'aria-label': 'SQL query' }),
+          attributes.current.of([]),
+          EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
             if (update.docChanged) callbacks.current.onChange(update.state.doc.toString());
           }),
@@ -80,5 +86,16 @@ export function SqlEditor({
     if (editor && editor.state.doc.toString() !== value)
       editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: value } });
   }, [value]);
-  return <div className="sql-editor" ref={element} />;
+  useEffect(() => {
+    view.current?.dispatch({
+      effects: attributes.current.reconfigure(
+        EditorView.contentAttributes.of({
+          'aria-label': 'SQL query',
+          'aria-invalid': String(invalid),
+          ...(describedBy ? { 'aria-describedby': describedBy } : {}),
+        }),
+      ),
+    });
+  }, [invalid, describedBy]);
+  return <div className="sql-editor" data-invalid={invalid || undefined} ref={element} />;
 }

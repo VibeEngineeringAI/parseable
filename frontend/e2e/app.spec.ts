@@ -62,7 +62,7 @@ test('SQL editor runs a real query against the explicit demo adapter', async ({ 
   const download = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Export JSON' }).click();
   expect((await download).suggestedFilename()).toBe('query-results.json');
-  await editor.fill('SELECT COUNT(*) FROM "application_logs"');
+  await editor.fill('SELECT COUNT(*) FROM "application_logs" GROUP BY "level"');
   await page.getByRole('button', { name: 'Run query' }).click();
   await expect(page.getByRole('alert')).toContainText('Demo SQL supports');
   await expect(page.getByRole('table')).toHaveCount(0);

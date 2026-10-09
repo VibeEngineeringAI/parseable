@@ -76,8 +76,112 @@ export type UserRoleSources = {
 };
 export type About = {
   oidcActive: boolean;
-  capabilities: { oidcRoleMapping: boolean; oidcRoleSync: boolean; promql: boolean };
+  capabilities: {
+    oidcRoleMapping: boolean;
+    oidcRoleSync: boolean;
+    promql: boolean;
+    promqlAlerts: boolean;
+  };
 };
+export type AlertSeverity = 'critical' | 'high' | 'medium' | 'low';
+export type AlertState = 'triggered' | 'not-triggered' | 'disabled';
+export type AlertQueryType = 'promql' | 'code' | 'builder';
+export type ThresholdOperator = '>' | '<' | '=' | '!=' | '>=' | '<=';
+export type NotificationState = string | { mute: string };
+export type PromqlAlertConfig = { holdDuration?: string; [key: string]: unknown };
+export type PromqlAlertRuntime = {
+  health: 'ok' | 'noData' | 'error';
+  error: string | null;
+  lastEvaluatedAt: string | null;
+  instances: Record<
+    string,
+    {
+      labels: PromqlLabels;
+      state: 'pending' | 'firing' | 'resolved';
+      pendingSince: string | null;
+      lastSeen: string;
+      value: number;
+    }
+  >;
+  deliveries: Array<{
+    labels: PromqlLabels;
+    value: number;
+    firing: boolean;
+    target: string;
+    attempts: number;
+    error: string | null;
+  }>;
+};
+export type AlertSummary = {
+  id: string;
+  title: string;
+  severity: AlertSeverity;
+  state: AlertState;
+  alertType: 'threshold';
+  datasets: string[];
+  notificationState: NotificationState;
+  created: string;
+  tags?: string[] | null;
+  lastTriggeredAt?: string | null;
+  queryType?: AlertQueryType;
+  promqlConfig?: PromqlAlertConfig;
+  promqlRuntime?: PromqlAlertRuntime;
+};
+export type AlertRequest = {
+  title: string;
+  severity: AlertSeverity;
+  query: string;
+  queryType: AlertQueryType;
+  datasets: string[];
+  alertType: 'threshold';
+  thresholdConfig: { operator: ThresholdOperator; value: number };
+  evalConfig: { rollingWindow: { evalStart: string; evalEnd: string; evalFrequency: number } };
+  notificationConfig: { interval: number };
+  targets: string[];
+  tags?: string[] | null;
+  promqlConfig?: PromqlAlertConfig;
+  [key: string]: unknown;
+};
+export type Alert = AlertRequest & {
+  version: string;
+  id: string;
+  state: AlertState;
+  notificationState: NotificationState;
+  created: string;
+  lastTriggeredAt: string | null;
+  promqlRuntime?: PromqlAlertRuntime;
+  executionIdentity?: { userId: string; tenantId: string };
+};
+export type AlertTargetType = 'slack' | 'webhook' | 'alertManager';
+export type AlertTargetRequest =
+  | { name: string; type: 'slack'; endpoint: string }
+  | {
+      name: string;
+      type: 'webhook';
+      endpoint: string;
+      headers?: Record<string, string>;
+      skipTlsCheck: boolean;
+    }
+  | {
+      name: string;
+      type: 'alertManager';
+      endpoint: string;
+      username?: string;
+      password?: string;
+      skipTlsCheck: boolean;
+    };
+// Alertmanager is returned as webhook by the backend; auth keys identify it.
+export type AlertTarget = {
+  id: string;
+  name: string;
+  type: AlertTargetType;
+  endpoint: string;
+  headers?: Record<string, string>;
+  skipTlsCheck?: boolean;
+  username?: string | null;
+  password?: string | null;
+};
+export type AlertTargetStatus = { target: AlertTarget; enabled: boolean; error?: string };
 export type ApiKey = {
   keyId: string;
   apiKey: string;
@@ -104,6 +208,21 @@ export interface ParseableClient {
   login(username: string, password: string, returnPath?: string): Promise<void>;
   logout(): Promise<void>;
   about(signal?: AbortSignal): Promise<About>;
+  listAlerts(signal?: AbortSignal): Promise<AlertSummary[]>;
+  getAlert(id: string, signal?: AbortSignal): Promise<Alert>;
+  createAlert(alert: AlertRequest): Promise<Alert>;
+  updateAlert(id: string, alert: AlertRequest): Promise<Alert>;
+  deleteAlert(id: string): Promise<void>;
+  enableAlert(id: string): Promise<Alert>;
+  disableAlert(id: string): Promise<Alert>;
+  muteAlert(id: string, state: string): Promise<Alert>;
+  evaluateAlert(id: string): Promise<Alert>;
+  listAlertTags(signal?: AbortSignal): Promise<string[]>;
+  listAlertTargets(signal?: AbortSignal): Promise<AlertTargetStatus[]>;
+  getAlertTarget(id: string, signal?: AbortSignal): Promise<AlertTargetStatus>;
+  createAlertTarget(target: AlertTargetRequest): Promise<AlertTarget>;
+  updateAlertTarget(id: string, target: AlertTargetRequest): Promise<AlertTarget>;
+  deleteAlertTarget(id: string): Promise<AlertTarget>;
   listUsers(signal?: AbortSignal): Promise<TeamUser[]>;
   createUser(username: string, roles: string[]): Promise<string>;
   deleteUser(id: string): Promise<void>;
