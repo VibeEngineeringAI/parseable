@@ -25,7 +25,7 @@ The proxy preserves the browser Host so the backend can validate the same-origin
 
 ## Build and embed in Parseable
 
-While this frontend reaches parity, Parseable serves it **beside** the classic Prism UI: Prism stays at `/` and this frontend is mounted at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both. Each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab, and a **Classic UI** sidebar group links to features not built here yet (alerts, users, roles).
+While this frontend reaches parity, Parseable serves it **beside** the classic Prism UI: Prism stays at `/` and this frontend is mounted at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both. Each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab, and a **Classic UI** sidebar group links to Alerts, the remaining classic-only page.
 
 Release builds use **Node 24**. `npm run build` targets the `/next/` base path. From this directory:
 
@@ -60,11 +60,12 @@ This creates `build.zip` with a top-level `dist/` directory, including `dist/ind
 - SQL: dataset explorer, CodeMirror editor, Ctrl/Cmd+Enter execution, time range, query errors, shared sortable/wrappable results, column selection, and JSON/CSV export.
 - Datasets: search, schema inspection, explorer navigation.
 - Dashboards: create, persist/reload, and confirm deletion of browser-local event-volume tiles; demo and live definitions use separate storage keys. These are not synced to the server and do not yet support arbitrary layouts or queries.
+- Team: native users and one-time passwords, role and privilege management, default OIDC role configuration, provider group mappings and role provenance, and API key creation/copy/deletion. Search and 25-row pagination apply to every tab; authorization stays with the backend.
 - Component gallery at `/components`, plus eight isolated Storybook stories.
 
 The default log query reads at most 100 rows, sorted by `p_timestamp`. Message search assumes a `message` field. The histogram represents returned rows, not total stream volume. Demo SQL intentionally supports only a small SELECT subset and rejects unsupported syntax. Full SQL requires a server.
 
-Metrics, traces, APM, alerts, team administration, ingestion setup, saved queries, server dashboards, virtualized tables, and original Prism pixel parity are future iterations. No unusable paid-feature navigation or upgrade controls are exposed.
+Metrics, traces, APM, alerts, ingestion setup, saved queries, server dashboards, virtualized tables, and original Prism pixel parity are future iterations. No unusable paid-feature navigation or upgrade controls are exposed.
 
 ## Components and selectors
 
@@ -110,4 +111,4 @@ PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
 npm run test:live
 ```
 
-Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DATASET` for a disposable server; defaults are `frontend-smoke`, `local-smoke-password` and `frontend_smoke`. Page paths use the `/next` mount of a server built with `NEXT_ASSETS_PATH`; set `PARSEABLE_LIVE_BASE=` (empty) when `PARSEABLE_LIVE_URL` points at `npm run dev` or another server at the root. API calls always go to the origin root. Omitting `PARSEABLE_LIVE_URL` skips the live tests. Add `PARSEABLE_LIVE_OIDC=true` only with the local fixture provider configured, or `PARSEABLE_LIVE_NO_OIDC=true` with a provider-free server to exercise the real missing-provider route. `npm run check` excludes this suite. The completed default check passed 36 unit, 33 app browser and 14 Storybook browser tests. The final live run passed seven tests with the provider-free case skipped; that case passed separately. See [the live runbook and recorded results](docs/validation-review.md) for setup, exact commands, scope and limitations.
+Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DATASET` for a disposable server; defaults are `frontend-smoke`, `local-smoke-password` and `frontend_smoke`. Page paths use the `/next` mount of a server built with `NEXT_ASSETS_PATH`; set `PARSEABLE_LIVE_BASE=` (empty) when `PARSEABLE_LIVE_URL` points at `npm run dev` or another server at the root. API calls always go to the origin root. Omitting `PARSEABLE_LIVE_URL` skips the live tests. Add `PARSEABLE_LIVE_OIDC=true` only with the local fixture provider configured, or `PARSEABLE_LIVE_NO_OIDC=true` with a provider-free server to exercise the real missing-provider route. `npm run check` excludes this suite. The completed default check passed 152 unit, 69 app browser and 14 Storybook browser tests (2026-10-08). The live suite, including the Team tests in `e2e-live/team.spec.ts`, passed 12 tests with the two opt-in OIDC cases skipped; the SSO case then passed separately with `PARSEABLE_LIVE_OIDC=true`. The Team live tests create uniquely named users, roles and API keys, remove them afterwards and restore the server's previous default OIDC role. See [the live runbook and recorded results](docs/validation-review.md) for setup, exact commands, scope and limitations.
