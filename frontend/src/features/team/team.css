@@ -1,0 +1,114 @@
+.team-page .page-heading > .inline {
+  flex-wrap: wrap;
+}
+.team-page .ui-tabs-list {
+  flex-wrap: wrap;
+}
+.team-table td {
+  padding: 10px 12px;
+  white-space: normal;
+  vertical-align: top;
+}
+.team-table th {
+  white-space: nowrap;
+}
+.team-table td:first-child {
+  min-width: 140px;
+}
+.team-table th .ui-button {
+  font-size: inherit;
+}
+.team-chips,
+.team-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.team-actions {
+  min-width: 200px;
+}
+.team-chip {
+  padding-right: 2px;
+  white-space: normal;
+}
+.team-chip .ui-button {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+}
+.team-inherited {
+  flex-wrap: wrap;
+  white-space: normal;
+}
+.team-inherited span {
+  font-weight: normal;
+}
+.team-role-picker,
+.team-privilege-row,
+.team-provenance {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  min-width: 0;
+}
+.team-role-picker legend,
+.team-privilege-row legend {
+  font-weight: 600;
+  padding: 0 4px;
+}
+.team-checkbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow: auto;
+}
+.team-checkbox-list label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 2px;
+  overflow-wrap: anywhere;
+}
+.team-checkbox-list input {
+  accent-color: var(--color-primary);
+  width: 16px;
+  height: 16px;
+}
+.team-privilege-row .ui-field + .ui-field {
+  margin-top: 12px;
+}
+.team-provenance p,
+.team-group-description p {
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.team-source-list p + p {
+  margin-top: 8px;
+}
+.team-group-description {
+  max-width: 900px;
+  margin-bottom: 16px;
+}
+.team-key-name {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.team-key-name code {
+  color: var(--color-muted);
+  overflow-wrap: anywhere;
+}
+.team-copy {
+  display: flex;
+  flex-direction: column;
+}
+.team-copy [role='status'] {
+  font-size: 11px;
+}
+.team-empty {
+  padding: 20px;
+  color: var(--color-muted);
+}

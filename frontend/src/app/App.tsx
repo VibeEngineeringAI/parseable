@@ -22,6 +22,9 @@ const DashboardsPage = lazy(() =>
 const LibraryPage = lazy(() =>
   import('../features/library/LibraryPage').then((m) => ({ default: m.LibraryPage })),
 );
+const TeamPage = lazy(() =>
+  import('../features/team/TeamPage').then((m) => ({ default: m.TeamPage })),
+);
 import { OverviewPage } from './OverviewPage';
 export function App() {
   const { mode, session, identity, needsLogin, client } = useApp();
@@ -40,6 +43,7 @@ export function App() {
         'sql-editor': 'SQL editor',
         datasets: 'Datasets',
         dashboards: 'Dashboards',
+        team: 'Team',
         components: 'Component library',
       } as Record<string, string>
     )[location.pathname.split('/')[1]] || 'Overview';
@@ -147,6 +151,7 @@ export function App() {
               <Route path="/sql-editor" element={<SqlPage />} />
               <Route path="/datasets" element={<DatasetsPage />} />
               <Route path="/dashboards" element={<DashboardsPage />} />
+              <Route path="/team" element={<TeamPage />} />
               <Route path="/components" element={<LibraryPage />} />
               <Route
                 path="*"

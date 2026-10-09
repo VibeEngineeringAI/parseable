@@ -1,4 +1,15 @@
-import type { Dataset, LogRecord, ParseableClient, QueryRequest } from './types';
+import type {
+  ApiKey,
+  Dataset,
+  LogRecord,
+  ParseableClient,
+  QueryRequest,
+  Roles,
+  TeamUser,
+  UserRoleSources,
+} from './types';
+import { ApiError } from './client';
+import { validateName } from '../features/team/helpers';
 
 export const demoDatasets: Dataset[] = [
   { name: 'application_logs', type: 'logs' },
@@ -205,12 +216,320 @@ export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): L
 
 export function createDemoClient(): ParseableClient {
   const records = createDemoRecords(Date.now() - 1_000);
+  const roles: Roles = {
+    administrators: [{ privilege: 'admin' }],
+    analysts: [{ privilege: 'reader', resource: { stream: 'application_logs' } }],
+    auditors: [{ privilege: 'reader', resource: { stream: 'api_logs' } }],
+    editors: [{ privilege: 'editor' }],
+    ingestors: [{ privilege: 'ingestor', resource: { stream: '*' } }],
+    observers: [{ privilege: 'reader', resource: { stream: 'infrastructure_logs' } }],
+    'provider-readers': [{ privilege: 'reader', resource: { stream: '*' } }],
+    writers: [{ privilege: 'writer', resource: { llmKey: '*' } }],
+  };
+  let defaultRole: string | null = 'observers';
+  type DemoUser = Omit<TeamUser, 'roles' | 'groupRoles'> & {
+    assigned: string[];
+    inherited: Record<string, string[]>;
+    oidc?: UserRoleSources['oidc'];
+  };
+  const users: DemoUser[] = [
+    {
+      id: 'admin',
+      username: 'admin',
+      method: 'native',
+      assigned: ['super-admin'],
+      inherited: {},
+      userGroups: [],
+    },
+    {
+      id: 'analyst',
+      username: 'analyst',
+      method: 'native',
+      email: 'analyst@example.test',
+      assigned: ['analysts'],
+      inherited: { analytics: ['auditors'] },
+      userGroups: ['analytics'],
+    },
+    {
+      id: 'https://issuer.example/sso-user',
+      username: 'sso.user',
+      method: 'oauth',
+      email: 'sso@example.test',
+      assigned: [],
+      inherited: {},
+      userGroups: [],
+      oidc: {
+        issuer: 'https://issuer.example',
+        legacy: false,
+        groups: ['provider-readers'],
+        providerRoles: ['provider-readers'],
+        manualRoles: ['auditors'],
+        defaultRole,
+      },
+    },
+    {
+      id: 'https://issuer.example/fallback-user',
+      username: 'sso.fallback',
+      method: 'oauth',
+      assigned: [],
+      inherited: {},
+      userGroups: [],
+      oidc: {
+        issuer: 'https://issuer.example',
+        legacy: false,
+        groups: [],
+        providerRoles: [],
+        manualRoles: [],
+        defaultRole,
+      },
+    },
+  ];
+  const now = new Date().toISOString();
+  const keys: ApiKey[] = [
+    {
+      keyId: apiKeyId(),
+      apiKey: 'demo-ingestion-key-1234',
+      keyName: 'ingestion',
+      roles: ['ingestors'],
+      createdBy: 'admin',
+      createdAt: now,
+      modifiedAt: now,
+    },
+    {
+      keyId: apiKeyId(),
+      apiKey: 'demo-query-key-5678',
+      keyName: 'queries',
+      roles: ['analysts'],
+      createdBy: 'admin',
+      createdAt: now,
+      modifiedAt: now,
+    },
+  ];
+  const clone = <T>(value: T): T => structuredClone(value);
+  function apiKeyId() {
+    const alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+    let timestamp = Date.now();
+    let prefix = '';
+    for (let i = 0; i < 10; i++) {
+      prefix = alphabet[timestamp % 32] + prefix;
+      timestamp = Math.floor(timestamp / 32);
+    }
+    const random = crypto.getRandomValues(new Uint8Array(16));
+    return prefix + Array.from(random, (byte) => alphabet[byte % 32]).join('');
+  }
+  function fail(message: string, status = 400): never {
+    throw new ApiError(message, status);
+  }
+  function knownRoles(names: string[]) {
+    const missing = names.filter((name) => !Object.hasOwn(roles, name));
+    if (missing.length) fail(`Roles do not exist: ${missing.join(', ')}`);
+  }
+  function named(name: string, kind: 'user' | 'role') {
+    const error = validateName(name, kind);
+    if (error) fail(error);
+  }
+  function findUser(id: string, mutation = false) {
+    const found = users.find((user) => user.id === id);
+    if (!found) fail('User does not exist', 404);
+    if (mutation && id === 'admin') fail('Cannot call this API for root admin user');
+    return found;
+  }
+  function effective(user: DemoUser): string[] {
+    if (!user.oidc || user.oidc.legacy) return user.assigned;
+    const assigned = [
+      ...new Set([...(user.oidc.manualRoles ?? []), ...(user.oidc.providerRoles ?? [])]),
+    ];
+    return assigned.length ? assigned : defaultRole ? [defaultRole] : [];
+  }
+  function privileges(names: string[]): TeamUser['roles'] {
+    return Object.fromEntries(
+      names.map((name) => [
+        name,
+        name === 'super-admin' ? [{ privilege: 'superadmin' }] : clone(roles[name] ?? []),
+      ]),
+    );
+  }
+  function sources(user: DemoUser): UserRoleSources {
+    const convert = (names: string[]) =>
+      Object.fromEntries(
+        Object.entries(privileges(names)).map(([name, actions]) => [
+          name,
+          { actions, roleType: name === 'super-admin' ? ('internal' as const) : ('user' as const) },
+        ]),
+      );
+    return {
+      roles: convert(effective(user)),
+      groupRoles: Object.fromEntries(
+        Object.entries(user.inherited).map(([group, names]) => [group, convert(names)]),
+      ),
+      oidc: user.oidc ? { ...clone(user.oidc), defaultRole } : undefined,
+    };
+  }
+  function findKey(id: string) {
+    const found = keys.find((key) => key.keyId === id);
+    if (!found) fail(`API key not found: ${id}`, 404);
+    return found;
+  }
   async function ready(signal?: AbortSignal) {
     signal?.throwIfAborted();
     await Promise.resolve();
     signal?.throwIfAborted();
   }
   return {
+    async about(signal) {
+      await ready(signal);
+      return { oidcActive: true, capabilities: { oidcRoleMapping: true, oidcRoleSync: true } };
+    },
+    async listRoles(signal) {
+      await ready(signal);
+      return clone(roles);
+    },
+    async putRole(name, actions) {
+      await ready();
+      named(name, 'role');
+      if (
+        actions.some(
+          (action) =>
+            !['admin', 'editor', 'reader', 'writer', 'ingestor'].includes(action.privilege),
+        )
+      )
+        fail('Cannot create a role with superadmin privilege.');
+      roles[name] = clone(actions);
+    },
+    async deleteRole(name) {
+      await ready();
+      if (name.toLowerCase() === 'default') fail(validateName(name, 'role')!);
+      if (defaultRole === name)
+        fail('Clear or change the default OIDC role before deleting this role.');
+      if (
+        users.some(
+          (user) =>
+            effective(user).includes(name) ||
+            Object.values(user.inherited).some((names) => names.includes(name)),
+        ) ||
+        keys.some((key) => key.roles.includes(name))
+      )
+        fail('Cannot perform this operation as role is assigned to an existing user.');
+      delete roles[name];
+    },
+    async defaultRole(signal) {
+      await ready(signal);
+      return defaultRole;
+    },
+    async setDefaultRole(name) {
+      await ready();
+      named(name, 'role');
+      if (!Object.hasOwn(roles, name)) fail('Default OIDC role must name an existing role.');
+      defaultRole = name;
+    },
+    async clearDefaultRole() {
+      await ready();
+      defaultRole = null;
+    },
+    async listUsers(signal) {
+      await ready(signal);
+      return users.map(({ assigned: _assigned, inherited, oidc: _oidc, ...user }) => ({
+        ...clone(user),
+        roles: privileges(effective(findUser(user.id))),
+        groupRoles: Object.fromEntries(
+          Object.entries(inherited).map(([group, names]) => [group, privileges(names)]),
+        ),
+      }));
+    },
+    async createUser(username, assigned) {
+      await ready();
+      if (username === 'admin') fail('Cannot call this API for root admin user');
+      named(username, 'user');
+      knownRoles(assigned);
+      if (!assigned.length) fail('User cannot be created without a role');
+      if (
+        users.some(
+          (user) =>
+            user.id === username || (user.method === 'native' && user.username === username),
+        )
+      )
+        fail(`User ${username} already exists`);
+      users.push({
+        id: username,
+        username,
+        method: 'native',
+        assigned: [...new Set(assigned)],
+        inherited: {},
+        userGroups: [],
+      });
+      return `demo-password-${crypto.randomUUID()}`;
+    },
+    async deleteUser(id) {
+      await ready();
+      const found = findUser(id, true);
+      if (found.userGroups.length) fail('Cannot delete user while assigned to a group.');
+      users.splice(users.indexOf(found), 1);
+    },
+    async addUserRoles(id, assigned) {
+      await ready();
+      const user = findUser(id, true);
+      knownRoles(assigned);
+      if (user.oidc && !user.oidc.legacy)
+        user.oidc.manualRoles = [...new Set([...(user.oidc.manualRoles ?? []), ...assigned])];
+      else user.assigned = [...new Set([...user.assigned, ...assigned])];
+    },
+    async removeUserRoles(id, assigned) {
+      await ready();
+      const user = findUser(id, true);
+      knownRoles(assigned);
+      const missing = assigned.filter((name) => !effective(user).includes(name));
+      if (missing.length) fail(`Roles are not assigned: ${missing.join(', ')}`);
+      if (user.oidc && !user.oidc.legacy) {
+        if (assigned.some((name) => !user.oidc?.manualRoles?.includes(name)))
+          fail(
+            'Provider and default OIDC roles cannot be removed as manual grants; change the identity-provider group or default role instead.',
+          );
+        user.oidc.manualRoles = (user.oidc.manualRoles ?? []).filter(
+          (name) => !assigned.includes(name),
+        );
+      } else user.assigned = user.assigned.filter((name) => !assigned.includes(name));
+    },
+    async resetPassword(id) {
+      await ready();
+      const user = findUser(id, true);
+      if (user.method !== 'native') fail('User does not exist', 404);
+      return `demo-password-${crypto.randomUUID()}`;
+    },
+    async userRoleSources(id, signal) {
+      await ready(signal);
+      return sources(findUser(id));
+    },
+    async listApiKeys(signal) {
+      await ready(signal);
+      return keys.map((key) => ({ ...clone(key), apiKey: `****${key.apiKey.slice(-4)}` }));
+    },
+    async createApiKey(keyName, assigned) {
+      await ready();
+      knownRoles(assigned);
+      if (!keyName.trim()) fail('Enter a name for the API key.');
+      if (keys.some((key) => key.keyName === keyName)) fail(`Duplicate key name: ${keyName}`, 409);
+      const timestamp = new Date().toISOString();
+      const key: ApiKey = {
+        keyId: apiKeyId(),
+        apiKey: crypto.randomUUID(),
+        keyName,
+        roles: [...new Set(assigned)],
+        createdBy: 'admin',
+        createdAt: timestamp,
+        modifiedAt: timestamp,
+      };
+      keys.push(key);
+      return clone(key);
+    },
+    async getApiKey(id, signal) {
+      await ready(signal);
+      return clone(findKey(id));
+    },
+    async deleteApiKey(id) {
+      await ready();
+      const key = findKey(id);
+      keys.splice(keys.indexOf(key), 1);
+    },
     async listDatasets(signal) {
       await ready(signal);
       return demoDatasets.map((dataset) => ({ ...dataset }));

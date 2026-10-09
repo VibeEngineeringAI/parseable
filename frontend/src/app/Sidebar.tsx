@@ -12,6 +12,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Search,
+  UsersRound,
 } from 'lucide-react';
 import { Button, Badge } from '../components/ui';
 import { useApp } from './AppProvider';
@@ -29,6 +30,10 @@ const groups = [
   {
     label: 'Data',
     links: [{ to: '/datasets', label: 'Datasets', id: 'datasets', icon: Database }],
+  },
+  {
+    label: 'Admin',
+    links: [{ to: '/team', label: 'Team', id: 'team', icon: UsersRound }],
   },
   {
     label: 'Develop',
