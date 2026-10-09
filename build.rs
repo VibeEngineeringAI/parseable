@@ -182,6 +182,7 @@ mod ui {
             &cargo_manifest_dir,
             &parseable_ui_path.join("dist"),
             &community_path,
+            ui_version,
         )?;
         resource_dir(&community_path).build()?;
 

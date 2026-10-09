@@ -5,10 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
-import { bustJavaScriptCache, overlayIdentity, rewriteJavaScriptReferences, transform } from './prepare-community-ui.mjs';
+import { bustJavaScriptCache, overlayIdentity, reachableModules, rewriteJavaScriptReferences, transform, verifyPrismVersion, verifyReachability } from './prepare-community-ui.mjs';
 
 const capabilitySource = await readFile(new URL('./community-promql-capabilities.js', import.meta.url), 'utf8');
 const capabilities = await import(`data:text/javascript;base64,${Buffer.from(capabilitySource).toString('base64')}`);
+const overlayFile = async prefix => {
+  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
+  return manifest.files.find(file => file.path.startsWith(`assets/${prefix}-`));
+};
 const state = (plan, advertised) => ({ app: { instanceConfig: { license: { plan }, capabilities: advertised } } });
 
 test('community PromQL capabilities are independent of Enterprise and alerts', () => {
@@ -46,12 +50,12 @@ test('unresolved dataset variables produce an actionable preview message', () =>
 });
 
 test('preview dataset resolver is safe when the editor shadows the stock imported name', async () => {
-  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
-  const replacements = manifest.files.find(file => file.path.startsWith('assets/DashboardView-')).replacements;
-  const imports = replacements.find(item => item.from.startsWith('import{n as gn,t as _n}'));
+  const replacements = (await overlayFile('DashboardView')).replacements;
+  const imports = replacements.find(item => item.from.includes('from"./datasetVariables-'));
   assert.match(imports.to, /n as communityResolvePreviewDataset/);
-  const binding = replacements.find(item => item.from === 'T=J(u),E=J(').to.match(/communityPreviewStream=(.*),E=J\($/)[1];
-  const preview = new Function('Q', 's', 'communityVariableValues', 'communityResolvePreviewDataset', `const communityPreviewStream=${binding}; const gn='editor local'; return communityPreviewStream;`);
+  const stockName = imports.from.match(/^import\{n as (\w+),/)[1];
+  const binding = replacements.find(item => item.to.includes('communityPreviewStream=(')).to.match(/communityPreviewStream=(.*),E=\w+\($/)[1];
+  const preview = new Function('Q', 's', 'communityVariableValues', 'communityResolvePreviewDataset', `const communityPreviewStream=${binding}; const ${stockName}='editor local'; return communityPreviewStream;`);
   assert.equal(preview({ useMemo: callback => callback() }, '$metrics_dataset', { metrics_dataset: 'real_metrics' }, (stream, values) => values[stream.slice(1)]), 'real_metrics');
 });
 
@@ -285,10 +289,9 @@ test('failed default lookup displays Unknown and a successful explicit save esta
 });
 
 test('OIDC overlay retains native groups gate and handles clearing the role marker', async () => {
-  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
-  const edits = manifest.files.find(file => file.path === 'assets/Team-DjnIdab9.js').replacements;
+  const edits = (await overlayFile('Team')).replacements;
   assert.ok(edits.some(edit => edit.to.includes('communityOidcEnabled?(0,$.jsx)(communityOidcGroupView') && edit.to.includes('(0,$.jsx)(yt,')));
-  assert.ok(edits.some(edit => edit.to.includes('k===`groups`&&!communityOidcEnabled')));
+  assert.ok(edits.some(edit => /\w+===`groups`&&!communityOidcEnabled/.test(edit.to)));
   assert.ok(edits.some(edit => edit.from === 's?.data&&p(s?.data)' && edit.to === 's&&p(s.data??null)'));
   assert.ok(edits.some(edit => edit.to.includes('communityNativeDefaultRole,props')));
 });
@@ -346,18 +349,17 @@ test('error account recovery works without application providers and navigates t
 });
 
 test('error overlay covers root, route, and application initialization failures', async () => {
-  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
-  const root = manifest.files.find(file => file.path === 'assets/index-BLF851sq.js');
+  const root = await overlayFile('index');
   assert.ok(root.replacements.some(item => item.from.includes('error-boundary') && item.to.includes('CommunityErrorAccountMenu')));
   assert.ok(root.replacements.some(item => item.from.includes('Parseable Error Icon') && item.to.includes('CommunityErrorAccountMenu')));
-  const app = manifest.files.find(file => file.path === 'assets/App-BaXntU9S.js');
-  assert.ok(app.replacements.some(item => item.from.includes('Parseable Error Icon') && item.to.includes('(0,J.jsx)($n,{})')));
+  // The native navigation user menu (NavUser) supplies account actions in the application shell.
+  const app = await overlayFile('App');
+  assert.ok(app.replacements.some(item => item.from.includes('Parseable Error Icon') && /fixed right-4 top-4 z-50`,children:\(0,\w+\.jsx\)\(\w+,\{\}\)/.test(item.to)));
 });
 
 test('standalone no-access and missing-page errors retain account recovery', async () => {
-  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
-  for (const path of ['assets/NoAccessPage-BiZpLDSB.js', 'assets/NotFoundPage-q_LZqNzB.js']) {
-    const file = manifest.files.find(file => file.path === path);
+  for (const prefix of ['NoAccessPage', 'NotFoundPage']) {
+    const file = await overlayFile(prefix);
     assert.ok(file.replacements.some(item => item.from.includes('Parseable Error Icon') && item.to.includes('CommunityErrorAccountMenu')));
   }
 });
@@ -371,8 +373,7 @@ test('route recovery stays within its panel and account trigger has no list mark
   assert.equal(panel.children[0].props.style.display, 'flex');
   assert.equal(panel.children[0].props.style.listStyle, 'none');
   assert.equal(panel.children[0].props.style.height, 40);
-  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
-  const root = manifest.files.find(file => file.path === 'assets/index-BLF851sq.js');
+  const root = await overlayFile('index');
   assert.ok(root.replacements.some(item => item.to.includes('relative h-screen')));
   assert.ok(root.replacements.some(item => item.to.includes('position:`absolute`')));
 });
@@ -397,4 +398,56 @@ test('account menu displays logout failure and restores retry control', async ()
     if (originalWindow === undefined) delete globalThis.window;
     else globalThis.window = originalWindow;
   }
+});
+
+const graph = entries => new Map(Object.entries(entries));
+const stockGraph = () => graph({
+  'index.html': '<script type="module" crossorigin src="/assets/index.js"></script><link rel="modulepreload" href="/assets/vendor.js"><link rel="stylesheet" href="/assets/index.css">',
+  'assets/index.js': 'const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/Page.js","assets/preloaded.js"])))=>i.map(i=>d[i]);import{a as b}from"./shared.js";import"./side-effect.js";const p=()=>import(`./Page.js`),__vite__mapDeps([0,1]);const note="mentioned.js";',
+  'assets/vendor.js': 'export const vendor = 1;',
+  'assets/shared.js': "export*from'../lib/deep.js';",
+  'lib/deep.js': 'const q=import("https://cdn.example/x.js");',
+  'assets/side-effect.js': '',
+  'assets/Page.js': '',
+  'assets/preloaded.js': '',
+  'assets/mentioned.js': '',
+  'assets/stale.js': 'import"./index.js";',
+});
+
+test('module graph follows HTML, static, dynamic and Vite preload references only', () => {
+  assert.deepEqual([...reachableModules(stockGraph())].sort(), [
+    'assets/Page.js', 'assets/index.js', 'assets/preloaded.js', 'assets/shared.js',
+    'assets/side-effect.js', 'assets/vendor.js', 'index.html', 'lib/deep.js',
+  ]);
+});
+
+test('overlay refuses patches to chunks the UI never loads', () => {
+  // Stale chunks from older Prism builds ship in the same ZIP; their hashes and
+  // replacement counts still verify, so reachability is the only signal.
+  const stock = stockGraph();
+  const patched = new Map(stock);
+  patched.set('assets/stale.js', 'import"./community.js";' + stock.get('assets/stale.js'));
+  patched.set('assets/community.js', '');
+  assert.throws(() => verifyReachability(stock, patched, ['assets/stale.js'], ['assets/community.js'], 'test'),
+    /test: overlay files not reachable from index\.html: assets\/stale\.js, assets\/community\.js/);
+  patched.delete('assets/stale.js');
+  patched.set('assets/Page.js', 'import"./community.js";');
+  verifyReachability(stock, patched, ['assets/Page.js'], ['assets/community.js'], 'test');
+});
+
+test('overlay refuses patches that import modules outside the stock graph', () => {
+  const stock = stockGraph();
+  const patched = new Map(stock);
+  patched.set('assets/Page.js', 'import"./community.js";import{x}from"./stale.js";');
+  patched.set('assets/community.js', '');
+  assert.throws(() => verifyReachability(stock, patched, ['assets/Page.js'], ['assets/community.js'], 'test'),
+    /outside the Prism UI graph: assets\/stale\.js/);
+});
+
+test('overlay manifest matches the Prism release pinned in Cargo.toml', async () => {
+  assert.throws(() => verifyPrismVersion('prism-v3.2.4-community', 'https://example/build/v3.2.5/build.zip'), /does not match the pinned Prism UI v3\.2\.5/);
+  verifyPrismVersion('prism-v3.2.5-community', 'https://example/build/v3.2.5/build.zip');
+  const manifest = JSON.parse(await readFile(new URL('./community-ui-overlay.json', import.meta.url), 'utf8'));
+  const cargo = await readFile(new URL('../Cargo.toml', import.meta.url), 'utf8');
+  verifyPrismVersion(manifest.version, cargo.match(/^assets-url\s*=\s*"([^"]+)"/m)[1]);
 });
