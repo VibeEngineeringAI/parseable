@@ -1,14 +1,8 @@
 name: Build and push edge tag
 
 on:
-  push:
-    branches:
-      - 'main'
-    paths-ignore:
-      - 'docs/**'
-      - 'helm/**'
-      - 'assets/**'
-      - '**.md'
+  # Temporarily pause automatic image publishing.
+  workflow_dispatch:
 
 jobs:
   docker:
