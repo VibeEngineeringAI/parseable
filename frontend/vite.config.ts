@@ -12,8 +12,12 @@ export default defineConfig(({ mode }) => {
           target: env.PARSEABLE_PROXY_TARGET || 'http://127.0.0.1:8000',
           changeOrigin: false,
         },
-        // Community PromQL is mounted at the server root, not under /api.
+        // Community PromQL and OTLP ingestion are mounted at the server root, not under /api.
         '/prometheus': {
+          target: env.PARSEABLE_PROXY_TARGET || 'http://127.0.0.1:8000',
+          changeOrigin: false,
+        },
+        '/v1': {
           target: env.PARSEABLE_PROXY_TARGET || 'http://127.0.0.1:8000',
           changeOrigin: false,
         },

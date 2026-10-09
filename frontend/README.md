@@ -15,7 +15,7 @@ Open http://127.0.0.1:5173. The app starts in **live server** mode. Sign in with
 
 **Explore demo data** is available in development. Production builds hide demo controls and ignore stored demo selections unless built with `VITE_ENABLE_DEMO=true npm run build`. Demo selection lasts for the browser tab and remains visibly labeled. The component gallery stays available at `/components`; the app and Storybook browser-test configurations explicitly enable their sample workspace where needed.
 
-Development requests to `/api` proxy to `http://127.0.0.1:8000`. Set a different target when starting Vite:
+Development requests to `/api` and `/prometheus` proxy to `http://127.0.0.1:8000`. Set a different target when starting Vite:
 
 ```sh
 PARSEABLE_PROXY_TARGET=http://127.0.0.1:8080 npm run dev
@@ -58,14 +58,15 @@ This creates `build.zip` with a top-level `dist/` directory, including `dist/ind
 - Compact workspace shell, collapsible navigation, light/dark theme, server-preferred signed-in identity, and logout. Standalone two-panel login includes password visibility and the administrator-contact password-reset dialog.
 - Logs: dataset selection, preset/absolute UTC time ranges, message search, exact field filters, searchable fields and columns, bounded event distribution, sortable/wrappable paginated results, JSON/CSV export, event details, include/exclude/copy actions, and handoff to SQL.
 - SQL: dataset explorer, CodeMirror editor, Ctrl/Cmd+Enter execution, time range, query errors, shared sortable/wrappable results, column selection, and JSON/CSV export.
+- Metrics: OTLP metrics dataset discovery, PromQL editor and label browser, up to five queries, Range/Instant/Both execution, automatic or explicit step, time range and refresh, line chart with legend, sortable instant and range-summary tables, JSON/CSV export, dataset history, and shareable URLs. PromQL availability follows the server capability.
 - Datasets: search, schema inspection, explorer navigation.
 - Dashboards: create, persist/reload, and confirm deletion of browser-local event-volume tiles; demo and live definitions use separate storage keys. These are not synced to the server and do not yet support arbitrary layouts or queries.
 - Team: native users and one-time passwords, role and privilege management, default OIDC role configuration, provider group mappings and role provenance, and API key creation/copy/deletion. Search and 25-row pagination apply to every tab; authorization stays with the backend.
-- Component gallery at `/components`, plus eight isolated Storybook stories.
+- Component gallery at `/components`, plus isolated Storybook stories for UI, PromQL and chart components.
 
 The default log query reads at most 100 rows, sorted by `p_timestamp`. Message search assumes a `message` field. The histogram represents returned rows, not total stream volume. Demo SQL intentionally supports only a small SELECT subset and rejects unsupported syntax. Full SQL requires a server.
 
-Metrics, traces, APM, alerts, ingestion setup, saved queries, server dashboards, virtualized tables, and original Prism pixel parity are future iterations. No unusable paid-feature navigation or upgrade controls are exposed.
+Traces, APM, alerts, ingestion setup, saved queries, server dashboards, virtualized tables, and original Prism pixel parity are future iterations. No unusable paid-feature navigation or upgrade controls are exposed.
 
 ## Components and selectors
 

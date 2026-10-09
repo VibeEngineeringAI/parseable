@@ -78,12 +78,23 @@ describe('PromQL steps and durations', () => {
   ])('parses %s into %s seconds', (text, expected) => {
     expect(parseDuration(text as string)).toBe(expected);
   });
-  it.each(['', 'nonsense', '1M', 'Infinity', 'NaN', '15sx', '1m 30s', '1s1m', '1m1m', '1e400'])(
-    'rejects invalid duration %s',
-    (text) => {
-      expect(parseDuration(text)).toBeUndefined();
-    },
-  );
+  it.each([
+    '',
+    'nonsense',
+    '1M',
+    'Infinity',
+    'NaN',
+    '15sx',
+    '1m 30s',
+    '1s1m',
+    '1m1m',
+    '1e400',
+    '1.5m',
+    '1m0.5s',
+    '0.5ms',
+  ])('rejects invalid duration %s', (text) => {
+    expect(parseDuration(text)).toBeUndefined();
+  });
   it.each([
     [0, '0s'],
     [15, '15s'],
@@ -101,6 +112,8 @@ describe('PromQL steps and durations', () => {
     { start: 0, end: 10999, step: '1s' },
     { start: 1.123, end: 1.123, step: 0.001 },
     { start: 0, end: 15, step: '1.5' },
+    { start: 0, end: 3600, step: '31d' },
+    { start: 0, end: 3600, step: 31 * 86400 },
   ])('accepts valid inclusive range %#', (range) => {
     expect(validateRange(range)).toBeUndefined();
   });
@@ -111,6 +124,10 @@ describe('PromQL steps and durations', () => {
     [{ start: 0, end: 1, step: '-1' }, 'positive'],
     [{ start: 0, end: 1, step: 'oops' }, 'positive'],
     [{ start: 0, end: 1, step: Infinity }, 'positive'],
+    [{ start: 0, end: 3600, step: '1.5m' }, 'positive'],
+    [{ start: 0, end: 3600, step: '32d' }, 'Step cannot exceed 31 days'],
+    [{ start: 0, end: 3600, step: '31d1ms' }, 'Step cannot exceed 31 days'],
+    [{ start: 0, end: 3600, step: 31 * 86400 + 0.001 }, 'Step cannot exceed 31 days'],
     [{ start: 1, end: 0, step: '15s' }, 'end time'],
     [{ start: NaN, end: 0, step: '15s' }, 'valid time'],
   ] as const)('rejects invalid range %#', (range, message) => {

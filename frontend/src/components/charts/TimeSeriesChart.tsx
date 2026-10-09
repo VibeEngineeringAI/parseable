@@ -28,6 +28,17 @@ export interface TimeSeriesChartProps {
 type Cursor = { index: number; left: number; top: number };
 type PositionedSeries = { series: ChartSeries; slot: number };
 
+// 24-hour ticks matching the tooltip; columns follow uPlot's time-axis format table:
+// [min increment, default, year, month, day, hour, minute, second, mode].
+const timeAxisFormats: uPlot.Axis.Values = [
+  [3600 * 24 * 365, '{YYYY}', null, null, null, null, null, null, 1],
+  [3600 * 24 * 28, '{MMM}', '\n{YYYY}', null, null, null, null, null, 1],
+  [3600 * 24, '{MMM} {D}', '\n{YYYY}', null, null, null, null, null, 1],
+  [3600, '{HH}:{mm}', '\n{MMM} {D}', null, '\n{MMM} {D}', null, null, null, 1],
+  [60, '{HH}:{mm}', '\n{MMM} {D}', null, '\n{MMM} {D}', null, null, null, 1],
+  [1, '{HH}:{mm}:{ss}', '\n{MMM} {D}', null, '\n{MMM} {D}', null, null, null, 1],
+];
+
 function seriesColor(slot: number): string {
   return slot < 8 ? `var(--chart-series-${slot + 1})` : 'var(--color-border-strong)';
 }
@@ -226,6 +237,7 @@ export function TimeSeriesChart({
               font,
               grid: { stroke: grid, width: 1 },
               ticks: { stroke: grid, width: 1 },
+              values: timeAxisFormats,
             },
             {
               stroke: muted,

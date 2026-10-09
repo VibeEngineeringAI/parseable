@@ -19,7 +19,7 @@ export function parseDuration(text: string): number | undefined {
     const seconds = Number(value);
     return Number.isFinite(seconds) ? seconds : undefined;
   }
-  const pattern = /(\d+(?:\.\d+)?)(ms|[ywdhms])/gy;
+  const pattern = /(\d+)(ms|[ywdhms])/gy;
   let offset = 0,
     total = 0,
     previous = Infinity;
@@ -117,6 +117,7 @@ export function validateRange({
   const seconds = typeof step === 'string' ? parseDuration(step) : step;
   if (seconds === undefined || !Number.isFinite(seconds) || seconds <= 0)
     return 'Step must be a positive duration or number of seconds.';
+  if (seconds > 31 * 86400) return 'Step cannot exceed 31 days.';
   if ((end - start) / seconds + 1 > 11000)
     return 'The time range exceeds 11000 steps. Increase the step.';
   return undefined;
