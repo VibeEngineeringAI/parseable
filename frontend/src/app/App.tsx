@@ -25,6 +25,9 @@ const LibraryPage = lazy(() =>
 const TeamPage = lazy(() =>
   import('../features/team/TeamPage').then((m) => ({ default: m.TeamPage })),
 );
+const MetricsPage = lazy(() =>
+  import('../features/metrics/MetricsPage').then((m) => ({ default: m.MetricsPage })),
+);
 import { OverviewPage } from './OverviewPage';
 export function App() {
   const { mode, session, identity, needsLogin, client } = useApp();
@@ -40,6 +43,7 @@ export function App() {
     (
       {
         logs: 'Logs',
+        metrics: 'Metrics',
         'sql-editor': 'SQL editor',
         datasets: 'Datasets',
         dashboards: 'Dashboards',
@@ -148,6 +152,8 @@ export function App() {
               <Route path="/" element={<OverviewPage onConnect={() => setConnect(true)} />} />
               <Route path="/logs" element={<LogsPage />} />
               <Route path="/logs/:view/:currentDataset" element={<LogsPage />} />
+              <Route path="/metrics" element={<MetricsPage />} />
+              <Route path="/metrics/explore/:dataset" element={<MetricsPage />} />
               <Route path="/sql-editor" element={<SqlPage />} />
               <Route path="/datasets" element={<DatasetsPage />} />
               <Route path="/dashboards" element={<DashboardsPage />} />

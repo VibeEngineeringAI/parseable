@@ -2,7 +2,8 @@ import { createDemoClient } from './demo';
 import { authEndpoint, cookieIdentity } from './auth';
 import { demoEnabled } from './config';
 import { apiKey, groupRoles, object, roles, roleSources, strings, userRoles } from './teamContract';
-import type { Dataset, LogRecord, ParseableClient } from './types';
+import { instantResult, rangeResult, successEnvelope } from './promqlContract';
+import type { Dataset, LogRecord, ParseableClient, PromqlMetadataRequest } from './types';
 
 export class ApiError extends Error {
   constructor(
@@ -13,6 +14,14 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+export function promqlErrorType(error: unknown): string | undefined {
+  return error instanceof ApiError &&
+    object(error.detail) &&
+    typeof error.detail.errorType === 'string'
+    ? error.detail.errorType
+    : undefined;
 }
 
 async function checked(response: Response): Promise<Response> {
@@ -58,6 +67,16 @@ async function readJson(
 
 async function request(endpoint: string, init: RequestInit, onUnauthorized?: () => void) {
   const response = await fetch(endpoint, { ...init, credentials: 'include' });
+  if (response.status === 401 && endpoint.startsWith('/prometheus/api/v1/')) {
+    try {
+      return await checked(response);
+    } catch (error) {
+      if (error instanceof ApiError && promqlErrorType(error) === 'forbidden')
+        throw new ApiError(error.message, 403, error.detail);
+      onUnauthorized?.();
+      throw error;
+    }
+  }
   if (response.status === 401) onUnauthorized?.();
   return checked(response);
 }
@@ -73,6 +92,17 @@ function jsonBody(method: string, body: unknown): RequestInit {
   return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
 }
 
+const seconds = (value: number) => String(Math.round(value * 1000) / 1000);
+
+function metadataParams({ stream, start, end, match, limit }: PromqlMetadataRequest) {
+  const params = new URLSearchParams({ stream });
+  if (start !== undefined) params.set('start', seconds(start));
+  if (end !== undefined) params.set('end', seconds(end));
+  if (limit !== undefined) params.set('limit', String(limit));
+  for (const selector of match ?? []) params.append('match[]', selector);
+  return params;
+}
+
 export function createClient({
   mode,
   onUnauthorized,
@@ -82,6 +112,7 @@ export function createClient({
 }): ParseableClient {
   if (mode === 'demo' && demoEnabled) return createDemoClient();
   const base = '/api/v1';
+  const prometheus = '/prometheus/api/v1';
   const keys = '/api/prism/v1/apikeys';
   const user = (id: string) => `${base}/user/${encodeURIComponent(id)}`;
   const role = (name: string) => {
@@ -95,6 +126,33 @@ export function createClient({
   const mutate = async (endpoint: string, init: RequestInit) => {
     await request(endpoint, init, onUnauthorized);
   };
+  const readPromql = async (endpoint: string, init: RequestInit) => {
+    const data = await readJson(endpoint, init, onUnauthorized);
+    if (object(data) && data.status === 'error') {
+      if (typeof data.error !== 'string' || typeof data.errorType !== 'string')
+        return malformed(endpoint);
+      const statuses: Record<string, number> = {
+        bad_data: 400,
+        execution: 422,
+        forbidden: 403,
+        unavailable: 503,
+        timeout: 503,
+      };
+      await checked(
+        new Response(JSON.stringify(data), { status: statuses[data.errorType] ?? 422 }),
+      );
+    }
+    if (!successEnvelope(data)) return malformed(endpoint);
+    return data;
+  };
+  const metadata = async (endpoint: string, signal?: AbortSignal) => {
+    const data = await readPromql(endpoint, { signal });
+    if (!strings(data.data)) return malformed(endpoint);
+    return {
+      data: data.data,
+      truncated: data.warnings?.some((warning) => warning.includes('truncated')) ?? false,
+    };
+  };
   return {
     async about(signal) {
       const endpoint = `${base}/about`;
@@ -107,7 +165,7 @@ export function createClient({
         return malformed(endpoint);
       const capabilities = object(data.capabilities) ? data.capabilities : {};
       if (
-        ['oidcRoleMapping', 'oidcRoleSync'].some(
+        ['oidcRoleMapping', 'oidcRoleSync', 'promql'].some(
           (field) => capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean',
         )
       )
@@ -117,6 +175,12 @@ export function createClient({
         capabilities: {
           oidcRoleMapping: capabilities.oidcRoleMapping === true,
           oidcRoleSync: capabilities.oidcRoleSync === true,
+          promql:
+            typeof capabilities.promql === 'boolean'
+              ? capabilities.promql
+              : object(data.license) &&
+                typeof data.license.plan === 'string' &&
+                data.license.plan !== 'OSS',
         },
       };
     },
@@ -219,6 +283,66 @@ export function createClient({
       // This endpoint returns names only. Do not infer telemetry type from a name.
       return data.map((item) => ({ name: item.name, type: 'logs' }) satisfies Dataset);
     },
+    async datasetInfo(name, signal) {
+      const endpoint = `${base}/logstream/${encodeURIComponent(name)}/info`;
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (
+        !object(data) ||
+        (data.telemetryType !== undefined && typeof data.telemetryType !== 'string') ||
+        (data.latestEventAt != null && typeof data.latestEventAt !== 'string') ||
+        (data.logSource !== undefined &&
+          (!Array.isArray(data.logSource) ||
+            !data.logSource.every(
+              (source) => object(source) && typeof source.log_source_format === 'string',
+            )))
+      )
+        return malformed(endpoint);
+      return {
+        name,
+        telemetryType: typeof data.telemetryType === 'string' ? data.telemetryType : undefined,
+        logSourceFormats: Array.isArray(data.logSource)
+          ? data.logSource.map((source) => source.log_source_format as string)
+          : [],
+        latestEventAt: typeof data.latestEventAt === 'string' ? data.latestEventAt : undefined,
+      };
+    },
+    async promqlQuery({ stream, query, time }, signal) {
+      const endpoint = `${prometheus}/query`;
+      const body = new URLSearchParams({ stream, query });
+      if (time !== undefined) body.set('time', seconds(time));
+      const data = await readPromql(endpoint, {
+        method: 'POST',
+        signal,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      });
+      if (!instantResult(data.data)) return malformed(endpoint);
+      return data.data;
+    },
+    async promqlQueryRange({ stream, query, start, end, step }, signal) {
+      const endpoint = `${prometheus}/query_range`;
+      const data = await readPromql(endpoint, {
+        method: 'POST',
+        signal,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          stream,
+          query,
+          start: seconds(start),
+          end: seconds(end),
+          step,
+        }),
+      });
+      if (!rangeResult(data.data)) return malformed(endpoint);
+      return data.data;
+    },
+    promqlLabels: (params, signal) =>
+      metadata(`${prometheus}/labels?${metadataParams(params)}`, signal),
+    promqlLabelValues: (label, params, signal) =>
+      metadata(
+        `${prometheus}/label/${encodeURIComponent(label)}/values?${metadataParams(params)}`,
+        signal,
+      ),
     async schema(dataset, signal) {
       const endpoint = `${base}/logstream/${encodeURIComponent(dataset)}/schema`;
       const data = await readJson(endpoint, { signal }, onUnauthorized);

@@ -9,12 +9,14 @@ import type {
   UserRoleSources,
 } from './types';
 import { ApiError } from './client';
+import { createDemoMetrics } from './demoMetrics';
 import { validateName } from '../features/team/helpers';
 
 export const demoDatasets: Dataset[] = [
   { name: 'application_logs', type: 'logs' },
   { name: 'api_logs', type: 'logs' },
   { name: 'infrastructure_logs', type: 'logs' },
+  { name: 'demo_metrics', type: 'metrics' },
 ];
 
 /** Fixed sequences anchored to now keep the initial relative time range useful. */
@@ -215,7 +217,9 @@ export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): L
 }
 
 export function createDemoClient(): ParseableClient {
-  const records = createDemoRecords(Date.now() - 1_000);
+  const fixtureTime = Date.now();
+  const records = createDemoRecords(fixtureTime - 1_000);
+  const metrics = createDemoMetrics(fixtureTime);
   const roles: Roles = {
     administrators: [{ privilege: 'admin' }],
     analysts: [{ privilege: 'reader', resource: { stream: 'application_logs' } }],
@@ -376,9 +380,13 @@ export function createDemoClient(): ParseableClient {
     signal?.throwIfAborted();
   }
   return {
+    ...metrics,
     async about(signal) {
       await ready(signal);
-      return { oidcActive: true, capabilities: { oidcRoleMapping: true, oidcRoleSync: true } };
+      return {
+        oidcActive: true,
+        capabilities: { oidcRoleMapping: true, oidcRoleSync: true, promql: true },
+      };
     },
     async listRoles(signal) {
       await ready(signal);
@@ -533,6 +541,20 @@ export function createDemoClient(): ParseableClient {
     async listDatasets(signal) {
       await ready(signal);
       return demoDatasets.map((dataset) => ({ ...dataset }));
+    },
+    async datasetInfo(name, signal) {
+      await ready(signal);
+      const dataset = demoDatasets.find((item) => item.name === name);
+      if (!dataset) throw new ApiError(`Unknown demo dataset: ${name}`, 404);
+      return {
+        name,
+        telemetryType: dataset.type,
+        logSourceFormats: [dataset.type === 'metrics' ? 'otel-metrics' : 'json'],
+        latestEventAt:
+          dataset.type === 'metrics'
+            ? new Date(Math.floor(fixtureTime / 15000) * 15000).toISOString()
+            : String(records[0].p_timestamp),
+      };
     },
     async schema(dataset, signal) {
       await ready(signal);

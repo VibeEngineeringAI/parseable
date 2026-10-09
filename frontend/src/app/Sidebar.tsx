@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   Activity,
+  ChartLine,
   Database,
   ExternalLink,
   FileCode2,
@@ -26,7 +27,13 @@ const groups = [
       { to: '/sql-editor', label: 'SQL editor', id: 'sql-editor', icon: FileCode2 },
     ],
   },
-  { label: 'Observe', links: [{ to: '/logs', label: 'Logs', id: 'logs', icon: Logs }] },
+  {
+    label: 'Observe',
+    links: [
+      { to: '/logs', label: 'Logs', id: 'logs', icon: Logs },
+      { to: '/metrics', label: 'Metrics', id: 'metrics', icon: ChartLine },
+    ],
+  },
   {
     label: 'Data',
     links: [{ to: '/datasets', label: 'Datasets', id: 'datasets', icon: Database }],

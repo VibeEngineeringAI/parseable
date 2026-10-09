@@ -2,6 +2,20 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Metrics explorer validation (2026-10-09)
+
+| Check                  | Actual result                                            | Scope                                                                                                                                                                                                                                             |
+| ---------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run check`        | **487 unit, 107 app browser, 33 Storybook tests passed** | Format, TypeScript, build, Vitest, Playwright (demo and mocked HTTP, including axe), Storybook story tests                                                                                                                                        |
+| Live suite via Vite    | **14 passed, 3 opt-in OIDC skips**                       | `server.spec.ts`, `team.spec.ts` and `metrics.spec.ts` at `http://127.0.0.1:8370` (`PARSEABLE_LIVE_BASE=`), proxying to a disposable v3.2.5 local-store server with `P_PROMQL_MAX_INGEST_DELAY=0`                                                 |
+| Embedded `/next` build | **14 passed, 3 opt-in OIDC skips**                       | Rust rebuilt with `NEXT_ASSETS_PATH` set to a snapshot of the checked `dist`; `PARSEABLE_LIVE_URL=http://127.0.0.1:8360` with the default `/next` base                                                                                            |
+| Contract probe         | Matched                                                  | PromQL routes answer at `/prometheus/api/v1/*`; `/api/v1/prometheus/*` returns 404. Quoted dotted metric and label names (`{"a.b", "service.name"="x"}`, `by ("service.name")`) parse in `@prometheus-io/lezer-promql` and evaluate on the server |
+| Mobile                 | No horizontal overflow at 390x844                        | Live data, range query                                                                                                                                                                                                                            |
+
+The metrics live spec ingests a gauge and a cumulative counter with two `host` values into a fresh `metrics_live_*` dataset through `POST /v1/metrics`. It checks the label browser, then compares the gauge and `sum by (host) (rate(...[5m]))` results with the API response, checks that `topk` shows the verbatim 422 message, and deletes the dataset. Vite proxies `/v1` so ingestion works through the dev server.
+
+Run Playwright with `TMPDIR` on a disk-backed directory when `/tmp` is a small tmpfs. Chromium leaves `.org.chromium.Chromium.*` scratch directories behind, and they filled a per-user `/tmp` quota during this validation. With `/tmp` full, both the server's staging writes and Chromium fail with `ERR_INSUFFICIENT_RESOURCES`.
+
 ## Team page validation (2026-10-08)
 
 | Check                                             | Actual result                                                                                          | Scope                                                                                                                                                                                                                                                                                                              |

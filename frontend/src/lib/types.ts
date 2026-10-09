@@ -1,4 +1,36 @@
 export type Dataset = { name: string; type: 'logs' | 'metrics' | 'traces' };
+export type PromqlLabels = Record<string, string>;
+export type PromqlSample = [number, string]; // [unix seconds, value string]
+export type PromqlInstantResult =
+  | { resultType: 'vector'; result: Array<{ metric: PromqlLabels; value: PromqlSample }> }
+  | { resultType: 'matrix'; result: Array<{ metric: PromqlLabels; values: PromqlSample[] }> }
+  | { resultType: 'scalar' | 'string'; result: PromqlSample };
+export type PromqlRangeResult = {
+  resultType: 'matrix';
+  result: Array<{ metric: PromqlLabels; values: PromqlSample[] }>;
+};
+export type PromqlQueryRequest = { stream: string; query: string; time?: number };
+export type PromqlRangeRequest = {
+  stream: string;
+  query: string;
+  start: number;
+  end: number;
+  step: string;
+};
+export type PromqlMetadataRequest = {
+  stream: string;
+  start?: number;
+  end?: number;
+  match?: string[];
+  limit?: number;
+};
+export type PromqlMetadataResult = { data: string[]; truncated: boolean };
+export type DatasetInfo = {
+  name: string;
+  telemetryType?: string;
+  logSourceFormats: string[];
+  latestEventAt?: string;
+};
 export type LogRecord = Record<string, unknown>;
 export type TimeRange = '15m' | '1h' | '6h' | '24h' | '7d' | { startTime: string; endTime: string };
 export type QueryRequest = { sql: string; startTime: string; endTime: string };
@@ -44,7 +76,7 @@ export type UserRoleSources = {
 };
 export type About = {
   oidcActive: boolean;
-  capabilities: { oidcRoleMapping: boolean; oidcRoleSync: boolean };
+  capabilities: { oidcRoleMapping: boolean; oidcRoleSync: boolean; promql: boolean };
 };
 export type ApiKey = {
   keyId: string;
@@ -58,6 +90,15 @@ export type ApiKey = {
 export interface ParseableClient {
   identity(signal?: AbortSignal): Promise<SessionIdentity | undefined>;
   listDatasets(signal?: AbortSignal): Promise<Dataset[]>;
+  datasetInfo(name: string, signal?: AbortSignal): Promise<DatasetInfo>;
+  promqlQuery(request: PromqlQueryRequest, signal?: AbortSignal): Promise<PromqlInstantResult>;
+  promqlQueryRange(request: PromqlRangeRequest, signal?: AbortSignal): Promise<PromqlRangeResult>;
+  promqlLabels(request: PromqlMetadataRequest, signal?: AbortSignal): Promise<PromqlMetadataResult>;
+  promqlLabelValues(
+    label: string,
+    request: PromqlMetadataRequest,
+    signal?: AbortSignal,
+  ): Promise<PromqlMetadataResult>;
   schema(dataset: string, signal?: AbortSignal): Promise<string[]>;
   query(request: QueryRequest, signal?: AbortSignal): Promise<LogRecord[]>;
   login(username: string, password: string, returnPath?: string): Promise<void>;

@@ -22,18 +22,23 @@
     "test:live": "playwright test -c playwright.live.config.ts"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
     "@codemirror/lang-sql": "^6.10.0",
     "@codemirror/language": "^6.12.4",
+    "@codemirror/lint": "^6.9.7",
     "@codemirror/state": "^6.7.6",
     "@codemirror/view": "^6.43.13",
+    "@lezer/common": "^1.5.3",
     "@lezer/highlight": "^1.2.5",
+    "@prometheus-io/codemirror-promql": "^0.313.4",
     "@radix-ui/react-dialog": "^1.2.0",
     "@radix-ui/react-tabs": "^1.1.22",
     "codemirror": "^6.0.2",
     "lucide-react": "^1.52.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "react-router-dom": "^7.18.4"
+    "react-router-dom": "^7.18.4",
+    "uplot": "^1.6.32"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",

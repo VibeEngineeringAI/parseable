@@ -10,6 +10,8 @@ export const classicOnlyPages = [{ href: '/alerts', label: 'Alerts', id: 'alerts
 export function classicUiPath(pathname: string): string {
   const [, section, view, dataset] = pathname.split('/');
   if (section === 'logs' && view && dataset) return `/logs/explore/${dataset}`;
+  if (section === 'metrics')
+    return view === 'explore' && dataset ? `/metrics/explore/${dataset}` : '/metrics';
   if (
     section === 'team' ||
     section === 'sql-editor' ||

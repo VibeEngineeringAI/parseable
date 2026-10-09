@@ -89,7 +89,7 @@ describe('demo contract', () => {
     const fetch = vi.fn();
     vi.stubGlobal('fetch', fetch);
     const client = createClient({ mode: 'demo' });
-    expect(await client.listDatasets()).toHaveLength(3);
+    expect(await client.listDatasets()).toHaveLength(4);
     expect(await client.schema('application_logs')).toContain('message');
     const controller = new AbortController();
     controller.abort();
