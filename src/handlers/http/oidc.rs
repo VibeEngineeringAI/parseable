@@ -727,3 +727,46 @@ fn is_valid_redirect_url(base_url: &str, redirect_url: &str) -> bool {
         .map(|url| url.origin() == redirect_origin)
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location(from: &str) -> String {
+        let response = redirect_no_oauth_setup(Url::parse(from).unwrap());
+        response
+            .headers()
+            .get(actix_web::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn no_oauth_redirect_keeps_next_ui_requests_on_next() {
+        assert_eq!(
+            location("http://host/next"),
+            "http://host/next/oidc-not-configured"
+        );
+        assert_eq!(
+            location("http://host/next/logs?x=1"),
+            "http://host/next/oidc-not-configured?x=1"
+        );
+    }
+
+    #[test]
+    fn no_oauth_redirect_sends_everything_else_to_the_classic_page() {
+        for from in [
+            "http://host/",
+            "http://host/nextfoo",
+            "http://host/logs/next",
+        ] {
+            assert_eq!(
+                location(from),
+                "http://host/oidc-not-configured",
+                "redirect from {from}"
+            );
+        }
+    }
+}

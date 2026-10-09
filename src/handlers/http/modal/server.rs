@@ -831,21 +831,67 @@ impl Server {
     }
 
     // GET "/" ==> Serve the static frontend directory
-    pub fn get_generated() -> ResourceFiles {
-        ResourceFiles::new("/", generate()).resolve_not_found_to_root()
-    }
-
     // GET "/next" ==> Serve the second frontend, when one was embedded at build time
-    pub fn get_next_generated() -> Option<ResourceFiles> {
-        let files = generate_next();
-        (!files.is_empty()).then(|| ResourceFiles::new("/next", files).resolve_not_found_to_root())
+    pub fn configure_ui(config: &mut web::ServiceConfig) {
+        Self::mount_ui(config, generate(), generate_next());
     }
 
     /// Registers `/next` ahead of the catch-all `/` so each UI owns its own routes.
-    pub fn configure_ui(config: &mut web::ServiceConfig) {
-        if let Some(next) = Self::get_next_generated() {
-            config.service(next);
+    fn mount_ui(config: &mut web::ServiceConfig, primary: UiFiles, next: UiFiles) {
+        if !next.is_empty() {
+            config.service(ResourceFiles::new("/next", next).resolve_not_found_to_root());
         }
-        config.service(Self::get_generated());
+        config.service(ResourceFiles::new("/", primary).resolve_not_found_to_root());
+    }
+}
+
+type UiFiles = std::collections::HashMap<&'static str, static_files::Resource>;
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{App, body::to_bytes, test};
+
+    use super::*;
+
+    fn ui(index: &'static [u8]) -> UiFiles {
+        UiFiles::from([(
+            "index.html",
+            static_files::Resource {
+                data: index,
+                modified: 0,
+                mime_type: "text/html",
+            },
+        )])
+    }
+
+    async fn body_at(path: &str, next: UiFiles) -> Bytes {
+        let app = test::init_service(
+            App::new().configure(|config| Server::mount_ui(config, ui(b"classic"), next)),
+        )
+        .await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+        assert!(response.status().is_success(), "GET {path} failed");
+        to_bytes(response.into_body()).await.unwrap()
+    }
+
+    #[actix_web::test]
+    async fn next_routes_take_precedence_over_the_root_fallback() {
+        for path in [
+            "/next",
+            "/next/",
+            "/next/logs?x=1",
+            "/next/oidc-not-configured",
+        ] {
+            assert_eq!(body_at(path, ui(b"next")).await, "next", "GET {path}");
+        }
+        for path in ["/", "/logs", "/nextfoo", "/oidc-not-configured"] {
+            assert_eq!(body_at(path, ui(b"next")).await, "classic", "GET {path}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn without_a_next_build_the_classic_ui_serves_next_paths() {
+        assert_eq!(body_at("/next/logs", UiFiles::new()).await, "classic");
     }
 }
