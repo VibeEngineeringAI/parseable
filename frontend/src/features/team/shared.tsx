@@ -162,7 +162,7 @@ export function SecretResult({ value, kind }: { value: string; kind: 'password' 
       <p className="notice">
         {kind === 'password'
           ? 'This is the only time you can see this password.'
-          : 'This is the only time this key is shown after creation. Store it securely.'}
+          : 'Store this key securely. Admins can copy it again from the API keys list.'}
       </p>
       <p role="status">{status}</p>
     </div>

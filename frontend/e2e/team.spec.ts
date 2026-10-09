@@ -389,7 +389,7 @@ test('API keys are created once, copied through GET, masked in the table and del
   const key = await sheet.getByLabel('API key', { exact: true }).inputValue();
   expect(key).toBeTruthy();
   await expect(
-    sheet.getByText(/This is the only time this key is shown after creation/),
+    sheet.getByText('Store this key securely. Admins can copy it again from the API keys list.'),
   ).toBeVisible();
   await sheet.getByRole('button', { name: 'Copy API key', exact: true }).click();
   await expect(sheet.getByRole('status')).toHaveText('API key copied to clipboard');
