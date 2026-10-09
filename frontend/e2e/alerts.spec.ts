@@ -720,8 +720,9 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   page,
 }) => {
   await mocked(page);
-  await page.route('**/prometheus/api/v1/query_range', (route) =>
-    route.fulfill({
+  await page.route('**/prometheus/api/v1/query_range', (route) => {
+    const end = Number(new URLSearchParams(route.request().postData()!).get('end'));
+    return route.fulfill({
       json: {
         status: 'success',
         data: {
@@ -730,21 +731,21 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
             {
               metric: { 'host.name': 'host-a', job: 'shots' },
               values: [
-                [1, '3.25'],
-                [31, '4.25'],
+                [end - 3000, '3.25'],
+                [end - 1800, '4.25'],
               ],
             },
           ],
         },
       },
-    }),
-  );
+    });
+  });
   await page.goto(detailPath);
   await expect(
     page.getByRole('heading', { name: 'Expression over the last hour', exact: true }),
   ).toBeVisible();
-  await expect(page.locator('.charts-title')).toContainText('host-a');
-  await expect(page.locator('.charts-title')).not.toContainText('{');
+  await expect(page.locator('.charts-title')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'host-a', exact: true })).toBeVisible();
   await expect(
     page.getByRole('table', { name: 'Alert instances' }).locator('.alerts-label-chip'),
   ).toHaveText('host=node-a');

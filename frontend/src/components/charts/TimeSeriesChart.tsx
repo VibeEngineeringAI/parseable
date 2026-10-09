@@ -22,6 +22,10 @@ export interface TimeSeriesChartProps {
   series: ChartSeries[];
   height?: number;
   title?: string;
+  /** Hide the visible caption when a surrounding card already supplies a heading. */
+  showTitle?: boolean;
+  /** Fixed x-axis bounds in Unix seconds, independent of the sample timestamps. */
+  xRange?: readonly [number, number];
   /** Series drawn before "Show all"; the ones with the highest peak value win. */
   maxSeries?: number;
   timeZone?: 'UTC' | 'local';
@@ -133,6 +137,8 @@ export function TimeSeriesChart({
   series,
   height = 280,
   title = 'Time series',
+  showTitle = true,
+  xRange,
   maxSeries = 20,
   timeZone = 'UTC',
   formatValue = formatChartValue,
@@ -150,6 +156,8 @@ export function TimeSeriesChart({
   const [themeRevision, setThemeRevision] = useState(0);
   const instructionsId = useId();
   const tooltipId = useId();
+  const xMin = xRange?.[0];
+  const xMax = xRange?.[1];
   const limit = Math.max(1, Math.floor(maxSeries));
   const references = useMemo(
     () => thresholds.filter(({ value }) => Number.isFinite(value)),
@@ -238,9 +246,10 @@ export function TimeSeriesChart({
             timeZone === 'UTC'
               ? uPlot.tzDate(new Date(timestamp * 1000), 'UTC')
               : new Date(timestamp * 1000),
-          ...(references.length
-            ? {
-                scales: {
+          scales: {
+            x: { range: xMin !== undefined && xMax !== undefined ? [xMin, xMax] : undefined },
+            ...(references.length
+              ? {
                   y: {
                     range: (_, min, max) =>
                       uPlot.rangeNum(
@@ -250,9 +259,9 @@ export function TimeSeriesChart({
                         true,
                       ),
                   },
-                },
-              }
-            : {}),
+                }
+              : {}),
+          },
           series: [
             {},
             ...entries.map(({ series: entry, slot }, index) => ({
@@ -362,7 +371,18 @@ export function TimeSeriesChart({
       plot.current = null;
       chart?.destroy();
     };
-  }, [timestamps, entries, height, timeZone, formatValue, hasData, themeRevision, references]);
+  }, [
+    timestamps,
+    entries,
+    height,
+    timeZone,
+    formatValue,
+    hasData,
+    themeRevision,
+    references,
+    xMin,
+    xMax,
+  ]);
 
   useEffect(() => {
     const chart = plot.current;
@@ -421,10 +441,12 @@ export function TimeSeriesChart({
 
   return (
     <figure className="charts-figure" aria-label={title}>
-      <figcaption className="charts-title">
-        {title}
-        {series.length === 1 && title !== series[0].label ? ` · ${series[0].label}` : ''}
-      </figcaption>
+      {showTitle && (
+        <figcaption className="charts-title">
+          {title}
+          {series.length === 1 && title !== series[0].label ? ` · ${series[0].label}` : ''}
+        </figcaption>
+      )}
       <p id={instructionsId} className="charts-sr-only">
         Use Left and Right arrow keys to inspect values. Escape hides the tooltip.
       </p>
@@ -481,7 +503,7 @@ export function TimeSeriesChart({
           </button>
         )}
       </div>
-      {series.length > 1 && (
+      {series.length > 0 && (series.length > 1 || !showTitle) && (
         <ul className="charts-legend" aria-label="Series visibility">
           {entries.map(({ series: entry, slot }, index) => (
             <li key={entry.id}>

@@ -25,6 +25,11 @@
   gap: 20px;
   align-items: start;
 }
+.alerts-form-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 .alerts-fields,
 .alerts-detail-cards,
 .alerts-metadata {
@@ -92,6 +97,12 @@
   min-width: 64px;
   background: var(--color-surface);
   box-shadow: -1px 0 var(--color-border);
+}
+.alerts-table th:last-child {
+  background: var(--color-bg);
+}
+.alerts-page tr:hover td {
+  background: var(--color-bg);
 }
 .alerts-table td:nth-child(2),
 .alerts-table td:nth-child(3) {
@@ -207,6 +218,9 @@
 .alerts-page .sql-editor[data-invalid] {
   border-color: var(--color-danger);
 }
+.alerts-page .sql-editor .cm-editor {
+  min-height: 120px;
+}
 @media (max-width: 1050px) {
   .alerts-form,
   .alerts-detail-cards {
@@ -214,6 +228,11 @@
   }
 }
 @media (max-width: 760px) {
+  .alerts-table th:last-child,
+  .alerts-table td:last-child {
+    position: static;
+    box-shadow: none;
+  }
   .alerts-scroll-hint {
     display: block;
     margin: 0;

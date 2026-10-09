@@ -46,6 +46,13 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const ThreeSeries: Story = {};
+export const RequestedRange: Story = {
+  args: {
+    series: [series[0]],
+    showTitle: false,
+    xRange: [timestamps[0] - 600, timestamps[0] + 3000],
+  },
+};
 export const ManySeries: Story = {
   args: {
     series: Array.from({ length: 25 }, (_, slot) => ({

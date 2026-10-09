@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import { Badge, Card, CardHeader, CardBody, EmptyState } from '../../components/ui';
+import { Badge, Card, CardHeader, CardBody } from '../../components/ui';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
@@ -64,6 +64,8 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
               {...chart}
               height={220}
               title="Expression over the last hour"
+              showTitle={false}
+              xRange={[end - 3600, end]}
               thresholds={[{ value: alert.thresholdConfig.value, label: 'Threshold' }]}
               timeZone="UTC"
               emptyMessage="No data for this expression in the last hour."
@@ -144,7 +146,7 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                   </table>
                 </div>
               ) : (
-                <EmptyState title="No alert instances" />
+                <p className="muted">No alert instances</p>
               )}
               {runtime.deliveries.length > 0 && (
                 <div

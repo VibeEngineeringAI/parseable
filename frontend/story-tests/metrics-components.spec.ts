@@ -121,6 +121,32 @@ test('legend toggle updates aria-pressed and the count, and Alt-click isolates',
   await expect(page.getByText('1 of 3 series', { exact: true })).toBeVisible();
 });
 
+test('requested range leaves space before and after samples without repeating a card title', async ({
+  page,
+}) => {
+  await story(page, 'timeserieschart', 'requested-range');
+  await expect(page.locator('.charts-title')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '{host="alpha"}', exact: true })).toBeVisible();
+  const chart = page.getByRole('img', { name: /PromQL range result: 1 series/ });
+  await chart.focus();
+  await chart.press('ArrowRight');
+  const cursor = page.locator('.u-cursor-x');
+  const plot = (await page.locator('.u-over').boundingBox())!;
+  // The first sample is 10 minutes into the requested hour; the last is 21 minutes in.
+  // Cursor positions verify the actual x scale, rather than only its accessible label.
+  expect(Math.abs((await cursor.boundingBox())!.x - plot.x - plot.width / 6)).toBeLessThanOrEqual(
+    1,
+  );
+  for (let index = 0; index < 11; index++) await chart.press('ArrowRight');
+  expect(
+    Math.abs((await cursor.boundingBox())!.x - plot.x - plot.width * 0.35),
+  ).toBeLessThanOrEqual(1);
+  await expect(page.getByRole('tooltip').locator('time')).toHaveAttribute(
+    'datetime',
+    new Date((1_700_000_000 + 660) * 1000).toISOString(),
+  );
+});
+
 test('chart draws the 20 highest-peaking series and keeps colours when showing all 25', async ({
   page,
 }) => {
@@ -192,6 +218,7 @@ for (const [component, name] of [
   ['promqleditor', 'with-metadata'],
   ['promqleditor', 'invalid'],
   ['timeserieschart', 'three-series'],
+  ['timeserieschart', 'requested-range'],
   ['timeserieschart', 'many-series'],
   ['timeserieschart', 'gaps-and-na-n'],
   ['timeserieschart', 'empty'],

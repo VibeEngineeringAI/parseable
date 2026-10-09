@@ -483,24 +483,26 @@ function AlertFormFields({
             />
           </CardBody>
         </Card>
-        {original?.queryType === 'promql' && (
-          <p className="notice">
-            Saving resets per-series runtime state and makes you the execution owner.
-          </p>
-        )}
         <InlineError error={mutation.error} />
-        <div className="dialog-actions">
-          <Button
-            disabled={mutation.pending}
-            onClick={() =>
-              navigate(original ? `/alerts/${encodeURIComponent(original.id)}` : '/alerts')
-            }
-          >
-            Cancel
-          </Button>
-          <Button type="submit" variant="primary" disabled={!canSubmit}>
-            {mutation.pending ? 'Saving…' : original ? 'Save alert' : 'Create alert'}
-          </Button>
+        <div className="alerts-form-footer">
+          {original?.queryType === 'promql' && (
+            <p className="muted">
+              Saving resets per-series runtime state and makes you the execution owner.
+            </p>
+          )}
+          <div className="dialog-actions">
+            <Button
+              disabled={mutation.pending}
+              onClick={() =>
+                navigate(original ? `/alerts/${encodeURIComponent(original.id)}` : '/alerts')
+              }
+            >
+              Cancel
+            </Button>
+            <Button type="submit" variant="primary" disabled={!canSubmit}>
+              {mutation.pending ? 'Saving…' : original ? 'Save alert' : 'Create alert'}
+            </Button>
+          </div>
         </div>
       </div>
       <AlertPreview
