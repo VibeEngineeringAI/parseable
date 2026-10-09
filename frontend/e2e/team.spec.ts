@@ -307,6 +307,15 @@ test('OIDC provider-only roles stay disabled; manual roles can be removed; sourc
   await axe(page);
 });
 
+test('OIDC fallback roles can be assigned manually', async ({ page }) => {
+  await demo(page, '/team?tab=user');
+  const row = namedRow(page, 'sso.fallback');
+  await expect(row.getByText('observers', { exact: true })).toBeVisible();
+  await row.getByRole('button', { name: 'Assign roles to sso.fallback' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Assign roles', exact: true });
+  await expect(dialog.getByRole('checkbox', { name: 'observers', exact: true })).toBeVisible();
+});
+
 test('OIDC inspection fails closed and a legacy account explains reauthentication', async ({
   page,
 }) => {

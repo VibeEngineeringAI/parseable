@@ -13,6 +13,8 @@ type Props = { user: TeamUser; onClose: () => void; onChanged: () => void };
 export function AssignRolesDialog({ user, onClose, onChanged }: Props) {
   const { client } = useApp();
   const roles = useAsync(useCallback((signal) => client.listRoles(signal), [client]));
+  const oauth = user.method === 'oauth';
+  const sources = useRoleSources(user.id, oauth);
   const [assigned, setAssigned] = useState<string[]>([]);
   const mutation = useMutation();
   function submit(event: FormEvent) {
@@ -35,10 +37,17 @@ export function AssignRolesDialog({ user, onClose, onChanged }: Props) {
     >
       <form className="stack" onSubmit={submit}>
         <QueryState loading={roles.loading} error={roles.error} retry={roles.reload} />
-        {roles.data && (
+        {oauth && (
+          <QueryState loading={sources.loading} error={sources.error} retry={sources.reload} />
+        )}
+        {roles.data && (!oauth || sources.data) && (
           <RoleCheckboxes
             roles={Object.keys(roles.data)
-              .filter((name) => !Object.hasOwn(user.roles, name))
+              .filter((name) =>
+                sources.data?.oidc?.legacy === false
+                  ? !sources.data.oidc.manualRoles?.includes(name)
+                  : !Object.hasOwn(user.roles, name),
+              )
               .sort((a, b) => a.localeCompare(b))}
             selected={assigned}
             onChange={setAssigned}
