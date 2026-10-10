@@ -967,7 +967,7 @@ for (const duplicate of [
   test(`invalid or builder duplicate history is ignored safely: ${duplicate.id}`, async ({
     page,
   }) => {
-    await mocked(page);
+    const api = await mocked(page);
     await page.addInitScript((duplicate) => {
       history.replaceState({ ...history.state, usr: { duplicate } }, '');
     }, duplicate);
@@ -975,11 +975,12 @@ for (const duplicate of [
     await expect(
       page.getByText('This alert cannot be duplicated. Create a new rule.', { exact: true }),
     ).toBeVisible();
-    await expect(page.getByLabel('Title', { exact: true })).toHaveValue('');
-    await expect(page.getByLabel('Title', { exact: true })).not.toHaveAttribute(
-      'aria-invalid',
-      'true',
-    );
+    const title = page.getByLabel('Title', { exact: true });
+    await expect(title).toHaveValue('');
+    await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+    await expect(title).toHaveAccessibleDescription('Enter an alert title.');
+    await expect(page).toHaveURL(/\/alerts\/new$/);
+    expect(api.writes).toHaveLength(0);
   });
 
 test('editing an alert preserves server-accepted long duration aliases unchanged', async ({
