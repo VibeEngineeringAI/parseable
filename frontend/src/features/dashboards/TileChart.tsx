@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from 'react';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { DataTable } from '../../components/explorer/DataTable';
-import { chartResults, instantRows } from '../../lib/promqlResults';
+import { chartResults, promqlTableRows } from '../../lib/promqlResults';
 import { chartValue } from './chartValue';
 import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
@@ -55,23 +55,7 @@ export function TileChart({
     return { ...chartResults(converted, converted.length), categorical: false };
   }, [result, tile]);
   const rows = useMemo(
-    () =>
-      result.rows ??
-      (result.promql
-        ? result.promql.some((row) => row.instant)
-          ? instantRows(result.promql, result.promql.length)
-          : result.promql.flatMap(
-              (row) =>
-                row.range?.result.flatMap((series) =>
-                  series.values.map(([time, value]) => ({
-                    Query: row.id,
-                    ...series.metric,
-                    time: new Date(time * 1000).toISOString(),
-                    Value: Number(value),
-                  })),
-                ) ?? [],
-            )
-        : []),
+    () => result.rows ?? (result.promql ? promqlTableRows(result.promql) : []),
     [result],
   );
   const precision =
@@ -89,7 +73,7 @@ export function TileChart({
     height,
     JSON.stringify([tile.config, chart.categorical, chart.series.map((series) => series.id)]),
   );
-  if (tile.chartType === 'table')
+  if (tile.chartType === 'table' || (chart.categorical && tile.chartType !== 'query-value'))
     return (
       <div
         className="dashboard-table"
@@ -97,6 +81,11 @@ export function TileChart({
         aria-label={`${tileTitle(tile)} results`}
         tabIndex={0}
       >
+        {chart.categorical && tile.chartType !== 'table' && (
+          <p className="muted dashboard-chart-note">
+            The x values are not timestamps, so the results are shown as a table.
+          </p>
+        )}
         <DataTable rows={rows} caption={`${tileTitle(tile)} results`} />
       </div>
     );
@@ -137,13 +126,10 @@ export function TileChart({
           64,
         )}
         announceSeries={false}
-        xRange={chart.categorical ? undefined : xRange}
+        xRange={xRange}
         formatValue={formatValue}
         emptyMessage="No results for the selected time range"
       />
-      {chart.categorical && (
-        <p className="muted dashboard-chart-note">Values are shown in query row order.</p>
-      )}
     </div>
   );
 }

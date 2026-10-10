@@ -12,13 +12,13 @@ it('parses offset-less Arrow timestamps as UTC even outside UTC, and honors expl
   const result = sqlChart(
     [
       { time: '2026-10-10T10:00:00.000', value: 3 },
-      { time: '2026-10-10T12:00:00+02:00', value: 4 },
+      { time: '2026-10-10T12:30:00+02:00', value: 4 },
     ],
     { tile_id: 'x' },
   );
   expect(result.timestamps).toEqual([
     Date.UTC(2026, 9, 10, 10) / 1000,
-    Date.UTC(2026, 9, 10, 10) / 1000,
+    Date.UTC(2026, 9, 10, 10, 30) / 1000,
   ]);
   expect(result.series).toEqual([{ id: 'value', label: 'value', values: [3, 4] }]);
 });

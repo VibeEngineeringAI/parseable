@@ -1,5 +1,5 @@
 import { parseSampleValue, seriesLabel, toChartSeries } from './promql';
-import type { PromqlInstantResult, PromqlRangeResult } from './types';
+import type { LogRecord, PromqlInstantResult, PromqlRangeResult } from './types';
 export type QueryResult = {
   id: string;
   pending: number;
@@ -51,4 +51,23 @@ export function instantRows(results: QueryResult[], queryCount: number) {
       Samples: values.length,
     }));
   });
+}
+
+/** Dashboard table rows: each query uses its instant result when it has one, otherwise its
+ * range samples. A Query column identifies the source whenever range rows are present. */
+export function promqlTableRows(results: QueryResult[]): LogRecord[] {
+  if (results.every((row) => row.instant || !row.range))
+    return instantRows(results, results.length);
+  return results.flatMap<LogRecord>((row) =>
+    row.instant
+      ? instantRows([row], 1).map((item) => ({ Query: row.id, ...item }))
+      : (row.range?.result.flatMap((series) =>
+          series.values.map(([time, value]) => ({
+            Query: row.id,
+            ...series.metric,
+            time: new Date(time * 1000).toISOString(),
+            Value: Number(value),
+          })),
+        ) ?? []),
+  );
 }

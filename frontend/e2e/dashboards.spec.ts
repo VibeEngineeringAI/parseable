@@ -1050,11 +1050,18 @@ test('legacy object builder from ingest_demo_data renders, converts and saves a 
     route.fulfill({
       json: [
         { time_bucket: new Date().toISOString(), COUNT_severity_number: 9, severity_text: 'ERROR' },
+        {
+          time_bucket: new Date().toISOString(),
+          COUNT_severity_number: 300,
+          severity_text: 'INFO',
+        },
       ],
     }),
   );
   await page.goto(detail);
-  await expect(tile(page, source.title).getByRole('img')).toHaveAccessibleName(/1 series from/);
+  await expect(tile(page, source.title).getByRole('img')).toHaveAccessibleName(/2 series from/);
+  for (const label of ['ERROR', 'INFO'])
+    await expect(tile(page, source.title).locator('.charts-legend')).toContainText(label);
   await tileAction(page, source.title, 'Edit as SQL');
   await page.getByRole('dialog').getByRole('button', { name: 'Edit as SQL', exact: true }).click();
   const editor = page.getByRole('dialog', { name: 'Edit tile', exact: true });

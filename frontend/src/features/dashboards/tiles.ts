@@ -114,41 +114,68 @@ export function newTile(tiles: DashboardTile[]): DashboardTile {
     config: chartConfig('timeseries'),
   };
 }
+// Numbers count as Unix seconds or milliseconds; smaller numbers and numeric strings are not times.
+const timeValue = (value: unknown) => {
+  if (typeof value === 'number')
+    return value >= 1e9 && value < 1e11
+      ? value
+      : value >= 1e12 && value < 1e14
+        ? value / 1000
+        : NaN;
+  if (typeof value === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(value)) return NaN;
+  return parseEventTimestamp(value) / 1000;
+};
+const groupValue = (value: unknown) =>
+  value == null || value === ''
+    ? '(empty)'
+    : typeof value === 'string'
+      ? value
+      : JSON.stringify(value);
+/** One series per y field and group of the remaining non-numeric columns. Rows whose x values
+ * are not all timestamps are `categorical` and have no chart data; callers show them as a table. */
 export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
   const axes = record(record(tile.config).axes),
     x = record(axes.x),
     y = record(axes.y);
   const fields = [...new Set(rows.flatMap(Object.keys))];
+  const numeric = (field: string) => rows.some((row) => typeof row[field] === 'number');
   const xField =
     text(x.field) || fields.find((field) => /timestamp|^time$|^ts$/i.test(field)) || '';
   const yFields = strings(y.field)
     ? y.field
     : text(y.field)
       ? [text(y.field)]
-      : fields.filter(
-          (field) => field !== xField && rows.some((row) => typeof row[field] === 'number'),
-        );
-  const ordered = rows.map((row, index) => ({
-    row,
-    time:
-      typeof row[xField] === 'number'
-        ? Number(row[xField])
-        : parseEventTimestamp(row[xField]) / 1000,
-    index,
-  }));
-  const categorical = ordered.some((row) => !Number.isFinite(row.time));
-  if (!categorical) ordered.sort((a, b) => a.time - b.time);
-  return {
-    categorical,
-    timestamps: ordered.map((row, index) => (categorical ? index : row.time)),
-    series: yFields.map((field) => ({
-      id: field,
-      label: field,
-      values: ordered.map(({ row }) =>
-        typeof row[field] === 'number' && Number.isFinite(row[field])
-          ? (row[field] as number)
-          : null,
-      ),
-    })),
-  };
+      : fields.filter((field) => field !== xField && numeric(field));
+  const groupFields = fields.filter(
+    (field) => field !== xField && !yFields.includes(field) && !numeric(field),
+  );
+  const points = rows.map((row) => ({ row, time: timeValue(row[xField]) }));
+  if (points.some((point) => !Number.isFinite(point.time)))
+    return { categorical: true, timestamps: [], series: [] };
+  const timestamps = [...new Set(points.map((point) => point.time))].sort((a, b) => a - b);
+  const position = new Map(timestamps.map((time, index) => [time, index]));
+  const series = new Map<string, { id: string; label: string; values: (number | null)[] }>();
+  if (!groupFields.length)
+    for (const field of yFields)
+      series.set(field, { id: field, label: field, values: timestamps.map(() => null) });
+  for (const { row, time } of points) {
+    const group = groupFields.map((field) => groupValue(row[field]));
+    for (const field of yFields) {
+      const id = groupFields.length ? JSON.stringify([field, ...group]) : field;
+      let entry = series.get(id);
+      if (!entry) {
+        const label = group.join(', ');
+        entry = {
+          id,
+          label: yFields.length > 1 ? `${field}: ${label}` : label,
+          values: timestamps.map(() => null),
+        };
+        series.set(id, entry);
+      }
+      const value = row[field];
+      if (typeof value === 'number' && Number.isFinite(value))
+        entry.values[position.get(time)!] = value;
+    }
+  }
+  return { categorical: false, timestamps, series: [...series.values()] };
 }

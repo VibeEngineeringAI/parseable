@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import classic from './__fixtures__/classic.json';
+import ingestDemoTile from './__fixtures__/ingest-demo-tile.json';
 import {
   appendLayout,
   moveTile,
   promqlQueries,
   resolvedLayouts,
+  sqlChart,
   sqlQuery,
   tileStep,
   tileVariableNames,
@@ -124,5 +126,79 @@ describe('classic tile helpers', () => {
       'SELECT DATE_TRUNC(\'minute\', \"p_timestamp\") AS \"time_bucket\", COUNT(*) AS \"COUNT_STAR\" FROM \"logs\" GROUP BY \"time_bucket\" ORDER BY \"time_bucket\" DESC',
     );
     expect(tile).toEqual(original);
+  });
+  it('splits grouped SQL rows into one aligned series per group', () => {
+    const t0 = '2026-10-10T10:00:00.000',
+      t1 = '2026-10-10T10:01:00.000';
+    const row = (time_bucket: string, severity_text: string, count: number) => ({
+      time_bucket,
+      COUNT_severity_number: count,
+      severity_text,
+    });
+    const chart = sqlChart(
+      [row(t1, 'ERROR', 9), row(t1, 'INFO', 300), row(t0, 'INFO', 280), row(t0, 'WARN', 7)],
+      ingestDemoTile,
+    );
+    expect(chart.categorical).toBe(false);
+    expect(chart.timestamps).toEqual(
+      [Date.UTC(2026, 9, 10, 10), Date.UTC(2026, 9, 10, 10, 1)].map((ms) => ms / 1000),
+    );
+    expect(chart.series.map(({ label, values }) => ({ label, values }))).toEqual([
+      { label: 'ERROR', values: [null, 9] },
+      { label: 'INFO', values: [280, 300] },
+      { label: 'WARN', values: [7, null] },
+    ]);
+    expect(new Set(chart.series.map(({ id }) => id)).size).toBe(3);
+    const several = sqlChart(
+      [
+        { time: t0, region: 'eu', host: 'a', hits: 1, errors: 0 },
+        { time: t0, region: 'us', host: null, hits: 2, errors: 1 },
+      ],
+      { tile_id: 'x' },
+    );
+    expect(several.series.map(({ label, values }) => ({ label, values }))).toEqual([
+      { label: 'hits: eu, a', values: [1] },
+      { label: 'errors: eu, a', values: [0] },
+      { label: 'hits: us, (empty)', values: [2] },
+      { label: 'errors: us, (empty)', values: [1] },
+    ]);
+  });
+  it('marks SQL rows with non-time x values as categorical instead of plotting fake times', () => {
+    const empty = { categorical: true, timestamps: [], series: [] };
+    expect(
+      sqlChart(
+        [
+          { method: 'GET', count: 10 },
+          { method: 'POST', count: 4 },
+        ],
+        { tile_id: 'x', config: { axes: { x: { field: 'method' } } } },
+      ),
+    ).toEqual(empty);
+    expect(
+      sqlChart(
+        [
+          { status: 200, count: 10 },
+          { status: 404, count: 4 },
+        ],
+        { tile_id: 'x', config: { axes: { x: { field: 'status' } } } },
+      ),
+    ).toEqual(empty);
+    expect(
+      sqlChart([{ status: '404', count: 1 }], {
+        tile_id: 'x',
+        config: { axes: { x: { field: 'status' } } },
+      }),
+    ).toEqual(empty);
+    expect(sqlChart([{ errors: 3 }], { tile_id: 'x' })).toEqual(empty);
+    expect(
+      sqlChart(
+        [
+          { ts: 1_791_000_000, n: 1 },
+          { ts: 1_791_000_060_000, n: 2 },
+        ],
+        { tile_id: 'x' },
+      ),
+    ).toMatchObject({ categorical: false, timestamps: [1_791_000_000, 1_791_000_060] });
+    expect(sqlChart([], { tile_id: 'x' })).toMatchObject({ categorical: false, timestamps: [] });
   });
 });
