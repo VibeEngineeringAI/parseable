@@ -7,12 +7,13 @@ import {
   EmptyState,
   Pagination,
   TypedConfirmDialog,
+  InlineError,
 } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import type { ApiKey } from '../../lib/types';
 import { CredentialSheet } from './CredentialSheet';
-import { InlineError, TeamSearch, useTeamSearch } from './shared';
+import { TeamSearch, useTeamSearch } from './shared';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 

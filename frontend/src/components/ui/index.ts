@@ -11,6 +11,7 @@ export { EmptyState, type EmptyStateProps } from './EmptyState';
 export { Dialog, type DialogProps } from './Dialog';
 export { Sheet } from './Sheet';
 export { Tabs, type TabsProps } from './Tabs';
+export { InlineError } from './InlineError';
 export { Spinner } from './Spinner';
 export { Pagination, PAGE_SIZE } from './Pagination';
 export { TypedConfirmDialog } from './TypedConfirmDialog';

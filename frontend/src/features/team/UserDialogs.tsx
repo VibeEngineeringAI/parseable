@@ -1,12 +1,12 @@
 import { useCallback, useState, type FormEvent } from 'react';
-import { Button, Dialog, Sheet, TypedConfirmDialog } from '../../components/ui';
+import { Button, Dialog, Sheet, TypedConfirmDialog, InlineError } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import type { TeamUser } from '../../lib/types';
 import { oidcManualRoleRemovable } from './helpers';
 import { OidcRoleInspector, useRoleSources } from './OidcRoleInspector';
-import { InlineError, RoleCheckboxes, SecretResult } from './shared';
+import { RoleCheckboxes, SecretResult } from './shared';
 import { useMutation } from '../../hooks/useMutation';
 
 type Props = { user: TeamUser; onClose: () => void; onChanged: () => void };

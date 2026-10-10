@@ -9,6 +9,7 @@ import {
   Pagination,
   Sheet,
   TypedConfirmDialog,
+  InlineError,
 } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
@@ -17,7 +18,7 @@ import type { Privilege } from '../../lib/types';
 import { privilegeLabel } from './helpers';
 import { RoleEditor } from './RoleEditor';
 import { DefaultRoleDialog } from './DefaultRoleDialog';
-import { InlineError, TeamSearch, useTeamSearch } from './shared';
+import { TeamSearch, useTeamSearch } from './shared';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 

@@ -1,10 +1,9 @@
 import { useCallback } from 'react';
-import { Button } from '../../components/ui';
+import { Button, InlineError } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import type { UserRoleSources } from '../../lib/types';
 import { oidcRemovalStatus } from './helpers';
-import { InlineError } from './shared';
 
 export function useRoleSources(id: string, oauth = true) {
   const { client } = useApp();

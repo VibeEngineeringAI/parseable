@@ -4,13 +4,6 @@ import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { displayDate, formatAlertDate } from './helpers';
 
-export function InlineError({ error }: { error?: string }) {
-  return error ? (
-    <p role="alert" className="error-text">
-      {error}
-    </p>
-  ) : null;
-}
 export function DateText({ value }: { value?: string | null }) {
   const iso = displayDate(value);
   return iso ? (

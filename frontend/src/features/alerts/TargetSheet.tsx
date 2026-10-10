@@ -1,11 +1,10 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Plus, X } from 'lucide-react';
-import { Button, Input, Select, Sheet } from '../../components/ui';
+import { Button, Input, Select, Sheet, InlineError } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { createId } from '../../lib/ids';
 import type { AlertTarget } from '../../lib/types';
 import { buildTargetPayload, targetDraft, validateTarget, type TargetDraft } from './targetHelpers';
-import { InlineError } from './shared';
 import { useMutation } from '../../hooks/useMutation';
 import { useTouchedErrors } from '../../hooks/useTouchedErrors';
 

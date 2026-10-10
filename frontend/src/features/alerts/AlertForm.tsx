@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { Button, Card, CardHeader, CardBody, EmptyState, Input, Select } from '../../components/ui';
+import {
+  Button,
+  Card,
+  CardHeader,
+  CardBody,
+  EmptyState,
+  Input,
+  Select,
+  InlineError,
+} from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { PromqlEditor, type PromqlMetadataSource } from '../../components/promql/PromqlEditor';
@@ -24,7 +33,7 @@ import {
   validateAlert,
   type AlertDraft,
 } from './helpers';
-import { InlineError, useAlertAccess, useLeaveGuard } from './shared';
+import { useAlertAccess, useLeaveGuard } from './shared';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 import { useTouchedErrors } from '../../hooks/useTouchedErrors';

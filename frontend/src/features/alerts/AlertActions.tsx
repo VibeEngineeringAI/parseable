@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ActionsMenu, Button, TypedConfirmDialog, type ActionsMenuItem } from '../../components/ui';
+import {
+  ActionsMenu,
+  Button,
+  TypedConfirmDialog,
+  type ActionsMenuItem,
+  InlineError,
+} from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import type { AlertSummary } from '../../lib/types';
 import { muteState } from './helpers';
-import { InlineError } from './shared';
 import { useMutation } from '../../hooks/useMutation';
 import { MuteMenu } from './MuteMenu';
 

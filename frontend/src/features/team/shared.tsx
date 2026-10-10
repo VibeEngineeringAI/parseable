@@ -2,14 +2,6 @@ import { useEffect, useRef, useState } from 'react';
 import { Copy, Search } from 'lucide-react';
 import { Button, Input, PAGE_SIZE } from '../../components/ui';
 
-export function InlineError({ error }: { error?: string }) {
-  return error ? (
-    <p className="error-text" role="alert">
-      {error}
-    </p>
-  ) : null;
-}
-
 export function useTeamSearch<T>(items: T[], matches: (item: T, query: string) => boolean) {
   const [search, setSearch] = useState('');
   const [requestedPage, setPage] = useState(0);
