@@ -29,6 +29,19 @@ export function timeBounds(range: TimeRange, now: Date | number = Date.now()) {
   };
 }
 
+export function paramsRange(params: URLSearchParams): TimeRange {
+  const startTime = params.get('start'),
+    endTime = params.get('end');
+  if (startTime && endTime) {
+    try {
+      return timeBounds({ startTime, endTime });
+    } catch {
+      /* Invalid handoff bounds fall back to the default range. */
+    }
+  }
+  return '1h';
+}
+
 export function quoteIdentifier(value: string): string {
   if (!value || value.includes('\0'))
     throw new Error('A field or dataset name must be nonempty and contain no null characters');

@@ -1802,7 +1802,9 @@ test('list, text and dataset variables can be authored; View query and Explore d
   await expect(page).toHaveURL(
     (url) =>
       url.pathname === '/sql-editor' &&
-      url.searchParams.get('query') === classic.tiles[1].chartQuery,
+      url.searchParams.get('query') === classic.tiles[1].chartQuery &&
+      url.searchParams.has('start') &&
+      url.searchParams.has('end'),
   );
 });
 

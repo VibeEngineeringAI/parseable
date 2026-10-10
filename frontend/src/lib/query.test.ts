@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildLogQuery, quoteIdentifier, timeBounds } from './query';
+import { buildLogQuery, paramsRange, quoteIdentifier, timeBounds } from './query';
 import { createDemoRecords, executeDemoQuery } from './demo';
 
 const now = Date.parse('2026-10-06T12:00:00Z');
@@ -21,6 +21,22 @@ describe('query construction', () => {
     });
     expect(() => timeBounds({ ...range, startTime: range.endTime })).toThrow('Invalid time range');
     expect(() => timeBounds({ ...range, endTime: 'not a date' })).toThrow('Invalid time range');
+  });
+  it('reads handoff start and end params as an absolute range', () => {
+    expect(
+      paramsRange(
+        new URLSearchParams({ start: '2026-10-03T12:00:00Z', end: '2026-10-06T12:00:00Z' }),
+      ),
+    ).toEqual({ startTime: '2026-10-03T12:00:00.000Z', endTime: '2026-10-06T12:00:00.000Z' });
+    expect(paramsRange(new URLSearchParams({ start: 'nope', end: '2026-10-06T12:00:00Z' }))).toBe(
+      '1h',
+    );
+    expect(
+      paramsRange(
+        new URLSearchParams({ start: '2026-10-06T12:00:00Z', end: '2026-10-06T11:00:00Z' }),
+      ),
+    ).toBe('1h');
+    expect(paramsRange(new URLSearchParams({ start: '2026-10-06T11:00:00Z' }))).toBe('1h');
   });
   it('validates row limits and computes exact UTC ranges', () => {
     expect(() => buildLogQuery('logs', '', [], -1)).toThrow('Limit');

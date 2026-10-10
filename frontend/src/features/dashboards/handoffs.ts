@@ -1,5 +1,12 @@
 import type { DashboardTile, DashboardVariable, QueryRequest } from '../../lib/types';
-import { knownTile, promqlQueries, sqlQuery, tileDatasets, tileTitle } from './tiles';
+import {
+  knownTile,
+  promqlQueries,
+  sqlQuery,
+  tileDatasets,
+  tileTitle,
+  tileVariableNames,
+} from './tiles';
 import {
   hasAllSelection,
   interpolatePromql,
@@ -25,9 +32,15 @@ export function tileHandoffs(
   const queries = original.map((query) =>
     isPromql ? interpolatePromql(query, values) : interpolateSql(query, values, variables),
   );
+  const referenced = tileVariableNames(tile, variables);
   const unresolved =
-    queries.some((query) => /\$\{?\w+\}?/.test(query)) ||
-    datasets.some((dataset) => !dataset || /\$\{?\w+\}?/.test(dataset));
+    datasets.some((dataset) => !dataset) ||
+    variables.some((variable) => {
+      if (!referenced.has(variable.name)) return false;
+      const value = Object.hasOwn(values, variable.name) ? values[variable.name] : undefined;
+      const selection = Array.isArray(value) ? value[0] : value;
+      return selection === undefined || (variable.type === 'dataset' && !selection);
+    });
   const all = hasAllSelection(variables, values, original.join(' '), tileDatasets(tile).join(' '));
   const reason = !knownTile(tile)
     ? 'This tile type is read-only.'
@@ -55,9 +68,9 @@ export function tileHandoffs(
       'type',
       types.every((type) => type === types[0]) ? (types[0] ?? 'range') : 'both',
     );
-    exploreParams.set('start', bounds.startTime);
-    exploreParams.set('end', bounds.endTime);
   }
+  exploreParams.set('start', bounds.startTime);
+  exploreParams.set('end', bounds.endTime);
   return {
     alertUrl: reason ? undefined : `/alerts/new?${alertParams}`,
     reason,

@@ -11,7 +11,7 @@ import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
 import { SqlEditor } from './SqlEditor';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
-import { timeBounds, quoteIdentifier } from '../../lib/query';
+import { paramsRange, timeBounds, quoteIdentifier } from '../../lib/query';
 import type { LogRecord, TimeRange } from '../../lib/types';
 export function SqlPage() {
   const { client, mode } = useApp();
@@ -22,7 +22,7 @@ export function SqlPage() {
         ? 'SELECT * FROM "application_logs"\nORDER BY "p_timestamp" DESC\nLIMIT 100'
         : ''),
   );
-  const [range, setRange] = useState<TimeRange>('1h');
+  const [range, setRange] = useState<TimeRange>(() => paramsRange(params));
   const [request, setRequest] = useState<{ sql: string; startTime: string; endTime: string }>();
   const [row, setRow] = useState<LogRecord>();
   const [wrap, setWrap] = useState(false);

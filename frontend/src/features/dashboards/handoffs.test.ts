@@ -53,6 +53,54 @@ describe('tile handoffs', () => {
     expect(explore.pathname).toBe('/sql-editor');
     expect(Object.fromEntries(explore.searchParams)).toEqual({
       query: classic.tiles[1].chartQuery,
+      start: bounds.startTime,
+      end: bounds.endTime,
     });
+  });
+  it('keeps links for queries whose $tokens are not dashboard variables', () => {
+    const variables = readVariables(classic.variables);
+    const values = { host: 'node-a', metrics_dataset: 'metrics' };
+    const tiles = [
+      {
+        ...classic.tiles[0],
+        chartQuery: ['label_replace(up, "host", "$1", "instance", "(.*):.*")'],
+      },
+      {
+        ...classic.tiles[1],
+        chartQuery: "SELECT regexp_replace(host, '(\\w+)-\\d+', '$1') FROM \"app-logs\"",
+      },
+      { ...classic.tiles[1], chartQuery: 'SELECT * FROM "app-logs" WHERE message = \'$1\'' },
+    ];
+    for (const tile of tiles) {
+      const links = tileHandoffs(tile, variables, values, bounds, true);
+      expect(links.reason).toBeUndefined();
+      expect(links.alertUrl).toBeDefined();
+      expect(links.exploreUrl).toBeDefined();
+      expect(new URL(links.alertUrl!, 'https://example.test').searchParams.get('alertQuery')).toBe(
+        Array.isArray(tile.chartQuery) ? tile.chartQuery[0] : tile.chartQuery,
+      );
+    }
+    expect(tileHandoffs(tiles[2], [], {}, bounds, true).alertUrl).toBeDefined();
+  });
+  it('disables links when a referenced dashboard variable has no value', () => {
+    const links = tileHandoffs(
+      classic.tiles[0],
+      readVariables(classic.variables),
+      { metrics_dataset: 'metrics' },
+      bounds,
+      true,
+    );
+    expect(links.reason).toBe('Alerts require one concrete query and dataset.');
+    expect(links.alertUrl).toBeUndefined();
+    expect(links.exploreUrl).toBeUndefined();
+    expect(
+      tileHandoffs(
+        classic.tiles[0],
+        readVariables(classic.variables),
+        { host: 'node-a' },
+        bounds,
+        true,
+      ).exploreUrl,
+    ).toBeUndefined();
   });
 });
