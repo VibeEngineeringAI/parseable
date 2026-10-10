@@ -1236,7 +1236,9 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   // the plot with the new range. Pin the clock so Mute does not move the window and the test
   // checks only that the plot is kept when nothing about the expression changed.
   await page.clock.setFixedTime(new Date('2026-10-10T12:00:00Z'));
+  let ranges = 0;
   await page.route('**/prometheus/api/v1/query_range', (route) => {
+    ranges++;
     const end = Number(new URLSearchParams(route.request().postData()!).get('end'));
     return route.fulfill({
       json: {
@@ -1265,19 +1267,29 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   const plot = page.locator('.uplot');
   await expect(plot).toBeVisible();
   await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
+  // StrictMode mounts the chart twice in development, so count from here rather than from 1.
+  const loaded = ranges;
   await page.getByRole('button', { name: 'Mute', exact: true }).click();
+  const reloaded = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'GET' &&
+      new URL(response.url()).pathname === `/api/v1/alerts/${alertFixture.id}`,
+  );
   await page
     .getByRole('dialog', { name: 'Mute notifications' })
     .getByRole('button', { name: 'Indefinitely', exact: true })
     .click();
+  await (await reloaded).finished();
   await expect(page.getByRole('button', { name: 'Unmute', exact: true })).toBeVisible();
-  await expect(plot).toHaveAttribute('data-retained', 'true');
   await expect(
     page.getByRole('table', { name: 'Alert instances' }).locator('.alerts-label-chip'),
   ).toHaveText('host=node-a');
   await expect(
     page.getByRole('table', { name: 'Notification deliveries' }).locator('.alerts-label-chip'),
   ).toHaveText('host=node-a');
+  // The reload must not query the range again, which would rebuild the plot.
+  expect(ranges).toBe(loaded);
+  await expect(plot).toHaveAttribute('data-retained', 'true');
   await expect(page.locator('.alerts-page time').first()).toBeVisible();
   for (const time of await page.locator('.alerts-page time').all())
     await expect(time).toHaveText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$/);
