@@ -131,8 +131,8 @@ const groupValue = (value: unknown) =>
     : typeof value === 'string'
       ? value
       : JSON.stringify(value);
-/** One series per y field and group of the remaining non-numeric columns. Rows whose x values
- * are not all timestamps are `categorical` and have no chart data; callers show them as a table. */
+/** One series per y field and group. Rows whose x values are not all timestamps are
+ * `categorical` and have no chart data; callers show them as a table. */
 export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
   const axes = record(record(tile.config).axes),
     x = record(axes.x),
@@ -146,13 +146,24 @@ export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
     : text(y.field)
       ? [text(y.field)]
       : fields.filter((field) => field !== xField && numeric(field));
-  const groupFields = fields.filter(
-    (field) => field !== xField && !yFields.includes(field) && !numeric(field),
-  );
   const points = rows.map((row) => ({ row, time: timeValue(row[xField]) }));
   if (points.some((point) => !Number.isFinite(point.time)))
     return { categorical: true, timestamps: [], series: [] };
   const timestamps = [...new Set(points.map((point) => point.time))].sort((a, b) => a - b);
+  const builder = object(tile.chartQuery) ? record(tile.chartQuery) : undefined;
+  // Builder tiles declare their groups. Otherwise only repeated x values are split, and only by
+  // low-cardinality columns, so raw log rows with messages and ids stay one series per y field.
+  const groupFields = builder
+    ? [record(builder.x).groupBy, record(builder.y).groupBy]
+        .flatMap((groups) => (strings(groups) ? groups : []))
+        .filter((field) => fields.includes(field))
+    : timestamps.length === rows.length
+      ? []
+      : fields.filter((field) => {
+          if (field === xField || yFields.includes(field) || numeric(field)) return false;
+          const distinct = new Set(rows.map((row) => groupValue(row[field]))).size;
+          return distinct <= 20 && distinct < rows.length;
+        });
   const position = new Map(timestamps.map((time, index) => [time, index]));
   const series = new Map<string, { id: string; label: string; values: (number | null)[] }>();
   if (!groupFields.length)

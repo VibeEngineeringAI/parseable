@@ -127,13 +127,14 @@ describe('classic tile helpers', () => {
     );
     expect(tile).toEqual(original);
   });
-  it('splits grouped SQL rows into one aligned series per group', () => {
+  it('groups legacy builder rows only by the declared groupBy fields', () => {
     const t0 = '2026-10-10T10:00:00.000',
       t1 = '2026-10-10T10:01:00.000';
     const row = (time_bucket: string, severity_text: string, count: number) => ({
       time_bucket,
       COUNT_severity_number: count,
       severity_text,
+      note: `${severity_text} at ${time_bucket}`,
     });
     const chart = sqlChart(
       [row(t1, 'ERROR', 9), row(t1, 'INFO', 300), row(t0, 'INFO', 280), row(t0, 'WARN', 7)],
@@ -149,19 +150,46 @@ describe('classic tile helpers', () => {
       { label: 'WARN', values: [7, null] },
     ]);
     expect(new Set(chart.series.map(({ id }) => id)).size).toBe(3);
-    const several = sqlChart(
-      [
-        { time: t0, region: 'eu', host: 'a', hits: 1, errors: 0 },
-        { time: t0, region: 'us', host: null, hits: 2, errors: 1 },
-      ],
-      { tile_id: 'x' },
-    );
-    expect(several.series.map(({ label, values }) => ({ label, values }))).toEqual([
-      { label: 'hits: eu, a', values: [1] },
-      { label: 'errors: eu, a', values: [0] },
-      { label: 'hits: us, (empty)', values: [2] },
-      { label: 'errors: us, (empty)', values: [1] },
+  });
+  it('keeps raw rows with distinct x values as one series per y field', () => {
+    const rows = Array.from({ length: 30 }, (_, index) => ({
+      p_timestamp: new Date(Date.UTC(2026, 9, 10, 10, index)).toISOString(),
+      level: index % 2 ? 'info' : 'error',
+      message: `request ${index}`,
+      trace_id: `trace-${index}`,
+      duration_ms: index,
+    }));
+    const chart = sqlChart(rows, {
+      tile_id: 'x',
+      chartQuery: 'SELECT * FROM "application_logs"',
+      config: { axes: { x: { field: 'p_timestamp' }, y: { field: 'duration_ms' } } },
+    });
+    expect(chart.timestamps).toHaveLength(30);
+    expect(chart.series).toEqual([
+      { id: 'duration_ms', label: 'duration_ms', values: rows.map((row) => row.duration_ms) },
     ]);
+  });
+  it('splits repeated x values by low-cardinality columns only', () => {
+    const t0 = '2026-10-10T10:00:00.000',
+      t1 = '2026-10-10T10:01:00.000';
+    const rows = [
+      { time: t0, level: 'error', request_id: 'r1', hits: 1, errors: 0 },
+      { time: t0, level: null, request_id: 'r2', hits: 2, errors: 1 },
+      { time: t1, level: 'error', request_id: 'r3', hits: 3, errors: 2 },
+    ];
+    const chart = sqlChart(rows, { tile_id: 'x' });
+    expect(chart.series.map(({ label, values }) => ({ label, values }))).toEqual([
+      { label: 'hits: error', values: [1, 3] },
+      { label: 'errors: error', values: [0, 2] },
+      { label: 'hits: (empty)', values: [2, null] },
+      { label: 'errors: (empty)', values: [1, null] },
+    ]);
+    const many = Array.from({ length: 42 }, (_, index) => ({
+      time: index % 2 ? t1 : t0,
+      host: `host-${index % 21}`,
+      hits: index,
+    }));
+    expect(sqlChart(many, { tile_id: 'x' }).series.map(({ id }) => id)).toEqual(['hits']);
   });
   it('marks SQL rows with non-time x values as categorical instead of plotting fake times', () => {
     const empty = { categorical: true, timestamps: [], series: [] };
