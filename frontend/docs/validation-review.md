@@ -2,6 +2,67 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Dashboards validation (2026-10-10)
+
+The required full `npm run check` passed: **898 unit tests in 35 files, 198 app browser tests and 42 Storybook browser tests**. This includes **25 dashboard browser cases** covering demo CRUD, SQL/PromQL tile editing and variables, full-document PUT preservation, conflict Reload/Overwrite, read-only ownership, capability-off and 403 behavior, import/export and local migration, concrete alert handoffs, dirty navigation, stale-response protection, favourite/rename preservation and typed-delete focus, six light/dark axe scans that assert the applied theme, and keyboard actions with no horizontal overflow at 390px. Formatting, TypeScript, the production build and the Storybook build also passed.
+
+Earlier full runs exposed an existing Alerts runtime chart reset when mute crossed a clock second, and timing-sensitive navigation assertions under ten-worker load. The chart now anchors its query end to the dataset/query rather than the entire alert object; its browser test advances the clock to verify that muting retains the plot. The dirty-navigation test awaits each native confirmation before the next navigation. App browsers now use four workers on this shared machine; Storybook still uses ten. The final full run passed without retries. The additional targeted preservation/theme run passed **7/7**, and the metadata helper run passed **6/6**.
+
+The live run used Vite on `http://127.0.0.1:8271`, proxying to the disposable server at `http://127.0.0.1:8030`, and Chromium at `/usr/bin/chromium`. All Playwright invocations used `flock /home/ajs/.cache/parseable-playwright.lock`, checking 5173 and 6006 inside the lock before running. `TMPDIR=/home/ajs/.cache/dash-tmp` kept Chromium temporary files off the small `/tmp` filesystem. No requests were sent to ports 8000, 8011 or 8012.
+
+The final dashboard live suite passed **4/4 in 17.2s**, without retries. It ingested twelve logs and two OTLP gauge series, created a dashboard through the UI with SQL/table and PromQL/timeseries tiles plus dataset and label-values variables, and verified exact stored classic shapes. A hard load at the server's own `/dashboards/<id>` displayed the real log messages and a PromQL canvas with successful nonempty matrix results from that origin. [Classic render capture](parity-screenshots/server-dashboard-classic.png) and [stored dashboard JSON](parity-screenshots/server-dashboard-created.json) record that result. The reverse test POSTed a classic-shaped Report with unknown document, time-range, section, tile and config keys, rendered it in this frontend, changed one tile title and deep-compared the stored document (apart from the changed title and server `modified`).
+
+One earlier live repeat observed an empty SQL response shortly after ingest; the test now exercises manual Refresh and waits for nonempty real SQL and PromQL responses before asserting rendered values. The final run passed. The temporary Vite process was stopped, and port 8271 had no listener afterwards.
+
+Contract surprises were resolved against Rust and the live server: missing dashboards are 400; titles are tenant-wide and case-sensitive; summaries use Chrono Display dates; `limit=0` returns the same full set as an absent limit; tiles use snake_case `tile_id`; custom time ranges use `type:"custom"`. Although `get_dashboard_by_user` permits admin lookup, the full-body update has a second strict owner check. A second reader user created a dashboard; admin PUT returned 400 `Cannot perform this operation: Dashboard does not exist or you do not have permission to access it`, while admin DELETE succeeded. The UI reflects that distinction. Cleanup in `afterAll` passed for all created dashboards, both datasets, the user and its role.
+
+The scope deliberately excludes AI, Enterprise/pricing, templates/CDN, Report creation, sections UI, drag/resize, present mode, PNG download and auto-refresh. Stored Report/section/unsupported chart data is preserved. The shared chart renders area/bar as a line while retaining their stored types. No cross-browser run, deployment, embedded `/next` rebuild or pixel-parity claim is included.
+
+Changed files are grouped here; implementation responsibilities are detailed in [the component map](component-map.md#server-backed-dashboards).
+
+| Area                          | Added or changed files                                                                                                                                                                                                                                                                                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Dashboard screens and helpers | `src/features/dashboards/`: list/detail containers, tile and variable editors/renderers, conflict and import dialogs, ownership, time range, queries, interpolation, handoffs, import/export, local migration, styles, classic fixture and unit tests; the old storage helpers now only read local dashboards or explicitly remove confirmed local copies |
+| Contracts and adapters        | `src/lib/types.ts`, `client.ts`, `dashboardsContract.ts`, `demoDashboards.ts`, `demo.ts`, `ids.ts`, `sha256.ts`, `concurrency.ts`, `promqlMetadata.ts`, `query.ts`, `classicUi.ts` and their tests, plus capability literals in existing Team/PromQL client tests                                                                                         |
+| Routing and shared controls   | `src/app/App.tsx`, `OverviewPage.tsx`, `src/components/explorer/TimeRangePicker.tsx`, `src/components/ui/ActionsMenu.tsx`                                                                                                                                                                                                                                 |
+| Existing feature integration  | `src/features/alerts/AlertForm.tsx`, `PromqlRuntime.tsx`, `shared.tsx`, `src/features/metrics/MetricsPage.tsx`                                                                                                                                                                                                                                            |
+| Browser validation            | `e2e/dashboards.spec.ts`, `e2e-live/dashboards.spec.ts`, `e2e/app.spec.ts`, `e2e/alerts.spec.ts`, `playwright.config.ts`                                                                                                                                                                                                                                  |
+| Documentation and evidence    | `README.md`, `docs/api-contracts.md`, `component-map.md`, `prism-parity.md`, `validation-review.md`, `wiki-drafts/prism-frontend-parity.md`, `parity-screenshots/server-dashboard-classic.png`, `parity-screenshots/server-dashboard-created.json`                                                                                                        |
+
+Commands from `frontend/` (start the live Vite process in another terminal and stop it afterwards):
+
+```sh
+npm run format
+flock /home/ajs/.cache/parseable-playwright.lock bash -c '
+  while [ -n "$(ss -H -ltn "( sport = :5173 or sport = :6006 )")" ]; do
+    ss -ltn "( sport = :5173 or sport = :6006 )"
+    sleep 5
+  done
+  ss -ltn "( sport = :5173 or sport = :6006 )"
+  export TMPDIR=/home/ajs/.cache/dash-tmp
+  export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+  export PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030
+  npm run check
+'
+
+PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030 \
+  npx vite --host 127.0.0.1 --port 8271 --strictPort
+
+flock /home/ajs/.cache/parseable-playwright.lock bash -c '
+  while [ -n "$(ss -H -ltn "( sport = :5173 or sport = :6006 )")" ]; do
+    ss -ltn "( sport = :5173 or sport = :6006 )"
+    sleep 5
+  done
+  ss -ltn "( sport = :5173 or sport = :6006 )"
+  export TMPDIR=/home/ajs/.cache/dash-tmp
+  export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+  export PARSEABLE_LIVE_URL=http://127.0.0.1:8271 PARSEABLE_LIVE_BASE=
+  export PARSEABLE_LIVE_SERVER_URL=http://127.0.0.1:8030
+  export PARSEABLE_LIVE_USERNAME=admin PARSEABLE_LIVE_PASSWORD=admin
+  npx playwright test -c playwright.live.config.ts e2e-live/dashboards.spec.ts
+'
+```
+
 ## Alerts validation (2026-10-09)
 
 This section records the frontend fixes and completed checks for the four supplied Opus reviews.
@@ -215,7 +276,7 @@ Production demo gating passed in a separate Chromium script against production b
 
 The gate builds used `VITE_ENABLE_DEMO=false` or `true`, `npm_config_cache=/tmp/astra-item2-npm`, `TMPDIR=/tmp/astra-item2-tmp`, and `npx vite build --outDir /tmp/astra-item2-production-no-demo` or `/tmp/astra-item2-production-demo`. Final source also passed the default production build in `npm run check`. Final screenshots are linked from [prism-parity.md](prism-parity.md).
 
-Cross-browser behavior, production deployment, real-provider interoperability, provider membership/refresh revocation, complete accessibility conformance and every original Prism interaction are not covered. Dashboards remain browser-local; server-backed dashboards, saved views, metrics, traces, alerts, administration and other excluded feature areas are not implemented. Wide-schema virtualization, arbitrary timezones and exact pixel equality remain parity gaps.
+Cross-browser behavior, production deployment, real-provider interoperability, provider membership/refresh revocation, complete accessibility conformance and every original Prism interaction are not covered. The 2026-10-07 baseline used browser-local dashboards. Subsequent dated sections record Team, Metrics, Alerts and server-backed Dashboards; saved views, traces and remaining feature areas are still outside scope. Wide-schema virtualization, arbitrary timezones and exact pixel equality remain parity gaps.
 
 ## Files and test coverage added in this iteration
 
@@ -223,7 +284,7 @@ Cross-browser behavior, production deployment, real-provider interoperability, p
 | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Authentication and shell    | `src/app/{App,AppProvider,Sidebar,ConnectionDialog,LoginPage,LoginForm}.tsx`, `src/lib/{auth,client,config,demo,types}.ts`, `src/styles/auth-shell.css`                                                                           | Standalone login, safe SSO/document navigation, missing-provider recovery, session/identity handling, production demo gate and measured shell layout                  |
 | Logs and shared explorer    | `src/features/logs/{LogsPage,FieldSidebar,FilterBar}.tsx`, `src/components/explorer/{ColumnPicker,DataTable,TimeRangePicker,RecordSheet,LogHistogram,QueryState}.tsx`, `src/components/explorer/timestamp.ts`, `src/lib/query.ts` | Compact summary results, columns/sort/wrap/export, edit/clear filters, absolute UTC ranges, event actions, explicit auth states and timezone-less backend UTC parsing |
-| Existing route presentation | `src/features/sql/SqlPage.tsx`, `src/features/datasets/DatasetsPage.tsx`, `src/features/dashboards/DashboardsPage.tsx`, `src/styles/global.css`                                                                                   | SQL explorer/empty live editor/results controls, inventory table and local dashboard layout refinements                                                               |
+| Existing route presentation | `src/features/sql/SqlPage.tsx`, `src/features/datasets/DatasetsPage.tsx`, `src/features/dashboards/DashboardsPage.tsx`, `src/styles/global.css`                                                                                   | SQL explorer/empty live editor/results controls, inventory table and historical browser-local dashboard layout refinements                                            |
 | Unit coverage               | `src/lib/{auth,client,query}.test.ts`, `src/components/explorer/timestamp.test.ts`                                                                                                                                                | Safe return paths, cookies/identity/auth request contracts, query bounds and backend timestamp handling; existing dashboard storage coverage retained                 |
 | App browser coverage        | `e2e/auth.spec.ts`, `e2e/explorer-parity.spec.ts`, `e2e/app.spec.ts`, `playwright.config.ts`                                                                                                                                      | Six auth and five explorer parity cases added; existing flows updated and regression coverage retained                                                                |
 | Real-server coverage        | `e2e-live/server.spec.ts`, `playwright.live.config.ts`, `e2e-live/fixtures/{mock-oidc,prism-proxy}.mjs`, `package.json`                                                                                                           | Opt-in live tests, protocol fixture, original-asset proxy and `test:live`; excluded from default check                                                                |

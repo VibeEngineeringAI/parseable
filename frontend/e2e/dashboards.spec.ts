@@ -1,0 +1,878 @@
+import { test, expect, type Page } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+import { readFile } from 'node:fs/promises';
+import { createUlid } from '../src/lib/ids';
+import classic from '../src/features/dashboards/__fixtures__/classic.json' with { type: 'json' };
+import type { Dashboard, DashboardSummary } from '../src/lib/types';
+const id = classic.dashboardId;
+const detail = `/dashboards/${id}`;
+const tile = (page: Page, name: string) =>
+  page.locator('[data-tile-id]').filter({ has: page.getByRole('heading', { name, exact: true }) });
+async function demo(page: Page, path = '/dashboards') {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  await page.goto(path);
+  await expect(page.getByRole('heading').first()).toBeVisible();
+}
+async function tileAction(page: Page, title: string, action: string) {
+  await page.getByRole('button', { name: `Actions for tile ${title}`, exact: true }).click();
+  await page.getByRole('menuitem', { name: action, exact: true }).click();
+}
+async function addSql(page: Page, title: string, dataset = 'application_logs') {
+  await page.getByRole('button', { name: 'Add tile', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
+  await editor.getByLabel('Tile title').fill(title);
+  await editor.getByLabel('Dataset', { exact: true }).selectOption(dataset);
+  await editor
+    .getByRole('textbox', { name: 'SQL query', exact: true })
+    .fill(`SELECT COUNT(*) AS events FROM "${dataset}"`);
+  await editor.getByLabel('Chart type').selectOption('query-value');
+  await editor.getByRole('button', { name: 'Add tile', exact: true }).click();
+}
+async function axe(page: Page) {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+  });
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
+}
+type Call = {
+  path: string;
+  method: string;
+  body?: Record<string, unknown>;
+  params: URLSearchParams;
+};
+async function mockServer(
+  page: Page,
+  options: {
+    document?: Dashboard;
+    enabled?: boolean;
+    denied?: string;
+    denyWrite?: boolean;
+    rows?: DashboardSummary[];
+    failTitle?: string;
+  } = {},
+) {
+  let current = structuredClone(options.document ?? classic) as Dashboard,
+    clock = 0;
+  const writes: Dashboard[] = [],
+    creates: Dashboard[] = [],
+    calls: Call[] = [];
+  const documents = new Map<string, Dashboard>([[current.dashboardId, current]]);
+  await page.context().addCookies([
+    { name: 'user_id', value: 'admin', url: 'http://127.0.0.1:5173' },
+    { name: 'username', value: 'admin', url: 'http://127.0.0.1:5173' },
+  ]);
+  await page.route('**/api/**', async (route) => {
+    const request = route.request(),
+      url = new URL(request.url()),
+      path = url.pathname,
+      method = request.method();
+    const body = request.postData()
+      ? path.startsWith('/prometheus')
+        ? Object.fromEntries(new URLSearchParams(request.postData()!))
+        : request.postDataJSON()
+      : undefined;
+    calls.push({ path, method, body, params: url.searchParams });
+    if (path === options.denied)
+      return route.fulfill({ status: 403, body: 'Dashboard permission denied' });
+    if (path === '/api/v1/about')
+      return route.fulfill({
+        json: {
+          capabilities: {
+            promql: true,
+            promqlDashboard: options.enabled ?? true,
+            promqlMetadata: options.enabled ?? true,
+            promqlAlerts: true,
+          },
+        },
+      });
+    if (path === '/api/v1/users/admin')
+      return route.fulfill({ json: { id: 'admin', username: 'admin' } });
+    if (path === '/api/v1/user/admin/role')
+      return route.fulfill({
+        json: {
+          roles: { root: { actions: [{ privilege: 'admin' }], roleType: 'internal' } },
+          groupRoles: {},
+        },
+      });
+    if (path === '/api/v1/logstream')
+      return route.fulfill({ json: [{ name: 'app-logs' }, { name: 'otel-metrics' }] });
+    if (path.endsWith('/info'))
+      return route.fulfill({
+        json: {
+          logSource: [
+            { log_source_format: path.includes('otel-metrics') ? 'otel-metrics' : 'json' },
+          ],
+        },
+      });
+    if (path === '/api/v1/targets') return route.fulfill({ json: [] });
+    if (path === '/api/v1/dashboards') {
+      if (method === 'POST') {
+        if (body.title === options.failTitle)
+          return route.fulfill({ status: 403, body: 'Import denied' });
+        if ([...documents.values()].some((value) => value.title === body.title))
+          return route.fulfill({
+            status: 400,
+            body: 'Cannot perform this operation: Dashboard title must be unique',
+          });
+        const doc = {
+          ...body,
+          author: classic.author,
+          dashboardId: createUlid(),
+          created: '2026-10-10T08:00:00Z',
+          modified: `2026-10-10T08:00:${String(++clock).padStart(2, '0')}Z`,
+          version: 'v1',
+          tenantId: null,
+          dashboardType: body.dashboardType ?? 'Dashboard',
+          tiles: body.tiles ?? [],
+        } as Dashboard;
+        documents.set(doc.dashboardId, doc);
+        creates.push(doc);
+        return route.fulfill({ json: doc });
+      }
+      return route.fulfill({
+        json:
+          options.rows ??
+          [...documents.values()].map(
+            ({ title, author, dashboardId, created, modified, tags, isFavorite }) => ({
+              title,
+              author,
+              dashboardId,
+              created,
+              modified,
+              tags,
+              isFavorite,
+            }),
+          ),
+      });
+    }
+    if (path.startsWith('/api/v1/dashboards/')) {
+      const requestedId = path.split('/').at(-1)!;
+      if (method === 'PUT') {
+        if (options.denyWrite)
+          return route.fulfill({ status: 403, body: 'Dashboard update denied' });
+        writes.push(structuredClone(body));
+        const doc = {
+          ...body,
+          modified: `2026-10-10T08:01:${String(++clock).padStart(2, '0')}Z`,
+        } as Dashboard;
+        documents.set(requestedId, doc);
+        if (requestedId === id) current = doc;
+        return route.fulfill({ json: doc });
+      }
+      if (method === 'DELETE') {
+        documents.delete(requestedId);
+        return route.fulfill({ status: 200, body: '' });
+      }
+      const doc = documents.get(requestedId);
+      return route.fulfill(
+        doc
+          ? { json: doc }
+          : { status: 400, body: 'Cannot perform this operation: Dashboard does not exist' },
+      );
+    }
+    if (path === '/api/v1/query')
+      return route.fulfill({ json: [{ time: '2026-10-10T08:00:00Z', events: 12 }] });
+    if (path.startsWith('/prometheus/api/v1/label/'))
+      return route.fulfill({
+        json: {
+          status: 'success',
+          data: path.includes('/__name__/') ? ['up'] : ['node-a', 'node-b'],
+        },
+      });
+    if (path === '/prometheus/api/v1/labels')
+      return route.fulfill({ json: { status: 'success', data: ['host'] } });
+    if (path === '/prometheus/api/v1/query_range')
+      return route.fulfill({
+        json: {
+          status: 'success',
+          data: {
+            resultType: 'matrix',
+            result: [
+              {
+                metric: { host: body?.query?.toString().includes('node-b') ? 'node-b' : 'node-a' },
+                values: [
+                  [Date.now() / 1000 - 30, '3'],
+                  [Date.now() / 1000, '4'],
+                ],
+              },
+            ],
+          },
+        },
+      });
+    if (path === '/prometheus/api/v1/query')
+      return route.fulfill({
+        json: {
+          status: 'success',
+          data: {
+            resultType: 'vector',
+            result: [{ metric: { host: 'node-a' }, value: [Date.now() / 1000, '4'] }],
+          },
+        },
+      });
+    return route.fulfill({ status: 404, body: `Unhandled mock ${path}` });
+  });
+  return {
+    writes,
+    creates,
+    calls,
+    change: (edits: Partial<Dashboard>) => {
+      current = {
+        ...current,
+        ...edits,
+        modified: `2026-10-10T08:02:${String(++clock).padStart(2, '0')}Z`,
+      };
+      documents.set(id, current);
+    },
+    current: () => current,
+  };
+}
+
+test('demo CRUD, SQL tile preview/config, duplicate/move and typed deletion', async ({ page }) => {
+  await demo(page);
+  await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
+  const create = page.getByRole('dialog', { name: 'Create dashboard', exact: true });
+  await create.getByLabel('Dashboard title').fill('Signals test');
+  await create.getByLabel('Tags', { exact: true }).fill('ops, demo');
+  await create.getByLabel('Description').fill('A saved description');
+  await create.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('heading', { name: 'Signals test', exact: true })).toBeVisible();
+  await addSql(page, 'Events');
+  await expect(tile(page, 'Events').getByLabel('Events value')).toContainText('100');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  await tileAction(page, 'Events', 'Edit');
+  const editor = page.getByRole('dialog', { name: 'Edit tile', exact: true });
+  await editor.getByLabel('Tile title').fill('Total events');
+  await editor.getByLabel('Unit', { exact: true }).fill('events');
+  await editor.getByLabel('Precision').fill('0');
+  await editor.getByRole('button', { name: 'Run query', exact: true }).click();
+  await expect(editor.getByLabel('Total events value')).toContainText('100 events');
+  await editor.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await tileAction(page, 'Total events', 'Duplicate tile');
+  await expect(tile(page, 'Total events (Copy)')).toBeVisible();
+  await tileAction(page, 'Total events (Copy)', 'Move earlier');
+  await expect(page.locator('[data-tile-id] h2').first()).toHaveText('Total events (Copy)');
+  await tileAction(page, 'Total events (Copy)', 'Delete tile');
+  await page
+    .getByRole('dialog', { name: 'Delete tile?', exact: true })
+    .getByRole('button', { name: 'Delete tile', exact: true })
+    .click();
+  await expect(tile(page, 'Total events (Copy)')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Duplicate dashboard', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Signals test (Copy)', exact: true }),
+  ).toBeVisible();
+  await expect(tile(page, 'Total events')).toBeVisible();
+  await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Delete dashboard', exact: true }).click();
+  const deletion = page.getByRole('dialog', { name: 'Delete dashboard', exact: true });
+  await deletion.getByLabel('Confirmation name').fill('Signals test (Copy)');
+  await deletion.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('heading', { name: 'Dashboards', exact: true })).toBeVisible();
+});
+
+test('list favourites and rename preserve the full document; typed deletion restores focus', async ({
+  page,
+}) => {
+  const source = {
+    ...classic,
+    isFavorite: false,
+    tags: ['svc,api', ' repeated ', ' repeated '],
+    description: ' keep whitespace ',
+  };
+  const server = await mockServer(page, { document: source });
+  await page.goto('/dashboards');
+  await page.getByRole('button', { name: `Favourite ${source.title}`, exact: true }).click();
+  await expect(
+    page.getByRole('button', { name: `Unfavourite ${source.title}`, exact: true }),
+  ).toBeEnabled();
+  expect(server.writes[0]).toEqual({ ...source, isFavorite: true });
+  const beforeRename = structuredClone(server.current());
+  await page.getByRole('button', { name: `Actions for ${source.title}`, exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
+  const form = page.getByRole('dialog', { name: 'Rename and tags', exact: true });
+  await form.getByLabel('Dashboard title').fill('Renamed service');
+  await form.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('link', { name: 'Renamed service', exact: true })).toBeVisible();
+  expect(server.writes[1]).toEqual({ ...beforeRename, title: 'Renamed service' });
+  await page.getByRole('button', { name: 'Actions for Renamed service', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Delete', exact: true }).click();
+  const deletion = page.getByRole('dialog', { name: 'Delete dashboard', exact: true });
+  await expect(deletion.locator('[data-dialog-confirm]')).toBeDisabled();
+  await deletion.getByLabel('Confirmation name').fill('Renamed service');
+  await deletion.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('link', { name: 'Renamed service', exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('Search dashboards')).toBeFocused();
+});
+
+test('demo PromQL tile add/edit/delete and variable selection', async ({ page }) => {
+  await demo(page, '/dashboards/01M4J000000000000000000002');
+  await expect(tile(page, 'Host load').getByRole('img')).toBeVisible();
+  await page.getByLabel('Host', { exact: true }).selectOption({ label: 'All' });
+  await expect(page).toHaveURL(/var-host=\.\*/);
+  await page.getByRole('button', { name: 'Add tile', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
+  await editor.getByLabel('Tile title').fill('Metric stat');
+  await editor.getByLabel('Query language').selectOption('promql');
+  await editor.getByLabel('Dataset', { exact: true }).selectOption('$metrics_dataset');
+  await editor
+    .getByRole('textbox', { name: 'PromQL query A', exact: true })
+    .fill('{__name__="system.cpu.load_average.1m",host=~"$host"}');
+  await editor.getByLabel('Chart type').selectOption('query-value');
+  await editor.getByRole('button', { name: 'Add tile', exact: true }).click();
+  await expect(tile(page, 'Metric stat').getByLabel('Metric stat value')).not.toHaveText(
+    'No values returned',
+  );
+  await tileAction(page, 'Metric stat', 'Edit');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('Edited metric');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await tileAction(page, 'Edited metric', 'Delete tile');
+  await page.getByRole('button', { name: 'Delete tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(tile(page, 'Edited metric')).toHaveCount(0);
+});
+
+test('a full-document PUT changes one tile title and keeps every classic field', async ({
+  page,
+}) => {
+  const server = await mockServer(page);
+  await page.goto(detail);
+  await expect(tile(page, 'Host load').getByRole('img')).toBeVisible();
+  await tileAction(page, 'Host load', 'Edit');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('Edited host load');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  const expected = structuredClone(classic);
+  expected.tiles[0].title = 'Edited host load';
+  expect(server.writes).toEqual([expected]);
+  expect(server.calls.some((call) => call.path.endsWith('/add_tile'))).toBe(false);
+});
+
+test('conflict Reload discards my edits and Overwrite saves the explicit copy', async ({
+  page,
+}) => {
+  const server = await mockServer(page);
+  await page.goto(detail);
+  await tileAction(page, 'Host load', 'Edit');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('My edit');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  server.change({ title: 'Server title' });
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  const conflict = page.getByRole('dialog', {
+    name: 'Dashboard changed on the server',
+    exact: true,
+  });
+  await expect(conflict).toBeVisible();
+  expect(server.writes).toHaveLength(0);
+  await conflict.getByRole('button', { name: 'Reload', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Server title', exact: true })).toBeVisible();
+  await expect(tile(page, 'Host load')).toBeVisible();
+  await tileAction(page, 'Host load', 'Edit');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('My overwrite');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  server.change({ title: 'Another server title' });
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await conflict.getByRole('button', { name: 'Overwrite', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  expect(server.writes[0].title).toBe('Server title');
+  expect(server.writes[0].tiles![0].title).toBe('My overwrite');
+});
+
+test('variables re-query SQL and PromQL with concrete request bodies; selections stay in the URL', async ({
+  page,
+}) => {
+  const doc = {
+    ...classic,
+    variables: [
+      ...classic.variables,
+      { name: 'level', label: 'Level', type: 'list', options: ['error', 'warn'], includeAll: true },
+    ],
+    tiles: [
+      classic.tiles[0],
+      {
+        ...classic.tiles[1],
+        tileType: 'code',
+        chartQuery: 'SELECT COUNT(*) AS events FROM "app-logs" WHERE level=\'$level\'',
+      },
+    ],
+  } as Dashboard;
+  const server = await mockServer(page, { document: doc });
+  await page.goto(detail);
+  await expect(tile(page, 'Host load').getByRole('img')).toBeVisible();
+  await page.getByLabel('Host', { exact: true }).selectOption('node-b');
+  await page.getByLabel('Level', { exact: true }).selectOption('warn');
+  await expect
+    .poll(
+      () =>
+        server.calls.filter((call) => call.path === '/prometheus/api/v1/query_range').at(-1)?.body
+          ?.query,
+    )
+    .toContain('host=~"node-b"');
+  await expect
+    .poll(() => server.calls.filter((call) => call.path === '/api/v1/query').at(-1)?.body?.query)
+    .toContain("level='warn'");
+  await expect(page).toHaveURL(/var-host=node-b/);
+  await expect(page).toHaveURL(/var-level=warn/);
+  await page.getByRole('button', { name: 'Add variable', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Add variable', exact: true });
+  await editor.getByLabel('Variable name').fill('note');
+  await editor.getByLabel('Variable label').fill('Note');
+  await editor.getByLabel('Variable type').selectOption('text');
+  await editor.getByLabel('Default value').fill('default');
+  await editor.getByRole('button', { name: 'Add variable', exact: true }).click();
+  await page.getByLabel('Note', { exact: true }).fill('selection');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  expect(server.writes[0].variables).toContainEqual({
+    name: 'note',
+    label: 'Note',
+    type: 'text',
+    defaultValue: 'default',
+  });
+  expect(server.writes[0]).not.toHaveProperty('variableValues');
+});
+
+test('non-owners see read-only tiles, including unknown and unavailable chart placeholders', async ({
+  page,
+}) => {
+  await mockServer(page, { document: { ...classic, author: 'another-owner' } });
+  await page.goto(`${detail}/`);
+  await expect(
+    page.getByText('This dashboard is read-only. Only its owner can edit it.', { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Add tile', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
+  await expect(tile(page, 'AI summary')).toContainText('read-only');
+  await expect(tile(page, 'Distribution')).toContainText(
+    "This chart type isn't available in /next yet",
+  );
+  await expect(
+    tile(page, 'Distribution').getByRole('link', { name: 'Open dashboard in classic UI' }),
+  ).toHaveAttribute('href', detail);
+  await page.getByRole('button', { name: 'Actions for tile Host load', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: 'Edit', exact: true })).toHaveCount(0);
+});
+
+test('PromQL capability off prevents authoring and querying without hiding stored tiles', async ({
+  page,
+}) => {
+  const server = await mockServer(page, {
+    enabled: false,
+    document: { ...classic, tiles: [classic.tiles[0], classic.tiles[1]] },
+  });
+  await page.goto(detail);
+  await expect(tile(page, 'Host load')).toContainText('PromQL dashboard tiles are unavailable');
+  await expect(tile(page, 'Errors').getByRole('img')).toBeVisible();
+  await expect(page.getByLabel('Host', { exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Add tile', exact: true }).click();
+  await expect(page.getByLabel('Query language').locator('option[value="promql"]')).toBeDisabled();
+  expect(server.calls.filter((call) => call.path.startsWith('/prometheus'))).toHaveLength(0);
+});
+
+test('403 reads and saves stay inline without signing the user out', async ({ page }) => {
+  await mockServer(page, { denied: '/api/v1/dashboards' });
+  await page.goto('/dashboards');
+  await expect(page.getByRole('heading', { name: 'Permission denied', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Explore demo data', exact: true })).toHaveCount(0);
+  await page.unroute('**/api/**');
+  const server = await mockServer(page, { denyWrite: true });
+  await page.goto(detail);
+  await tileAction(page, 'Host load', 'Edit');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('Denied edit');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Dashboard update denied');
+  await expect(page).toHaveURL(new RegExp(detail));
+  await expect(page.getByText('Unsaved changes', { exact: true })).toBeVisible();
+  expect(server.writes).toHaveLength(0);
+});
+
+test('builder conversion requires confirmation and a stored pie type is retained on title edit', async ({
+  page,
+}) => {
+  const server = await mockServer(page);
+  await page.goto(detail);
+  await tileAction(page, 'Errors', 'Edit as SQL');
+  const confirmation = page.getByRole('dialog', { name: 'Edit builder tile as SQL?', exact: true });
+  await expect(confirmation).toContainText("visual builder isn't available");
+  await confirmation.getByRole('button', { name: 'Edit as SQL', exact: true }).click();
+  await page
+    .getByRole('dialog', { name: 'Edit tile' })
+    .getByRole('button', { name: 'Apply tile', exact: true })
+    .click();
+  await tileAction(page, 'Distribution', 'Edit');
+  await expect(page.getByLabel('Chart type')).toHaveValue('pie');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('Saved pie');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  expect(server.writes[0].tiles![1].tileType).toBe('code');
+  expect(server.writes[0].tiles![3]).toEqual({ ...classic.tiles[3], title: 'Saved pie' });
+});
+
+test('list uses limit=0, 25-row pagination, search, tabs, tag filters and sorting', async ({
+  page,
+}) => {
+  const rows = Array.from({ length: 31 }, (_, index) => ({
+    ...classic,
+    dashboardId: createUlid(),
+    title: `Dashboard ${String(index).padStart(2, '0')}`,
+    author: index % 2 ? 'other' : classic.author,
+    isFavorite: index % 3 === 0,
+    tags: [index % 2 ? 'shared' : 'mine'],
+  }));
+  const server = await mockServer(page, { rows });
+  await page.goto('/dashboards');
+  await expect(page.getByText('Page 1 of 2', { exact: true })).toBeVisible();
+  await expect(page.locator('tbody tr')).toHaveCount(25);
+  await page.getByRole('button', { name: 'Next page', exact: true }).click();
+  await expect(page.locator('tbody tr')).toHaveCount(6);
+  await page.getByRole('tab', { name: 'Mine', exact: true }).click();
+  await expect(page.locator('tbody tr')).toHaveCount(16);
+  await page.getByRole('tab', { name: 'Favourites', exact: true }).click();
+  await expect(page.locator('tbody tr')).toHaveCount(11);
+  await page.getByRole('tab', { name: 'All', exact: true }).click();
+  await page.getByLabel('Filter by tag').selectOption('shared');
+  await expect(page.locator('tbody tr')).toHaveCount(15);
+  await page.getByLabel('Search dashboards').fill('09');
+  await expect(page.locator('tbody tr')).toHaveCount(1);
+  await page.getByLabel('Search dashboards').fill('');
+  await page.getByLabel('Filter by tag').selectOption('');
+  await page.getByRole('button', { name: 'Reverse sort order', exact: true }).click();
+  await expect(page.locator('tbody tr').first()).toContainText('Dashboard 30');
+  expect(server.calls.find((call) => call.path === '/api/v1/dashboards')?.params.get('limit')).toBe(
+    '0',
+  );
+  expect(server.calls.filter((call) => call.path.startsWith('/api/v1/dashboards/'))).toHaveLength(
+    0,
+  );
+});
+
+test('import accepts a file with promql_query, empty tiles and timeRange; export matches classic', async ({
+  page,
+}) => {
+  const server = await mockServer(page);
+  await page.goto('/dashboards');
+  await page.getByRole('button', { name: 'Import dashboard', exact: true }).click();
+  const importer = page.getByRole('dialog', { name: 'Import dashboard', exact: true });
+  await importer.getByLabel('Dashboard title').fill('File import');
+  const input = { ...classic, tiles: [] };
+  await importer.getByLabel('Upload JSON').setInputFiles({
+    name: 'classic.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(input)),
+  });
+  await importer.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('heading', { name: 'File import', exact: true })).toBeVisible();
+  expect(server.creates[0].variables).toEqual(classic.variables);
+  expect(server.creates[0].timeRange).toEqual(classic.timeRange);
+  expect(server.creates[0].tiles).toEqual([]);
+  await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
+  const download = page.waitForEvent('download');
+  await page.getByRole('menuitem', { name: 'Export JSON', exact: true }).click();
+  const downloaded = await download;
+  const output = test.info().outputPath('export.json');
+  await downloaded.saveAs(output);
+  const exported = JSON.parse(await readFile(output, 'utf8'));
+  expect(Object.keys(exported)).toEqual(['tags', 'variables', 'sections', 'tiles']);
+  expect(exported.variables).toEqual(classic.variables);
+  await page
+    .getByRole('navigation', { name: 'Dashboard breadcrumb' })
+    .getByRole('link', { name: 'Dashboards', exact: true })
+    .click();
+  await page.getByRole('button', { name: 'Import dashboard', exact: true }).click();
+  await importer.getByLabel('Dashboard title').fill('Paste import');
+  await importer.getByLabel('Paste dashboard JSON').fill('{"tiles":[]}');
+  await importer.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('heading', { name: 'Paste import', exact: true })).toBeVisible();
+});
+
+test('live local import retains copies, records identity and requires explicit removal', async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      'parseable-dashboards-v1-live',
+      JSON.stringify([
+        { id: 'local-one', title: 'Local volume', description: 'Keep me', dataset: 'app-logs' },
+      ]),
+    ),
+  );
+  const server = await mockServer(page);
+  await page.goto('/dashboards');
+  await page.getByRole('button', { name: 'Import local dashboards', exact: true }).click();
+  await expect(
+    page.getByRole('button', { name: 'Remove local copies', exact: true }),
+  ).toBeVisible();
+  expect(server.creates[0]).toMatchObject({
+    description: 'Keep me',
+    tiles: [
+      { tileType: 'code', dbName: ['app-logs'], chartQuery: expect.stringContaining('date_trunc') },
+    ],
+  });
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem('parseable-dashboards-import-v1:admin')!).importedIds,
+    ),
+  ).toEqual(['local-one']);
+  expect(
+    await page.evaluate(() => localStorage.getItem('parseable-dashboards-v1-live')),
+  ).not.toBeNull();
+  await page.getByRole('button', { name: 'Remove local copies', exact: true }).click();
+  const confirmation = page.getByRole('dialog', { name: 'Remove local copies?', exact: true });
+  await confirmation.getByRole('button', { name: 'Remove local copies', exact: true }).click();
+  expect(
+    await page.evaluate(() => localStorage.getItem('parseable-dashboards-v1-live')),
+  ).toBeNull();
+});
+
+test('local import reports partial failures and Not now dismisses the notice for this identity', async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      'parseable-dashboards-v1-live',
+      JSON.stringify([
+        { id: 'ok', title: 'Good', description: '', dataset: 'app-logs' },
+        { id: 'bad', title: 'Bad', description: '', dataset: 'app-logs' },
+      ]),
+    ),
+  );
+  await mockServer(page, { failTitle: 'Bad' });
+  await page.goto('/dashboards');
+  await page.getByRole('button', { name: 'Import local dashboards', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Bad: Import denied');
+  await expect(page.getByRole('button', { name: 'Remove local copies', exact: true })).toHaveCount(
+    0,
+  );
+  await page.getByRole('button', { name: 'Not now', exact: true }).click();
+  await page.reload();
+  await expect(page.getByRole('link', { name: classic.title, exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Import local dashboards', exact: true }),
+  ).toHaveCount(0);
+});
+
+test('create-alert URLs are concrete; All is disabled with a tooltip; classic SQL links prefill', async ({
+  page,
+}) => {
+  await mockServer(page);
+  await page.goto(detail);
+  await expect(tile(page, 'Host load').getByRole('img')).toBeVisible();
+  await page.getByLabel('Host', { exact: true }).selectOption({ label: 'All' });
+  await page.getByRole('button', { name: 'Actions for tile Host load', exact: true }).click();
+  const disabled = page.getByRole('menuitem', { name: 'Create alert', exact: true });
+  await expect(disabled).toBeDisabled();
+  await expect(disabled).toHaveAttribute('title', /All/);
+  await page.keyboard.press('Escape');
+  await page.getByLabel('Host', { exact: true }).selectOption('node-b');
+  await tileAction(page, 'Host load', 'Create alert');
+  await expect(page.getByRole('heading', { name: 'New alert', exact: true })).toBeVisible();
+  const url = new URL(page.url());
+  expect(url.pathname).toBe('/alerts/new');
+  expect(url.searchParams.get('dataset')).toBe('otel-metrics');
+  expect(url.searchParams.get('alertQuery')).toContain('host=~"node-b"');
+  expect(url.searchParams.get('queryBuilderType')).toBe('promql');
+  expect(url.searchParams.get('title')).toBe('Host load');
+  await page.goto(
+    '/alerts/create?' +
+      new URLSearchParams({
+        dataset: 'app-logs',
+        queryBuilderType: 'sql',
+        alertQuery: 'SELECT COUNT(*) FROM "app-logs"',
+        title: 'SQL panel',
+      }),
+  );
+  await expect(page).toHaveURL(/\/alerts\/new\?/);
+  await expect(page.getByRole('textbox', { name: 'SQL query', exact: true })).toHaveText(
+    'SELECT COUNT(*) FROM "app-logs"',
+  );
+  await expect(page.getByLabel('Title', { exact: true })).toHaveValue('SQL panel');
+});
+
+test('time ranges refresh every tile and a dirty leave guard lets the user stay or discard', async ({
+  page,
+}) => {
+  const server = await mockServer(page, {
+    document: { ...classic, variables: [], tiles: [classic.tiles[1]] },
+  });
+  await page.goto(detail);
+  await page.getByLabel('Time range', { exact: true }).selectOption('30m');
+  await expect(page).toHaveURL(/range=30m/);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  expect(server.writes[0].timeRange).toMatchObject({
+    startTime: '30m',
+    endTime: 'now',
+    type: 'fixed',
+    interval: 1800000,
+  });
+  const queries = server.calls.filter((call) => call.path === '/api/v1/query').length;
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect
+    .poll(() => server.calls.filter((call) => call.path === '/api/v1/query').length)
+    .toBeGreaterThan(queries);
+  await tileAction(page, 'Errors', 'Edit as SQL');
+  await page
+    .getByRole('dialog', { name: 'Edit builder tile as SQL?', exact: true })
+    .getByRole('button', { name: 'Edit as SQL', exact: true })
+    .click();
+  await page.getByRole('dialog').getByLabel('Tile title').fill('Dirty');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  let leave = false,
+    handled = 0;
+  page.on('dialog', async (dialog) => {
+    if (leave) await dialog.accept();
+    else await dialog.dismiss();
+    handled++;
+  });
+  await page.getByTestId('sidebar-dashboards').click();
+  await expect.poll(() => handled).toBe(1);
+  await expect(page.getByRole('heading', { name: classic.title, exact: true })).toBeVisible();
+  leave = true;
+  await page.getByTestId('sidebar-dashboards').click();
+  await expect(page.getByRole('heading', { name: 'Dashboards', exact: true })).toBeVisible();
+});
+
+test('a late tile response cannot replace the result of a new variable selection', async ({
+  page,
+}) => {
+  await mockServer(page, {
+    document: {
+      ...classic,
+      variables: [
+        {
+          name: 'level',
+          label: 'Level',
+          type: 'list',
+          options: ['error', 'warn'],
+          defaultValue: 'error',
+        },
+      ],
+      tiles: [
+        {
+          ...classic.tiles[1],
+          tileType: 'code',
+          chartType: 'query-value',
+          chartQuery: 'SELECT COUNT(*) AS events FROM "app-logs" WHERE level=\'$level\'',
+        },
+      ],
+    },
+  });
+  let release!: () => void,
+    started = false,
+    finished = false;
+  const oldResponse = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/v1/query', async (route) => {
+    const old = route.request().postDataJSON().query.includes("level='error'");
+    if (old) {
+      started = true;
+      await oldResponse;
+    }
+    await route.fulfill({ json: [{ events: old ? 111 : 222 }] }).catch(() => undefined);
+    if (old) finished = true;
+  });
+  await page.goto(detail);
+  await expect.poll(() => started).toBe(true);
+  await page.getByLabel('Level', { exact: true }).selectOption('warn');
+  await expect(tile(page, 'Errors').getByLabel('Errors value')).toHaveText('222');
+  release();
+  await expect.poll(() => finished).toBe(true);
+  await expect(tile(page, 'Errors').getByLabel('Errors value')).toHaveText('222');
+});
+
+test('pending saves freeze document edits and a failed save keeps the complete draft', async ({
+  page,
+}) => {
+  await mockServer(page, { document: { ...classic, tiles: [classic.tiles[0]] } });
+  let release!: () => void,
+    started = false;
+  const saving = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/v1/dashboards/' + id, async (route) => {
+    if (route.request().method() !== 'PUT') return route.fallback();
+    started = true;
+    await saving;
+    await route.fulfill({
+      status: 400,
+      body: 'Cannot perform this operation: User is not authorized',
+    });
+  });
+  await page.goto(detail);
+  await tileAction(page, 'Host load', 'Edit');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('Keep my edit');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect.poll(() => started).toBe(true);
+  await expect(page.getByRole('button', { name: 'Add tile', exact: true })).toBeDisabled();
+  await expect(page.getByLabel('Time range', { exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Actions for tile Keep my edit', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: 'Edit', exact: true })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  release();
+  await expect(page.getByRole('alert')).toContainText('User is not authorized');
+  await expect(page.getByText('Unsaved changes', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+  await expect(tile(page, 'Keep my edit')).toBeVisible();
+});
+
+for (const theme of ['light', 'dark'])
+  for (const surface of ['list', 'view', 'editor'])
+    test(`axe ${theme} on dashboard ${surface}`, async ({ page }) => {
+      await page.addInitScript((theme) => localStorage.setItem('parseable-theme', theme), theme);
+      await demo(
+        page,
+        surface === 'list' ? '/dashboards' : '/dashboards/01M4J000000000000000000001',
+      );
+      if (surface === 'list')
+        await expect(
+          page.getByRole('link', { name: 'Application signals', exact: true }),
+        ).toBeVisible();
+      else await expect(tile(page, 'Request duration').getByRole('img')).toBeVisible();
+      if (surface === 'editor') await tileAction(page, 'Request duration', 'Edit');
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      await axe(page);
+    });
+
+test('390px contains list, tiles and the editor; keyboard tile actions remain reachable', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await demo(page);
+  await expect(page.getByRole('link', { name: 'Application signals', exact: true })).toBeVisible();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+  ).toBeLessThanOrEqual(1);
+  await page.getByRole('link', { name: 'Application signals', exact: true }).click();
+  await expect(tile(page, 'Request duration').getByRole('img')).toBeVisible();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+  ).toBeLessThanOrEqual(1);
+  const actions = page.getByRole('button', {
+    name: 'Actions for tile Request duration',
+    exact: true,
+  });
+  await actions.focus();
+  await page.keyboard.press('ArrowDown');
+  await expect(page.getByRole('menuitem', { name: 'Edit', exact: true })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('dialog', { name: 'Edit tile', exact: true })).toBeVisible();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+  ).toBeLessThanOrEqual(1);
+  await axe(page);
+});

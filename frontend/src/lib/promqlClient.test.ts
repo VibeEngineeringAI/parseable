@@ -314,6 +314,8 @@ describe('metrics capabilities and dataset discovery', () => {
       oidcRoleMapping: false,
       oidcRoleSync: false,
       promqlAlerts: false,
+      promqlDashboard: false,
+      promqlMetadata: false,
       promql,
     });
   });

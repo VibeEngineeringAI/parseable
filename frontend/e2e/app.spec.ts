@@ -79,72 +79,64 @@ test('narrow-screen navigation retains accessible links and contained layout', a
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
-test('a dashboard persists locally and deletion requires confirmation', async ({ page }) => {
+test('demo dashboards survive navigation and deletion requires a typed name', async ({ page }) => {
   await demo(page, '/dashboards');
   await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Create dashboard' });
-  await dialog.getByLabel('Dashboard name').fill('Production signals');
+  await dialog.getByLabel('Dashboard title').fill('Production signals');
   await dialog.getByLabel('Description').fill('Application event volume');
-  await dialog.getByLabel('Dataset', { exact: true }).selectOption('application_logs');
   await dialog.getByRole('button', { name: 'Create dashboard', exact: true }).click();
   await expect(
     page.getByRole('heading', { name: 'Production signals', exact: true }),
   ).toBeVisible();
-  await page.reload();
-  await expect(
-    page.getByRole('heading', { name: 'Production signals', exact: true }),
-  ).toBeVisible();
-  await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
-  await dialog.getByLabel('Dashboard name').fill(' production SIGNALS ');
-  await expect(dialog.getByLabel('Dashboard name')).toHaveAccessibleDescription(
-    'A dashboard with this name already exists.',
-  );
-  await expect(
-    dialog.getByRole('button', { name: 'Create dashboard', exact: true }),
-  ).toBeDisabled();
-  await page.keyboard.press('Escape');
-  await page.getByRole('button', { name: 'Delete dashboard Production signals' }).click();
-  await expect(page.getByRole('dialog', { name: 'Delete dashboard?' })).toBeVisible();
-  await page.keyboard.press('Escape');
-  await expect(
-    page.getByRole('heading', { name: 'Production signals', exact: true }),
-  ).toBeVisible();
-  await page.getByRole('button', { name: 'Delete dashboard Production signals' }).click();
   await page
-    .getByRole('dialog')
-    .getByRole('button', { name: 'Delete dashboard', exact: true })
+    .getByRole('navigation', { name: 'Dashboard breadcrumb' })
+    .getByRole('link', { name: 'Dashboards' })
     .click();
-  await expect(page.getByRole('heading', { name: 'Production signals', exact: true })).toHaveCount(
-    0,
-  );
-  await page.reload();
-  await expect(page.getByRole('heading', { name: 'Production signals', exact: true })).toHaveCount(
-    0,
-  );
+  await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
+  await dialog.getByLabel('Dashboard title').fill('Production signals');
+  await dialog.getByRole('button', { name: 'Create dashboard', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Dashboard title must be unique');
+  await page.keyboard.press('Escape');
+  const actions = page.getByRole('button', { name: 'Actions for Production signals', exact: true });
+  await actions.click();
+  await page.getByRole('menuitem', { name: 'Delete', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Delete dashboard', exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('link', { name: 'Production signals', exact: true })).toBeVisible();
+  await actions.click();
+  await page.getByRole('menuitem', { name: 'Delete', exact: true }).click();
+  const confirmation = page.getByRole('dialog', { name: 'Delete dashboard', exact: true });
+  await expect(confirmation.locator('[data-dialog-confirm]')).toBeDisabled();
+  await confirmation.getByLabel('Confirmation name').fill('Production signals');
+  await confirmation.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('link', { name: 'Production signals', exact: true })).toHaveCount(0);
 });
 
-test('dashboards saved with duplicate titles get distinct delete labels', async ({ page }) => {
-  await page.addInitScript(() => {
-    const dashboard = { description: '', dataset: 'application_logs', title: 'API errors' };
+test('demo dashboards use fresh per-client state and ignore legacy localStorage', async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
     localStorage.setItem(
       'parseable-dashboards-v1-demo',
       JSON.stringify([
-        { ...dashboard, id: 'a' },
-        { ...dashboard, id: 'b' },
+        { id: 'a', title: 'Legacy dashboard', description: '', dataset: 'application_logs' },
       ]),
-    );
-  });
+    ),
+  );
   await demo(page, '/dashboards');
-  await expect(
-    page.getByRole('button', { name: 'Delete dashboard API errors', exact: true }),
-  ).toHaveCount(1);
-  await page.getByRole('button', { name: 'Delete dashboard API errors (2)', exact: true }).click();
-  await page
-    .getByRole('dialog')
-    .getByRole('button', { name: 'Delete dashboard', exact: true })
-    .click();
-  await expect(page.getByRole('heading', { name: 'API errors (2)', exact: true })).toHaveCount(0);
-  await expect(page.getByRole('heading', { name: 'API errors', exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Legacy dashboard', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Application signals', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Create dashboard' });
+  await dialog.getByLabel('Dashboard title').fill('Ephemeral demo');
+  await dialog.getByRole('button', { name: 'Create dashboard', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Ephemeral demo', exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Could not load data' })).toBeVisible();
+  await page.getByTestId('sidebar-dashboards').click();
+  await expect(page.getByRole('link', { name: 'Ephemeral demo', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Application signals', exact: true })).toBeVisible();
 });
 
 test('dataset search and schema inspection lead to the matching explorer', async ({ page }) => {

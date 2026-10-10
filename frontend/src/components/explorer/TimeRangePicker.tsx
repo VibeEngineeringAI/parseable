@@ -6,9 +6,19 @@ import type { TimeRange } from '../../lib/types';
 export function TimeRangePicker({
   value,
   onChange,
+  disabled = false,
+  presets = [
+    { value: '15m', label: 'Last 15 minutes' },
+    { value: '1h', label: 'Last 1 hour' },
+    { value: '6h', label: 'Last 6 hours' },
+    { value: '24h', label: 'Last 24 hours' },
+    { value: '7d', label: 'Last 7 days' },
+  ],
 }: {
   value: TimeRange;
   onChange: (value: TimeRange) => void;
+  disabled?: boolean;
+  presets?: ReadonlyArray<{ value: Extract<TimeRange, string>; label: string }>;
 }) {
   const [open, setOpen] = useState(false);
   const [from, setFrom] = useState('');
@@ -26,19 +36,26 @@ export function TimeRangePicker({
       <Clock size={15} aria-hidden="true" />
       <Select
         aria-label="Time range"
+        disabled={disabled}
         value={typeof value === 'string' ? value : 'custom'}
         onChange={(e) =>
           e.target.value === 'custom' ? begin() : onChange(e.target.value as TimeRange)
         }
       >
-        <option value="15m">Last 15 minutes</option>
-        <option value="1h">Last 1 hour</option>
-        <option value="6h">Last 6 hours</option>
-        <option value="24h">Last 24 hours</option>
-        <option value="7d">Last 7 days</option>
+        {presets.map(({ value, label }) => (
+          <option key={value} value={value}>
+            {label}
+          </option>
+        ))}
         <option value="custom">Custom range</option>
       </Select>
-      <Button size="icon" variant="ghost" aria-label="Choose absolute time range" onClick={begin}>
+      <Button
+        size="icon"
+        variant="ghost"
+        aria-label="Choose absolute time range"
+        disabled={disabled}
+        onClick={begin}
+      >
         <CalendarDays size={15} />
       </Button>
       <Dialog

@@ -9,6 +9,7 @@ export type ActionsMenuItem = {
   onSelect: () => void;
   disabled?: boolean;
   destructive?: boolean;
+  description?: string;
 };
 
 /** A menu button with roving focus. The portal keeps menus out of scrolling table clips. */
@@ -155,6 +156,8 @@ export function ActionsMenu({
                 role="menuitem"
                 tabIndex={-1}
                 disabled={item.disabled}
+                title={item.description}
+                aria-description={item.description}
                 data-destructive={item.destructive || undefined}
                 onClick={() => {
                   close();

@@ -1,3 +1,4 @@
+import { createPromqlMetadata } from '../../lib/promqlMetadata';
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import {
@@ -12,12 +13,11 @@ import {
 } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
-import { PromqlEditor, type PromqlMetadataSource } from '../../components/promql/PromqlEditor';
+import { PromqlEditor } from '../../components/promql/PromqlEditor';
 import { SqlEditor } from '../sql/SqlEditor';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
-import { matcher } from '../../lib/promql';
 import { alert as isAlert } from '../../lib/alertsContract';
 import type { Alert } from '../../lib/types';
 import { AlertPreview } from './AlertPreview';
@@ -33,7 +33,8 @@ import {
   validateAlert,
   type AlertDraft,
 } from './helpers';
-import { useAlertAccess, useLeaveGuard } from './shared';
+import { useAlertAccess } from './shared';
+import { useLeaveGuard } from '../../hooks/useLeaveGuard';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 import { useTouchedErrors } from '../../hooks/useTouchedErrors';
@@ -139,35 +140,8 @@ function AlertFormFields({
   const choices = draft.type === 'promql' ? (metrics.data?.datasets ?? []) : (datasets.data ?? []);
   const unchecked = draft.type === 'promql' ? (metrics.data?.unchecked ?? []) : [];
   // Keep completion scoped to the selected dataset; changing the query does not reset it.
-  const metadata = useMemo<PromqlMetadataSource>(
-    () => ({
-      metricNames: async (signal) =>
-        (await client.promqlLabelValues('__name__', { stream: draft.dataset, limit: 1000 }, signal))
-          .data,
-      labelNames: async (metric, signal) =>
-        (
-          await client.promqlLabels(
-            {
-              stream: draft.dataset,
-              limit: 1000,
-              ...(metric ? { match: [`{${matcher('__name__', metric)}}`] } : {}),
-            },
-            signal,
-          )
-        ).data,
-      labelValues: async (label, metric, signal) =>
-        (
-          await client.promqlLabelValues(
-            label,
-            {
-              stream: draft.dataset,
-              limit: 1000,
-              ...(metric ? { match: [`{${matcher('__name__', metric)}}`] } : {}),
-            },
-            signal,
-          )
-        ).data,
-    }),
+  const metadata = useMemo(
+    () => createPromqlMetadata(client, draft.dataset),
     [client, draft.dataset],
   );
   function update<K extends keyof AlertDraft>(key: K, value: AlertDraft[K]) {

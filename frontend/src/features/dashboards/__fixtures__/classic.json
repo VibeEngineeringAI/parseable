@@ -1,0 +1,112 @@
+{
+  "dashboardId": "01JZ8Y3KQ4V9M2X7T5R1B6N0EW",
+  "version": "v1",
+  "title": "Service health",
+  "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+  "created": "2026-09-01T10:00:00Z",
+  "modified": "2026-10-10T08:00:00Z",
+  "tenantId": "example",
+  "tags": ["prod"],
+  "isFavorite": true,
+  "dashboardType": "Report",
+  "description": "Classic report",
+  "timeRange": {
+    "startTime": "1h",
+    "endTime": "now",
+    "type": "fixed",
+    "label": "Last 1 hour",
+    "interval": 3600000,
+    "shiftInterval": 1
+  },
+  "variables": [
+    {
+      "name": "metrics_dataset",
+      "label": "Metrics dataset",
+      "type": "dataset",
+      "defaultValue": "otel-metrics",
+      "customVariable": true
+    },
+    {
+      "name": "host",
+      "label": "Host",
+      "type": "promql",
+      "dataset": "$metrics_dataset",
+      "labelName": "host",
+      "includeAll": true
+    },
+    {
+      "name": "result",
+      "label": "Result",
+      "type": "promql_query",
+      "promqlQuery": "up",
+      "promqlQueryDataset": "$metrics_dataset"
+    }
+  ],
+  "sections": [
+    { "sectionId": "classic-section", "title": "Health", "isExpanded": false, "future": 1 }
+  ],
+  "future": { "important": [1, 2, 3] },
+  "tiles": [
+    {
+      "tile_id": "01JZ8Y5R7B2K9WQ0X4F6M1T3HD",
+      "title": "Host load",
+      "tileType": "promql",
+      "chartType": "timeseries",
+      "chartQuery": ["avg by (host) ({__name__=\"system.cpu.load_average.15m\",host=~\"$host\"})"],
+      "promqlQueryType": ["range"],
+      "dbName": "$metrics_dataset",
+      "config": {
+        "type": "timeseries",
+        "colourScheme": "purple",
+        "layout": {
+          "legendPosition": "bottom",
+          "label": true,
+          "precision": 3,
+          "unit": "load",
+          "future": "keep"
+        },
+        "axes": {
+          "x": { "field": "time", "title": "Time", "display": false },
+          "y": { "title": "Load", "beginAtZero": true }
+        },
+        "advanced": { "tooltip": { "mode": "index" } },
+        "unknown": 17
+      },
+      "layout": { "x": 0, "y": 0, "w": 6, "h": 6, "static": true },
+      "sectionId": "classic-section",
+      "unknownTile": { "keep": true }
+    },
+    {
+      "tile_id": "01JZ8Y4A0C7H3GQ5P2W9D8S6VF",
+      "title": "Errors",
+      "tileType": "builder",
+      "chartType": "bar",
+      "chartQuery": "SELECT COUNT(*) AS errors FROM \"app-logs\"",
+      "dbName": ["app-logs"],
+      "layout": { "x": 6, "y": 0, "w": 6, "h": 6 },
+      "config": { "colourScheme": "classic", "layout": { "stacked": true } }
+    },
+    {
+      "tile_id": "01JZ8Y4A0C7H3GQ5P2W9D8S6VG",
+      "title": "AI summary",
+      "tileType": "ai",
+      "authorMode": "generate",
+      "chartQuery": { "legacy": true },
+      "ai": { "prompt": "keep" },
+      "layout": { "x": 0, "y": 6, "w": 6, "h": 6 }
+    },
+    {
+      "tile_id": "01JZ8Y4A0C7H3GQ5P2W9D8S6VH",
+      "title": "Distribution",
+      "tileType": "code",
+      "chartType": "pie",
+      "chartQuery": "SELECT level, COUNT(*) AS events FROM \"app-logs\" GROUP BY level",
+      "dbName": ["app-logs"],
+      "config": {
+        "type": "pie",
+        "layout": { "segments": { "value": [10, 90], "isPercent": true } }
+      },
+      "layout": { "x": 6, "y": 6, "w": 6, "h": 6 }
+    }
+  ]
+}

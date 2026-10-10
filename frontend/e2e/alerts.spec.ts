@@ -475,11 +475,17 @@ test('validation errors describe their controls and block invalid thresholds, fr
 test('dirty form blocks sidebar navigation and browser Back until confirmed', async ({ page }) => {
   await demo(page);
   await createPromql(page);
-  const dismiss = (dialog: import('@playwright/test').Dialog) => dialog.dismiss();
+  let handled = 0;
+  const dismiss = async (dialog: import('@playwright/test').Dialog) => {
+    await dialog.dismiss();
+    handled++;
+  };
   page.on('dialog', dismiss);
   await page.getByTestId('sidebar-metrics').click();
+  await expect.poll(() => handled).toBe(1);
   await expect(page).toHaveURL(/\/alerts\/new$/);
   await page.goBack();
+  await expect.poll(() => handled).toBe(2);
   await expect(page).toHaveURL(/\/alerts\/new$/);
   await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Test threshold');
   page.off('dialog', dismiss);
@@ -1198,6 +1204,8 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   const plot = page.locator('.uplot');
   await expect(plot).toBeVisible();
   await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
+  // An unrelated state mutation must retain the chart even across clock seconds.
+  await page.clock.setFixedTime(new Date(Date.now() + 60_000));
   await page.getByRole('button', { name: 'Mute', exact: true }).click();
   await page
     .getByRole('dialog', { name: 'Mute notifications' })

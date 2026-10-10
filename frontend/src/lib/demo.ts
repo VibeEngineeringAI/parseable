@@ -11,6 +11,7 @@ import type {
 import { ApiError } from './client';
 import { createDemoMetrics } from './demoMetrics';
 import { createDemoAlerts } from './demoAlerts';
+import { createDemoDashboards } from './demoDashboards';
 import { alertDuration } from '../features/alerts/helpers';
 import { validateName } from '../features/team/helpers';
 
@@ -258,6 +259,7 @@ export function createDemoClient(): ParseableClient {
   const records = createDemoRecords(fixtureTime - 1_000);
   const metrics = createDemoMetrics(fixtureTime);
   const alerts = createDemoAlerts(fixtureTime);
+  const dashboards = createDemoDashboards(fixtureTime);
   const roles: Roles = {
     administrators: [{ privilege: 'admin' }],
     analysts: [{ privilege: 'reader', resource: { stream: 'application_logs' } }],
@@ -420,6 +422,7 @@ export function createDemoClient(): ParseableClient {
   return {
     ...metrics,
     ...alerts,
+    ...dashboards,
     async about(signal) {
       await ready(signal);
       return {
@@ -429,6 +432,8 @@ export function createDemoClient(): ParseableClient {
           oidcRoleSync: true,
           promql: true,
           promqlAlerts: true,
+          promqlDashboard: true,
+          promqlMetadata: true,
         },
       };
     },

@@ -32,7 +32,18 @@ export type DatasetInfo = {
   latestEventAt?: string;
 };
 export type LogRecord = Record<string, unknown>;
-export type TimeRange = '15m' | '1h' | '6h' | '24h' | '7d' | { startTime: string; endTime: string };
+export type TimeRange =
+  | '10m'
+  | '15m'
+  | '30m'
+  | '1h'
+  | '5h'
+  | '6h'
+  | '1d'
+  | '24h'
+  | '3d'
+  | '7d'
+  | { startTime: string; endTime: string };
 export type QueryRequest = { sql: string; startTime: string; endTime: string };
 export type LogFilter = { id: string; field: string; operator: '=' | '!='; value: string };
 export type SessionIdentity = {
@@ -81,6 +92,8 @@ export type About = {
     oidcRoleSync: boolean;
     promql: boolean;
     promqlAlerts: boolean;
+    promqlDashboard: boolean;
+    promqlMetadata: boolean;
   };
 };
 export type AlertSeverity = 'critical' | 'high' | 'medium' | 'low';
@@ -191,6 +204,44 @@ export type ApiKey = {
   createdAt: string;
   modifiedAt: string;
 };
+// Dashboard and tile extras are part of the classic contract. Keep the fetched document
+// intact and patch it; a narrower editor model must never become the PUT body.
+export type DashboardTile = { tile_id: string; [key: string]: unknown };
+export type DashboardSummary = {
+  dashboardId: string;
+  title: string;
+  author?: string | null;
+  created?: string | null;
+  modified?: string | null;
+  tags?: string[] | null;
+  isFavorite?: boolean | null;
+  [key: string]: unknown;
+};
+export type DashboardRequest = {
+  title: string;
+  tiles?: DashboardTile[] | null;
+  tags?: string[] | null;
+  isFavorite?: boolean | null;
+  [key: string]: unknown;
+};
+export type Dashboard = DashboardSummary & DashboardRequest;
+export type DashboardVariable = {
+  name: string;
+  label: string;
+  type: 'promql' | 'promql_query' | 'sql' | 'list' | 'text' | 'dataset';
+  dataset?: string;
+  labelName?: string;
+  metric?: string;
+  labelFilters?: Array<{ label: string; operator: '=' | '!=' | '=~' | '!~'; value: string }>;
+  options?: string[];
+  sqlQuery?: string;
+  promqlQuery?: string;
+  promqlQueryDataset?: string;
+  promqlQueryLabel?: string;
+  includeAll?: boolean;
+  defaultValue?: string;
+  [key: string]: unknown;
+};
 export interface ParseableClient {
   identity(signal?: AbortSignal): Promise<SessionIdentity | undefined>;
   listDatasets(signal?: AbortSignal): Promise<Dataset[]>;
@@ -208,6 +259,11 @@ export interface ParseableClient {
   login(username: string, password: string, returnPath?: string): Promise<void>;
   logout(): Promise<void>;
   about(signal?: AbortSignal): Promise<About>;
+  listDashboards(signal?: AbortSignal): Promise<DashboardSummary[]>;
+  getDashboard(id: string, signal?: AbortSignal): Promise<Dashboard>;
+  createDashboard(body: DashboardRequest): Promise<Dashboard>;
+  updateDashboard(id: string, body: DashboardRequest): Promise<Dashboard>;
+  deleteDashboard(id: string): Promise<void>;
   listAlerts(signal?: AbortSignal): Promise<AlertSummary[]>;
   getAlert(id: string, signal?: AbortSignal): Promise<Alert>;
   createAlert(alert: AlertRequest): Promise<Alert>;

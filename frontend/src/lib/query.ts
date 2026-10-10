@@ -1,10 +1,15 @@
 import type { LogFilter, TimeRange } from './types';
 
 const durations: Record<Extract<TimeRange, string>, number> = {
+  '10m': 10 * 60_000,
   '15m': 15 * 60_000,
+  '30m': 30 * 60_000,
   '1h': 60 * 60_000,
+  '5h': 5 * 60 * 60_000,
   '6h': 6 * 60 * 60_000,
+  '1d': 24 * 60 * 60_000,
   '24h': 24 * 60 * 60_000,
+  '3d': 3 * 24 * 60 * 60_000,
   '7d': 7 * 24 * 60 * 60_000,
 };
 
