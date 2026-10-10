@@ -1,3 +1,4 @@
+import { parser } from '@prometheus-io/lezer-promql';
 import { describe, expect, it, vi } from 'vitest';
 import {
   allValue,
@@ -19,6 +20,15 @@ import {
 import type { DashboardVariable, ParseableClient } from '../../lib/types';
 const dataset: DashboardVariable = { name: 'ds', label: 'Dataset', type: 'dataset' };
 const bounds = { startTime: '2026-10-10T00:00:00Z', endTime: '2026-10-10T01:00:00Z' };
+function parseErrors(query: string) {
+  const errors: number[] = [];
+  parser.parse(query).iterate({
+    enter(node) {
+      if (node.type.isError) errors.push(node.from);
+    },
+  });
+  return errors;
+}
 describe('classic interpolation', () => {
   it('supports both placeholder forms, array alternations, unresolved and empty arrays', () => {
     expect(interpolate('$v ${v} $other', { v: ['a', 'b'] })).toBe('(a|b) (a|b) $other');
@@ -34,8 +44,19 @@ describe('classic interpolation', () => {
       'up{host=~"(a\\\\.b|c\\\\|d)"}',
     );
     expect(interpolatePromql('up{host="$v",region!="$v"}', { v: '.*' })).toBe(
-      'up{host=~".*",region!=~".*"}',
+      'up{host=~".*",region!=".*"}',
     );
+  });
+  it('produces PromQL the Lezer grammar parses for every All operator', () => {
+    for (const template of [
+      'up{host="$v",region!="$v"}',
+      'up{host = "$v", region != "$v"}',
+      'up{host=~"$v",region!~"$v"}',
+      'sum(rate(up{host="$v"}[5m])) by (host)',
+    ]) {
+      const query = interpolatePromql(template, { v: '.*' });
+      expect(parseErrors(query), query).toEqual([]);
+    }
   });
   it('quotes dataset identifiers, SQL literals, arrays and embedded literal values', () => {
     const values = { ds: 'a"b', host: ["a'b", 'c'], word: "x'y" };
@@ -52,6 +73,18 @@ describe('classic interpolation', () => {
     expect(interpolateSql("SELECT '$v'", { v: '$other', other: 'injected' })).toBe(
       "SELECT '$other'",
     );
+  });
+  it('keeps escaping literals after SQL comments that contain apostrophes', () => {
+    const values = { v: "O'Brien", ds: "x'y" };
+    expect(interpolateSql("-- user's filter\nSELECT * FROM logs WHERE name='$v'", values)).toBe(
+      "-- user's filter\nSELECT * FROM logs WHERE name='O''Brien'",
+    );
+    expect(
+      interpolateSql("/* user's\n filter */ SELECT * FROM logs WHERE name='$v' /* '$v */", values),
+    ).toBe("/* user's\n filter */ SELECT * FROM logs WHERE name='O''Brien' /* '$v */");
+    expect(
+      interpolateSql("SELECT '--', '/*' FROM $ds WHERE name='$v' -- $v", values, [dataset]),
+    ).toBe("SELECT '--', '/*' FROM \"x'y\" WHERE name='O''Brien' -- $v");
   });
   it('leaves unknown dollar tokens untouched in generic, SQL and PromQL interpolation', () => {
     const sql =
@@ -145,6 +178,37 @@ describe('variable option sources', () => {
       expect.objectContaining({ stream: 'metrics', match: ['{__name__="up"}'] }),
       signal,
     );
+    vi.mocked(c.promqlLabelValues).mockClear();
+    await loadVariableOptions(
+      c,
+      {
+        ...v,
+        type: 'promql',
+        dataset: '$ds',
+        labelName: 'host',
+        labelFilters: [
+          { label: 'path', operator: '=', value: '$path' },
+          { label: 'quote', operator: '!=', value: '$quote' },
+          { label: 'region', operator: '=', value: '$region' },
+          { label: 'zone', operator: '!=', value: '${region}' },
+          { label: 'rack', operator: '=~', value: '$region' },
+          { label: 'env', operator: '=', value: '' },
+          { label: ' ', operator: '=', value: 'prod' },
+          { label: 'team', operator: '=', value: '  ' },
+        ],
+      },
+      { ...values, path: 'C:\\Users', quote: 'a"b', region: '.*' },
+      [dataset],
+      bounds,
+      signal,
+    );
+    const match = '{path="C:\\\\Users",quote!="a\\"b",region=~".*",rack=~".*"}';
+    expect(c.promqlLabelValues).toHaveBeenCalledWith(
+      'host',
+      expect.objectContaining({ stream: 'metrics', match: [match] }),
+      signal,
+    );
+    expect(parseErrors(match)).toEqual([]);
     expect(
       await loadVariableOptions(
         c,

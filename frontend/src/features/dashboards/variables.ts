@@ -37,17 +37,23 @@ export function interpolate(value: string, values: VariableValues): string {
         : selection;
   });
 }
+function substitutePromql(
+  query: string,
+  values: VariableValues,
+  escape: (value: string) => string,
+): string {
+  return query.replace(placeholder, (token, name) => {
+    const selection = valueFor(values, name);
+    return selection === undefined || (Array.isArray(selection) && !selection.length)
+      ? token
+      : Array.isArray(selection)
+        ? `(${selection.map((value) => escape(regexEscape(value))).join('|')})`
+        : escape(selection);
+  });
+}
+/** All (`.*`) turns `=` into a regex match; `!=".*"` already excludes nothing and stays. */
 export function interpolatePromql(query: string, values: VariableValues): string {
-  return query
-    .replace(placeholder, (token, name) => {
-      const selection = valueFor(values, name);
-      return selection === undefined || (Array.isArray(selection) && !selection.length)
-        ? token
-        : Array.isArray(selection)
-          ? `(${selection.map((value) => promqlEscape(regexEscape(value))).join('|')})`
-          : promqlEscape(selection);
-    })
-    .replace(/(!?)=\s*"(\.\*)"/g, '$1=~"$2"');
+  return substitutePromql(query, values, promqlEscape).replace(/(?<![!=<>])=\s*"\.\*"/g, '=~".*"');
 }
 /** Matches classic quoting rules for stream identifiers, SQL literals and comma lists. */
 export function interpolateSql(
@@ -55,24 +61,20 @@ export function interpolateSql(
   values: VariableValues,
   variables: DashboardVariable[] = [],
 ): string {
-  const datasets = variables.filter((variable) => variable.type === 'dataset');
-  let resolved = query;
-  for (const variable of datasets) {
-    const value = valueFor(values, variable.name),
+  const datasetNames = new Set(
+    variables.filter((variable) => variable.type === 'dataset').map((variable) => variable.name),
+  );
+  const dataset = (name: string) => {
+    const value = valueFor(values, name),
       selection = Array.isArray(value) ? value[0] : value;
-    if (!selection) continue;
-    const name = regexEscape(variable.name),
-      quoted = identifier(selection);
-    resolved = resolved.replace(
-      new RegExp(`"\\$\\{${name}\\}"|"\\$${name}"|\\$\\{${name}\\}|\\$${name}\\b`, 'g'),
-      () => quoted,
-    );
-  }
-  const datasetNames = new Set(datasets.map((variable) => variable.name));
-  // One lexical pass prevents a value containing "$other" from being interpolated again.
-  return resolved.replace(
-    /'(?:''|[^'])*'|"(\$\{?(\w+)\}?)"|\$\{?(\w+)\}?/g,
+    return selection ? identifier(selection) : undefined;
+  };
+  // One lexical pass prevents a value containing "$other", quotes or comment markers from being
+  // lexed again; comments are kept verbatim so their apostrophes cannot open a literal.
+  return query.replace(
+    /--[^\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(\$\{?(\w+)\}?)"|\$\{?(\w+)\}?/g,
     (token, quoted, name, bare) => {
+      if (token.startsWith('--') || token.startsWith('/*')) return token;
       if (token.startsWith("'")) {
         const contents = token.slice(1, -1),
           exact = /^\$\{?(\w+)\}?$/.exec(contents);
@@ -84,14 +86,18 @@ export function interpolateSql(
             .join(',');
         }
         return `'${contents.replace(placeholder, (token, name) => {
-          if (datasetNames.has(name)) return token;
+          if (datasetNames.has(name)) {
+            const stream = dataset(name);
+            return stream === undefined ? token : sqlEscape(stream);
+          }
           const value = valueFor(values, name),
             selection = Array.isArray(value) ? value[0] : value;
           return selection === undefined ? token : sqlEscape(selection);
         })}'`;
       }
       const variable = name ?? bare;
-      if (!variable || datasetNames.has(variable)) return token;
+      if (!variable) return token;
+      if (datasetNames.has(variable)) return dataset(variable) ?? token;
       const value = valueFor(values, variable);
       if (value === undefined || (Array.isArray(value) && !value.length)) return token;
       const selections = Array.isArray(value) ? value : [value];
@@ -168,9 +174,15 @@ export async function loadVariableOptions(
   } else if (variable.type === 'promql') {
     const stream = resolveDataset(variable.dataset ?? '', values);
     if (!stream) throw new Error('Select a dataset for this variable.');
-    const filters = (variable.labelFilters ?? []).map((filter) =>
-      matcher(filter.label, interpolatePromql(filter.value, values), filter.operator),
-    );
+    // matcher() quotes the raw value; All widens `=` and makes `!=` a no-op.
+    const filters = (variable.labelFilters ?? []).flatMap((filter) => {
+      const label = filter.label.trim(),
+        value = substitutePromql(filter.value, values, (value) => value);
+      if (!label || !value.trim()) return [];
+      if (value !== '.*') return [matcher(label, value, filter.operator)];
+      if (filter.operator === '!=') return [];
+      return [matcher(label, value, filter.operator === '=' ? '=~' : filter.operator)];
+    });
     if (variable.metric) filters.unshift(matcher('__name__', variable.metric));
     options = (
       await client.promqlLabelValues(
