@@ -313,6 +313,7 @@ describe('metrics capabilities and dataset discovery', () => {
     expect((await createClient({ mode: 'live' }).about()).capabilities).toEqual({
       oidcRoleMapping: false,
       oidcRoleSync: false,
+      promqlAlerts: false,
       promql,
     });
   });

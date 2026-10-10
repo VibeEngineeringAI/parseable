@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import type { Meta, StoryObj } from '@storybook/react-vite';
 import { TimeSeriesChart, type ChartSeries, type TimeSeriesChartProps } from './TimeSeriesChart';
 
@@ -20,6 +20,25 @@ function DarkChart(args: TimeSeriesChartProps) {
     };
   }, []);
   return <TimeSeriesChart {...args} />;
+}
+
+function RerenderingChart(args: TimeSeriesChartProps) {
+  const [revision, setRevision] = useState(0);
+  const [threshold, setThreshold] = useState(2);
+  const [end, setEnd] = useState(timestamps[0] + 3000);
+  return (
+    <>
+      <button onClick={() => setRevision((value) => value + 1)}>Render again</button>
+      <button onClick={() => setThreshold((value) => value + 1)}>Raise threshold</button>
+      <button onClick={() => setEnd((value) => value + 600)}>Extend range</button>
+      <p role="status">Render {revision}</p>
+      <TimeSeriesChart
+        {...args}
+        thresholds={[{ value: threshold, label: 'Threshold' }]}
+        xRange={[timestamps[0] - 600, end]}
+      />
+    </>
+  );
 }
 
 const meta = {
@@ -46,6 +65,13 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const ThreeSeries: Story = {};
+export const RequestedRange: Story = {
+  args: {
+    series: [series[0]],
+    showTitle: false,
+    xRange: [timestamps[0] - 600, timestamps[0] + 3000],
+  },
+};
 export const ManySeries: Story = {
   args: {
     series: Array.from({ length: 25 }, (_, slot) => ({
@@ -69,3 +95,19 @@ export const GapsAndNaN: Story = {
 };
 export const Empty: Story = { args: { timestamps: [], series: [] } };
 export const DarkTheme: Story = { render: (args) => <DarkChart {...args} /> };
+export const Rerendering: Story = { render: (args) => <RerenderingChart {...args} /> };
+export const WithThresholds: Story = {
+  args: {
+    series: [
+      {
+        id: 'host-a',
+        label: 'host-a',
+        values: timestamps.map((_, index) => 3.75 + Math.sin(index / 2) / 2),
+      },
+    ],
+    thresholds: [
+      { value: 2, label: 'Lower threshold' },
+      { value: 6, label: 'Upper threshold' },
+    ],
+  },
+};

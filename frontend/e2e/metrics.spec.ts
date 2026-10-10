@@ -19,6 +19,14 @@ async function demo(page: Page, path = '/metrics') {
 }
 
 async function axe(page: Page) {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  // Disable caret loops and the global 0.01ms transitions for a settled axe snapshot.
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+  });
   expect(
     (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
       .violations,

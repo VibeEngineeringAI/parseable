@@ -28,6 +28,9 @@ const TeamPage = lazy(() =>
 const MetricsPage = lazy(() =>
   import('../features/metrics/MetricsPage').then((m) => ({ default: m.MetricsPage })),
 );
+const AlertsPage = lazy(() =>
+  import('../features/alerts/AlertsPage').then((m) => ({ default: m.AlertsPage })),
+);
 import { OverviewPage } from './OverviewPage';
 export function App() {
   const { mode, session, identity, needsLogin, client } = useApp();
@@ -44,6 +47,7 @@ export function App() {
       {
         logs: 'Logs',
         metrics: 'Metrics',
+        alerts: 'Alerts',
         'sql-editor': 'SQL editor',
         datasets: 'Datasets',
         dashboards: 'Dashboards',
@@ -158,6 +162,11 @@ export function App() {
               <Route path="/datasets" element={<DatasetsPage />} />
               <Route path="/dashboards" element={<DashboardsPage />} />
               <Route path="/team" element={<TeamPage />} />
+              <Route path="/alerts" element={<AlertsPage />} />
+              <Route path="/alerts/new" element={<AlertsPage />} />
+              <Route path="/alerts/targets" element={<AlertsPage />} />
+              <Route path="/alerts/:id/edit" element={<AlertsPage />} />
+              <Route path="/alerts/:id" element={<AlertsPage />} />
               <Route path="/components" element={<LibraryPage />} />
               <Route
                 path="*"

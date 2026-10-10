@@ -62,7 +62,7 @@ test('SQL editor runs a real query against the explicit demo adapter', async ({ 
   const download = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Export JSON' }).click();
   expect((await download).suggestedFilename()).toBe('query-results.json');
-  await editor.fill('SELECT COUNT(*) FROM "application_logs"');
+  await editor.fill('SELECT COUNT(*) FROM "application_logs" GROUP BY "level"');
   await page.getByRole('button', { name: 'Run query' }).click();
   await expect(page.getByRole('alert')).toContainText('Demo SQL supports');
   await expect(page.getByRole('table')).toHaveCount(0);
@@ -186,6 +186,14 @@ test('library dialogs restore focus, contain keyboard navigation, and tabs use a
   await expect(page.getByRole('tabpanel')).toContainText('Each panel has a clear purpose.');
   await page.getByRole('button', { name: 'Use dark theme' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  // Disable caret loops and the global 0.01ms transitions for a settled axe snapshot.
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+  });
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21aa'])
     .analyze();
@@ -277,6 +285,15 @@ test('dark SQL editor retains accessible syntax contrast', async ({ page }) => {
   await demo(page, '/sql-editor');
   await page.getByRole('textbox', { name: 'SQL query' }).waitFor();
   await page.getByRole('button', { name: 'Use dark theme' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  // Disable caret loops and the global 0.01ms transitions for a settled axe snapshot.
+  await page.addStyleTag({
+    content: '*, *::before, *::after { animation: none !important; transition: none !important; }',
+  });
+  await page.evaluate(async () => {
+    await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+  });
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21aa'])
     .analyze();

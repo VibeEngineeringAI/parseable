@@ -2,6 +2,66 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Alerts validation (2026-10-09)
+
+This section records the frontend fixes and completed checks for the four supplied Opus reviews.
+
+| Check                             | Actual result                                                                   | Scope                                                                                                                                                          |
+| --------------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run format`                  | Passed                                                                          | Source, browser/live tests, stories and frontend docs                                                                                                          |
+| Required `npm run check`          | **800 unit tests (22 files), 172 app browser tests, 42 Storybook tests passed** | Formatting, TypeScript, production build, Vitest, demo/mocked HTTP app tests, Storybook build and browser tests                                                |
+| Alerts app browser suite          | **61 passed** in the full check                                                 | CRUD, routing, SQL handoff, duplicate validation, duration round-trips, tags, validation, focus, announcements, runtime tables, preview and chart preservation |
+| Repeated dark accessibility tests | **60/60 passed in 50.2s**, zero failures or retries                             | Alerts **50/50** across five views and Metrics **10/10**, with `--repeat-each=10 --workers=6`                                                                  |
+| Rust duration compatibility       | **93 parser-oracle cases passed: 59 accepted, 34 rejected**                     | Fixture generated with the actual Cargo.lock dependency, humantime 2.3.0; aliases, compound/fractional units, precision and overflow boundaries                |
+| Alerts accessibility and layout   | Passed                                                                          | Ten desktop light/dark axe scans; keyboard scrolling and axe for runtime, delivery and preview tables at 390px; Tags/Actions geometry at 1024px                |
+| Isolated components               | Included in the **42 Storybook tests** above                                    | ArrowUp wrap-around, disabled menu exposure, open-menu dark axe, threshold-story light/dark axe, threshold canvas strokes and uPlot identity/value changes     |
+| Alerts live suite via Vite        | **3 passed in 11.4s**                                                           | Native admin session at `http://127.0.0.1:8270`, proxying to the disposable server on port 8010                                                                |
+| Live cleanup and seeded inventory | Verified; Vite stopped                                                          | Before/after inventories retain three seeded alerts, two targets and three datasets; the suite's unique fixtures are gone                                      |
+
+The regression coverage verifies these review fixes:
+
+- Dark axe scans assert the applied theme, emulate reduced motion, disable CSS animation/transition motion for the snapshot and await all remaining `document.getAnimations()` promises. The same setup covers Alerts, Metrics, Team and app scans. Earlier attempts exposed CodeMirror's infinite caret animation and residual 0.01ms transitions that could stall; the final full check and repeated run passed without retries.
+- Runtime instances, deliveries and preview tables expose named, focusable scroll regions. Named action IDs keep Disable/Enable and Mute/Unmute focused after toggling and remove positional/label coupling.
+- Runtime chart data and references are memoized. Equivalent threshold and range values preserve the uPlot instance; changed values update it.
+- Duplicate navigation state is validated with the alerts contract guard. Builder alerts do not offer Duplicate, and invalid or builder source state displays an explanation. Trailing-slash routes resolve correctly, and both `queryBuilderType=sql` and `code` select SQL.
+- Tag rows have stable IDs, blank tags are omitted from requests, and nonblank tags preserve whitespace, commas and duplicates. Adding/removing tags and target headers moves focus to a sensible control. Theme changes preserve an untouched edit draft.
+- Evaluation-window and hold-duration validation matches humantime aliases, including `10mins`, `2hrs` and `30secs`. Existing accepted durations can be saved unchanged.
+- Disabled Create/Save controls have immediately visible field errors, including an invalid prefilled query. Runtime/state badges use human labels. Preview numbers are rounded for display with the raw values in titles.
+- Persistent live regions announce list/detail actions, target creation and preview completion. Tags wrap within their column at 1024px without being covered by Actions.
+- List-menu tests assert mute and unmute results; chart/card loops first assert a positive state. The live delete-focus assertion accepts search when the table becomes empty. The accessibility smoke loop includes `with-thresholds`.
+
+The existing permission/session, held-save, dirty-form, reader/capability, cancellation and deletion-focus regressions also passed. Permission errors retain the session and draft; genuine session expiry still recovers.
+
+The live spec creates a unique `alerts_live_*` OTLP dataset with two gauge series (3.25 and 7.5), a webhook target and a PromQL rule. It compares preview values with the API, verifies evaluation through a successful PUT and a strictly newer runtime timestamp, checks mute/unmute and disable/enable, then edits hold duration and performs typed deletion. Cleanup touches only these unique fixtures. Authenticated before/after inventories matched: the three seeded alerts, `ops-slack`, `ops-webhook`, `pstats`, `shots_logs` and `shots_metrics` remain. Port 8270 had no listener after Vite was stopped.
+
+No fresh screenshot inspection, contract-probe sweep, embedded-server validation, cross-browser check or classic-UI pixel comparison was performed in this follow-up. Shared collection/mutation hook extraction, badge-colour/sort-header deduplication and lib-to-feature import cleanup remain deferred.
+
+Commands from `frontend`:
+
+```sh
+npm run format
+
+TMPDIR=/home/ajs/.cache/alerts-tmp \
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+PARSEABLE_PROXY_TARGET=http://127.0.0.1:8010 npm run check
+
+TMPDIR=/home/ajs/.cache/alerts-tmp \
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+PARSEABLE_PROXY_TARGET=http://127.0.0.1:8010 \
+npx playwright test e2e/alerts.spec.ts e2e/metrics.spec.ts \
+  --grep 'passes axe in dark|accessible light/dark results' \
+  --repeat-each=10 --workers=6
+
+PARSEABLE_PROXY_TARGET=http://127.0.0.1:8010 \
+npx vite --host 127.0.0.1 --port 8270
+
+TMPDIR=/home/ajs/.cache/alerts-tmp \
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+PARSEABLE_LIVE_URL=http://127.0.0.1:8270 PARSEABLE_LIVE_BASE= \
+PARSEABLE_LIVE_USERNAME=admin PARSEABLE_LIVE_PASSWORD=admin \
+npx playwright test -c playwright.live.config.ts e2e-live/alerts.spec.ts
+```
+
 ## Metrics explorer validation (2026-10-09)
 
 | Check                  | Actual result                                            | Scope                                                                                                                                                                                                                                             |

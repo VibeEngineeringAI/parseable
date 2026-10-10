@@ -3,9 +3,6 @@ import { basePath } from './config';
 /** The classic (Prism) UI owns the root while this frontend is mounted under a prefix. */
 export const classicUiAvailable = basePath !== '';
 
-/** Classic UI pages for features this frontend does not provide yet. */
-export const classicOnlyPages = [{ href: '/alerts', label: 'Alerts', id: 'alerts' }] as const;
-
 /** The classic UI page equivalent to a route in this frontend, for comparison. */
 export function classicUiPath(pathname: string): string {
   const [, section, view, dataset] = pathname.split('/');
@@ -16,6 +13,7 @@ export function classicUiPath(pathname: string): string {
     section === 'team' ||
     section === 'sql-editor' ||
     section === 'datasets' ||
+    section === 'alerts' ||
     section === 'dashboards'
   )
     return `/${section}`;

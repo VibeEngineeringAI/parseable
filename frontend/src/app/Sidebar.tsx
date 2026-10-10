@@ -2,9 +2,9 @@ import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   Activity,
+  Bell,
   ChartLine,
   Database,
-  ExternalLink,
   FileCode2,
   LayoutDashboard,
   Library,
@@ -17,7 +17,6 @@ import {
 } from 'lucide-react';
 import { Button, Badge } from '../components/ui';
 import { useApp } from './AppProvider';
-import { classicOnlyPages, classicUiAvailable } from '../lib/classicUi';
 const groups = [
   { label: '', links: [{ to: '/', label: 'Overview', id: 'home', icon: Activity }] },
   {
@@ -32,6 +31,7 @@ const groups = [
     links: [
       { to: '/logs', label: 'Logs', id: 'logs', icon: Logs },
       { to: '/metrics', label: 'Metrics', id: 'metrics', icon: ChartLine },
+      { to: '/alerts', label: 'Alerts', id: 'alerts', icon: Bell },
     ],
   },
   {
@@ -123,30 +123,6 @@ export function Sidebar({
               No matching pages
             </p>
           )}
-        {classicUiAvailable && !search && (
-          <div className="sidebar-group" data-sidebar="group">
-            {!collapsed && (
-              <div className="sidebar-group-label" data-sidebar="group-label">
-                Classic UI
-                <span />
-              </div>
-            )}
-            {classicOnlyPages.map(({ href, label, id }) => (
-              <a
-                key={id}
-                href={href}
-                aria-label={`${label} (classic UI)`}
-                title={collapsed ? `${label} (classic UI)` : undefined}
-                data-testid={`sidebar-classic-${id}`}
-                data-sidebar="menu-button"
-                className="nav-item"
-              >
-                <ExternalLink size={15} aria-hidden="true" />
-                <span className={collapsed ? 'sr-only' : ''}>{label}</span>
-              </a>
-            ))}
-          </div>
-        )}
       </nav>
       <div className="sidebar-footer" data-sidebar="footer">
         {!collapsed && mode === 'demo' && (
