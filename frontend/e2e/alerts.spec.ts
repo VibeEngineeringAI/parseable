@@ -1028,6 +1028,34 @@ test('delivery errors redact credential-bearing URLs', async ({ page }) => {
   await expect(deliveries).not.toContainText('secret-token');
   await expect(deliveries.locator('xpath=ancestor::*[@role="alert"]')).toHaveCount(0);
 });
+test('the threshold shows its exact configured value while measured values are rounded', async ({
+  page,
+}) => {
+  const runtime = alertFixture.promqlRuntime!;
+  await mocked(page, {
+    original: {
+      ...alertFixture,
+      thresholdConfig: { operator: '>', value: 1234.5 },
+      promqlRuntime: {
+        ...runtime,
+        instances: { a: { ...runtime.instances.a, value: 0.12345 } },
+      },
+    } as Alert,
+  });
+  await page.goto(detailPath);
+  const evaluation = page
+    .locator('.ui-card')
+    .filter({ has: page.getByRole('heading', { name: 'Threshold and evaluation', exact: true }) });
+  await expect(evaluation.locator('dt:text-is("Threshold") + dd')).toHaveText('> 1234.5');
+  await expect(
+    page.getByText('Threshold: > 1234.5. Times are UTC.', { exact: true }),
+  ).toBeVisible();
+  const value = page
+    .getByRole('table', { name: 'Alert instances' })
+    .locator('tbody td:nth-child(3)');
+  await expect(value).toHaveText('0.1235');
+  await expect(value).toHaveAttribute('title', '0.12345');
+});
 
 for (const health of ['ok', 'noData', 'error'] as const)
   test(`runtime health ${health} and every instance/delivery state use human labels`, async ({

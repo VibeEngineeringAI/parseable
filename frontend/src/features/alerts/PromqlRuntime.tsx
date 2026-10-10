@@ -70,8 +70,8 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
         </CardHeader>
         <CardBody className="stack">
           <p className="muted">
-            Threshold: {alert.thresholdConfig.operator}{' '}
-            {formatChartValue(alert.thresholdConfig.value)}. Times are UTC.
+            Threshold: {alert.thresholdConfig.operator} {alert.thresholdConfig.value}. Times are
+            UTC.
           </p>
           <QueryState loading={range.loading && !shown} error={range.error} retry={range.reload} />
           {chart && (
