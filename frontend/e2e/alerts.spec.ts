@@ -1171,9 +1171,8 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   page,
 }) => {
   await mocked(page);
-  // The chart's window ends at "now" and moves forward whenever the alert reloads, which rebuilds
-  // the plot with the new range. Pin the clock so Mute does not move the window and the test
-  // checks only that the plot is kept when nothing about the expression changed.
+  // The chart's window ends at "now" when the expression loads and moves only when the dataset or
+  // query changes. Pin the clock so the step below is deterministic.
   await page.clock.setFixedTime(new Date('2026-10-10T12:00:00Z'));
   await page.route('**/prometheus/api/v1/query_range', (route) => {
     const end = Number(new URLSearchParams(route.request().postData()!).get('end'));
@@ -1204,8 +1203,8 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   const plot = page.locator('.uplot');
   await expect(plot).toBeVisible();
   await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
-  // An unrelated state mutation must retain the chart even across clock seconds.
-  await page.clock.setFixedTime(new Date(Date.now() + 60_000));
+  // Mute reloads the alert a minute later; the window must not move and the plot must be kept.
+  await page.clock.setFixedTime(new Date('2026-10-10T12:01:00Z'));
   await page.getByRole('button', { name: 'Mute', exact: true }).click();
   await page
     .getByRole('dialog', { name: 'Mute notifications' })

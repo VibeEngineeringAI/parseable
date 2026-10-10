@@ -23,9 +23,12 @@ test('disabled menu reason stays visible and keyboard reachable, and activation 
   await expect(item).toBeFocused();
   await expect(item).toHaveAttribute('aria-disabled', 'true');
   await expect(item).toHaveAccessibleDescription('Save your changes before duplicating.');
-  await expect(
-    page.getByText('Save your changes before duplicating.', { exact: true }),
-  ).toBeVisible();
+  const reason = page.getByText('Save your changes before duplicating.', { exact: true });
+  await expect(reason).toBeVisible();
+  const labelBox = (await item.getByText('Duplicate', { exact: true }).boundingBox())!;
+  const reasonBox = (await reason.boundingBox())!;
+  expect(reasonBox.y).toBeGreaterThanOrEqual(labelBox.y + labelBox.height);
+  expect(reasonBox.x).toBeCloseTo(labelBox.x, 0);
   await item.press('Enter');
   await expect(page.getByRole('status')).toHaveText('No action selected');
   expect(
