@@ -246,6 +246,24 @@ describe('alerts client requests', () => {
     expect(result[0].severity).toBe('high');
     expect(fetch.mock.calls[1][0]).toBe('/api/v1/alerts?limit=1000&offset=1000');
   });
+  it('keeps unsupported alert types and the first copy of rows repeated across pages', async () => {
+    const first = Array.from({ length: 1000 }, (_, index) => ({
+      ...alertSummaryFixture,
+      id: String(index),
+    }));
+    const anomaly = { ...alertSummaryFixture, id: 'anomaly', alertType: 'anomaly' };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(first)))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify([{ ...first[999], title: 'Moved' }, anomaly])),
+      );
+    vi.stubGlobal('fetch', fetch);
+    const result = await createClient({ mode: 'live' }).listAlerts();
+    expect(result).toHaveLength(1001);
+    expect(result[999].title).toBe(alertSummaryFixture.title);
+    expect(result[1000]).toMatchObject({ id: 'anomaly', alertType: 'anomaly' });
+  });
   it.each(['alert', 'target'])('preserves HTTP 400 for a missing %s', async (kind) => {
     vi.stubGlobal(
       'fetch',

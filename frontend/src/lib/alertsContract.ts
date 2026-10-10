@@ -78,7 +78,8 @@ export function alertSummary(value: unknown): value is Omit<AlertSummary, 'sever
       'Low',
     ]) &&
     oneOf(value.state, ['triggered', 'not-triggered', 'disabled']) &&
-    value.alertType === 'threshold' &&
+    typeof value.alertType === 'string' &&
+    value.alertType !== '' &&
     strings(value.datasets) &&
     notificationState(value.notificationState) &&
     (value.tags == null || strings(value.tags)) &&
@@ -94,6 +95,7 @@ export function alert(value: unknown): value is Alert {
   const notification = value.notificationConfig;
   const window = object(evaluation) ? evaluation.rollingWindow : undefined;
   return (
+    value.alertType === 'threshold' &&
     typeof value.version === 'string' &&
     typeof value.query === 'string' &&
     oneOf(value.severity, ['critical', 'high', 'medium', 'low']) &&

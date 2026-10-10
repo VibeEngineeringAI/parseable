@@ -122,6 +122,7 @@ function AlertFormFields({
   )
     errors.targets = 'Remove unavailable targets or select existing targets.';
   const choices = draft.type === 'promql' ? (metrics.data?.datasets ?? []) : (datasets.data ?? []);
+  const unchecked = draft.type === 'promql' ? (metrics.data?.unchecked ?? []) : [];
   // Keep completion scoped to the selected dataset; changing the query does not reset it.
   const metadata = useMemo<PromqlMetadataSource>(
     () => ({
@@ -157,12 +158,16 @@ function AlertFormFields({
   function update<K extends keyof AlertDraft>(key: K, value: AlertDraft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
   }
+  const unverified =
+    !metrics.loading &&
+    draft.type === 'promql' &&
+    Boolean(draft.dataset) &&
+    !choices.some((item) => item.name === draft.dataset);
+  // The server checks the dataset again on save, so a dataset that could not be checked, or the
+  // one the alert already runs on, only warns.
   const datasetError =
     errors.dataset ??
-    (!metrics.loading &&
-    draft.type === 'promql' &&
-    draft.dataset &&
-    !choices.some((item) => item.name === draft.dataset)
+    (unverified && !unchecked.includes(draft.dataset) && draft.dataset !== original?.datasets[0]
       ? 'Select an OTLP metrics dataset.'
       : undefined);
   const canSubmit =
@@ -235,19 +240,28 @@ function AlertFormFields({
                 disabled={Boolean(original) || mutation.pending}
                 error={datasetError}
                 hint={
-                  draft.type === 'promql'
-                    ? 'Only OTLP metrics datasets support PromQL.'
-                    : 'SQL can query any accessible dataset.'
+                  unverified
+                    ? 'This dataset could not be verified as OTLP metrics. The server validates it on save.'
+                    : draft.type === 'promql'
+                      ? 'Only OTLP metrics datasets support PromQL.'
+                      : 'SQL can query any accessible dataset.'
                 }
                 onChange={(event) => update('dataset', event.target.value)}
               >
                 <option value="">Select a dataset</option>
-                {draft.dataset && !choices.some((item) => item.name === draft.dataset) && (
-                  <option value={draft.dataset}>{draft.dataset}</option>
-                )}
+                {draft.dataset &&
+                  !choices.some((item) => item.name === draft.dataset) &&
+                  !unchecked.includes(draft.dataset) && (
+                    <option value={draft.dataset}>{draft.dataset}</option>
+                  )}
                 {choices.map((item) => (
                   <option key={item.name} value={item.name}>
                     {item.name}
+                  </option>
+                ))}
+                {unchecked.map((name) => (
+                  <option key={name} value={name}>
+                    {name} (not verified)
                   </option>
                 ))}
               </Select>

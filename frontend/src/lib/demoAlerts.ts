@@ -238,6 +238,7 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
           notificationState: item.notificationState,
           tags: item.tags,
           lastTriggeredAt: item.lastTriggeredAt,
+          queryType: item.queryType,
           ...(item.promqlConfig ? { promqlConfig: item.promqlConfig } : {}),
         })),
       );

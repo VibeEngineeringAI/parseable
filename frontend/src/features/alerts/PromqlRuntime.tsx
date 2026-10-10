@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Badge, Card, CardHeader, CardBody } from '../../components/ui';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { QueryState } from '../../components/explorer/QueryState';
@@ -12,20 +12,28 @@ import { LabelChips } from './LabelChips';
 
 export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: AlertTargetStatus[] }) {
   const { client } = useApp();
-  const [end] = useState(() => Math.floor(Date.now() / 1000));
+  // Each reload of the alert moves the window forward; the last chart stays up while it loads.
+  const end = useMemo(() => Math.floor(Date.now() / 1000), [alert]);
   const range = useAsync(
     useCallback(
-      (signal) =>
-        client.promqlQueryRange(
+      async (signal) => ({
+        end,
+        data: await client.promqlQueryRange(
           { stream: alert.datasets[0], query: alert.query, start: end - 3600, end, step: '30s' },
           signal,
         ),
+      }),
       [client, alert.datasets[0], alert.query, end],
     ),
   );
+  const [last, setLast] = useState(range.data);
+  useEffect(() => {
+    if (range.data || range.error) setLast(range.data);
+  }, [range.data, range.error]);
+  const shown = range.data ?? last;
   const chart = useMemo(() => {
-    if (!range.data) return;
-    const chart = toChartSeries(range.data);
+    if (!shown) return;
+    const chart = toChartSeries(shown.data);
     const varying = varyingLabelKeys(chart.series.map((series) => series.metric));
     const series = chart.series.map((series) => {
       const labels = series.metric;
@@ -43,13 +51,12 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
             .join(' · '));
       return { ...series, label: name || labels.__name__ || 'Expression' };
     });
-    return { ...chart, series };
-  }, [range.data]);
+    return { ...chart, series, xRange: [shown.end - 3600, shown.end] as const };
+  }, [shown]);
   const thresholds = useMemo(
     () => [{ value: alert.thresholdConfig.value, label: 'Threshold' }],
     [alert.thresholdConfig.value],
   );
-  const xRange = useMemo(() => [end - 3600, end] as const, [end]);
   const runtime = alert.promqlRuntime;
   const instances = Object.entries(runtime?.instances ?? {});
   const targetName = (id: string) =>
@@ -65,14 +72,13 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
             Threshold: {alert.thresholdConfig.operator} {alert.thresholdConfig.value}. Times are
             UTC.
           </p>
-          <QueryState loading={range.loading} error={range.error} retry={range.reload} />
+          <QueryState loading={range.loading && !shown} error={range.error} retry={range.reload} />
           {chart && (
             <TimeSeriesChart
               {...chart}
               height={220}
               title="Expression over the last hour"
               showTitle={false}
-              xRange={xRange}
               thresholds={thresholds}
               timeZone="UTC"
               emptyMessage="No data for this expression in the last hour."

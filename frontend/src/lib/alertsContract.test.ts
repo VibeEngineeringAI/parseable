@@ -27,6 +27,10 @@ describe('alerts response contracts', () => {
     ).toBe(true);
     expect(alert({ ...alertFixture, notificationState: { mute: 'indefinite' } })).toBe(true);
   });
+  it('lists unsupported alert types but only accepts threshold configs', () => {
+    expect(alertSummary({ ...alertSummaryFixture, alertType: 'anomaly' })).toBe(true);
+    expect(alert({ ...alertFixture, alertType: 'anomaly' })).toBe(false);
+  });
   it.each([
     null,
     [],
@@ -50,6 +54,8 @@ describe('alerts response contracts', () => {
     { ...alertSummaryFixture, severity: 'urgent' },
     { ...alertSummaryFixture, datasets: {} },
     { ...alertSummaryFixture, queryType: 'sql' },
+    { ...alertSummaryFixture, alertType: '' },
+    { ...alertSummaryFixture, alertType: undefined },
   ])('rejects malformed summary %#', (value) => expect(alertSummary(value)).toBe(false));
   it.each(['notify', 'indefinite', { mute: '2026-10-10T00:00:00Z' }])(
     'accepts notification state %j',

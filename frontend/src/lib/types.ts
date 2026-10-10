@@ -117,7 +117,7 @@ export type AlertSummary = {
   title: string;
   severity: AlertSeverity;
   state: AlertState;
-  alertType: 'threshold';
+  alertType: 'threshold' | 'anomaly' | 'forecast' | (string & {});
   datasets: string[];
   notificationState: NotificationState;
   created: string;

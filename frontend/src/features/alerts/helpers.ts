@@ -23,6 +23,10 @@ export const queryTypeLabel = (type?: AlertQueryType) =>
       : type === 'builder'
         ? 'Builder'
         : 'Unavailable';
+export const alertTypeLabel = (row: AlertSummary) =>
+  row.alertType === 'threshold'
+    ? queryTypeLabel(row.queryType)
+    : row.alertType.charAt(0).toUpperCase() + row.alertType.slice(1);
 export const stateLabel = (state: AlertSummary['state']) =>
   state === 'not-triggered' ? 'Not triggered' : state === 'triggered' ? 'Triggered' : 'Disabled';
 export const severityLabel = (severity: AlertSeverity) =>
@@ -312,7 +316,7 @@ export function filterSortAlerts(
     sort === 'severity'
       ? String(severities.indexOf(row.severity))
       : sort === 'type'
-        ? queryTypeLabel(row.queryType)
+        ? alertTypeLabel(row)
         : sort === 'dataset'
           ? row.datasets.join(', ')
           : sort === 'tags'
@@ -327,27 +331,36 @@ export function filterSortAlerts(
       (a, b) => (key(a).localeCompare(key(b)) || a.id.localeCompare(b.id)) * (descending ? -1 : 1),
     );
 }
+// Query type and id are immutable, so resolved types survive list reloads.
+const resolvedTypes = new WeakMap<ParseableClient, Map<string, AlertQueryType>>();
 export async function resolveAlertTypes(
   client: ParseableClient,
   rows: AlertSummary[],
   signal: AbortSignal,
 ) {
+  const known = resolvedTypes.get(client) ?? new Map<string, AlertQueryType>();
+  resolvedTypes.set(client, known);
   const result = rows.map((row) => ({ ...row }));
+  for (const row of result) {
+    if (row.queryType) known.set(row.id, row.queryType);
+    else row.queryType = known.get(row.id);
+  }
+  const pending = result.filter((row) => !row.queryType && row.alertType === 'threshold');
   const unchecked: string[] = [];
   let next = 0;
   async function worker() {
-    while (next < result.length) {
+    while (next < pending.length) {
       signal.throwIfAborted();
-      const row = result[next++];
-      if (row.queryType) continue;
+      const row = pending[next++];
       try {
         row.queryType = (await client.getAlert(row.id, signal)).queryType;
+        known.set(row.id, row.queryType);
       } catch (error) {
         if (signal.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
         unchecked.push(row.title);
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(6, rows.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(6, pending.length) }, worker));
   return { rows: result, unchecked };
 }

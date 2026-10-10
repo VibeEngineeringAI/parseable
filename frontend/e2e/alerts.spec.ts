@@ -559,6 +559,38 @@ test('save failure stays in the dirty form with the plain-text server error', as
   );
   await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Failure');
 });
+test('a PromQL alert whose dataset could not be checked still previews and saves with a warning', async ({
+  page,
+}) => {
+  const api = await mocked(page);
+  await page.route('**/api/v1/logstream/metrics/info', (route) =>
+    route.fulfill({ status: 500, body: 'Internal error' }),
+  );
+  const warning = 'This dataset could not be verified as OTLP metrics.';
+  await page.goto(`${detailPath}/edit`);
+  const dataset = page.getByLabel('Dataset', { exact: true });
+  await expect(dataset).toHaveValue('metrics');
+  await expect(
+    page.getByRole('status').filter({ hasText: 'Some datasets could not be checked: metrics.' }),
+  ).toBeVisible();
+  await expect(page.getByText(warning)).toBeVisible();
+  await expect(page.getByText('Select an OTLP metrics dataset.')).toHaveCount(0);
+  await expect(
+    page.getByRole('button', { name: 'Preview current values (no notifications)', exact: true }),
+  ).toBeEnabled();
+  await page.getByLabel('Threshold value').fill('9');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`${detailPath}$`));
+  expect(api.writes).toHaveLength(1);
+  expect(api.writes[0]).toMatchObject({ datasets: ['metrics'], thresholdConfig: { value: 9 } });
+
+  await page.goto('/alerts/new?queryBuilderType=promql');
+  await page
+    .getByLabel('Dataset', { exact: true })
+    .selectOption({ label: 'metrics (not verified)' });
+  await expect(page.getByText(warning)).toBeVisible();
+  await expect(page.getByText('Select an OTLP metrics dataset.')).toHaveCount(0);
+});
 for (const type of ['promql', 'code'] as const) {
   test(`${type} dataset-permission 401 keeps the session, draft and dirty guard on failed save`, async ({
     page,

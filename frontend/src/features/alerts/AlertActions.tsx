@@ -47,7 +47,7 @@ export function AlertActions({
       }
     });
   }
-  if (!canWrite) return <span className="muted">Read-only</span>;
+  if (!canWrite || alert.alertType !== 'threshold') return <span className="muted">Read-only</span>;
   const evaluate: ActionsMenuItem = {
     id: 'evaluate',
     label: 'Evaluate now',

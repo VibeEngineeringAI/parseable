@@ -347,6 +347,46 @@ describe('list filtering, sorting and bounded type discovery', () => {
     expect(getAlert.mock.calls.every(([, value]) => value === signal)).toBe(true);
     expect(input.every((row) => row.queryType === undefined)).toBe(true);
   });
+  it('caches resolved types per client and retries failures on reload', async () => {
+    let fail = true;
+    const getAlert = vi.fn(async (id: string) => {
+      if (id === 'bad' && fail) throw new Error('missing');
+      return { queryType: 'code' };
+    });
+    const client = { getAlert } as unknown as ParseableClient,
+      signal = new AbortController().signal;
+    const input = [
+      { ...rows[0], id: 'new', queryType: undefined },
+      { ...rows[0], id: 'bad', queryType: undefined },
+      { ...rows[0], id: 'known', queryType: 'builder' as const },
+    ];
+    expect((await resolveAlertTypes(client, input, signal)).unchecked).toEqual([rows[0].title]);
+    expect(getAlert.mock.calls.map(([id]) => id).sort()).toEqual(['bad', 'new']);
+    getAlert.mockClear();
+    fail = false;
+    const reloaded = await resolveAlertTypes(
+      client,
+      input.map((row) => ({ ...row, queryType: undefined })),
+      signal,
+    );
+    expect(getAlert.mock.calls.map(([id]) => id)).toEqual(['bad']);
+    expect(reloaded.unchecked).toEqual([]);
+    expect(reloaded.rows.map((row) => row.queryType)).toEqual(['code', 'code', 'builder']);
+    getAlert.mockClear();
+    await resolveAlertTypes(client, input, signal);
+    expect(getAlert).not.toHaveBeenCalled();
+  });
+  it('skips summaries that carry a query type and non-threshold alerts', async () => {
+    const getAlert = vi.fn();
+    const result = await resolveAlertTypes(
+      { getAlert } as unknown as ParseableClient,
+      [rows[0], { ...rows[1], id: 'anomaly', alertType: 'anomaly', queryType: undefined }],
+      new AbortController().signal,
+    );
+    expect(getAlert).not.toHaveBeenCalled();
+    expect(result.unchecked).toEqual([]);
+    expect(result.rows.map((row) => row.queryType)).toEqual(['promql', undefined]);
+  });
 });
 describe('target forms', () => {
   it('recognizes masked Alertmanager, requires re-entry and builds top-level credentials', () => {

@@ -14,6 +14,7 @@ describe('demo alerts', () => {
     const details = await Promise.all(summaries.map((row) => client.getAlert(row.id)));
     expect(details.every(alert)).toBe(true);
     expect(details.map((row) => row.queryType)).toContain('builder');
+    expect(summaries.map((row) => row.queryType)).toEqual(details.map((row) => row.queryType));
     expect(Object.keys(details[0].promqlRuntime!.instances)).toHaveLength(2);
     expect(details[0].promqlRuntime!.deliveries[0].attempts).toBe(2);
     expect((await client.listAlertTargets()).every(alertTargetStatus)).toBe(true);

@@ -188,17 +188,19 @@ export function createClient({
   return {
     async listAlerts(signal) {
       // The server caps each page at 1000 and returns no total. Never silently truncate.
-      const result = [];
+      // It sorts by state, severity and title before offsetting, so an alert changing state
+      // between pages can appear twice or be missed. Keep the first copy of each id.
+      const result = [],
+        seen = new Set<string>();
       for (let offset = 0; ; offset += 1000) {
         const endpoint = `${base}/alerts?limit=1000&offset=${offset}`;
         const data = await readJson(endpoint, { signal }, onUnauthorized);
         if (!Array.isArray(data) || !data.every(alertSummary)) return malformed(endpoint);
-        result.push(
-          ...data.map((item) => ({
-            ...item,
-            severity: item.severity.toLowerCase() as AlertSeverity,
-          })),
-        );
+        for (const item of data) {
+          if (seen.has(item.id)) continue;
+          seen.add(item.id);
+          result.push({ ...item, severity: item.severity.toLowerCase() as AlertSeverity });
+        }
         if (data.length < 1000) return result;
       }
     },

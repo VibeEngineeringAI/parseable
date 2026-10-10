@@ -17,7 +17,7 @@ import { useRowDeletionFocus } from './shared';
 import {
   filterSortAlerts,
   muteState,
-  queryTypeLabel,
+  alertTypeLabel,
   severityLabel,
   stateLabel,
   type AlertSort,
@@ -147,10 +147,17 @@ export function AlertsList({
               <tbody>
                 {filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((row) => {
                   const mute = muteState(row.notificationState);
+                  const supported = row.alertType === 'threshold';
                   return (
                     <tr key={row.id}>
                       <td>
-                        <Link to={`/alerts/${encodeURIComponent(row.id)}`}>{row.title}</Link>
+                        {supported ? (
+                          <Link to={`/alerts/${encodeURIComponent(row.id)}`}>{row.title}</Link>
+                        ) : (
+                          <>
+                            {row.title} <span className="muted">Not supported here</span>
+                          </>
+                        )}
                         {mute.muted && (
                           <span className="alerts-muted" title={mute.label}>
                             <BellOff size={13} aria-hidden="true" />
@@ -184,7 +191,7 @@ export function AlertsList({
                           {stateLabel(row.state)}
                         </Badge>
                       </td>
-                      <td>{queryTypeLabel(row.queryType)}</td>
+                      <td>{alertTypeLabel(row)}</td>
                       <td>{row.datasets.join(', ')}</td>
                       <td>
                         <div className="alerts-tags">

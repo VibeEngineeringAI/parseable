@@ -823,6 +823,11 @@ impl AlertConfig {
             );
         }
 
+        map.insert(
+            "queryType".to_string(),
+            serde_json::to_value(self.query_type).unwrap_or_default(),
+        );
+
         if let Some(other_fields) = &self.other_fields {
             for (key, value) in other_fields {
                 map.insert(key.clone(), value.clone());
@@ -1815,6 +1820,22 @@ mod tests {
         let failure =
             super::AlertError::Error(actix_web::error::ErrorInternalServerError("failed"));
         assert_eq!(failure.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn summary_includes_query_type() {
+        for query_type in ["builder", "code", "promql"] {
+            let config: super::AlertConfig = serde_json::from_value(serde_json::json!({
+                "version":"v2","id":ulid::Ulid::new(),"severity":"high","title":"Load",
+                "queryType":query_type,"query":"load","datasets":["metrics"],"alertType":"threshold",
+                "thresholdConfig":{"operator":">","value":8.0},
+                "evalConfig":{"rollingWindow":{"evalStart":"5m","evalEnd":"now","evalFrequency":1}},
+                "targets":[],"notificationState":"notify","notificationConfig":{"interval":1},
+                "created":chrono::Utc::now()
+            }))
+            .unwrap();
+            assert_eq!(config.to_summary()["queryType"], query_type);
+        }
     }
 
     #[test]
