@@ -202,6 +202,8 @@ export function createClient({
     getDashboard: (id, signal) => readDashboard(dashboardPath(id), { signal }),
     createDashboard: (body) => readDashboard(`${base}/dashboards`, jsonBody('POST', body)),
     updateDashboard: (id, body) => readDashboard(dashboardPath(id), jsonBody('PUT', body)),
+    setDashboardFavorite: (id, isFavorite) =>
+      readDashboard(`${dashboardPath(id)}?isFavorite=${isFavorite}`, { method: 'PUT' }),
     deleteDashboard: (id) => mutate(dashboardPath(id), { method: 'DELETE' }),
     async listAlerts(signal) {
       // The server caps each page at 1000 and returns no total. Never silently truncate.

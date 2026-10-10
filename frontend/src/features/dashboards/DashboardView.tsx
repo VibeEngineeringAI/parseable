@@ -152,7 +152,11 @@ function DashboardFields({ original }: { original: Dashboard }) {
                       : undefined,
                   onSelect: () =>
                     void mutation.run(async () => {
-                      const created = await client.createDashboard(duplicateDashboard(draft));
+                      const titles = (await client.listDashboards()).map((row) => row.title);
+                      if (!mutation.isActive()) return;
+                      const created = await client.createDashboard(
+                        duplicateDashboard(draft, titles),
+                      );
                       if (mutation.isActive()) {
                         workspace.markSaved();
                         navigate(`/dashboards/${created.dashboardId}`);

@@ -5,7 +5,12 @@ import { ulid } from './dashboardsContract';
 import type { Dashboard, DashboardRequest, DashboardSummary, ParseableClient } from './types';
 
 type Methods =
-  'listDashboards' | 'getDashboard' | 'createDashboard' | 'updateDashboard' | 'deleteDashboard';
+  | 'listDashboards'
+  | 'getDashboard'
+  | 'createDashboard'
+  | 'updateDashboard'
+  | 'setDashboardFavorite'
+  | 'deleteDashboard';
 const clone = <T>(value: T): T => structuredClone(value);
 const fail = (message: string): never => {
   throw new ApiError(`Cannot perform this operation: ${message}`, 400);
@@ -233,6 +238,15 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
         dashboardType: body.dashboardType ?? 'Dashboard',
         tenantId: body.tenantId ?? null,
       };
+      dashboards = dashboards.map((item) => (item.dashboardId === id ? value : item));
+      return clone(value);
+    },
+    async setDashboardFavorite(id, isFavorite) {
+      await ready();
+      const original = get(id, 'Dashboard does not exist or user is not authorized');
+      if (original.author !== owner)
+        fail('Dashboard does not exist or you do not have permission to access it');
+      const value: Dashboard = { ...original, isFavorite, modified: timestamp() };
       dashboards = dashboards.map((item) => (item.dashboardId === id ? value : item));
       return clone(value);
     },

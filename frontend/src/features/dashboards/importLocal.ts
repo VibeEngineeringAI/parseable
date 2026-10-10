@@ -4,14 +4,8 @@ import { createUlid } from '../../lib/ids';
 import { mapConcurrent } from '../../lib/concurrency';
 import { chartConfig } from './tiles';
 import type { LocalDashboard } from './storage';
+import { availableTitle } from './helpers';
 export type ImportItem = { local: LocalDashboard; title: string };
-export function availableTitle(title: string, taken: Set<string>) {
-  let result = title,
-    index = 2;
-  while (taken.has(result)) result = `${title} (${index++})`;
-  taken.add(result);
-  return result;
-}
 export function planLocalImport(
   local: LocalDashboard[],
   serverTitles: string[],

@@ -9,12 +9,8 @@ import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 import type { Dashboard, DashboardSummary } from '../../lib/types';
 import { useLeaveGuard } from '../../hooks/useLeaveGuard';
-import {
-  checkDashboardConflict,
-  dashboardError,
-  duplicateDashboard,
-  editDashboardMetadata,
-} from './helpers';
+import { dashboardError, duplicateDashboard, metadataPatch, patchConflicts } from './helpers';
+import { patchedDocument } from './draft';
 import { useDashboardAccess } from './owner';
 import { DashboardsList } from './DashboardsList';
 import { DashboardForm } from './DashboardForm';
@@ -34,13 +30,17 @@ export function DashboardsPage() {
     mutation = useMutation();
   const controller = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => controller.current?.abort(), []);
-  const [form, setForm] = useState<{ original?: Dashboard; recovered?: boolean }>(),
+  const [form, setForm] = useState<{
+      original?: Dashboard;
+      values?: Dashboard;
+      recovered?: boolean;
+    }>(),
     [deleting, setDeleting] = useState<DashboardSummary>();
   const [importing, setImporting] = useState(false);
   const [formDirty, setFormDirty] = useState(false);
   const [deleted, setDeleted] = useState<string>(),
     [status, setStatus] = useState('');
-  const [conflict, setConflict] = useState<{ latest: Dashboard; draft: Dashboard }>();
+  const [conflict, setConflict] = useState<{ latest: Dashboard; patch: Partial<Dashboard> }>();
   const markSaved = useLeaveGuard(formDirty || !!conflict || !!form?.recovered, 'dashboard');
   function readSignal() {
     controller.current?.abort();
@@ -53,17 +53,18 @@ export function DashboardsPage() {
     setConflict(undefined);
     collection.reload();
   }
-  async function save(loaded: Dashboard, draft: Dashboard, markSaved?: () => void) {
-    const latest = await checkDashboardConflict(client, loaded, readSignal());
+  /** Applies a metadata patch to the latest stored copy, so newer tiles and settings survive. */
+  async function save(loaded: Dashboard, patch: Partial<Dashboard>, overwrite = false) {
+    const latest = await client.getDashboard(loaded.dashboardId, readSignal());
     if (!mutation.isActive()) return;
-    if (latest) {
+    if (!overwrite && patchConflicts(loaded, latest, patch)) {
       setForm(undefined);
-      setConflict({ latest, draft });
+      setConflict({ latest, patch });
       return;
     }
-    await client.updateDashboard(loaded.dashboardId, draft);
+    await client.updateDashboard(latest.dashboardId, patchedDocument(latest, patch));
     if (mutation.isActive()) {
-      markSaved?.();
+      markSaved();
       completed('Dashboard updated.');
     }
   }
@@ -81,10 +82,16 @@ export function DashboardsPage() {
       if (!mutation.isActive()) return;
       if (kind === 'export') downloadDashboard(original);
       else if (kind === 'rename') setForm({ original });
-      else if (kind === 'favourite')
-        await save(original, { ...original, isFavorite: !original.isFavorite });
-      else if (kind === 'duplicate') {
-        const created = await client.createDashboard(duplicateDashboard(original));
+      else if (kind === 'favourite') {
+        await client.setDashboardFavorite(original.dashboardId, !original.isFavorite);
+        if (mutation.isActive()) completed('Dashboard updated.');
+      } else if (kind === 'duplicate') {
+        const created = await client.createDashboard(
+          duplicateDashboard(
+            original,
+            (collection.data ?? []).map((item) => item.title),
+          ),
+        );
         if (mutation.isActive()) navigate(`/dashboards/${created.dashboardId}`);
       }
     });
@@ -159,7 +166,7 @@ export function DashboardsPage() {
       )}
       {form && (
         <DashboardForm
-          original={form.original}
+          original={form.values ?? form.original}
           pending={mutation.pending}
           error={mutation.error}
           onDirtyChange={setFormDirty}
@@ -170,11 +177,7 @@ export function DashboardsPage() {
           onSubmit={(title, tags, description) =>
             void mutation.run(async () => {
               if (form.original)
-                await save(
-                  form.original,
-                  editDashboardMetadata(form.original, title, tags, description),
-                  markSaved,
-                );
+                await save(form.original, metadataPatch(form.original, title, tags, description));
               else {
                 const created = await client.createDashboard({
                   title,
@@ -251,14 +254,17 @@ export function DashboardsPage() {
           collection.reload();
         }}
         onCancel={() => {
-          if (conflict) setForm({ original: conflict.draft, recovered: true });
+          if (conflict)
+            setForm({
+              original: conflict.latest,
+              values: { ...conflict.latest, ...conflict.patch },
+              recovered: true,
+            });
           setConflict(undefined);
         }}
         onOverwrite={() =>
           void mutation.run(async () => {
-            if (!conflict) return;
-            await client.updateDashboard(conflict.draft.dashboardId, conflict.draft);
-            if (mutation.isActive()) completed('Dashboard updated.');
+            if (conflict) await save(conflict.latest, conflict.patch, true);
           })
         }
       />

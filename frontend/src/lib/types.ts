@@ -263,6 +263,8 @@ export interface ParseableClient {
   getDashboard(id: string, signal?: AbortSignal): Promise<Dashboard>;
   createDashboard(body: DashboardRequest): Promise<Dashboard>;
   updateDashboard(id: string, body: DashboardRequest): Promise<Dashboard>;
+  /** Bodyless partial PUT: the server skips tile validation and keeps the stored document. */
+  setDashboardFavorite(id: string, isFavorite: boolean): Promise<Dashboard>;
   deleteDashboard(id: string): Promise<void>;
   listAlerts(signal?: AbortSignal): Promise<AlertSummary[]>;
   getAlert(id: string, signal?: AbortSignal): Promise<Alert>;

@@ -7,9 +7,11 @@ import {
   applyTile,
   applyVariable,
   duplicateTile,
+  patchedDocument,
   removeVariable,
   variableNames,
 } from './draft';
+import { createDemoDashboards } from '../../lib/demoDashboards';
 import {
   convertBuilder,
   setQueryLanguage,
@@ -68,6 +70,27 @@ describe('production dashboard draft and save payload', () => {
     const edited = applyTile(draft, { ...draft.tiles![1], title: 'Only second' });
     expect(edited.tiles!.map((tile) => tile.title)).toEqual(['Host load', 'Only second', 'Errors']);
     expect(input.tiles[1].tile_id).toBe(input.tiles[0].tile_id);
+  });
+  it('applies a list-page metadata patch to the latest copy with repaired tile IDs', async () => {
+    const client = createDemoDashboards(),
+      broken = await client.createDashboard({
+        ...classic,
+        title: 'Broken',
+        tiles: [
+          classic.tiles[0],
+          classic.tiles[0],
+          { ...classic.tiles[1], tile_id: '0'.repeat(26) },
+        ],
+      });
+    await expect(
+      client.updateDashboard(broken.dashboardId, { ...broken, title: 'Renamed' }),
+    ).rejects.toThrow('Tile ID must be provided');
+    const body = patchedDocument(broken, { title: 'Renamed' });
+    expect(body).toMatchObject({ title: 'Renamed', variables: classic.variables });
+    expect(body.tiles!.map((tile) => tile.title)).toEqual(broken.tiles!.map((tile) => tile.title));
+    const saved = await client.updateDashboard(broken.dashboardId, body);
+    expect(new Set(saved.tiles!.map((tile) => tile.tile_id)).size).toBe(3);
+    expect(saved.tiles![0].tile_id).toBe(classic.tiles[0].tile_id);
   });
   it('reads the ingest_demo_data.sh fixture as a builder and converts its exact classic aliases', () => {
     expect(demoTile).not.toHaveProperty('tileType');

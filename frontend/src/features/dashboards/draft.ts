@@ -24,6 +24,10 @@ export function loadDraft(original: Dashboard) {
   });
   return { draft: repaired ? { ...original, tiles } : original, repaired };
 }
+/** A full-document PUT body that applies `patch` to the latest stored copy, with tile IDs repaired. */
+export function patchedDocument(latest: Dashboard, patch: Partial<Dashboard>): Dashboard {
+  return { ...loadDraft(latest).draft, ...patch };
+}
 /** This is the full document passed to PUT; sections and extras are never rebuilt. */
 export function dashboardPayload(
   draft: Dashboard,

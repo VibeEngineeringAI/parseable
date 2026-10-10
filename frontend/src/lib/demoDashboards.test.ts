@@ -74,6 +74,23 @@ describe('per-client dashboard demo', () => {
       }),
     ).rejects.toThrow('Tile IDs must be unique');
   });
+  it('toggles favourites with a partial update that keeps unrepaired tiles and checks ownership', async () => {
+    const c = createDemoDashboards(),
+      tiles = [classic.tiles[0], classic.tiles[0]];
+    const created = await c.createDashboard({ ...classic, title: 'Starred', tiles });
+    const starred = await c.setDashboardFavorite(created.dashboardId, true);
+    expect(starred).toEqual({ ...created, isFavorite: true, modified: starred.modified });
+    expect(starred.modified).not.toBe(created.modified);
+    expect((await c.getDashboard(created.dashboardId)).tiles).toEqual(tiles);
+    expect((await c.setDashboardFavorite(created.dashboardId, false)).isFavorite).toBe(false);
+    const other = (await c.listDashboards()).find((row) => row.title === 'Shared operations')!;
+    await expect(c.setDashboardFavorite(other.dashboardId, true)).rejects.toThrow(
+      'you do not have permission',
+    );
+    await expect(c.setDashboardFavorite('01M4J000000000000000000099', true)).rejects.toThrow(
+      'Dashboard does not exist or user is not authorized',
+    );
+  });
   it('honours aborted reads', async () => {
     const controller = new AbortController();
     controller.abort();

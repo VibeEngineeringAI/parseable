@@ -162,9 +162,12 @@ async function mockServer(
       if (method === 'PUT') {
         if (options.denyWrite)
           return route.fulfill({ status: 403, body: 'Dashboard update denied' });
-        writes.push(structuredClone(body));
+        const favourite = url.searchParams.get('isFavorite');
+        if (favourite !== null && body) return route.fulfill({ status: 400, body: 'Both' });
+        if (!body && favourite === null) return route.fulfill({ status: 400, body: 'No body' });
+        if (body) writes.push(structuredClone(body));
         const doc = {
-          ...body,
+          ...(body ?? { ...documents.get(requestedId)!, isFavorite: favourite === 'true' }),
           modified: `2026-10-10T08:01:${String(++clock).padStart(2, '0')}Z`,
         } as Dashboard;
         documents.set(requestedId, doc);
@@ -302,7 +305,11 @@ test('list favourites and rename preserve the full document; typed deletion rest
   await expect(
     page.getByRole('button', { name: `Unfavourite ${source.title}`, exact: true }),
   ).toBeEnabled();
-  expect(server.writes[0]).toEqual({ ...source, isFavorite: true });
+  const favourite = server.calls.find((call) => call.method === 'PUT')!;
+  expect(favourite.body).toBeUndefined();
+  expect(favourite.params.get('isFavorite')).toBe('true');
+  expect(server.writes).toHaveLength(0);
+  expect(server.current()).toEqual({ ...source, isFavorite: true, modified: expect.any(String) });
   const beforeRename = structuredClone(server.current());
   await page.getByRole('button', { name: `Actions for ${source.title}`, exact: true }).click();
   await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
@@ -310,7 +317,7 @@ test('list favourites and rename preserve the full document; typed deletion rest
   await form.getByLabel('Dashboard title').fill('Renamed service');
   await form.locator('[data-dialog-confirm]').click();
   await expect(page.getByRole('link', { name: 'Renamed service', exact: true })).toBeVisible();
-  expect(server.writes[1]).toEqual({ ...beforeRename, title: 'Renamed service' });
+  expect(server.writes[0]).toEqual({ ...beforeRename, title: 'Renamed service' });
   await page.getByRole('button', { name: 'Actions for Renamed service', exact: true }).click();
   await page.getByRole('menuitem', { name: 'Delete', exact: true }).click();
   const deletion = page.getByRole('dialog', { name: 'Delete dashboard', exact: true });
@@ -1744,8 +1751,10 @@ test('favourite toggles the latest row, and list conflicts can be cancelled for 
   await expect(page.getByRole('link', { name: classic.title, exact: true })).toBeVisible();
   server.change({ isFavorite: true });
   await page.getByRole('button', { name: `Favourite ${classic.title}`, exact: true }).click();
-  await expect.poll(() => server.writes.length).toBe(1);
-  expect(server.writes[0].isFavorite).toBe(false);
+  await expect
+    .poll(() => server.calls.find((call) => call.method === 'PUT')?.params.get('isFavorite'))
+    .toBe('false');
+  expect(server.writes).toHaveLength(0);
   await page.getByRole('button', { name: `Actions for ${classic.title}`, exact: true }).click();
   await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
   await page.getByLabel('Dashboard title').fill('Local rename');
@@ -1774,6 +1783,46 @@ test('favourite toggles the latest row, and list conflicts can be cancelled for 
   ]);
   await expect(page).toHaveURL(/\/dashboards$/);
   await expect(page.getByLabel('Dashboard title')).toHaveValue('Local rename');
+});
+
+test('list rename patches the latest copy, repairs tile IDs and repeats duplicates under free titles', async ({
+  page,
+}) => {
+  const server = await mockServer(page, {
+    document: { ...classic, tiles: [classic.tiles[0], classic.tiles[0]] },
+  });
+  await page.goto('/dashboards');
+  async function rename(from: string, to: string) {
+    await page.getByRole('button', { name: `Actions for ${from}`, exact: true }).click();
+    await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
+    await page.getByLabel('Dashboard title').fill(to);
+  }
+  await rename(classic.title, 'Mine');
+  server.change({ tags: ['remote'] });
+  await page.getByRole('dialog').locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('link', { name: 'Mine', exact: true })).toBeVisible();
+  expect(server.writes[0]).toMatchObject({ title: 'Mine', tags: ['remote'] });
+  expect(new Set(server.writes[0].tiles!.map((tile) => tile.tile_id)).size).toBe(2);
+  await rename('Mine', 'Mine again');
+  server.change({ title: 'Theirs', variables: [] });
+  await page.getByRole('dialog').locator('[data-dialog-confirm]').click();
+  const conflict = page.getByRole('dialog', {
+    name: 'Dashboard changed on the server',
+    exact: true,
+  });
+  await conflict.getByRole('button', { name: 'Overwrite', exact: true }).click();
+  await expect(page.getByRole('link', { name: 'Mine again', exact: true })).toBeVisible();
+  expect(server.writes[1]).toMatchObject({ title: 'Mine again', tags: ['remote'], variables: [] });
+  for (const copy of ['Mine again (Copy)', 'Mine again (Copy) (2)']) {
+    await page.getByRole('button', { name: 'Actions for Mine again', exact: true }).click();
+    await page.getByRole('menuitem', { name: 'Duplicate', exact: true }).click();
+    await expect(page.getByRole('heading', { name: copy, exact: true })).toBeVisible();
+    await page.goto('/dashboards');
+  }
+  expect(server.creates.map((doc) => doc.title)).toEqual([
+    'Mine again (Copy)',
+    'Mine again (Copy) (2)',
+  ]);
 });
 
 test('created and updated sorts use their distinct dates in both directions', async ({ page }) => {

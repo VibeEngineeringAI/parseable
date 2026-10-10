@@ -6,6 +6,8 @@ import {
   duplicateDashboard,
   filterDashboards,
   editDashboardMetadata,
+  metadataPatch,
+  patchConflicts,
 } from './helpers';
 import { dashboardRange, classicTimeRange } from './timeRange';
 import { ulid } from '../../lib/dashboardsContract';
@@ -35,6 +37,23 @@ describe('dashboard helpers', () => {
         title: 'Renamed',
       });
   });
+  it('patches only edited metadata and reports conflicts only on fields both sides changed', () => {
+    const patch = metadataPatch(classic, 'Renamed', classic.tags, classic.description);
+    expect(patch).toEqual({ title: 'Renamed' });
+    const latest = {
+      ...classic,
+      modified: 'later',
+      tags: ['remote'],
+      tiles: [...classic.tiles, { ...classic.tiles[0], tile_id: '01M4J000000000000000000099' }],
+    };
+    expect(patchConflicts(classic, latest, patch)).toBe(false);
+    expect({ ...latest, ...patch }).toMatchObject({ title: 'Renamed', tags: ['remote'] });
+    expect({ ...latest, ...patch }.tiles).toHaveLength(5);
+    expect(patchConflicts(classic, { ...latest, title: 'Remote' }, patch)).toBe(true);
+    expect(
+      patchConflicts(classic, latest, metadataPatch(classic, classic.title, ['mine'], '')),
+    ).toBe(true);
+  });
   it('checks modified again before save and propagates aborts and permission errors', async () => {
     const getDashboard = vi.fn().mockResolvedValue({ ...classic, modified: 'later' }),
       client = { getDashboard } as unknown as ParseableClient;
@@ -47,7 +66,7 @@ describe('dashboard helpers', () => {
     await expect(checkDashboardConflict(client, classic, signal)).rejects.toThrow('Denied');
   });
   it('duplicates all extras with fresh tile ULIDs and no old metadata', () => {
-    const result = duplicateDashboard(classic);
+    const result = duplicateDashboard(classic, [classic.title]);
     expect(result.title).toBe('Service health (Copy)');
     expect(result.isFavorite).toBe(false);
     expect(result.tiles.every((tile) => ulid(tile.tile_id))).toBe(true);
@@ -61,6 +80,13 @@ describe('dashboard helpers', () => {
     expect(result.dashboardId).toBeUndefined();
     expect(result).not.toHaveProperty('tenantId');
     expect(result.dashboardType).toBe('Report');
+  });
+  it('gives each duplicate of the same dashboard a title the server has not taken', () => {
+    const titles = [classic.title, 'Service health (Copy)'];
+    expect(duplicateDashboard(classic, titles).title).toBe('Service health (Copy) (2)');
+    titles.push('Service health (Copy) (2)');
+    expect(duplicateDashboard(classic, titles).title).toBe('Service health (Copy) (3)');
+    expect(titles).toHaveLength(3);
   });
   it('parses Chrono summary dates and filters/sorts without fetching details', () => {
     expect(dashboardDate('2026-10-10 12:00:00.123456789 UTC')).toBe('2026-10-10T12:00:00.123Z');

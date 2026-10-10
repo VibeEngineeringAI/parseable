@@ -37,28 +37,50 @@ export async function checkDashboardConflict(
   const latest = await client.getDashboard(loaded.dashboardId, signal);
   return hasConflict(loaded, latest) ? latest : undefined;
 }
+/** Only the metadata fields that differ from `original`. */
+export function metadataPatch(
+  original: Dashboard,
+  title: string,
+  tags: string[],
+  description: string,
+): Partial<Dashboard> {
+  const currentDescription = typeof original.description === 'string' ? original.description : '';
+  return {
+    ...(title !== original.title ? { title } : {}),
+    ...(JSON.stringify(tags) !== JSON.stringify(original.tags ?? []) ? { tags } : {}),
+    ...(description !== currentDescription ? { description } : {}),
+  };
+}
 export function editDashboardMetadata(
   original: Dashboard,
   title: string,
   tags: string[],
   description: string,
 ): Dashboard {
-  const currentDescription = typeof original.description === 'string' ? original.description : '';
-  return {
-    ...original,
-    title,
-    ...(JSON.stringify(tags) !== JSON.stringify(original.tags ?? []) ? { tags } : {}),
-    ...(description !== currentDescription ? { description } : {}),
-  };
+  return { ...original, ...metadataPatch(original, title, tags, description) };
+}
+/** True when someone else changed a field that `patch` also changes. */
+export function patchConflicts(loaded: Dashboard, latest: Dashboard, patch: Partial<Dashboard>) {
+  return Object.keys(patch).some(
+    (key) => JSON.stringify(latest[key]) !== JSON.stringify(loaded[key]),
+  );
+}
+export function availableTitle(title: string, taken: Set<string>) {
+  let result = title,
+    index = 2;
+  while (taken.has(result)) result = `${title} (${index++})`;
+  taken.add(result);
+  return result;
 }
 export function duplicateDashboard(
   source: Dashboard,
+  titles: Iterable<string>,
 ): DashboardRequest & { tiles: DashboardTile[] } {
   const body = structuredClone(source);
   for (const key of ['dashboardId', 'author', 'created', 'modified', 'tenantId']) delete body[key];
   return {
     ...body,
-    title: `${source.title} (Copy)`,
+    title: availableTitle(`${source.title} (Copy)`, new Set(titles)),
     isFavorite: false,
     tiles: (source.tiles ?? []).map((tile) => ({ ...tile, tile_id: createUlid() })),
   };

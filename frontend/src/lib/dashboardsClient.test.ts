@@ -44,6 +44,13 @@ const cases: Array<{
     body: classic,
     reply: classic,
   },
+  {
+    name: 'bodyless favourite update',
+    run: (c) => c.setDashboardFavorite('id/with space', true),
+    url: `${path}?isFavorite=true`,
+    method: 'PUT',
+    reply: classic,
+  },
   { name: 'delete', run: (c) => c.deleteDashboard('id/with space'), url: path, method: 'DELETE' },
 ];
 afterEach(() => vi.unstubAllGlobals());
