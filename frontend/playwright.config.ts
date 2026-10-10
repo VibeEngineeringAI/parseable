@@ -2,9 +2,9 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
-  // Bound Chromium load on shared development machines; lazy routes still use
-  // the normal assertion timeout and each test keeps an isolated browser context.
-  workers: 4,
+  // Bound Chromium load on shared development machines; CI keeps Playwright's
+  // default. Each test keeps an isolated browser context.
+  workers: process.env.CI ? undefined : 4,
   retries: process.env.CI ? 1 : 0,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {

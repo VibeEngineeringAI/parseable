@@ -130,9 +130,6 @@ export function DashboardsList({
                       <Badge key={value}>{value}</Badge>
                     ))}
                   </div>
-                  {typeof row.description === 'string' && (
-                    <p className="muted">{row.description}</p>
-                  )}
                 </td>
                 <td className="dashboards-date">
                   <span className="dashboards-mobile-label">Updated: </span>

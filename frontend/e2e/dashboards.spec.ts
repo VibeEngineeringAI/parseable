@@ -732,6 +732,29 @@ test('create-alert URLs are concrete; All is disabled with a tooltip; classic SQ
   await expect(page.getByLabel('Title', { exact: true })).toHaveValue('SQL panel');
 });
 
+const blocksUnload = (page: Page) =>
+  page.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+
+test('an unsaved time range stays saveable without prompting on leave', async ({ page }) => {
+  await mockServer(page, { document: { ...classic, variables: [], tiles: [classic.tiles[1]] } });
+  await page.goto(detail);
+  await page.getByLabel('Time range', { exact: true }).selectOption('30m');
+  await expect(page.getByText('Unsaved changes', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+  let prompts = 0;
+  page.on('dialog', async (dialog) => {
+    prompts++;
+    await dialog.dismiss();
+  });
+  await page.getByTestId('sidebar-dashboards').click();
+  await expect(page.getByRole('heading', { name: 'Dashboards', exact: true })).toBeVisible();
+  expect(prompts).toBe(0);
+});
+
 test('time ranges refresh every tile and a dirty leave guard lets the user stay or discard', async ({
   page,
 }) => {
@@ -741,6 +764,8 @@ test('time ranges refresh every tile and a dirty leave guard lets the user stay 
   await page.goto(detail);
   await page.getByLabel('Time range', { exact: true }).selectOption('30m');
   await expect(page).toHaveURL(/range=30m/);
+  await expect(page.getByText('Unsaved changes', { exact: true })).toBeVisible();
+  expect(await blocksUnload(page)).toBe(false);
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
   expect(server.writes[0].timeRange).toMatchObject({
@@ -761,6 +786,7 @@ test('time ranges refresh every tile and a dirty leave guard lets the user stay 
     .click();
   await page.getByRole('dialog').getByLabel('Tile title').fill('Dirty');
   await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  expect(await blocksUnload(page)).toBe(true);
   let leave = false,
     handled = 0;
   page.on('dialog', async (dialog) => {

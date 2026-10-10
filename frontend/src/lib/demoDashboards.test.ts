@@ -7,6 +7,16 @@ describe('per-client dashboard demo', () => {
     const client = createDemoDashboards(),
       rows = await client.listDashboards();
     expect(rows).toHaveLength(3);
+    for (const row of rows)
+      expect(Object.keys(row).sort()).toEqual([
+        'author',
+        'created',
+        'dashboardId',
+        'isFavorite',
+        'modified',
+        'tags',
+        'title',
+      ]);
     const sql = await client.getDashboard(
       rows.find((row) => row.title === 'Application signals')!.dashboardId,
     );

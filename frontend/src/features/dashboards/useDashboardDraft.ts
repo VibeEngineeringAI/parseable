@@ -29,8 +29,10 @@ export function useDashboardDraft(original: Dashboard, focusHeading: () => void)
     },
     [],
   );
-  const dirty = JSON.stringify(draft) !== JSON.stringify(baseline) || rangeDirty;
-  const markSaved = useLeaveGuard(dirty || editorDirty, 'dashboard');
+  const edited = JSON.stringify(draft) !== JSON.stringify(baseline),
+    dirty = edited || rangeDirty;
+  // A range-only change stays saveable but does not block leaving.
+  const markSaved = useLeaveGuard(edited || editorDirty, 'dashboard');
   useEffect(() => {
     if (dirty && status === 'Dashboard saved.') setStatus('');
   }, [dirty, status]);
