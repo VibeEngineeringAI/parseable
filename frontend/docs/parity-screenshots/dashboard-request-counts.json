@@ -1,0 +1,47 @@
+{
+  "initial": {
+    "filtered": 1,
+    "independent": 1,
+    "promql": 1
+  },
+  "time range": {
+    "filtered": 2,
+    "independent": 2,
+    "promql": 2
+  },
+  "host variable": {
+    "filtered": 2,
+    "independent": 2,
+    "promql": 3
+  },
+  "level variable": {
+    "filtered": 3,
+    "independent": 2,
+    "promql": 3
+  },
+  "refresh": {
+    "filtered": 4,
+    "independent": 3,
+    "promql": 4
+  },
+  "move": {
+    "filtered": 4,
+    "independent": 3,
+    "promql": 4
+  },
+  "variable label": {
+    "filtered": 4,
+    "independent": 3,
+    "promql": 4
+  },
+  "edit title": {
+    "filtered": 4,
+    "independent": 3,
+    "promql": 4
+  },
+  "save": {
+    "filtered": 4,
+    "independent": 3,
+    "promql": 4
+  }
+}

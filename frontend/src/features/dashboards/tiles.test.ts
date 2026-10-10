@@ -3,14 +3,13 @@ import classic from './__fixtures__/classic.json';
 import {
   appendLayout,
   moveTile,
-  patchTile,
   promqlQueries,
   resolvedLayouts,
   sqlQuery,
   tileStep,
   tileVariableNames,
 } from './tiles';
-import type { Dashboard, DashboardTile } from '../../lib/types';
+import type { DashboardTile } from '../../lib/types';
 const make = (id: string, layout: unknown): DashboardTile => ({
   tile_id: id,
   layout,
@@ -35,13 +34,6 @@ describe('classic tile helpers', () => {
       }),
     ]).toEqual(['host', 'zone', 'dataset']);
     expect([...tileVariableNames(classic.tiles[1])]).toEqual([]);
-  });
-  it('patches one title without rebuilding any tile or document', () => {
-    const result = patchTile(classic, classic.tiles[0].tile_id, { title: 'Edited' });
-    const expected = structuredClone(classic);
-    expected.tiles[0].title = 'Edited';
-    expect(result).toEqual(expected);
-    expect(classic.tiles[0].title).toBe('Host load');
   });
   it('orders by y,x and appends null, missing and non-finite y without mutating originals', () => {
     const tiles = [
@@ -96,8 +88,9 @@ describe('classic tile helpers', () => {
       },
     };
     const original = structuredClone(tile);
-    expect(sqlQuery(tile)).toContain('date_trunc');
-    expect(sqlQuery(tile)).toContain('COUNT(*)');
+    expect(sqlQuery({ ...tile, chartType: 'timeseries' })).toBe(
+      'SELECT DATE_TRUNC(\'minute\', \"p_timestamp\") AS \"time_bucket\", COUNT(*) AS \"COUNT_STAR\" FROM \"logs\" GROUP BY \"time_bucket\" ORDER BY \"time_bucket\" DESC',
+    );
     expect(tile).toEqual(original);
   });
 });

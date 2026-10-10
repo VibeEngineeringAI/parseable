@@ -1,62 +1,27 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import {
-  ActionsMenu,
-  Badge,
-  Button,
-  Dialog,
-  EmptyState,
-  Spinner,
-  TypedConfirmDialog,
-} from '../../components/ui';
+import { useCallback, useMemo, useRef, useState } from 'react';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { ActionsMenu, Badge, Button, InlineError } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
-import { useMutation } from '../../hooks/useMutation';
+import { useRowDeletionFocus } from '../../hooks/useRowDeletionFocus';
 import { createLimiter } from '../../lib/concurrency';
-import { createUlid } from '../../lib/ids';
-import { timeBounds } from '../../lib/query';
-import type {
-  Dashboard,
-  DashboardTile as Tile,
-  DashboardVariable,
-  TimeRange,
-} from '../../lib/types';
-import { InlineError } from '../../components/ui';
-import { useLeaveGuard } from '../../hooks/useLeaveGuard';
+import type { Dashboard, DashboardTile as Tile } from '../../lib/types';
 import { useDashboardAccess } from './owner';
-import {
-  checkDashboardConflict,
-  dashboardError,
-  dashboardPresets,
-  duplicateDashboard,
-  editDashboardMetadata,
-} from './helpers';
-import {
-  appendLayout,
-  moveTile,
-  record,
-  resolvedLayouts,
-  text,
-  tileTitle,
-  tileVariableNames,
-} from './tiles';
-import { classicTimeRange, dashboardRange, rangeParams } from './timeRange';
-import { readVariables, type VariableValues } from './variables';
-import { DashboardTile } from './DashboardTile';
+import { dashboardError, dashboardPresets, duplicateDashboard } from './helpers';
+import { moveTile, text, tileType } from './tiles';
+import { duplicateTile } from './draft';
+import { DashboardSections } from './DashboardSections';
 import { VariablesBar } from './VariablesBar';
-import { ConflictDialog } from './ConflictDialog';
-import { DashboardForm } from './DashboardForm';
+import type { VariableResolutions } from './VariableControl';
+import { DashboardDialogs, type DashboardDialog } from './DashboardDialogs';
+import { useDashboardDraft } from './useDashboardDraft';
+import { useDashboardUrl } from './useDashboardUrl';
 import { downloadDashboard } from './importExport';
 import './dashboards.css';
-const TileEditor = lazy(() =>
-  import('./TileEditor').then((module) => ({ default: module.TileEditor })),
-);
-const VariableEditor = lazy(() =>
-  import('./VariableEditor').then((module) => ({ default: module.VariableEditor })),
-);
+
 export function DashboardView() {
   const { id = '' } = useParams(),
     { client } = useApp();
@@ -73,166 +38,62 @@ export function DashboardView() {
 function DashboardFields({ original }: { original: Dashboard }) {
   const { client } = useApp(),
     navigate = useNavigate(),
-    access = useDashboardAccess(),
-    mutation = useMutation();
-  const [params, setParams] = useSearchParams();
-  // useSearchParams callbacks do not queue like React state updates. Merge against
-  // the latest URL so simultaneous variable defaults and selections keep each other.
-  const paramsRef = useRef(params);
-  paramsRef.current = params;
-  const updateParams = useCallback(
-    (edit: (current: URLSearchParams) => URLSearchParams) => {
-      const next = edit(new URLSearchParams(paramsRef.current));
-      paramsRef.current = next;
-      setParams(next, { replace: true });
-    },
-    [setParams],
-  );
-  const [loaded, setLoaded] = useState(original),
-    [draft, setDraft] = useState(original);
-  const [initialRange, setInitialRange] = useState(() =>
-    dashboardRange(params, original.timeRange),
-  );
-  useEffect(() => {
-    const current = paramsRef.current;
-    if (!current.has('range') && !(current.has('start') && current.has('end')))
-      updateParams((params) => rangeParams(params, initialRange));
-  }, [initialRange, updateParams]);
-  const [rangeDirty, setRangeDirty] = useState(false),
-    [anchor, setAnchor] = useState(Date.now()),
-    [revision, setRevision] = useState(0);
-  const range = useMemo(
-      () => dashboardRange(params, draft.timeRange, anchor),
-      [params, draft.timeRange, anchor],
-    ),
-    rangeKey = JSON.stringify(range);
-  const [editor, setEditor] = useState<{ tile?: Tile }>(),
-    [variableEditor, setVariableEditor] = useState<{ variable?: DashboardVariable }>();
-  const [editorDirty, setEditorDirty] = useState(false),
-    [metadataOpen, setMetadataOpen] = useState(false);
-  const [deletingTile, setDeletingTile] = useState<Tile>(),
-    [deletingVariable, setDeletingVariable] = useState<DashboardVariable>(),
-    [deleting, setDeleting] = useState(false),
-    [convert, setConvert] = useState<Tile>();
-  const [conflict, setConflict] = useState<Dashboard>(),
-    [status, setStatus] = useState(''),
-    [variablesReady, setVariablesReady] = useState<Record<string, boolean>>({});
-  const writable = !!access.hash && access.hash === draft.author;
-  const dirty = JSON.stringify(draft) !== JSON.stringify(loaded) || rangeDirty;
-  const markSaved = useLeaveGuard(dirty || editorDirty, 'dashboard');
-  const about = useAsync(useCallback((signal) => client.about(signal), [client]));
-  const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
-  const promqlEnabled = about.data?.capabilities.promqlDashboard === true;
-  const variables = useMemo(() => readVariables(draft.variables), [draft.variables]);
-  const values = useMemo<VariableValues>(
+    access = useDashboardAccess();
+  const page = useRef<HTMLDivElement>(null);
+  const focusHeading = useCallback(
     () =>
-      Object.fromEntries(
-        variables.flatMap((variable) => {
-          const value =
-            params.get(`var-${variable.name}`) ??
-            variable.defaultValue ??
-            (variable.type === 'list'
-              ? variable.options?.[0]
-              : variable.type === 'text'
-                ? ''
-                : undefined);
-          return value === undefined ? [] : [[variable.name, value]];
-        }),
-      ),
-    [variables, params],
-  );
-  const select = useCallback(
-    (name: string, value: string) =>
-      updateParams((current) => {
-        current.set(`var-${name}`, value);
-        return current;
-      }),
-    [updateParams],
-  );
-  const bounds = useMemo(() => timeBounds(range, anchor), [rangeKey, anchor]);
-  const limit = useMemo(() => createLimiter(4), [client]);
-  const ordered = useMemo(() => resolvedLayouts(draft.tiles ?? []), [draft.tiles]);
-  const readController = useRef<AbortController | undefined>(undefined);
-  useEffect(() => () => readController.current?.abort(), []);
-  function setRange(value: TimeRange) {
-    updateParams((current) => rangeParams(current, value));
-    setAnchor(Date.now());
-    setRangeDirty(writable);
-  }
-  function completed(saved: Dashboard) {
-    setLoaded(saved);
-    setDraft(saved);
-    setRangeDirty(false);
-    setInitialRange(range);
-    setConflict(undefined);
-    setStatus('Dashboard saved.');
-    mutation.reset();
-    markSaved();
-  }
-  function payload() {
-    return {
-      ...draft,
-      ...(rangeDirty || draft.timeRange == null
-        ? { timeRange: classicTimeRange(range, draft.timeRange) }
-        : {}),
-    };
-  }
-  function save(overwrite = false) {
-    void mutation.run(async () => {
-      readController.current?.abort();
-      readController.current = new AbortController();
-      if (!overwrite) {
-        const latest = await checkDashboardConflict(client, loaded, readController.current.signal);
-        if (!mutation.isActive()) return;
-        if (latest) {
-          setConflict(latest);
-          return;
+      requestAnimationFrame(() => {
+        const heading = page.current?.querySelector('h1');
+        if (heading) {
+          heading.tabIndex = -1;
+          heading.focus();
         }
-      }
-      const saved = await client.updateDashboard(draft.dashboardId, payload());
-      if (mutation.isActive()) completed(saved);
-    });
-  }
+      }),
+    [],
+  );
+  const workspace = useDashboardDraft(original, focusHeading),
+    { draft, dirty, mutation } = workspace;
+  const url = useDashboardUrl(draft);
+  const [dialog, setDialog] = useState<DashboardDialog>();
+  const [resolutions, setResolutions] = useState<VariableResolutions>({});
+  const about = useAsync(useCallback((signal) => client.about(signal), [client]));
+  const promqlEnabled = about.data ? about.data.capabilities.promqlDashboard === true : undefined;
+  const writable = !!access.hash && access.hash === draft.author;
+  const editing = writable && !mutation.pending;
+  const limit = useMemo(() => createLimiter(4), [client]);
+  const tileFocus = useRowDeletionFocus(
+    (draft.tiles ?? []).map((tile) => tile.tile_id),
+    false,
+  );
+  const variableFocus = useRowDeletionFocus(
+    url.variables.map((variable) => variable.name),
+    false,
+  );
   function tileAction(action: 'edit' | 'duplicate' | 'earlier' | 'later' | 'delete', tile: Tile) {
-    if (action === 'edit') {
-      if (tile.tileType === 'builder') setConvert(tile);
-      else setEditor({ tile });
-    }
-    if (action === 'delete') setDeletingTile(tile);
+    if (action === 'edit')
+      setDialog({ kind: tileType(tile) === 'builder' ? 'convert' : 'tile', tile });
+    if (action === 'delete') setDialog({ kind: 'remove', tile });
     if (action === 'duplicate')
-      setDraft((current) => ({
-        ...current,
-        tiles: [
-          ...(current.tiles ?? []),
-          {
-            ...structuredClone(tile),
-            tile_id: createUlid(),
-            title: `${tileTitle(tile)} (Copy)`,
-            layout: {
-              ...record(tile.layout),
-              ...appendLayout(
-                current.tiles ?? [],
-                resolvedLayouts([tile])[0].layout.w,
-                resolvedLayouts([tile])[0].layout.h,
-              ),
-            },
-          },
-        ],
-      }));
+      workspace.changeDraft(
+        (current) => duplicateTile(current, tile),
+        'Tile duplicated. Save to keep this change.',
+      );
     if (action === 'earlier' || action === 'later')
-      setDraft((current) => ({
-        ...current,
-        tiles: moveTile(current.tiles ?? [], tile.tile_id, action === 'earlier' ? -1 : 1),
-      }));
-  }
-  function closeEditor() {
-    if (editorDirty && !window.confirm('Discard changes in this editor?')) return;
-    setEditor(undefined);
-    setVariableEditor(undefined);
-    setEditorDirty(false);
+      workspace.changeDraft(
+        (current) => ({
+          ...current,
+          tiles: moveTile(
+            current.tiles ?? [],
+            tile.tile_id,
+            action === 'earlier' ? -1 : 1,
+            current.sections,
+          ),
+        }),
+        `Tile moved ${action}. Save to keep this change.`,
+      );
   }
   return (
-    <div className="page dashboards-page">
+    <div ref={page} className="page dashboards-page">
       <nav aria-label="Dashboard breadcrumb" className="dashboard-breadcrumb">
         <Link to="/dashboards">Dashboards</Link>
         <span aria-hidden="true">/</span>
@@ -247,7 +108,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
               <>
                 <Button
                   variant="primary"
-                  onClick={() => save()}
+                  onClick={() => workspace.save(url.range)}
                   disabled={!dirty || mutation.pending}
                 >
                   {mutation.pending ? 'Saving…' : 'Save'}
@@ -255,11 +116,8 @@ function DashboardFields({ original }: { original: Dashboard }) {
                 <Button
                   disabled={!dirty || mutation.pending}
                   onClick={() => {
-                    setDraft(loaded);
-                    setRangeDirty(false);
-                    updateParams((current) => rangeParams(current, initialRange));
-                    mutation.reset();
-                    setStatus('Changes discarded.');
+                    url.setRange(workspace.storedRange());
+                    workspace.discard();
                   }}
                 >
                   Discard
@@ -277,7 +135,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
                         label: 'Rename and tags',
                         onSelect: () => {
                           mutation.reset();
-                          setMetadataOpen(true);
+                          setDialog({ kind: 'metadata' });
                         },
                       },
                     ]
@@ -287,11 +145,16 @@ function DashboardFields({ original }: { original: Dashboard }) {
                   id: 'duplicate',
                   label: 'Duplicate dashboard',
                   disabled: !access.canCreate || dirty,
+                  description: dirty
+                    ? 'Save or discard your changes before duplicating this dashboard.'
+                    : !access.canCreate
+                      ? 'You do not have permission to create dashboards.'
+                      : undefined,
                   onSelect: () =>
                     void mutation.run(async () => {
                       const created = await client.createDashboard(duplicateDashboard(draft));
                       if (mutation.isActive()) {
-                        markSaved();
+                        workspace.markSaved();
                         navigate(`/dashboards/${created.dashboardId}`);
                       }
                     }),
@@ -304,7 +167,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
                         destructive: true,
                         onSelect: () => {
                           mutation.reset();
-                          setDeleting(true);
+                          setDialog({ kind: 'dashboard-delete' });
                         },
                       },
                     ]
@@ -318,13 +181,18 @@ function DashboardFields({ original }: { original: Dashboard }) {
         <TimeRangePicker
           presets={dashboardPresets}
           disabled={mutation.pending}
-          value={range}
-          onChange={setRange}
+          value={url.range}
+          onChange={(value) => {
+            url.setRange(value);
+            workspace.setRangeDirty(writable);
+          }}
         />
         <Button
           onClick={() => {
-            setAnchor(Date.now());
-            setRevision((value) => value + 1);
+            url.refresh();
+            workspace.announce(
+              `Refreshing ${(draft.tiles ?? []).length} ${(draft.tiles ?? []).length === 1 ? 'tile' : 'tiles'}.`,
+            );
           }}
         >
           Refresh
@@ -335,236 +203,88 @@ function DashboardFields({ original }: { original: Dashboard }) {
           </Badge>
         )}
       </div>
-      {!writable && (
-        <p className="notice">This dashboard is read-only. Only its owner can edit it.</p>
+      {!access.loading && !writable && (
+        <p className="notice">
+          This dashboard is read-only. Only its owner can edit it.
+          {access.canCreate ? ' Duplicate it to make an editable copy.' : ''}
+        </p>
       )}
-      <p className="dashboards-status muted" role="status">
-        {status}
+      {!!workspace.repaired && (
+        <p className="notice">
+          This dashboard has duplicate or nil tile IDs. Saving will assign new IDs to{' '}
+          {workspace.repaired} {workspace.repaired === 1 ? 'tile' : 'tiles'}.
+        </p>
+      )}
+      <p className="dashboards-status muted" role="status" aria-live="polite">
+        {workspace.status}
       </p>
-      <InlineError error={!conflict ? dashboardError(mutation.error) : undefined} />
-      <QueryState loading={false} error={about.error} retry={about.reload} />
-      <VariablesBar
-        variables={variables}
-        values={values}
-        params={params}
-        bounds={bounds}
-        writable={writable && !mutation.pending}
+      <InlineError error={!workspace.conflict ? dashboardError(mutation.error) : undefined} />
+      {about.error && (
+        <div>
+          <InlineError error={`Could not load server capabilities: ${about.error.message}`} />
+          <Button onClick={about.reload}>Retry capabilities</Button>
+        </div>
+      )}
+      <div ref={variableFocus.root}>
+        <VariablesBar
+          variables={url.variables}
+          values={url.values}
+          params={url.params}
+          bounds={url.bounds}
+          writable={editing}
+          promqlEnabled={promqlEnabled}
+          resolutions={resolutions}
+          onSelect={url.select}
+          onResolve={setResolutions}
+          onEdit={(variable) => setDialog({ kind: 'variable', variable })}
+          onDelete={(variable) => setDialog({ kind: 'remove', variable })}
+        />
+        {writable && (
+          <div className="dashboard-add-actions">
+            <Button
+              data-list-search
+              disabled={mutation.pending}
+              onClick={() => setDialog({ kind: 'variable' })}
+            >
+              Add variable
+            </Button>
+            <Button disabled={mutation.pending} onClick={() => setDialog({ kind: 'tile' })}>
+              Add tile
+            </Button>
+          </div>
+        )}
+      </div>
+      <div ref={tileFocus.root} className="dashboard-sections">
+        <DashboardSections
+          dashboard={draft}
+          url={url}
+          writable={editing}
+          promqlEnabled={promqlEnabled}
+          promqlAlerts={about.data?.capabilities.promqlAlerts === true}
+          resolutions={resolutions}
+          limit={limit}
+          onAction={tileAction}
+        />
+      </div>
+      <DashboardDialogs
+        dialog={dialog}
+        setDialog={setDialog}
+        workspace={workspace}
+        url={url}
+        limit={limit}
         promqlEnabled={promqlEnabled}
-        onSelect={select}
-        onReady={setVariablesReady}
-        onAdd={() => setVariableEditor({})}
-        onEdit={(variable) => setVariableEditor({ variable })}
-        onDelete={setDeletingVariable}
-      />
-      {writable && (
-        <div className="inline">
-          <Button disabled={mutation.pending} onClick={() => setEditor({})}>
-            Add tile
-          </Button>
-        </div>
-      )}
-      {!ordered.length ? (
-        <EmptyState
-          title="Start building your dashboard"
-          description="Add SQL and PromQL tiles to visualize your telemetry."
-        />
-      ) : (
-        <div className="dashboard-server-grid">
-          {ordered.map(({ tile, layout }, index) => (
-            <DashboardTile
-              key={tile.tile_id}
-              tile={tile}
-              layout={layout}
-              dashboardId={draft.dashboardId}
-              variables={variables}
-              values={values}
-              bounds={bounds}
-              anchor={anchor}
-              revision={revision}
-              ready={variables
-                .filter((variable) => tileVariableNames(tile).has(variable.name))
-                .every((variable) => variablesReady[variable.name])}
-              writable={writable && !mutation.pending}
-              promqlEnabled={promqlEnabled}
-              promqlAlerts={about.data?.capabilities.promqlAlerts === true}
-              limit={limit}
-              first={index === 0}
-              last={index === ordered.length - 1}
-              onAction={tileAction}
-            />
-          ))}
-        </div>
-      )}
-      <Suspense fallback={<Spinner />}>
-        {editor && (
-          <TileEditor
-            limit={limit}
-            original={editor.tile}
-            tiles={draft.tiles ?? []}
-            variables={variables}
-            values={values}
-            promqlEnabled={promqlEnabled}
-            metadataEnabled={about.data?.capabilities.promqlMetadata === true}
-            start={Date.parse(bounds.startTime) / 1000}
-            end={Date.parse(bounds.endTime) / 1000}
-            onDirty={setEditorDirty}
-            onClose={closeEditor}
-            onApply={(tile) => {
-              setDraft((current) => ({
-                ...current,
-                tiles: editor.tile
-                  ? (current.tiles ?? []).map((stored) =>
-                      stored.tile_id === tile.tile_id ? tile : stored,
-                    )
-                  : [...(current.tiles ?? []), tile],
-              }));
-              setEditor(undefined);
-            }}
-          />
-        )}
-        {variableEditor && (
-          <VariableEditor
-            original={variableEditor.variable}
-            variables={variables}
-            datasets={(datasets.data ?? []).map((dataset) => dataset.name)}
-            promqlEnabled={promqlEnabled}
-            onDirty={setEditorDirty}
-            onClose={closeEditor}
-            onApply={(variable) => {
-              setDraft((current) => ({
-                ...current,
-                variables: variableEditor.variable
-                  ? (Array.isArray(current.variables) ? current.variables : []).map((stored) =>
-                      record(stored).name === variableEditor.variable!.name ? variable : stored,
-                    )
-                  : [...(Array.isArray(current.variables) ? current.variables : []), variable],
-              }));
-              setVariableEditor(undefined);
-            }}
-          />
-        )}
-      </Suspense>
-      {metadataOpen && (
-        <DashboardForm
-          original={draft}
-          pending={false}
-          onDirtyChange={setEditorDirty}
-          onClose={() => {
-            setMetadataOpen(false);
-            setEditorDirty(false);
-          }}
-          onSubmit={(title, tags, description) => {
-            setDraft((current) => editDashboardMetadata(current, title, tags, description));
-            setMetadataOpen(false);
-            setEditorDirty(false);
-          }}
-        />
-      )}
-      <Dialog
-        open={!!convert}
-        onOpenChange={(open) => {
-          if (!open) setConvert(undefined);
-        }}
-        title="Edit builder tile as SQL?"
-        description="The visual builder isn't available in /next. Applying this edit converts the tile to SQL; its stored query and chart settings are kept."
-      >
-        <div className="dialog-actions">
-          <Button onClick={() => setConvert(undefined)}>Cancel</Button>
-          <Button
-            variant="primary"
-            onClick={() => {
-              if (convert) {
-                setEditor({ tile: { ...convert, tileType: 'code' } });
-                setConvert(undefined);
-              }
-            }}
-          >
-            Edit as SQL
-          </Button>
-        </div>
-      </Dialog>
-      <Dialog
-        open={!!deletingTile || !!deletingVariable}
-        onOpenChange={(open) => {
-          if (!open) {
-            setDeletingTile(undefined);
-            setDeletingVariable(undefined);
-          }
-        }}
-        title={deletingTile ? 'Delete tile?' : 'Delete variable?'}
-        description={`Remove ${deletingTile ? tileTitle(deletingTile) : (deletingVariable?.label ?? 'this variable')}? Save the dashboard to persist this change.`}
-      >
-        <div className="dialog-actions">
-          <Button
-            onClick={() => {
-              setDeletingTile(undefined);
-              setDeletingVariable(undefined);
-            }}
-          >
-            Cancel
-          </Button>
-          <Button
-            variant="danger"
-            onClick={() => {
-              if (deletingTile)
-                setDraft((current) => ({
-                  ...current,
-                  tiles: (current.tiles ?? []).filter(
-                    (tile) => tile.tile_id !== deletingTile.tile_id,
-                  ),
-                }));
-              if (deletingVariable)
-                setDraft((current) => ({
-                  ...current,
-                  variables: (Array.isArray(current.variables) ? current.variables : []).filter(
-                    (variable) => record(variable).name !== deletingVariable.name,
-                  ),
-                }));
-              setDeletingTile(undefined);
-              setDeletingVariable(undefined);
-            }}
-          >
-            {deletingTile ? 'Delete tile' : 'Delete variable'}
-          </Button>
-        </div>
-      </Dialog>
-      <TypedConfirmDialog
-        open={deleting}
-        onOpenChange={setDeleting}
-        title="Delete dashboard"
-        name={draft.title}
-        action="Delete dashboard"
-        pending={mutation.pending}
-        error={dashboardError(mutation.error)}
-        onConfirm={() =>
-          void mutation.run(async () => {
-            await client.deleteDashboard(draft.dashboardId);
-            if (mutation.isActive()) {
-              markSaved();
-              navigate('/dashboards');
-            }
-          })
-        }
-      />
-      <ConflictDialog
-        open={!!conflict}
-        pending={mutation.pending}
-        error={mutation.error}
-        onReload={() => {
-          if (conflict) {
-            setLoaded(conflict);
-            setDraft(conflict);
-            setInitialRange(dashboardRange(new URLSearchParams(), conflict.timeRange));
-            updateParams((current) =>
-              rangeParams(current, dashboardRange(new URLSearchParams(), conflict.timeRange)),
+        metadataEnabled={about.data?.capabilities.promqlMetadata === true}
+        onTileDeleted={(id) => {
+          tileFocus.onDeleted(id);
+          if (draft.tiles?.length === 1)
+            requestAnimationFrame(() =>
+              page.current
+                ?.querySelector<HTMLButtonElement>('.dashboard-add-actions button:last-child')
+                ?.focus(),
             );
-            setRangeDirty(false);
-            setConflict(undefined);
-            mutation.reset();
-            setStatus('Loaded the server copy.');
-          }
         }}
-        onOverwrite={() => save(true)}
+        onVariableDeleted={variableFocus.onDeleted}
+        onDashboardDeleted={() => navigate('/dashboards')}
       />
     </div>
   );

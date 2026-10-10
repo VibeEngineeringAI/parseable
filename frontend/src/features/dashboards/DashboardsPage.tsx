@@ -1,14 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, RefreshCw } from 'lucide-react';
-import { Button, TypedConfirmDialog } from '../../components/ui';
+import { Button, TypedConfirmDialog, InlineError } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 import type { Dashboard, DashboardSummary } from '../../lib/types';
-import { InlineError } from '../../components/ui';
 import { useLeaveGuard } from '../../hooks/useLeaveGuard';
 import {
   checkDashboardConflict,
@@ -35,14 +34,14 @@ export function DashboardsPage() {
     mutation = useMutation();
   const controller = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => controller.current?.abort(), []);
-  const [form, setForm] = useState<{ original?: Dashboard }>(),
+  const [form, setForm] = useState<{ original?: Dashboard; recovered?: boolean }>(),
     [deleting, setDeleting] = useState<DashboardSummary>();
   const [importing, setImporting] = useState(false);
   const [formDirty, setFormDirty] = useState(false);
   const [deleted, setDeleted] = useState<string>(),
     [status, setStatus] = useState('');
   const [conflict, setConflict] = useState<{ latest: Dashboard; draft: Dashboard }>();
-  const markSaved = useLeaveGuard(formDirty || !!conflict, 'dashboard');
+  const markSaved = useLeaveGuard(formDirty || !!conflict || !!form?.recovered, 'dashboard');
   function readSignal() {
     controller.current?.abort();
     controller.current = new AbortController();
@@ -83,7 +82,7 @@ export function DashboardsPage() {
       if (kind === 'export') downloadDashboard(original);
       else if (kind === 'rename') setForm({ original });
       else if (kind === 'favourite')
-        await save(original, { ...original, isFavorite: !row.isFavorite });
+        await save(original, { ...original, isFavorite: !original.isFavorite });
       else if (kind === 'duplicate') {
         const created = await client.createDashboard(duplicateDashboard(original));
         if (mutation.isActive()) navigate(`/dashboards/${created.dashboardId}`);
@@ -97,11 +96,7 @@ export function DashboardsPage() {
         description="Visualize logs and metrics with your team."
         actions={
           <>
-            <Button
-              size="sm"
-              disabled={collection.loading || mutation.pending}
-              onClick={collection.reload}
-            >
+            <Button disabled={collection.loading || mutation.pending} onClick={collection.reload}>
               <RefreshCw size={15} aria-hidden="true" />
               Refresh
             </Button>
@@ -157,6 +152,7 @@ export function DashboardsPage() {
           refreshing={collection.loading || mutation.pending}
           owner={access.hash}
           isAdmin={access.isAdmin}
+          canCreate={access.canCreate}
           deleted={deleted}
           onAction={action}
         />
@@ -253,6 +249,10 @@ export function DashboardsPage() {
           setConflict(undefined);
           mutation.reset();
           collection.reload();
+        }}
+        onCancel={() => {
+          if (conflict) setForm({ original: conflict.draft, recovered: true });
+          setConflict(undefined);
         }}
         onOverwrite={() =>
           void mutation.run(async () => {

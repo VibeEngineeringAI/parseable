@@ -4,7 +4,7 @@ import { SqlEditor } from '../sql/SqlEditor';
 import { PromqlEditor } from '../../components/promql/PromqlEditor';
 import { createId } from '../../lib/ids';
 import type { DashboardVariable } from '../../lib/types';
-import { serializeVariable } from './variables';
+import { serializeVariable, setVariableType, variableDependencyError } from './variables';
 const types: Array<[DashboardVariable['type'], string]> = [
   ['promql', 'PromQL label values'],
   ['promql_query', 'PromQL query'],
@@ -25,7 +25,7 @@ export function VariableEditor({
   original?: DashboardVariable;
   variables: DashboardVariable[];
   datasets: string[];
-  promqlEnabled: boolean;
+  promqlEnabled?: boolean;
   onClose: () => void;
   onApply: (variable: DashboardVariable) => void;
   onDirty: (dirty: boolean) => void;
@@ -61,7 +61,9 @@ export function VariableEditor({
       : !draft.label.trim()
         ? 'Enter a variable label.'
         : ['promql', 'promql_query'].includes(draft.type) && !promqlEnabled
-          ? 'PromQL variables are unavailable on this server.'
+          ? promqlEnabled === undefined
+            ? 'Loading server capabilities…'
+            : 'PromQL variables are unavailable on this server.'
           : draft.type === 'promql' && (!draft.dataset || !draft.labelName)
             ? 'Choose a dataset and label name.'
             : draft.type === 'promql' && draft.labelFilters?.some((filter) => !filter.label.trim())
@@ -73,7 +75,10 @@ export function VariableEditor({
                   ? 'Enter a SQL query.'
                   : draft.type === 'list' && !draft.options?.length
                     ? 'Enter at least one list value.'
-                    : '';
+                    : (variableDependencyError([
+                        ...variables.filter((variable) => variable.name !== original?.name),
+                        draft,
+                      ]) ?? '');
   return (
     <Dialog
       open
@@ -98,6 +103,7 @@ export function VariableEditor({
         }}
       >
         <Input
+          autoFocus
           label="Variable name"
           hint="Reference this as $name or ${name} in queries."
           required
@@ -113,7 +119,12 @@ export function VariableEditor({
         <Select
           label="Variable type"
           value={draft.type}
-          onChange={(event) => change({ type: event.target.value as DashboardVariable['type'] })}
+          onChange={(event) => {
+            setDraft((current) =>
+              setVariableType(current, event.target.value as DashboardVariable['type']),
+            );
+            onDirty(true);
+          }}
         >
           {types.map(([type, label]) => (
             <option
@@ -125,6 +136,7 @@ export function VariableEditor({
             </option>
           ))}
         </Select>
+        {promqlEnabled === undefined && <p className="muted">Loading server capabilities…</p>}
         {draft.type === 'list' && (
           <div className="ui-field">
             <label className="ui-field-label" htmlFor={optionsId}>
@@ -147,11 +159,14 @@ export function VariableEditor({
           </div>
         )}
         {draft.type === 'sql' && (
-          <SqlEditor
-            value={draft.sqlQuery ?? ''}
-            onChange={(sqlQuery) => change({ sqlQuery })}
-            onRun={() => {}}
-          />
+          <div className="stack">
+            <p className="ui-field-label">SQL query</p>
+            <SqlEditor
+              value={draft.sqlQuery ?? ''}
+              onChange={(sqlQuery) => change({ sqlQuery })}
+              onRun={() => {}}
+            />
+          </div>
         )}
         {draft.type === 'promql' && (
           <>
@@ -254,6 +269,7 @@ export function VariableEditor({
                 <option key={name}>{name}</option>
               ))}
             </Select>
+            <p className="ui-field-label">PromQL query</p>
             <PromqlEditor
               value={draft.promqlQuery ?? ''}
               onChange={(promqlQuery) => change({ promqlQuery })}

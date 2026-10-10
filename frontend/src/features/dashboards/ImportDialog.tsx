@@ -1,6 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Button, Dialog, Input } from '../../components/ui';
-import { InlineError } from '../../components/ui';
+import { Button, Dialog, Input, InlineError } from '../../components/ui';
 import type { DashboardRequest } from '../../lib/types';
 import { dashboardError } from './helpers';
 import { importDashboard } from './importExport';
@@ -62,6 +61,7 @@ export function ImportDialog({
         }}
       >
         <Input
+          autoFocus
           label="Dashboard title"
           disabled={pending}
           value={title}
@@ -81,6 +81,11 @@ export function ImportDialog({
               const file = event.target.files?.[0];
               if (!file) return;
               const version = ++fileVersion.current;
+              if (file.size > 5 * 1024 * 1024) {
+                setJson('');
+                setParseError('Dashboard imports must be 5 MB or smaller.');
+                return;
+              }
               try {
                 const contents = await file.text();
                 if (active.current && fileVersion.current === version) {

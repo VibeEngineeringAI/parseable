@@ -1,7 +1,9 @@
 import { useCallback, useMemo } from 'react';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { DataTable } from '../../components/explorer/DataTable';
-import { chartResults, instantRows } from '../metrics/helpers';
+import { chartResults, instantRows } from '../../lib/promqlResults';
+import { chartValue } from './chartValue';
+import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
 import { record, sqlChart, text, tileTitle } from './tiles';
@@ -17,7 +19,7 @@ export function TileChart({
   result: TileResults;
   start: number;
   end: number;
-  height: number;
+  height: number | 'fit';
 }) {
   const config = record(tile.config),
     layout = record(config.layout),
@@ -83,6 +85,10 @@ export function TileChart({
     [precision, unit],
   );
   const xRange = useMemo(() => [start, end] as const, [start, end]);
+  const fitted = useChartHeight(
+    height,
+    JSON.stringify([tile.config, chart.series.map((series) => series.id)]),
+  );
   if (tile.chartType === 'table')
     return (
       <div
@@ -95,18 +101,19 @@ export function TileChart({
       </div>
     );
   if (tile.chartType === 'query-value') {
-    const value = rows
-      .flatMap((row) => Object.values(row))
-      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
-      .at(-1);
+    const value = chartValue(rows, tile, !!result.promql);
     return (
-      <div className="dashboard-stat" aria-label={`${tileTitle(tile)} value`}>
+      <div className="dashboard-stat" role="group" aria-label={`${tileTitle(tile)} value`}>
         {value === undefined ? 'No values returned' : formatValue(value)}
       </div>
     );
   }
   return (
-    <div className="dashboard-chart" data-legend-position={text(layout.legendPosition, 'bottom')}>
+    <div
+      ref={fitted.root}
+      className="dashboard-chart"
+      data-legend-position={text(layout.legendPosition, 'bottom')}
+    >
       {text(record(axes.y).title) && (
         <p className="muted dashboard-axis-title">{text(record(axes.y).title)}</p>
       )}
@@ -115,7 +122,19 @@ export function TileChart({
         series={chart.series}
         title={`${tileTitle(tile)} chart`}
         showTitle={false}
-        height={Math.max(140, height)}
+        height={fitted.pixels}
+        yAxisSize={chart.series.reduce<number>(
+          (size, series) =>
+            series.values.reduce<number>(
+              (width, value) =>
+                value !== null && Number.isFinite(value)
+                  ? Math.max(width, formatValue(value).length * 7 + 24)
+                  : width,
+              size,
+            ),
+          64,
+        )}
+        announceSeries={false}
         xRange={chart.categorical ? undefined : xRange}
         formatValue={formatValue}
         emptyMessage="No results for the selected time range"
@@ -123,7 +142,9 @@ export function TileChart({
       {text(record(axes.x).title) && (
         <p className="muted dashboard-axis-title">{text(record(axes.x).title)}</p>
       )}
-      {chart.categorical && <p className="muted">Values are shown in query row order.</p>}
+      {chart.categorical && (
+        <p className="muted dashboard-chart-note">Values are shown in query row order.</p>
+      )}
     </div>
   );
 }

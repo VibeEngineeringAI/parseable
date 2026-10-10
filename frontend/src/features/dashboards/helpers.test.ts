@@ -5,7 +5,6 @@ import {
   dashboardDate,
   duplicateDashboard,
   filterDashboards,
-  hasConflict,
   editDashboardMetadata,
 } from './helpers';
 import { dashboardRange, classicTimeRange } from './timeRange';
@@ -37,13 +36,13 @@ describe('dashboard helpers', () => {
       });
   });
   it('checks modified again before save and propagates aborts and permission errors', async () => {
-    expect(hasConflict(classic, { ...classic, modified: classic.modified })).toBe(false);
-    expect(hasConflict(classic, { ...classic, modified: 'later' })).toBe(true);
     const getDashboard = vi.fn().mockResolvedValue({ ...classic, modified: 'later' }),
       client = { getDashboard } as unknown as ParseableClient;
     const signal = new AbortController().signal;
     expect((await checkDashboardConflict(client, classic, signal))?.modified).toBe('later');
     expect(getDashboard).toHaveBeenCalledWith(classic.dashboardId, signal);
+    getDashboard.mockResolvedValue(classic);
+    expect(await checkDashboardConflict(client, classic, signal)).toBeUndefined();
     getDashboard.mockRejectedValue(new Error('Denied'));
     await expect(checkDashboardConflict(client, classic, signal)).rejects.toThrow('Denied');
   });
@@ -60,6 +59,8 @@ describe('dashboard helpers', () => {
     expect(result.timeRange).toEqual(classic.timeRange);
     expect(result.future).toEqual(classic.future);
     expect(result.dashboardId).toBeUndefined();
+    expect(result).not.toHaveProperty('tenantId');
+    expect(result.dashboardType).toBe('Report');
   });
   it('parses Chrono summary dates and filters/sorts without fetching details', () => {
     expect(dashboardDate('2026-10-10 12:00:00.123456789 UTC')).toBe('2026-10-10T12:00:00.123Z');
@@ -83,7 +84,7 @@ describe('dashboard helpers', () => {
         descending: false,
         owner: classic.author,
       }),
-    ).toHaveLength(1);
+    ).toEqual([classic]);
     expect(
       filterDashboards(rows, {
         search: '',
@@ -92,7 +93,13 @@ describe('dashboard helpers', () => {
         sort: 'created',
         descending: true,
       }),
-    ).toHaveLength(1);
+    ).toEqual([classic]);
+    expect(
+      filterDashboards(rows, { search: '', tab: 'all', tag: '', sort: 'title', descending: false }),
+    ).toEqual([rows[1], classic]);
+    expect(
+      filterDashboards(rows, { search: '', tab: 'all', tag: '', sort: 'title', descending: true }),
+    ).toEqual([classic, rows[1]]);
   });
   it('reads saved and URL ranges and writes the exact fixed or custom classic shape', () => {
     expect(dashboardRange(new URLSearchParams(), classic.timeRange)).toBe('1h');

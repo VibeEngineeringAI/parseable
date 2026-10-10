@@ -414,3 +414,20 @@
     transition: none;
   }
 }
+
+.ui-actions-menu button:has(.ui-actions-reason) {
+  flex-direction: column;
+  align-items: flex-start;
+  white-space: normal;
+  max-width: 280px;
+}
+.ui-actions-reason {
+  font-size: 11px;
+  color: var(--color-muted);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+.ui-actions-menu button[aria-disabled='true'] {
+  color: var(--color-muted);
+  cursor: default;
+}

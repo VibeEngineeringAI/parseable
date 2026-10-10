@@ -1,8 +1,9 @@
-import { object, strings } from '../../lib/teamContract';
+import { object, strings } from '../../lib/guards';
 import { dashboardVariable } from '../../lib/dashboardsContract';
 import { createUlid } from '../../lib/ids';
 import type { Dashboard, DashboardRequest, DashboardTile } from '../../lib/types';
 import { record, resolvedLayouts } from './tiles';
+import { sectionGroups } from './layout';
 /** The classic portable export deliberately omits server metadata, title and timeRange. */
 export function exportDashboard(dashboard: Dashboard) {
   return structuredClone({
@@ -40,12 +41,16 @@ export function importDashboard(json: string, title: string): DashboardRequest {
     throw new Error('Invalid dashboard variables.');
   if (!title.trim()) throw new Error('Enter a dashboard title.');
   const body = structuredClone(value);
-  for (const key of ['dashboardId', 'author', 'created', 'modified']) delete body[key];
+  for (const key of ['dashboardId', 'author', 'created', 'modified', 'tenantId']) delete body[key];
   const tiles: DashboardTile[] = value.tiles.map((tile) => ({
     ...structuredClone(tile),
     tile_id: createUlid(),
   }));
-  const layouts = new Map(resolvedLayouts(tiles).map(({ tile, layout }) => [tile.tile_id, layout]));
+  const layouts = new Map(
+    sectionGroups(tiles, body.sections).flatMap((group) =>
+      resolvedLayouts(group.tiles).map(({ tile, layout }) => [tile.tile_id, layout] as const),
+    ),
+  );
   return {
     ...body,
     title: title.trim(),
@@ -55,7 +60,13 @@ export function importDashboard(json: string, title: string): DashboardRequest {
     isFavorite: false,
     tiles: tiles.map((tile) => ({
       ...tile,
-      layout: { ...record(tile.layout), ...layouts.get(tile.tile_id)! },
+      layout: {
+        ...record(tile.layout),
+        x: layouts.get(tile.tile_id)!.x,
+        y: layouts.get(tile.tile_id)!.y,
+        w: record(tile.layout).w ?? 6,
+        h: record(tile.layout).h ?? 4,
+      },
     })),
   } as DashboardRequest;
 }

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { test, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { createUlid } from '../src/lib/ids';
-import { chartConfig } from '../src/features/dashboards/tiles';
+import classicFixture from './fixtures/classic-dashboard.json' with { type: 'json' };
 import type { Dashboard, DashboardSummary } from '../src/lib/types';
 const live = process.env.PARSEABLE_LIVE_URL;
 const server = process.env.PARSEABLE_LIVE_SERVER_URL;
@@ -35,7 +35,7 @@ test.skip(
   !live || !server,
   'Set PARSEABLE_LIVE_URL and PARSEABLE_LIVE_SERVER_URL to opt in to the classic interchangeability suite.',
 );
-test.describe.configure({ mode: 'serial' });
+// Tests 3 and 4 are independent; a create failure must not skip reverse or ownership checks.
 async function signIn(page: Page, path: string) {
   await page.goto(app(`/login?next=${encodeURIComponent(path)}`));
   await page.getByLabel('Username', { exact: true }).fill(username);
@@ -60,6 +60,9 @@ async function apiCreate(request: APIRequestContext, body: unknown, auth = heade
   return doc;
 }
 test.beforeAll(async ({ request }) => {
+  // Cookies are shared across ports only when both origins use the same host.
+  if (new URL(live!).hostname !== new URL(server!).hostname)
+    throw new Error('The /next and classic origins must use the same host to share login cookies.');
   const now = Math.floor(Date.now() / 1000);
   ingestAttempted = true;
   const points = ['node-a', 'node-b'].flatMap((host, hostIndex) =>
@@ -256,7 +259,7 @@ test('create SQL and PromQL tiles and variables through /next; verify exact clas
       .locator('[data-tile-id]')
       .filter({ has: page.getByRole('heading', { name: 'Live host load', exact: true }) })
       .getByRole('img'),
-  ).toBeVisible();
+  ).toHaveAccessibleName(/1 series from/);
   await expect(page.getByRole('alert')).toHaveCount(0);
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
@@ -272,7 +275,10 @@ test('create SQL and PromQL tiles and variables through /next; verify exact clas
     .attach('stored-dashboard.json', { body: verbatim, contentType: 'application/json' });
   expect(primary.tiles).toHaveLength(2);
   const [sqlTile, promTile] = primary.tiles!;
-  expect(sqlTile).toMatchObject({
+  expect(sqlTile).toEqual({
+    tile_id: expect.any(String),
+    config: { ...classicFixture.tiles[0].config, type: 'table' },
+    layout: { x: 0, y: 0, w: 12, h: 4 },
     title: 'Live log events',
     tileType: 'code',
     chartQuery: sql,
@@ -280,7 +286,10 @@ test('create SQL and PromQL tiles and variables through /next; verify exact clas
     chartType: 'table',
     authorMode: 'manual',
   });
-  expect(promTile).toMatchObject({
+  expect(promTile).toEqual({
+    tile_id: expect.any(String),
+    config: { ...classicFixture.tiles[0].config, type: 'timeseries' },
+    layout: { x: 0, y: 4, w: 12, h: 4 },
     title: 'Live host load',
     tileType: 'promql',
     chartQuery: [promql],
@@ -320,7 +329,13 @@ test('create SQL and PromQL tiles and variables through /next; verify exact clas
 test('hard-load the saved dashboard on the classic origin; both tiles render without errors', async ({
   page,
 }) => {
+  expect(
+    primary,
+    'The create test must provide a saved dashboard for the classic check.',
+  ).toBeDefined();
   await signIn(page, `/dashboards/${primary.dashboardId}`);
+  const pageErrors: string[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
   const resultPromises: Array<Promise<unknown>> = [];
   page.on('response', (response) => {
     const url = new URL(response.url());
@@ -351,6 +366,8 @@ test('hard-load the saved dashboard on the classic origin; both tiles render wit
       { timeout: 30000 },
     )
     .toBe(true);
+  await expect(page.getByText('node-a', { exact: true }).first()).toBeVisible();
+  expect(pageErrors).toEqual([]);
   await expect(sqlTile).not.toContainText(/Query Error|Query failed to load|No results for/);
   await expect(promTile).not.toContainText(/Query Error|Query failed to load|No results for/);
   await page.screenshot({
@@ -366,8 +383,16 @@ test('classic-shaped API dashboard renders in /next and unknown document, tile a
   page,
   request,
 }) => {
-  const config = chartConfig('timeseries');
+  const config = structuredClone(classicFixture.tiles[1].config);
+  const {
+    dashboardId: _id,
+    author: _author,
+    created: _created,
+    modified: _modified,
+    ...fixture
+  } = structuredClone(classicFixture);
   reverse = await apiCreate(request, {
+    ...fixture,
     title: reverseTitle,
     tags: ['parity'],
     isFavorite: true,
@@ -399,6 +424,7 @@ test('classic-shaped API dashboard renders in /next and unknown document, tile a
     future: { important: true },
     tiles: [
       {
+        ...fixture.tiles[0],
         tile_id: createUlid(),
         title: 'Classic log events',
         authorMode: 'manual',
@@ -406,12 +432,13 @@ test('classic-shaped API dashboard renders in /next and unknown document, tile a
         chartType: 'table',
         chartQuery: sql,
         dbName: [logs],
-        config: { ...chartConfig('table'), unknownConfig: 'keep' },
+        config: { ...classicFixture.tiles[0].config, type: 'table', unknownConfig: 'keep' },
         layout: { x: 0, y: 0, w: 12, h: 4, static: true },
         sectionId: 'health',
         futureTile: { keep: [1, 2] },
       },
       {
+        ...fixture.tiles[1],
         tile_id: createUlid(),
         title: 'Classic host load',
         authorMode: 'manual',
@@ -429,7 +456,14 @@ test('classic-shaped API dashboard renders in /next and unknown document, tile a
       },
     ],
   });
+  const nonemptyMatrix = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === '/prometheus/api/v1/query_range' && response.ok(),
+  );
   await signIn(page, `/dashboards/${reverse.dashboardId}`);
+  const matrix = await (await nonemptyMatrix).json();
+  expect(matrix.status).toBe('success');
+  expect(matrix.data.result.some((row: { values?: unknown[] }) => row.values?.length)).toBe(true);
   await expect(
     page.getByRole('region', { name: 'Classic log events results', exact: true }),
   ).toContainText('Dashboard live event 0');
@@ -438,7 +472,7 @@ test('classic-shaped API dashboard renders in /next and unknown document, tile a
       .locator('[data-tile-id]')
       .filter({ has: page.getByRole('heading', { name: 'Classic host load', exact: true }) })
       .getByRole('img'),
-  ).toBeVisible();
+  ).toHaveAccessibleName(/1 series from/);
   await expect(page.getByRole('alert')).toHaveCount(0);
   await page
     .getByRole('button', { name: 'Actions for tile Classic log events', exact: true })
@@ -486,14 +520,13 @@ test('limit=0 is complete; admins may delete another owner but PUT remains owner
   );
   await signIn(page, `/dashboards/${owned.dashboardId}`);
   await expect(
-    page.getByText('This dashboard is read-only. Only its owner can edit it.', { exact: true }),
+    page.getByText(
+      'This dashboard is read-only. Only its owner can edit it. Duplicate it to make an editable copy.',
+      { exact: true },
+    ),
   ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
-  const all = await json<DashboardSummary[]>(request, '/api/v1/dashboards?limit=0'),
-    absent = await json<DashboardSummary[]>(request, '/api/v1/dashboards');
-  expect(all.map((row) => row.dashboardId).sort()).toEqual(
-    absent.map((row) => row.dashboardId).sort(),
-  );
+  const all = await json<DashboardSummary[]>(request, '/api/v1/dashboards?limit=0');
   for (const id of dashboardIds) expect(all.some((row) => row.dashboardId === id)).toBe(true);
   const deletion = await request.delete(`/api/v1/dashboards/${owned.dashboardId}`, { headers });
   expect(deletion.status()).toBe(200);

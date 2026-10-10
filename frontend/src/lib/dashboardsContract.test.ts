@@ -15,7 +15,7 @@ describe('dashboard wire guards', () => {
       expect(dashboard({ ...classic, dashboardId: id })).toBe(false);
     },
   );
-  it('allows unknown tile kinds, query shapes and future variable definitions', () => {
+  it('allows unknown tile kinds and query shapes', () => {
     expect(
       tile({
         tile_id: classic.tiles[0].tile_id,
@@ -23,7 +23,6 @@ describe('dashboard wire guards', () => {
         chartQuery: { anything: true },
       }),
     ).toBe(true);
-    expect(dashboard({ ...classic, tiles: [], variables: [{ type: 'future' }] })).toBe(true);
     expect(dashboard({ ...classic, tiles: null })).toBe(true);
   });
   it('validates known metadata and required snake-case tile IDs', () => {

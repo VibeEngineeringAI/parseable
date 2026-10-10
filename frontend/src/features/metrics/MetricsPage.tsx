@@ -6,7 +6,6 @@ import { Button, EmptyState, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
-import type { PromqlMetadataSource } from '../../components/promql/PromqlEditor';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
@@ -17,7 +16,6 @@ import {
   insertBrowserQuery,
   maxQueries,
   metadataAnchor,
-  metadataRequest,
   parseExplorerSearch,
   rangeBounds,
   removeSnapshotQuery,

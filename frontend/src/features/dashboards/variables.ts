@@ -103,7 +103,7 @@ export function defaultSelection(
   if (url !== null && options.includes(url)) return url;
   if (variable.defaultValue && options.includes(variable.defaultValue))
     return variable.defaultValue;
-  return options.find((value) => value !== allValue(variable)) ?? options[0] ?? '';
+  return options[0] ?? '';
 }
 export function hasAllSelection(
   variables: DashboardVariable[],
@@ -124,13 +124,7 @@ export function variableInputs(
   variable: DashboardVariable,
   values: VariableValues,
 ): VariableValues {
-  const source = [
-    variable.dataset,
-    variable.sqlQuery,
-    variable.promqlQuery,
-    variable.promqlQueryDataset,
-    ...(variable.labelFilters ?? []).map((filter) => filter.value),
-  ].join(' ');
+  const source = variableSource(variable);
   return Object.fromEntries(
     [...source.matchAll(/\$\{?(\w+)\}?/g)]
       .map((match) => [match[1], values[match[1]]])
@@ -199,7 +193,7 @@ export async function loadVariableOptions(
   }
   options = [...new Set(options)];
   if (variable.includeAll && !['text', 'dataset'].includes(variable.type))
-    options = [...options.filter((value) => value !== allValue(variable)), allValue(variable)];
+    options = [allValue(variable), ...options.filter((value) => value !== allValue(variable))];
   return options;
 }
 const fields = [
@@ -220,6 +214,10 @@ export function serializeVariable(
   original?: DashboardVariable,
 ): DashboardVariable {
   const result = { ...original, ...draft };
+  if (original && original.type !== draft.type) {
+    for (const field of typeFields[original.type])
+      if (!typeFields[draft.type].includes(field)) delete result[field];
+  }
   for (const field of fields)
     if (
       result[field] === '' ||
@@ -229,4 +227,60 @@ export function serializeVariable(
     )
       delete result[field];
   return result;
+}
+
+const typeFields: Record<DashboardVariable['type'], string[]> = {
+  promql: ['dataset', 'labelName', 'metric', 'labelFilters', 'includeAll'],
+  promql_query: ['promqlQuery', 'promqlQueryDataset', 'promqlQueryLabel', 'includeAll'],
+  sql: ['sqlQuery', 'includeAll'],
+  list: ['options', 'includeAll'],
+  text: [],
+  dataset: [],
+};
+/** Only fields consumed by the option loader, without labels, defaults or extras. */
+export function variableOptionsDefinition(variable: DashboardVariable) {
+  return {
+    type: variable.type,
+    ...Object.fromEntries(typeFields[variable.type].map((field) => [field, variable[field]])),
+  };
+}
+function variableSource(variable: DashboardVariable) {
+  if (variable.type === 'sql') return variable.sqlQuery ?? '';
+  if (variable.type === 'promql_query')
+    return [variable.promqlQuery, variable.promqlQueryDataset].join(' ');
+  if (variable.type === 'promql')
+    return [variable.dataset, ...(variable.labelFilters ?? []).map((filter) => filter.value)].join(
+      ' ',
+    );
+  return '';
+}
+export function setVariableType(variable: DashboardVariable, type: DashboardVariable['type']) {
+  return serializeVariable({ ...variable, type }, variable);
+}
+export function variableDependencies(variable: DashboardVariable): string[] {
+  return [
+    ...new Set([...variableSource(variable).matchAll(/\$\{?(\w+)\}?/g)].map((match) => match[1])),
+  ];
+}
+export function variableDependencyError(variables: DashboardVariable[]): string | undefined {
+  const byName = new Map(variables.map((variable) => [variable.name, variable]));
+  const visited = new Set<string>(),
+    visiting = new Set<string>();
+  function visit(name: string): string | undefined {
+    if (visiting.has(name)) return `Variable dependencies contain a cycle at ${name}.`;
+    if (visited.has(name)) return;
+    visiting.add(name);
+    for (const dependency of variableDependencies(byName.get(name)!)) {
+      if (!byName.has(dependency))
+        return `Variable ${name} references a variable that does not exist: ${dependency}.`;
+      const error = visit(dependency);
+      if (error) return error;
+    }
+    visiting.delete(name);
+    visited.add(name);
+  }
+  for (const variable of variables) {
+    const error = visit(variable.name);
+    if (error) return error;
+  }
 }

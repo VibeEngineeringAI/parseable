@@ -2,21 +2,11 @@ import {
   autoStep,
   matcher,
   metricSelector,
-  parseSampleValue,
-  seriesLabel,
   summarizeSeries,
-  toChartSeries,
   validateRange,
 } from '../../lib/promql';
 import { timeBounds } from '../../lib/query';
-import type {
-  PromqlInstantResult,
-  PromqlMetadataRequest,
-  PromqlQueryRequest,
-  PromqlRangeRequest,
-  PromqlRangeResult,
-  TimeRange,
-} from '../../lib/types';
+import type { PromqlQueryRequest, PromqlRangeRequest, TimeRange } from '../../lib/types';
 
 export const maxQueries = 5;
 export type QueryType = 'range' | 'instant' | 'both';
@@ -28,14 +18,10 @@ export type RunSnapshot = Bounds & {
   step: string;
   queries: Array<{ id: string; query: string; resolvedStep: string }>;
 };
-export type QueryResult = {
-  id: string;
-  pending: number;
-  range?: PromqlRangeResult;
-  instant?: PromqlInstantResult;
-  errors: Array<{ kind: 'range' | 'instant'; error: Error }>;
-};
-
+export type { QueryResult } from '../../lib/promqlResults';
+import type { QueryResult } from '../../lib/promqlResults';
+export { chartResults, instantRows } from '../../lib/promqlResults';
+import { chartResults } from '../../lib/promqlResults';
 export const queryId = (index: number) => String.fromCharCode(65 + index);
 
 export function parseExplorerSearch(search: string): ExplorerState {
@@ -91,9 +77,8 @@ export function stepError(step: string): string | undefined {
   if (step.trim()) return validateRange({ start: 0, end: 0, step });
 }
 
-export function boundsError(bounds: Bounds): string | undefined {
-  return validateRange({ ...bounds, step: Math.max(1, bounds.end - bounds.start) });
-}
+export { boundsError, metadataRequest } from '../../lib/promqlMetadata';
+import { boundsError } from '../../lib/promqlMetadata';
 
 export function createRunSnapshot(
   state: ExplorerState,
@@ -184,20 +169,6 @@ export function requestsForSnapshot(
   });
 }
 
-export function metadataRequest(
-  stream: string,
-  bounds: Bounds,
-  metrics: string[] = [],
-): PromqlMetadataRequest | undefined {
-  if (boundsError(bounds)) return;
-  return {
-    stream,
-    ...bounds,
-    limit: 1000,
-    ...(metrics.length ? { match: metrics.map((name) => `{${matcher('__name__', name)}}`) } : {}),
-  };
-}
-
 // Metadata bounds hold still across runs, so Run keeps the label browser and completion caches.
 // Absolute ranges never move. A relative range re-anchors on Run only after the completion
 // cache's lifetime, so new series still appear without a request on every Run.
@@ -239,51 +210,6 @@ export function insertBrowserQuery(
       error: 'Remove a query to add another. Five queries are allowed.',
     };
   return { queries: [...queries, query], active: queries.length };
-}
-
-export function chartResults(results: QueryResult[], queryCount: number) {
-  const charts = results.flatMap((row) => (row.range ? [toChartSeries(row.range, row.id)] : []));
-  const timestamps = [...new Set(charts.flatMap((chart) => chart.timestamps))].sort(
-    (a, b) => a - b,
-  );
-  const series = charts.flatMap((chart) =>
-    chart.series.map((series) => {
-      const values = new Map(chart.timestamps.map((time, index) => [time, series.values[index]]));
-      return {
-        ...series,
-        label: queryCount > 1 ? series.label : series.label.slice(series.id.indexOf(':') + 2),
-        values: timestamps.map((time) => values.get(time) ?? null),
-      };
-    }),
-  );
-  return { timestamps, series };
-}
-
-const finiteValue = (value: string) => {
-  const parsed = parseSampleValue(value);
-  return Number.isFinite(parsed) ? parsed : null;
-};
-
-export function instantRows(results: QueryResult[], queryCount: number) {
-  return results.flatMap(({ id, instant }) => {
-    if (!instant) return [];
-    const prefix = queryCount > 1 ? `${id}: ` : '';
-    if (instant.resultType === 'scalar' || instant.resultType === 'string')
-      return [{ Series: `${prefix}scalar`, Value: finiteValue(instant.result[1]) }];
-    if (instant.resultType === 'vector')
-      return instant.result.map(({ metric, value }) => ({
-        Series: `${prefix}${seriesLabel(metric, { keepName: true })}`,
-        Value: finiteValue(value[1]),
-      }));
-    if (instant.resultType !== 'matrix') return [];
-    return instant.result.map(({ metric, values }) => ({
-      Series: `${prefix}${seriesLabel(metric, { keepName: true })}`,
-      Value: values.length
-        ? finiteValue(values.reduce((last, sample) => (sample[0] >= last[0] ? sample : last))[1])
-        : null,
-      Samples: values.length,
-    }));
-  });
 }
 
 export function rangeRows(results: QueryResult[], queryCount: number) {

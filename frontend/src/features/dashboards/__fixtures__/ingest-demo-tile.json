@@ -1,0 +1,63 @@
+{
+  "tile_id": "01K017X5NG2SZ20PJ0EEYG9376",
+  "title": "Service Error Rate Over Time",
+  "chartQuery": {
+    "x": {
+      "fields": [
+        {
+          "name": "p_timestamp",
+          "type": "time"
+        }
+      ],
+      "granularity": "minute"
+    },
+    "y": {
+      "fields": [
+        {
+          "name": "severity_number",
+          "aggregate": "COUNT"
+        }
+      ],
+      "groupBy": ["severity_text"]
+    },
+    "filters": []
+  },
+  "dbName": ["demodata"],
+  "chartType": "timeseries",
+  "config": {
+    "type": "bar",
+    "colourScheme": "forest",
+    "layout": {
+      "legendPosition": "bottom"
+    },
+    "axes": {
+      "x": {
+        "field": "time_bucket",
+        "title": "Time"
+      },
+      "y": {
+        "field": "COUNT_severity_number",
+        "title": "Event Count"
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "w": 12,
+    "h": 8,
+    "x": 0,
+    "y": 0,
+    "i": "01K017X5NG2SZ20PJ0EEYG9376",
+    "moved": false,
+    "static": false
+  }
+}

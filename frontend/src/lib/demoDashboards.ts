@@ -144,9 +144,9 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
       ],
     }),
   ];
-  const get = (id: string) => {
+  const get = (id: string, missing = 'Dashboard does not exist') => {
     if (!ulid(id)) fail('Invalid dashboard ID format - must be a valid ULID');
-    return dashboards.find((item) => item.dashboardId === id) ?? fail('Dashboard does not exist');
+    return dashboards.find((item) => item.dashboardId === id) ?? fail(missing);
   };
   const unique = (body: DashboardRequest, id?: string) => {
     if (dashboards.some((item) => item.title === body.title && item.dashboardId !== id))
@@ -211,14 +211,14 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
     },
     async updateDashboard(id, body) {
       await ready();
-      const original = get(id);
-      if (original.author !== owner)
-        fail('Dashboard does not exist or you do not have permission to access it');
+      const original = get(id, 'Dashboard does not exist or user is not authorized');
       const tiles = body.tiles ?? [];
       if (tiles.some((item) => item.tile_id === '00000000000000000000000000'))
         fail('Tile ID must be provided');
       if (new Set(tiles.map((item) => item.tile_id)).size !== tiles.length)
         fail('Tile IDs must be unique');
+      if (original.author !== owner)
+        fail('Dashboard does not exist or you do not have permission to access it');
       unique(body, id);
       const value: Dashboard = {
         ...clone(body),
@@ -238,7 +238,7 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
     },
     async deleteDashboard(id) {
       await ready();
-      get(id);
+      get(id, 'Dashboard does not exist or you do not have permission to access it');
       // The demo identity has admin privileges: DELETE permits any owner, unlike PUT.
       dashboards = dashboards.filter((item) => item.dashboardId !== id);
     },

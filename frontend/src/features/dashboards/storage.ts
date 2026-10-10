@@ -1,3 +1,4 @@
+export const localDashboardKey = 'parseable-dashboards-v1-live';
 export type LocalDashboard = { id: string; title: string; description: string; dataset: string };
 /** Normalises a title the way accessible names are compared: trimmed, collapsed, case-insensitive. */
 export function titleKey(title: string) {

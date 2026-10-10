@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Search, Star, ArrowDown, ArrowUp } from 'lucide-react';
+import { Search, Star } from 'lucide-react';
 import {
   ActionsMenu,
   Badge,
@@ -22,6 +22,7 @@ export function DashboardsList({
   refreshing,
   owner,
   isAdmin,
+  canCreate,
   deleted,
   onAction,
 }: {
@@ -29,6 +30,7 @@ export function DashboardsList({
   refreshing: boolean;
   owner?: string;
   isAdmin: boolean;
+  canCreate: boolean;
   deleted?: string;
   onAction: (
     action: 'rename' | 'duplicate' | 'delete' | 'favourite' | 'export',
@@ -64,7 +66,9 @@ export function DashboardsList({
       description={
         rows.length
           ? 'Try another title, tab or tag.'
-          : 'Create a dashboard to visualize logs and metrics.'
+          : canCreate
+            ? 'Create a dashboard to visualize logs and metrics.'
+            : 'Dashboards shared with you will appear here.'
       }
     />
   ) : (
@@ -79,23 +83,7 @@ export function DashboardsList({
                 scope="col"
                 aria-sort={sort === key ? (descending ? 'descending' : 'ascending') : 'none'}
               >
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setSort(key);
-                    setDescending(sort === key ? !descending : false);
-                    setPage(0);
-                  }}
-                >
-                  {key === 'title' ? 'Title and tags' : key === 'modified' ? 'Updated' : 'Created'}
-                  {sort === key &&
-                    (descending ? (
-                      <ArrowDown size={12} aria-hidden="true" />
-                    ) : (
-                      <ArrowUp size={12} aria-hidden="true" />
-                    ))}
-                </Button>
+                {key === 'title' ? 'Title and tags' : key === 'modified' ? 'Updated' : 'Created'}
               </th>
             ))}
             <th scope="col">Actions</th>
@@ -113,9 +101,14 @@ export function DashboardsList({
                       size="icon"
                       aria-label={`${row.isFavorite ? 'Unfavourite' : 'Favourite'} ${row.title}`}
                       aria-pressed={!!row.isFavorite}
-                      disabled={!owned || refreshing}
+                      aria-disabled={!owned || refreshing}
+                      aria-describedby={
+                        !owned || refreshing ? `${row.dashboardId}-favourite-reason` : undefined
+                      }
                       title={owned ? undefined : 'Only the owner can change favourites.'}
-                      onClick={() => onAction('favourite', row)}
+                      onClick={() => {
+                        if (owned && !refreshing) onAction('favourite', row);
+                      }}
                     >
                       <Star
                         size={16}
@@ -123,6 +116,11 @@ export function DashboardsList({
                         aria-hidden="true"
                       />
                     </Button>
+                    {(!owned || refreshing) && (
+                      <span className="sr-only" id={`${row.dashboardId}-favourite-reason`}>
+                        {owned ? 'Dashboard is updating.' : 'Only the owner can change favourites.'}
+                      </span>
+                    )}
                     <Link to={`/dashboards/${encodeURIComponent(row.dashboardId)}`}>
                       {row.title}
                     </Link>
@@ -162,6 +160,10 @@ export function DashboardsList({
                       {
                         id: 'duplicate',
                         label: 'Duplicate',
+                        disabled: !canCreate,
+                        description: !canCreate
+                          ? 'You do not have permission to create dashboards.'
+                          : undefined,
                         onSelect: () => onAction('duplicate', row),
                       },
                       {
@@ -187,7 +189,12 @@ export function DashboardsList({
           })}
         </tbody>
       </table>
-      <Pagination page={page} total={filtered.length} noun="dashboards" onPageChange={setPage} />
+      <Pagination
+        page={page}
+        total={filtered.length}
+        noun={filtered.length === 1 ? 'dashboard' : 'dashboards'}
+        onPageChange={setPage}
+      />
     </Card>
   );
   return (
@@ -231,12 +238,8 @@ export function DashboardsList({
           <option value="modified">Updated</option>
           <option value="created">Created</option>
         </Select>
-        <Button
-          size="sm"
-          onClick={() => setDescending(!descending)}
-          aria-label="Reverse sort order"
-        >
-          {descending ? 'Descending' : 'Ascending'}
+        <Button size="sm" onClick={() => setDescending(!descending)}>
+          {descending ? 'Sort descending' : 'Sort ascending'}
         </Button>
       </div>
       <Tabs

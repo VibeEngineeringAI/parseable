@@ -1,7 +1,6 @@
 import { useEffect, useId, useState } from 'react';
-import { Button, Dialog, Input } from '../../components/ui';
+import { Button, Dialog, Input, InlineError } from '../../components/ui';
 import type { Dashboard } from '../../lib/types';
-import { InlineError } from '../../components/ui';
 import { dashboardError, tagsFromText } from './helpers';
 
 export function DashboardForm({
@@ -11,8 +10,10 @@ export function DashboardForm({
   onClose,
   onSubmit,
   onDirtyChange,
+  draftOnly = false,
 }: {
   original?: Dashboard;
+  draftOnly?: boolean;
   pending: boolean;
   error?: string;
   onClose: () => void;
@@ -41,6 +42,7 @@ export function DashboardForm({
       }}
       dismissible={!pending}
       title={original ? 'Rename and tags' : 'Create dashboard'}
+      description={draftOnly ? 'Save the dashboard to keep these changes.' : undefined}
     >
       <form
         className="stack"
@@ -92,7 +94,13 @@ export function DashboardForm({
             disabled={pending || !title.trim()}
             aria-describedby={reason}
           >
-            {pending ? 'Saving…' : original ? 'Update dashboard' : 'Create dashboard'}
+            {pending
+              ? 'Saving…'
+              : draftOnly
+                ? 'Apply'
+                : original
+                  ? 'Update dashboard'
+                  : 'Create dashboard'}
           </Button>
         </div>
       </form>

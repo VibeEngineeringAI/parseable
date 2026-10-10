@@ -3,11 +3,10 @@ import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { sha256 } from '../../lib/sha256';
 
-export const ownerHash = sha256;
 export function useDashboardAccess() {
   const { client, identity, mode } = useApp();
   const hash = useAsync(
-    useCallback(async () => (identity ? ownerHash(identity.id) : undefined), [identity?.id]),
+    useCallback(async () => (identity ? sha256(identity.id) : undefined), [identity?.id]),
   );
   const roles = useAsync(
     useCallback(
@@ -24,6 +23,7 @@ export function useDashboardAccess() {
     ].flatMap((role) => role.actions);
   return {
     hash: hash.data,
+    loading: hash.loading,
     canCreate: privileges
       ? privileges.some((item) =>
           ['superadmin', 'admin', 'editor', 'writer', 'reader'].includes(item.privilege),

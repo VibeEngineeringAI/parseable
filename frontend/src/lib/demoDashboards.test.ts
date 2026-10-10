@@ -24,6 +24,9 @@ describe('per-client dashboard demo', () => {
     created.tiles![0].title = 'Edited';
     expect((await client.getDashboard(created.dashboardId)).tiles![0].title).toBe('Host load');
     const saved = await client.updateDashboard(created.dashboardId, created);
+    expect(saved.tiles![0].title).toBe('Edited');
+    expect(await client.listDashboards()).toHaveLength(4);
+    expect(await createDemoDashboards().listDashboards()).toHaveLength(3);
     expect(saved.future).toEqual(classic.future);
     expect(saved.variables).toEqual(classic.variables);
     expect(saved.created).toBe(created.created);
@@ -68,4 +71,25 @@ describe('per-client dashboard demo', () => {
       name: 'AbortError',
     });
   });
+});
+
+it('returns the exact server messages for missing dashboards and validates tiles before owner checks', async () => {
+  const client = createDemoDashboards(),
+    id = '01M4J000000000000000000099';
+  await expect(client.getDashboard(id)).rejects.toThrow(
+    'Cannot perform this operation: Dashboard does not exist',
+  );
+  await expect(client.updateDashboard(id, { title: 'Missing' })).rejects.toThrow(
+    'Cannot perform this operation: Dashboard does not exist or user is not authorized',
+  );
+  await expect(client.deleteDashboard(id)).rejects.toThrow(
+    'Cannot perform this operation: Dashboard does not exist or you do not have permission to access it',
+  );
+  const other = (await client.listDashboards()).find((row) => row.title === 'Shared operations')!;
+  await expect(
+    client.updateDashboard(other.dashboardId, {
+      title: 'Bad',
+      tiles: [{ tile_id: '00000000000000000000000000' }],
+    }),
+  ).rejects.toThrow('Tile ID must be provided');
 });

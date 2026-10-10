@@ -1,9 +1,8 @@
 import { useState } from 'react';
-import { Button, Dialog } from '../../components/ui';
+import { Button, Dialog, InlineError } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { useMutation } from '../../hooks/useMutation';
-import { InlineError } from '../../components/ui';
-import { loadDashboards } from './storage';
+import { loadDashboards, localDashboardKey } from './storage';
 import {
   markerKey,
   planLocalImport,
@@ -23,7 +22,7 @@ export function LocalImportNotice({
 }) {
   const { client } = useApp(),
     mutation = useMutation();
-  const [local, setLocal] = useState(() => loadDashboards('parseable-dashboards-v1-live'));
+  const [local, setLocal] = useState(() => loadDashboards(localDashboardKey));
   const [marker, setMarker] = useState(() => readImportMarker(identity)),
     [results, setResults] = useState<LocalImportResult[]>();
   const [skipped, setSkipped] = useState(0);
@@ -47,7 +46,7 @@ export function LocalImportNotice({
     <div className="notice dashboard-local-notice">
       <div role="status">
         {plan.create.length
-          ? `${plan.create.length} dashboards are saved only in this browser. Import them to your server account?`
+          ? `${plan.create.length} ${plan.create.length === 1 ? 'dashboard is' : 'dashboards are'} saved only in this browser. Import ${plan.create.length === 1 ? 'it' : 'them'} to your server account?`
           : 'Your browser-local dashboards have been imported. Local copies are still available.'}
         {results && (
           <p>
@@ -76,6 +75,8 @@ export function LocalImportNotice({
                     ]),
                   ],
                 };
+                // The marker is intentionally batch-level: interrupted batches can offer items again.
+                // Per-item progress and attributing browser-local copies to accounts are follow-ups.
                 // Persist successful IDs even if the user has left while the authorized imports finish.
                 try {
                   localStorage.setItem(markerKey(identity), JSON.stringify(next));
@@ -102,20 +103,26 @@ export function LocalImportNotice({
             disabled={mutation.pending}
             onClick={() => remember({ ...marker, dismissed: true })}
           >
-            Not now
+            Don't ask again
           </Button>
         )}
         {!plan.create.length && (
           <Button onClick={() => setRemoving(true)}>Remove local copies</Button>
         )}
       </div>
-      {results
-        ?.filter((result) => !result.imported)
-        .map((result) => (
-          <p role="alert" key={result.id} className="error-text">
-            {result.title}: {result.error}
-          </p>
-        ))}
+      {!!results?.some((result) => !result.imported) && (
+        <div role="alert" className="error-text">
+          <ul>
+            {results
+              .filter((result) => !result.imported)
+              .map((result) => (
+                <li key={result.id}>
+                  {result.title}: {result.error}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
       <InlineError error={storageError ?? mutation.error} />
       <Dialog
         open={removing}
@@ -131,7 +138,7 @@ export function LocalImportNotice({
               variant="danger"
               onClick={() => {
                 try {
-                  localStorage.removeItem('parseable-dashboards-v1-live');
+                  localStorage.removeItem(localDashboardKey);
                   setLocal([]);
                   setRemoving(false);
                 } catch {

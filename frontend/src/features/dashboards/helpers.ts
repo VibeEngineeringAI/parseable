@@ -26,7 +26,7 @@ export function dashboardDate(value: string | null | undefined) {
   const date = Date.parse(normalized);
   return Number.isFinite(date) ? new Date(date).toISOString() : undefined;
 }
-export function hasConflict(loaded: Dashboard, latest: Dashboard): boolean {
+function hasConflict(loaded: Dashboard, latest: Dashboard): boolean {
   return loaded.modified !== latest.modified;
 }
 export async function checkDashboardConflict(
@@ -55,7 +55,7 @@ export function duplicateDashboard(
   source: Dashboard,
 ): DashboardRequest & { tiles: DashboardTile[] } {
   const body = structuredClone(source);
-  for (const key of ['dashboardId', 'author', 'created', 'modified']) delete body[key];
+  for (const key of ['dashboardId', 'author', 'created', 'modified', 'tenantId']) delete body[key];
   return {
     ...body,
     title: `${source.title} (Copy)`,

@@ -1,0 +1,89 @@
+{
+  "dashboardId": "01JZ8Y3KQ4V9M2X7T5R1B6N0EW",
+  "version": "v1",
+  "title": "Service health",
+  "author": "<sha256 of user id>",
+  "created": "2026-09-01T10:00:00Z",
+  "modified": "2026-10-10T08:00:00Z",
+  "tags": ["prod"],
+  "isFavorite": false,
+  "timeRange": {
+    "startTime": "1h",
+    "endTime": "now",
+    "type": "fixed",
+    "label": "Last 1 hour",
+    "interval": 3600000,
+    "shiftInterval": 1
+  },
+  "variables": [
+    {
+      "name": "metrics_dataset",
+      "label": "Metrics dataset",
+      "type": "dataset",
+      "defaultValue": "otel-metrics"
+    },
+    {
+      "name": "host",
+      "label": "Host",
+      "type": "promql",
+      "dataset": "$metrics_dataset",
+      "labelName": "host",
+      "metric": "system.cpu.load_average.15m",
+      "includeAll": true
+    }
+  ],
+  "sections": [],
+  "tiles": [
+    {
+      "tile_id": "01JZ8Y4A0C7H3GQ5P2W9D8S6VF",
+      "title": "Error logs by service",
+      "authorMode": "manual",
+      "tileType": "code",
+      "chartType": "bar",
+      "chartQuery": "SELECT service_name, COUNT(*) AS errors FROM \"app-logs\" WHERE level = 'error' GROUP BY service_name ORDER BY errors DESC LIMIT 20",
+      "dbName": ["app-logs"],
+      "config": {
+        "type": "bar",
+        "colourScheme": "classic",
+        "layout": {
+          "legendPosition": "bottom",
+          "segments": { "value": [10, 90], "isPercent": true },
+          "label": false
+        },
+        "axes": {
+          "x": { "field": "", "title": "", "display": true },
+          "y": { "field": "", "title": "", "display": true, "beginAtZero": false }
+        },
+        "advanced": {
+          "dataLabels": { "enabled": false },
+          "tooltip": { "enabled": true, "mode": "index", "intersect": false }
+        }
+      },
+      "layout": { "x": 0, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "tile_id": "01JZ8Y5R7B2K9WQ0X4F6M1T3HD",
+      "title": "Load average (15m) by host",
+      "authorMode": "manual",
+      "tileType": "promql",
+      "chartType": "timeseries",
+      "chartQuery": ["avg by (host) ({__name__=\"system.cpu.load_average.15m\", host=~\"$host\"})"],
+      "promqlQueryType": ["range"],
+      "dbName": "$metrics_dataset",
+      "config": {
+        "type": "timeseries",
+        "colourScheme": "classic",
+        "layout": { "legendPosition": "bottom", "label": false },
+        "axes": {
+          "x": { "field": "", "title": "", "display": true },
+          "y": { "field": "", "title": "", "display": true, "beginAtZero": false }
+        },
+        "advanced": {
+          "dataLabels": { "enabled": false },
+          "tooltip": { "enabled": true, "mode": "index", "intersect": false }
+        }
+      },
+      "layout": { "x": 6, "y": 0, "w": 6, "h": 6 }
+    }
+  ]
+}

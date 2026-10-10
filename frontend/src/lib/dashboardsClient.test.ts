@@ -3,7 +3,7 @@ import { createClient } from './client';
 import classic from '../features/dashboards/__fixtures__/classic.json';
 import type { ParseableClient } from './types';
 import { checkDashboardConflict } from '../features/dashboards/helpers';
-import { patchTile } from '../features/dashboards/tiles';
+import { applyTile, dashboardPayload, loadDraft } from '../features/dashboards/draft';
 const path = '/api/v1/dashboards/id%2Fwith%20space';
 const cases: Array<{
   name: string;
@@ -57,7 +57,11 @@ describe('dashboard requests', () => {
     vi.stubGlobal('fetch', fetch);
     const client = createClient({ mode: 'live' }),
       loaded = await client.getDashboard(classic.dashboardId);
-    const edited = patchTile(loaded, loaded.tiles![0].tile_id, { title: 'Changed title' });
+    const edited = dashboardPayload(
+      applyTile(loadDraft(loaded).draft, { ...loaded.tiles![0], title: 'Changed title' }),
+      '1h',
+      false,
+    );
     expect(
       await checkDashboardConflict(client, loaded, new AbortController().signal),
     ).toBeUndefined();

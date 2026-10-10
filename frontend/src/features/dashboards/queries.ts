@@ -6,7 +6,7 @@ import type {
   QueryRequest,
   LogRecord,
 } from '../../lib/types';
-import type { QueryResult } from '../metrics/helpers';
+import type { QueryResult } from '../../lib/promqlResults';
 import { promqlQueries, sqlQuery, tileDatasets, tileStep } from './tiles';
 import {
   interpolatePromql,

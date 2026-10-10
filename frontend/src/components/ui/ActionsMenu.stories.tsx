@@ -40,3 +40,26 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 export const RowActions: Story = {};
+export const DisabledWithReason: Story = {
+  render: () => {
+    const [selected, setSelected] = useState(false);
+    return (
+      <div style={{ padding: 24 }}>
+        <ActionsMenu
+          label="Dashboard actions"
+          items={[
+            {
+              id: 'duplicate',
+              label: 'Duplicate',
+              disabled: true,
+              description: 'Save your changes before duplicating.',
+              onSelect: () => setSelected(true),
+            },
+            { id: 'export', label: 'Export', onSelect: () => setSelected(true) },
+          ]}
+        />
+        <p role="status">{selected ? 'Action selected' : 'No action selected'}</p>
+      </div>
+    );
+  },
+};

@@ -21,6 +21,10 @@ export interface TimeSeriesChartProps {
   timestamps: number[];
   series: ChartSeries[];
   height?: number;
+  /** Reserve more axis space for formatted units in compact tiles. */
+  yAxisSize?: number;
+  /** A page with a shared live region can keep per-chart counts quiet. */
+  announceSeries?: boolean;
   title?: string;
   /** Hide the visible caption when a surrounding card already supplies a heading. */
   showTitle?: boolean;
@@ -136,6 +140,8 @@ export function TimeSeriesChart({
   timestamps,
   series,
   height = 280,
+  yAxisSize = 64,
+  announceSeries = true,
   title = 'Time series',
   showTitle = true,
   xRange,
@@ -286,7 +292,7 @@ export function TimeSeriesChart({
             {
               stroke: muted,
               font,
-              size: 64,
+              size: yAxisSize,
               grid: { stroke: grid, width: 1 },
               ticks: { stroke: grid, width: 1 },
               values: (_, values) => values.map(formatValue),
@@ -377,6 +383,7 @@ export function TimeSeriesChart({
     timestamps,
     entries,
     height,
+    yAxisSize,
     timeZone,
     formatValue,
     hasData,
@@ -489,7 +496,7 @@ export function TimeSeriesChart({
         </div>
       )}
       <div className="charts-count-row">
-        <span aria-live="polite">
+        <span aria-live={announceSeries ? 'polite' : 'off'}>
           {visibleEntries.length === series.length
             ? `${series.length} series`
             : `${visibleEntries.length} of ${series.length} series`}

@@ -1,5 +1,5 @@
 import { timeBounds } from '../../lib/query';
-import { object } from '../../lib/teamContract';
+import { object } from '../../lib/guards';
 import type { TimeRange } from '../../lib/types';
 import { dashboardPresets } from './helpers';
 const presets: string[] = dashboardPresets.map((preset) => preset.value);

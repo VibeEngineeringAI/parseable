@@ -9,6 +9,12 @@ import {
   loadVariableOptions,
   resolveDataset,
   serializeVariable,
+  readVariables,
+  setVariableType,
+  variableDependencyError,
+  variableInputs,
+  variableDependencies,
+  variableOptionsDefinition,
 } from './variables';
 import type { DashboardVariable, ParseableClient } from '../../lib/types';
 const dataset: DashboardVariable = { name: 'ds', label: 'Dataset', type: 'dataset' };
@@ -63,9 +69,10 @@ describe('classic interpolation', () => {
       defaultValue: 'b',
       includeAll: true,
     };
-    expect(defaultSelection(v, ['a', 'b', '*'], '*')).toBe('*');
+    expect(defaultSelection(v, ['*', 'a', 'b'], '*')).toBe('*');
     expect(defaultSelection(v, ['a', 'b'], null)).toBe('b');
     expect(defaultSelection({ ...v, defaultValue: undefined }, ['a', 'b'], null)).toBe('a');
+    expect(defaultSelection({ ...v, defaultValue: undefined }, ['*', 'a', 'b'], null)).toBe('*');
     expect(allValue({ ...v, type: 'promql_query' })).toBe('.*');
     expect(hasAllSelection([v], { v: '*' }, "SELECT '$v'", 'logs')).toBe(true);
     expect(hasAllSelection([v], { v: '*' }, 'SELECT 1', 'logs')).toBe(false);
@@ -99,7 +106,7 @@ describe('variable option sources', () => {
         bounds,
         signal,
       ),
-    ).toEqual(['a', 'b', '*']);
+    ).toEqual(['*', 'a', 'b']);
     expect(
       await loadVariableOptions(c, { ...v, type: 'text' }, values, [], bounds, signal),
     ).toEqual([]);
@@ -112,7 +119,7 @@ describe('variable option sources', () => {
         bounds,
         signal,
       ),
-    ).toEqual(['a', 'b', '*']);
+    ).toEqual(['*', 'a', 'b']);
     expect(c.query).toHaveBeenCalledWith({ sql: 'SELECT host FROM "metrics"', ...bounds }, signal);
     expect(
       await loadVariableOptions(
@@ -123,7 +130,7 @@ describe('variable option sources', () => {
         bounds,
         signal,
       ),
-    ).toEqual(['node-a', 'node-b', '.*']);
+    ).toEqual(['.*', 'node-a', 'node-b']);
     expect(c.promqlLabelValues).toHaveBeenCalledWith(
       'host',
       expect.objectContaining({ stream: 'metrics', match: ['{__name__="up"}'] }),
@@ -150,4 +157,70 @@ describe('variable option sources', () => {
       signal,
     );
   });
+});
+
+it('removes only known old variable-type fields and preserves unknown definitions in the document', () => {
+  const sql: DashboardVariable = {
+    name: 'v',
+    label: 'V',
+    type: 'sql',
+    sqlQuery: 'SELECT 1',
+    future: 42,
+    defaultValue: 'x',
+    includeAll: true,
+  };
+  expect(setVariableType(sql, 'text')).toEqual({
+    name: 'v',
+    label: 'V',
+    type: 'text',
+    future: 42,
+    defaultValue: 'x',
+  });
+  expect(serializeVariable({ ...sql, type: 'list', options: ['x'] }, sql)).toEqual({
+    name: 'v',
+    label: 'V',
+    type: 'list',
+    future: 42,
+    defaultValue: 'x',
+    includeAll: true,
+    options: ['x'],
+  });
+  const definitions = [sql, { name: 'f', type: 'future', unknown: true }];
+  expect(readVariables(definitions)).toEqual([sql]);
+  expect(definitions[1]).toEqual({ name: 'f', type: 'future', unknown: true });
+});
+it('rejects unknown references, self references and dependency cycles', () => {
+  const a: DashboardVariable = { name: 'a', label: 'A', type: 'sql', sqlQuery: "SELECT '$b'" };
+  const b: DashboardVariable = { name: 'b', label: 'B', type: 'text' };
+  expect(variableDependencyError([a, b])).toBeUndefined();
+  expect(variableDependencyError([a])).toBe(
+    'Variable a references a variable that does not exist: b.',
+  );
+  expect(variableDependencyError([{ ...a, name: 'b' }])).toBe(
+    'Variable dependencies contain a cycle at b.',
+  );
+  expect(variableDependencyError([a, { ...b, type: 'sql', sqlQuery: "SELECT '$a'" }])).toContain(
+    'cycle',
+  );
+  const list: DashboardVariable = {
+    name: 'list',
+    label: 'List',
+    type: 'list',
+    options: ['one'],
+    sqlQuery: "SELECT '$missing'",
+  };
+  expect(variableInputs(list, { missing: 'value' })).toEqual({});
+  expect(variableDependencies(list)).toEqual([]);
+  expect(variableDependencyError([list])).toBeUndefined();
+  expect(
+    variableOptionsDefinition({ ...a, label: 'Renamed', defaultValue: 'new', unknown: 7 }),
+  ).toEqual(variableOptionsDefinition(a));
+});
+it('interpolates SQL All and variable name prefixes exactly', () => {
+  expect(interpolateSql("SELECT '$host', '$hostname'", { host: '*', hostname: 'api' })).toBe(
+    "SELECT '*', 'api'",
+  );
+  expect(interpolatePromql('up{host="$host",name="$hostname"}', { host: 'a', hostname: 'b' })).toBe(
+    'up{host="a",name="b"}',
+  );
 });

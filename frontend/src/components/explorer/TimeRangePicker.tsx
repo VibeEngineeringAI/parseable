@@ -82,6 +82,7 @@ export function TimeRangePicker({
           }}
         >
           <Input
+            autoFocus
             label="From"
             type="datetime-local"
             step="1"

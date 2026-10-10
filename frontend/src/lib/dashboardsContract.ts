@@ -1,4 +1,4 @@
-import { object, strings } from './teamContract';
+import { object, strings } from './guards';
 import type { Dashboard, DashboardSummary, DashboardTile, DashboardVariable } from './types';
 
 export const ulid = (value: unknown): value is string =>
@@ -22,7 +22,8 @@ export function dashboard(value: unknown): value is Dashboard {
     (value.tiles == null || (Array.isArray(value.tiles) && value.tiles.every(tile)))
   );
 }
-// Unknown variable definitions are preserved in the document but have no editor controls.
+// Recognizes definitions the variables UI can edit. Unknown types are skipped by
+// readVariables; callers retain the full document unchanged for saving.
 export function dashboardVariable(value: unknown): value is DashboardVariable {
   return (
     object(value) &&

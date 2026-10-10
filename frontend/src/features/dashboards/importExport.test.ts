@@ -16,7 +16,8 @@ describe('classic portable JSON', () => {
     expect(result.variables).toEqual(classic.variables);
     expect(result.timeRange).toEqual(classic.timeRange);
     expect(result.future).toEqual(classic.future);
-    expect(result.tenantId).toBe(classic.tenantId);
+    expect(result).not.toHaveProperty('tenantId');
+    expect(result.dashboardType).toBe('Report');
     expect(result.tiles?.every((tile) => ulid(tile.tile_id))).toBe(true);
     expect(result.tiles?.[0].tile_id).not.toBe(classic.tiles[0].tile_id);
     expect(importDashboard('{"tiles":[],"variables":[]}', 'Empty').tiles).toEqual([]);

@@ -1,15 +1,28 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ActionsMenu, Button, Card, Dialog } from '../../components/ui';
-import { QueryState } from '../../components/explorer/QueryState';
+import { ExternalLink } from 'lucide-react';
+import { classicUiAvailable, classicUiPath } from '../../lib/classicUi';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { timeBounds } from '../../lib/query';
 import type { QueryLimiter } from '../../lib/concurrency';
 import type { DashboardTile as Tile, DashboardVariable, QueryRequest } from '../../lib/types';
 import { TileChart } from './TileChart';
-import { loadTile } from './queries';
-import { knownTile, supportedCharts, text, tileTitle, type TileLayout } from './tiles';
+import { loadTile, type TileResults } from './queries';
+import {
+  knownTile,
+  supportedCharts,
+  text,
+  tileTitle,
+  tileType,
+  tileVariableNames,
+  record,
+  promqlQueries,
+  sqlQuery,
+  tileDatasets,
+  type TileLayout,
+} from './tiles';
 import { storedRange } from './timeRange';
 import { tileHandoffs } from './handoffs';
 import type { VariableValues } from './variables';
@@ -23,6 +36,7 @@ export function DashboardTile({
   anchor,
   revision,
   ready,
+  variableError,
   writable,
   promqlEnabled,
   promqlAlerts,
@@ -40,51 +54,84 @@ export function DashboardTile({
   anchor: number;
   revision: number;
   ready: boolean;
+  variableError?: string;
   writable: boolean;
-  promqlEnabled: boolean;
+  promqlEnabled?: boolean;
   promqlAlerts: boolean;
   limit: QueryLimiter;
   first: boolean;
   last: boolean;
   onAction: (action: 'edit' | 'duplicate' | 'earlier' | 'later' | 'delete', tile: Tile) => void;
 }) {
-  const { client } = useApp(),
+  const { client, mode } = useApp(),
     navigate = useNavigate();
   const [viewQuery, setViewQuery] = useState(false);
   const supported = knownTile(tile) && supportedCharts.includes(text(tile.chartType, 'timeseries'));
-  const locked = tile.tileType === 'promql' && !promqlEnabled;
+  const locked = tile.tileType === 'promql' && promqlEnabled !== true;
   const effectiveBounds = useMemo(
     () => (tile.timeRange ? timeBounds(storedRange(tile.timeRange, anchor), anchor) : bounds),
-    [tile.timeRange, anchor, bounds],
+    [JSON.stringify(tile.timeRange), anchor, bounds.startTime, bounds.endTime],
   );
+  const names = tileVariableNames(tile);
+  let query: unknown;
+  try {
+    query = tile.tileType === 'promql' ? promqlQueries(tile) : sqlQuery(tile);
+  } catch (error) {
+    query = error instanceof Error ? error.message : String(error);
+  }
+  const inputKey = JSON.stringify({
+    query,
+    datasets: tileDatasets(tile),
+    values: [...names].map((name) => [name, values[name]]),
+    datasetVariables: variables
+      .filter((variable) => names.has(variable.name) && variable.type === 'dataset')
+      .map((variable) => variable.name),
+    ...(tile.tileType === 'promql'
+      ? {
+          stat: tile.chartType === 'query-value',
+          step: tile.promqlStep ?? record(tile.promqlQuery).step ?? record(tile.chartQuery).step,
+          maxDataPoints:
+            record(tile.config).maxDataPoints ?? record(record(tile.config).layout).maxDataPoints,
+        }
+      : {}),
+    start: effectiveBounds.startTime,
+    end: effectiveBounds.endTime,
+    revision,
+    supported,
+    locked,
+    ready,
+  });
   const results = useAsync(
     useCallback(
       (signal) =>
         supported && !locked && ready
           ? loadTile(client, tile, variables, values, effectiveBounds, limit, signal)
           : Promise.resolve(undefined),
-      [
-        client,
-        tile,
-        variables,
-        JSON.stringify(values),
-        effectiveBounds,
-        limit,
-        supported,
-        locked,
-        ready,
-        revision,
-      ],
+      [client, limit, inputKey],
     ),
   );
+  const [lastResult, setLastResult] = useState<TileResults>();
+  useEffect(() => {
+    if (results.data) setLastResult(results.data);
+  }, [results.data]);
+  const result = results.data ?? lastResult;
   const handoff = tileHandoffs(tile, variables, values, effectiveBounds, promqlAlerts);
-  const classic = `/dashboards/${encodeURIComponent(dashboardId)}`;
+  const classic =
+    classicUiAvailable && mode !== 'demo'
+      ? classicUiPath(`/dashboards/${encodeURIComponent(dashboardId)}`)
+      : undefined;
+  const classicLink = classic && (
+    <a className="text-link" href={classic} target="_blank" rel="noopener noreferrer">
+      Open in classic UI <ExternalLink size={14} aria-hidden="true" />
+      <span className="sr-only"> (opens in a new tab)</span>
+    </a>
+  );
   return (
     <Card
-      className="dashboard-tile"
+      className="dashboard-server-tile"
       role="region"
       aria-label={`Tile ${tileTitle(tile)}`}
-      tabIndex={0}
+      aria-busy={supported && !locked && ready && results.loading}
       data-tile-id={tile.tile_id}
       style={{
         gridColumn: `${layout.x + 1} / span ${layout.w}`,
@@ -95,12 +142,18 @@ export function DashboardTile({
         <h2>{tileTitle(tile)}</h2>
         <ActionsMenu
           label={`Actions for tile ${tileTitle(tile)}`}
+          data-row-action={tile.tile_id}
           items={[
             ...(writable && knownTile(tile)
               ? [
                   {
                     id: 'edit',
-                    label: tile.tileType === 'builder' ? 'Edit as SQL' : 'Edit',
+                    label: tileType(tile) === 'builder' ? 'Edit as SQL' : 'Edit',
+                    description: locked
+                      ? promqlEnabled === undefined
+                        ? 'Loading server capabilities.'
+                        : 'PromQL dashboard tiles are unavailable on this server.'
+                      : undefined,
                     disabled: locked,
                     onSelect: () => onAction('edit', tile),
                   },
@@ -150,39 +203,64 @@ export function DashboardTile({
           ]}
         />
       </div>
-      {!knownTile(tile) ? (
-        <div className="dashboard-placeholder">
-          <p>This tile type is read-only in /next ({text(tile.tileType, 'unknown')}).</p>
-          <a className="text-link" href={classic} target="_blank" rel="noopener noreferrer">
-            Open dashboard in classic UI
-          </a>
-        </div>
-      ) : !supported ? (
-        <div className="dashboard-placeholder">
-          <p>This chart type isn't available in /next yet</p>
-          <pre>{handoff.queries.join('\n\n') || JSON.stringify(tile.chartQuery, null, 2)}</pre>
-          <a className="text-link" href={classic} target="_blank" rel="noopener noreferrer">
-            Open dashboard in classic UI
-          </a>
-        </div>
-      ) : locked ? (
-        <p className="notice">PromQL dashboard tiles are unavailable on this server.</p>
-      ) : !ready ? (
-        <p className="muted">Select dashboard variables to load this tile.</p>
-      ) : (
-        <>
-          <QueryState loading={results.loading} error={results.error} retry={results.reload} />
-          {results.data && (
-            <TileChart
-              tile={tile}
-              result={results.data}
-              start={Date.parse(effectiveBounds.startTime) / 1000}
-              end={Date.parse(effectiveBounds.endTime) / 1000}
-              height={layout.h * 70 - 110}
-            />
-          )}
-        </>
-      )}
+      <div className="dashboard-tile-body">
+        {!knownTile(tile) ? (
+          <div className="dashboard-placeholder">
+            <p>
+              {text(tile.tileType, 'Unknown')} tiles cannot be shown in /next. The tile is kept
+              unchanged.
+            </p>
+            {classicLink}
+          </div>
+        ) : !supported ? (
+          <div className="dashboard-placeholder">
+            <p>
+              {text(tile.chartType, 'Unknown')} charts are not available in /next yet. The tile is
+              kept unchanged.
+            </p>
+            <pre>{handoff.queries.join('\n\n') || JSON.stringify(tile.chartQuery, null, 2)}</pre>
+            {classicLink}
+          </div>
+        ) : locked ? (
+          <p className="notice">
+            {promqlEnabled === undefined
+              ? 'Loading server capabilities…'
+              : 'PromQL dashboard tiles are unavailable on this server.'}
+          </p>
+        ) : !ready && (!lastResult || variableError) ? (
+          <p className="muted">
+            {variableError
+              ? `A variable failed to load: ${variableError}`
+              : 'Select a value for this tile’s dashboard variables.'}
+          </p>
+        ) : (
+          <>
+            {results.loading && <p className="muted">Loading tile…</p>}
+            {results.error && (
+              <div className="dashboard-tile-error">
+                <p className="error-text">Query failed: {results.error.message}</p>
+                <div className="inline">
+                  <Button size="sm" onClick={results.reload}>
+                    Retry query
+                  </Button>
+                  <Button size="sm" onClick={() => setViewQuery(true)}>
+                    View query
+                  </Button>
+                </div>
+              </div>
+            )}
+            {result && !results.error && (
+              <TileChart
+                tile={tile}
+                result={result}
+                start={Date.parse(effectiveBounds.startTime) / 1000}
+                end={Date.parse(effectiveBounds.endTime) / 1000}
+                height="fit"
+              />
+            )}
+          </>
+        )}
+      </div>
       <Dialog open={viewQuery} onOpenChange={setViewQuery} title={`Query for ${tileTitle(tile)}`}>
         <div className="stack">
           <pre className="dashboard-query-view">
