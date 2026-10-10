@@ -1522,3 +1522,33 @@ test('list, detail, form, targets and an open sheet fit 390px without horizontal
     await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
   ).toBeLessThanOrEqual(1);
 });
+
+test('a tabbed-to sort button scrolls clear of the sticky Actions column at 390px', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const [path, first, tabbed] of [
+    ['/alerts', 'Sort by title', ['Sort by severity', 'Sort by state']],
+    ['/alerts/targets', 'Sort by name', ['Sort by type', 'Sort by endpoint']],
+  ] as const) {
+    await demo(page, path);
+    await page.getByRole('button', { name: first, exact: true }).focus();
+    for (const name of tabbed) {
+      await page.keyboard.press('Tab');
+      const button = page.getByRole('button', { name, exact: true });
+      await expect(button).toBeFocused();
+      const { centreHit, right, stickyLeft } = await button.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const sticky = element.closest('table')!.querySelector('thead th:last-child')!;
+        const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        return {
+          centreHit: element.contains(hit),
+          right: rect.right,
+          stickyLeft: sticky.getBoundingClientRect().left,
+        };
+      });
+      expect(centreHit, name).toBe(true);
+      expect(right, name).toBeLessThan(stickyLeft);
+    }
+  }
+});
