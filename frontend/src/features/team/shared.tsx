@@ -1,50 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Copy, Search } from 'lucide-react';
 import { Button, Input, PAGE_SIZE } from '../../components/ui';
-import { errorMessage } from './helpers';
-import { useAsync } from '../../hooks/useAsync';
-
-export function useTeamCollection<T>(loader: (signal: AbortSignal) => Promise<T>) {
-  const result = useAsync(loader);
-  const [previous, setPrevious] = useState<{ loader: typeof loader; data: T }>();
-  useEffect(() => {
-    if (result.error) setPrevious(undefined);
-    else if (result.data !== undefined) setPrevious({ loader, data: result.data });
-  }, [loader, result.data, result.error]);
-  // Keep row openers connected during refresh; never carry data across loaders or errors.
-  const data = result.error
-    ? undefined
-    : (result.data ?? (previous?.loader === loader ? previous.data : undefined));
-  return { ...result, data };
-}
-
-export function useMutation() {
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string>();
-  const active = useRef(true);
-  const running = useRef(false);
-  useEffect(() => {
-    active.current = true;
-    return () => {
-      active.current = false;
-    };
-  }, []);
-  async function run(operation: () => Promise<void>) {
-    if (running.current) return;
-    running.current = true;
-    setPending(true);
-    setError(undefined);
-    try {
-      await operation();
-    } catch (failure) {
-      if (active.current) setError(errorMessage(failure));
-    } finally {
-      running.current = false;
-      if (active.current) setPending(false);
-    }
-  }
-  return { pending, error, run, reset: () => setError(undefined), isActive: () => active.current };
-}
 
 export function InlineError({ error }: { error?: string }) {
   return error ? (

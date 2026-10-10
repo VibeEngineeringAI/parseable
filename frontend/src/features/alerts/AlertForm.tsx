@@ -24,7 +24,9 @@ import {
   validateAlert,
   type AlertDraft,
 } from './helpers';
-import { InlineError, useAlertAccess, useCollection, useLeaveGuard, useMutation } from './shared';
+import { InlineError, useAlertAccess, useLeaveGuard } from './shared';
+import { useCollection } from '../../hooks/useCollection';
+import { useMutation } from '../../hooks/useMutation';
 
 export function AlertForm({ original }: { original?: Alert }) {
   const { client } = useApp();

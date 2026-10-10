@@ -3,7 +3,8 @@ import { Button, Dialog, Select } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import type { Roles } from '../../lib/types';
-import { InlineError, useMutation } from './shared';
+import { InlineError } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 
 export function DefaultRoleDialog({
   roles,

@@ -6,7 +6,8 @@ import { useAsync } from '../../hooks/useAsync';
 import type { TeamUser } from '../../lib/types';
 import { oidcManualRoleRemovable } from './helpers';
 import { OidcRoleInspector, useRoleSources } from './OidcRoleInspector';
-import { InlineError, RoleCheckboxes, SecretResult, useMutation } from './shared';
+import { InlineError, RoleCheckboxes, SecretResult } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 
 type Props = { user: TeamUser; onClose: () => void; onChanged: () => void };
 

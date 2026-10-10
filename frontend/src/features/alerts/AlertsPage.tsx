@@ -9,7 +9,8 @@ import { AlertDetail } from './AlertDetail';
 import { AlertForm } from './AlertForm';
 import { TargetsPage } from './TargetsPage';
 import { resolveAlertTypes } from './helpers';
-import { useAlertAccess, useCollection } from './shared';
+import { useAlertAccess } from './shared';
+import { useCollection } from '../../hooks/useCollection';
 import './alerts.css';
 
 export function AlertsPage() {

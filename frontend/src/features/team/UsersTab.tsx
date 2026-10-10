@@ -11,7 +11,8 @@ import {
   UserConfirmDialog,
   UserRoleSourcesSheet,
 } from './UserDialogs';
-import { TeamSearch, useTeamCollection, useTeamSearch } from './shared';
+import { TeamSearch, useTeamSearch } from './shared';
+import { useCollection } from '../../hooks/useCollection';
 import { isRootAdmin } from './helpers';
 
 type Action = { user: TeamUser } & (
@@ -27,7 +28,7 @@ export function UsersTab({
   closeCreate: () => void;
 }) {
   const { client } = useApp();
-  const users = useTeamCollection(useCallback((signal) => client.listUsers(signal), [client]));
+  const users = useCollection(useCallback((signal) => client.listUsers(signal), [client]));
   const [action, setAction] = useState<Action>();
   const [sort, setSort] = useState<Sort>('username');
   const [descending, setDescending] = useState(false);

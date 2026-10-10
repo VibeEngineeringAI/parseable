@@ -18,7 +18,9 @@ import { useApp } from '../../app/AppProvider';
 import type { AlertTarget } from '../../lib/types';
 import { TargetSheet } from './TargetSheet';
 import { targetType, targetTypeLabel } from './targetHelpers';
-import { useAlertAccess, useCollection, useMutation, useRowDeletionFocus } from './shared';
+import { useAlertAccess, useRowDeletionFocus } from './shared';
+import { useCollection } from '../../hooks/useCollection';
+import { useMutation } from '../../hooks/useMutation';
 
 export function TargetsPage() {
   const { client } = useApp(),

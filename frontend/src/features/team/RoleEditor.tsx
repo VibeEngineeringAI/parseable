@@ -7,7 +7,8 @@ import { useAsync } from '../../hooks/useAsync';
 import { createId } from '../../lib/ids';
 import type { Privilege, PrivilegeName, Roles } from '../../lib/types';
 import { privilegeNames, validateName } from './helpers';
-import { InlineError, useMutation } from './shared';
+import { InlineError } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 
 type Row = { id: string; privilege: PrivilegeName; dataset: string };
 const newRow = (): Row => ({ id: createId(), privilege: 'reader', dataset: '*' });

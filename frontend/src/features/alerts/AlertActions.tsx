@@ -4,7 +4,8 @@ import { ActionsMenu, Button, TypedConfirmDialog, type ActionsMenuItem } from '.
 import { useApp } from '../../app/AppProvider';
 import type { AlertSummary } from '../../lib/types';
 import { muteState } from './helpers';
-import { InlineError, useMutation } from './shared';
+import { InlineError } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 import { MuteMenu } from './MuteMenu';
 
 export function AlertActions({

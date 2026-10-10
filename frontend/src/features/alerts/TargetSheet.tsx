@@ -5,7 +5,8 @@ import { useApp } from '../../app/AppProvider';
 import { createId } from '../../lib/ids';
 import type { AlertTarget } from '../../lib/types';
 import { buildTargetPayload, targetDraft, validateTarget, type TargetDraft } from './targetHelpers';
-import { InlineError, useMutation } from './shared';
+import { InlineError } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 
 export function TargetSheet({
   target,

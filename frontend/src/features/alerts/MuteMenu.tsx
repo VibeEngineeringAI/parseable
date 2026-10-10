@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Button, Dialog, Input } from '../../components/ui';
 import { utcMuteDate } from './helpers';
-import { InlineError, useMutation } from './shared';
+import { InlineError } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 
 export function MuteMenu({
   onClose,

@@ -4,7 +4,8 @@ import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { validateName } from './helpers';
-import { InlineError, RoleCheckboxes, SecretResult, useMutation } from './shared';
+import { InlineError, RoleCheckboxes, SecretResult } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 
 export function CredentialSheet({
   kind,

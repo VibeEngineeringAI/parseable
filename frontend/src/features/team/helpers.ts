@@ -63,7 +63,3 @@ export function oidcRemovalStatus(summary: UserRoleSources, role: string): strin
       : 'This removes the administrator’s manual grant.'
     : 'This role has no manual grant to remove. Update the provider group or default role configuration.';
 }
-
-export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
