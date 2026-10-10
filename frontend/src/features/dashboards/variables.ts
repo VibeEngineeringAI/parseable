@@ -174,13 +174,13 @@ export async function loadVariableOptions(
   } else if (variable.type === 'promql') {
     const stream = resolveDataset(variable.dataset ?? '', values);
     if (!stream) throw new Error('Select a dataset for this variable.');
-    // matcher() quotes the raw value; All widens `=` and makes `!=` a no-op.
+    // matcher() quotes the raw value; All widens `=` and drops negative matchers.
     const filters = (variable.labelFilters ?? []).flatMap((filter) => {
       const label = filter.label.trim(),
         value = substitutePromql(filter.value, values, (value) => value);
       if (!label || !value.trim()) return [];
       if (value !== '.*') return [matcher(label, value, filter.operator)];
-      if (filter.operator === '!=') return [];
+      if (filter.operator === '!=' || filter.operator === '!~') return [];
       return [matcher(label, value, filter.operator === '=' ? '=~' : filter.operator)];
     });
     if (variable.metric) filters.unshift(matcher('__name__', variable.metric));

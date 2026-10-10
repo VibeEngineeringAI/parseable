@@ -192,6 +192,7 @@ describe('variable option sources', () => {
           { label: 'region', operator: '=', value: '$region' },
           { label: 'zone', operator: '!=', value: '${region}' },
           { label: 'rack', operator: '=~', value: '$region' },
+          { label: 'row', operator: '!~', value: '$region' },
           { label: 'env', operator: '=', value: '' },
           { label: ' ', operator: '=', value: 'prod' },
           { label: 'team', operator: '=', value: '  ' },
