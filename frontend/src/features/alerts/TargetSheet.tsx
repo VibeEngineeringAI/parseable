@@ -1,4 +1,4 @@
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Plus, X } from 'lucide-react';
 import { Button, Input, Select, Sheet } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
@@ -7,6 +7,7 @@ import type { AlertTarget } from '../../lib/types';
 import { buildTargetPayload, targetDraft, validateTarget, type TargetDraft } from './targetHelpers';
 import { InlineError } from './shared';
 import { useMutation } from '../../hooks/useMutation';
+import { useTouchedErrors } from '../../hooks/useTouchedErrors';
 
 export function TargetSheet({
   target,
@@ -29,7 +30,13 @@ export function TargetSheet({
     pendingFocus.current = undefined;
   }, [draft.headers]);
   const mutation = useMutation();
-  const errors = validateTarget(draft);
+  const invalid = validateTarget(draft);
+  const shown = useTouchedErrors(invalid);
+  const errors = shown.errors;
+  const form = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    if (shown.attempts) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+  }, [shown.attempts]);
   function update<K extends keyof TargetDraft>(key: K, value: TargetDraft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
   }
@@ -48,12 +55,17 @@ export function TargetSheet({
       className="alerts-target-sheet"
     >
       <form
+        ref={form}
         className="stack"
         noValidate
         onSubmit={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          if (Object.keys(errors).length) return;
+          if (mutation.pending) return;
+          if (Object.keys(invalid).length) {
+            shown.attempt();
+            return;
+          }
           void mutation.run(async () => {
             const body = buildTargetPayload(draft);
             const saved = target
@@ -72,6 +84,7 @@ export function TargetSheet({
           readOnly={Boolean(target)}
           disabled={mutation.pending}
           error={errors.name}
+          onBlur={() => shown.touch('name')}
           onChange={(event) => update('name', event.target.value)}
         />
         <Select
@@ -96,6 +109,7 @@ export function TargetSheet({
           value={draft.endpoint}
           disabled={mutation.pending}
           error={errors.endpoint}
+          onBlur={() => shown.touch('endpoint')}
           hint={
             target
               ? undefined
@@ -129,6 +143,7 @@ export function TargetSheet({
                   disabled={mutation.pending}
                   aria-invalid={Boolean(errors.headers)}
                   aria-describedby={errors.headers ? headersError : undefined}
+                  onBlur={() => shown.touch('headers')}
                   onChange={(event) =>
                     update(
                       'headers',
@@ -146,6 +161,7 @@ export function TargetSheet({
                   disabled={mutation.pending}
                   aria-invalid={Boolean(errors.headers)}
                   aria-describedby={errors.headers ? headersError : undefined}
+                  onBlur={() => shown.touch('headers')}
                   onChange={(event) =>
                     update(
                       'headers',
@@ -213,6 +229,7 @@ export function TargetSheet({
                   : 'Username and password must both be set, or both empty.'
               }
               error={errors.password}
+              onBlur={() => shown.touch('password')}
               onChange={(event) => update('password', event.target.value)}
             />
           </>
@@ -233,12 +250,7 @@ export function TargetSheet({
           <Button onClick={close} disabled={mutation.pending}>
             Cancel
           </Button>
-          <Button
-            type="submit"
-            variant="primary"
-            data-dialog-confirm
-            disabled={mutation.pending || Object.keys(errors).length > 0}
-          >
+          <Button type="submit" variant="primary" data-dialog-confirm disabled={mutation.pending}>
             {mutation.pending ? 'Saving…' : target ? 'Save target' : 'Create target'}
           </Button>
         </div>

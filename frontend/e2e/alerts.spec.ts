@@ -383,7 +383,11 @@ test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the
   await expect(
     sheet.getByText('Endpoints are masked by the server.', { exact: false }),
   ).toBeVisible();
-  await expect(sheet.getByRole('button', { name: 'Save target' })).toBeDisabled();
+  // The masked endpoint must be re-entered: saving without it explains why instead of sending.
+  await expect(sheet.getByLabel('Endpoint URL')).not.toHaveAttribute('aria-invalid', 'true');
+  await sheet.getByRole('button', { name: 'Save target' }).click();
+  await expect(sheet.getByLabel('Endpoint URL')).toHaveAttribute('aria-invalid', 'true');
+  await expect(sheet.getByLabel('Endpoint URL')).toBeFocused();
   await sheet.getByLabel('Endpoint URL').fill('https://example.com/new');
   await sheet.getByLabel('Header 1 value').fill('new-secret');
   await sheet.getByRole('button', { name: 'Save target' }).click();
@@ -437,22 +441,36 @@ test('validation errors describe their controls and block invalid thresholds, fr
   await demo(page);
   await createPromql(page);
   await page.getByLabel('Threshold value').fill('');
+  await page.getByLabel('Threshold value').blur();
+  await expect(page.getByLabel('Threshold value')).toHaveAttribute('aria-invalid', 'true');
   await expect(page.getByLabel('Threshold value')).toHaveAccessibleDescription(
     'Enter a finite threshold value.',
   );
+  // An invalid value in a field the user is still editing stays quiet until it loses focus.
   await page.getByLabel('Evaluation frequency (minutes)').fill('1441');
+  await expect(page.getByLabel('Evaluation frequency (minutes)')).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await page.getByLabel('Evaluation frequency (minutes)').blur();
   await expect(page.getByLabel('Evaluation frequency (minutes)')).toHaveAccessibleDescription(
     'Use 1–1440 whole minutes.',
   );
   await page.getByLabel('Hold duration').fill('31d');
+  await page.getByLabel('Hold duration').blur();
   await expect(page.getByLabel('Hold duration')).toHaveAccessibleDescription(
     'Hold duration cannot exceed 30 days.',
   );
-  await page.getByRole('textbox', { name: 'PromQL query', exact: true }).fill('up[5m]');
-  await expect(
-    page.getByRole('textbox', { name: 'PromQL query', exact: true }),
-  ).toHaveAccessibleDescription('Alerts require an instant vector of numeric samples.');
-  await expect(page.getByRole('button', { name: 'Create alert', exact: true })).toBeDisabled();
+  const query = page.getByRole('textbox', { name: 'PromQL query', exact: true });
+  await query.fill('up[5m]');
+  await expect(query).toHaveAttribute('aria-invalid', 'true');
+  await expect(query).toHaveAccessibleDescription(
+    'Alerts require an instant vector of numeric samples.',
+  );
+  // Create stays available: submitting an invalid form focuses the first invalid field.
+  await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+  await expect(page).toHaveURL(/\/alerts\/new$/);
+  await expect(query).toBeFocused();
 });
 test('dirty form blocks sidebar navigation and browser Back until confirmed', async ({ page }) => {
   await demo(page);
@@ -796,8 +814,18 @@ test('header inputs focus additions, surviving neighbours and Add after the last
   await demo(page, '/alerts/targets');
   await page.getByRole('button', { name: 'New target', exact: true }).click();
   const sheet = page.getByRole('dialog', { name: 'New target', exact: true });
-  await expect(sheet.getByRole('button', { name: 'Create target', exact: true })).toBeDisabled();
+  // A pristine sheet shows no errors; blurring an empty field or submitting reveals them.
+  await expect(sheet.getByLabel('Target name')).not.toHaveAttribute('aria-invalid', 'true');
+  await expect(sheet.getByLabel('Target name')).not.toHaveAccessibleDescription(
+    /Enter a target name/,
+  );
+  await expect(sheet.getByRole('alert')).toHaveCount(0);
+  await sheet.getByLabel('Target name').focus();
+  await sheet.getByLabel('Target name').blur();
   await expect(sheet.getByLabel('Target name')).toHaveAccessibleDescription('Enter a target name.');
+  await expect(sheet.getByLabel('Endpoint URL')).not.toHaveAttribute('aria-invalid', 'true');
+  await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
+  await expect(sheet.getByLabel('Target name')).toBeFocused();
   await expect(sheet.getByLabel('Endpoint URL')).toHaveAccessibleDescription(
     /Enter a complete HTTP or HTTPS endpoint URL\./,
   );
@@ -857,32 +885,40 @@ for (const type of ['sql', 'code'])
     expect(api.writes[0]).toMatchObject({ queryType: 'code', query, datasets: ['logs'] });
   });
 
-test('an untouched invalid handoff and blank new form explain why Create is disabled', async ({
+test('an untouched invalid handoff and blank new form stay quiet until blur or a submit attempt', async ({
   page,
 }) => {
   await mocked(page);
+  const query = page.getByRole('textbox', { name: 'PromQL query', exact: true });
+  const create = page.getByRole('button', { name: 'Create alert', exact: true });
   await page.goto(
     `/alerts/new?${new URLSearchParams({ dataset: 'metrics', alertQuery: 'sum by (host.name) (up)', title: 'Invalid handoff' })}`,
   );
-  await expect(page.getByRole('button', { name: 'Create alert', exact: true })).toBeDisabled();
-  await expect(page.getByRole('textbox', { name: 'PromQL query', exact: true })).toHaveAttribute(
-    'aria-invalid',
-    'true',
-  );
-  await expect(
-    page.getByRole('textbox', { name: 'PromQL query', exact: true }),
-  ).toHaveAccessibleDescription('Enter a valid PromQL expression.');
+  await expect(query).toHaveAttribute('aria-invalid', 'false');
+  await expect(page.getByText('Enter a valid PromQL expression.')).toHaveCount(0);
+  await create.click();
+  await expect(query).toHaveAttribute('aria-invalid', 'true');
+  await expect(query).toBeFocused();
+  await expect(query).toHaveAccessibleDescription('Enter a valid PromQL expression.');
   await expect(page.getByText('Enter a valid PromQL expression.', { exact: true })).toBeVisible();
   await page.goto('/alerts/new');
-  await expect(page.getByLabel('Title', { exact: true })).toHaveAccessibleDescription(
-    'Enter an alert title.',
-  );
-  await expect(page.getByLabel('Dataset', { exact: true })).toHaveAccessibleDescription(
-    /Select a dataset\./,
-  );
-  await expect(
-    page.getByRole('textbox', { name: 'PromQL query', exact: true }),
-  ).toHaveAccessibleDescription('Enter a query.');
+  const title = page.getByLabel('Title', { exact: true });
+  const dataset = page.getByLabel('Dataset', { exact: true });
+  await expect(title).toBeVisible();
+  await expect(title).not.toHaveAttribute('aria-invalid', 'true');
+  await expect(title).not.toHaveAccessibleDescription(/Enter an alert title/);
+  await expect(query).toHaveAttribute('aria-invalid', 'false');
+  await expect(query).not.toHaveAccessibleDescription('Enter a query.');
+  await expect(dataset).not.toHaveAttribute('aria-invalid', 'true');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await title.focus();
+  await title.blur();
+  await expect(title).toHaveAccessibleDescription('Enter an alert title.');
+  await expect(dataset).not.toHaveAttribute('aria-invalid', 'true');
+  await create.click();
+  await expect(dataset).toBeFocused();
+  await expect(dataset).toHaveAccessibleDescription(/Select a dataset\./);
+  await expect(query).toHaveAccessibleDescription('Enter a query.');
 });
 
 for (const duplicate of [
@@ -901,7 +937,10 @@ for (const duplicate of [
       page.getByText('This alert cannot be duplicated. Create a new rule.', { exact: true }),
     ).toBeVisible();
     await expect(page.getByLabel('Title', { exact: true })).toHaveValue('');
-    await expect(page.getByRole('button', { name: 'Create alert', exact: true })).toBeDisabled();
+    await expect(page.getByLabel('Title', { exact: true })).not.toHaveAttribute(
+      'aria-invalid',
+      'true',
+    );
   });
 
 test('editing an alert preserves server-accepted long duration aliases unchanged', async ({

@@ -1,4 +1,4 @@
-import { useCallback, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Button, Card, CardHeader, CardBody, EmptyState, Input, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
@@ -27,6 +27,10 @@ import {
 import { InlineError, useAlertAccess, useLeaveGuard } from './shared';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
+import { useTouchedErrors } from '../../hooks/useTouchedErrors';
+
+// Not typed by the user, so they are explained from the start.
+const alwaysShown: (keyof AlertDraft)[] = ['type', 'targets'];
 
 export function AlertForm({ original }: { original?: Alert }) {
   const { client } = useApp();
@@ -172,9 +176,9 @@ function AlertFormFields({
     (unverified && !unchecked.includes(draft.dataset) && draft.dataset !== original?.datasets[0]
       ? 'Select an OTLP metrics dataset.'
       : undefined);
-  const canSubmit =
-    !Object.keys(errors).length &&
-    !datasetError &&
+  const valid = !Object.keys(errors).length && !datasetError;
+  // Validation never disables Create or Save: submitting an invalid form reveals every error.
+  const ready =
     !mutation.pending &&
     !datasets.loading &&
     !metrics.loading &&
@@ -182,6 +186,14 @@ function AlertFormFields({
     !datasets.error &&
     !metrics.error &&
     !targets.error;
+  const form = useRef<HTMLFormElement>(null);
+  const shown = useTouchedErrors(
+    datasetError ? { ...errors, dataset: datasetError } : errors,
+    alwaysShown,
+  );
+  useEffect(() => {
+    if (shown.attempts) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+  }, [shown.attempts]);
   const invalidPreview = Boolean(
     errors.query ||
     errors.dataset ||
@@ -193,11 +205,16 @@ function AlertFormFields({
   );
   return (
     <form
+      ref={form}
       className="alerts-form"
       noValidate
       onSubmit={(event) => {
         event.preventDefault();
-        if (!canSubmit) return;
+        if (!ready) return;
+        if (!valid) {
+          shown.attempt();
+          return;
+        }
         void mutation.run(async () => {
           const body = buildAlertPayload(draft, source);
           const saved = original
@@ -221,7 +238,7 @@ function AlertFormFields({
                 label="Alert type"
                 value={draft.type}
                 disabled={Boolean(original) || mutation.pending}
-                error={errors.type}
+                error={shown.errors.type}
                 onChange={(event) => {
                   update('type', event.target.value as AlertDraft['type']);
                   update('dataset', '');
@@ -240,7 +257,8 @@ function AlertFormFields({
                 label="Dataset"
                 value={draft.dataset}
                 disabled={Boolean(original) || mutation.pending}
-                error={datasetError}
+                error={shown.errors.dataset}
+                onBlur={() => shown.touch('dataset')}
                 hint={
                   unverified
                     ? 'This dataset could not be verified as OTLP metrics. The server validates it on save.'
@@ -291,33 +309,36 @@ function AlertFormFields({
                 </Button>
               </p>
             ) : null}
-            {draft.type === 'promql' ? (
-              <PromqlEditor
-                value={draft.query}
-                onChange={(value) => update('query', value)}
-                metadata={draft.dataset ? metadata : undefined}
-                invalid={Boolean(errors.query)}
-                describedBy={queryMessage}
-                readOnly={mutation.pending}
-                onRun={() => previewButton.current?.click()}
-              />
-            ) : (
-              <SqlEditor
-                value={draft.query}
-                onChange={(value) => update('query', value)}
-                invalid={Boolean(errors.query)}
-                describedBy={queryMessage}
-                readOnly={mutation.pending}
-                onRun={() => previewButton.current?.click()}
-              />
-            )}
+            {/* Focus leaving the editor, including its completion list, touches the query. */}
+            <div onBlur={() => shown.touch('query')}>
+              {draft.type === 'promql' ? (
+                <PromqlEditor
+                  value={draft.query}
+                  onChange={(value) => update('query', value)}
+                  metadata={draft.dataset ? metadata : undefined}
+                  invalid={Boolean(shown.errors.query)}
+                  describedBy={queryMessage}
+                  readOnly={mutation.pending}
+                  onRun={() => previewButton.current?.click()}
+                />
+              ) : (
+                <SqlEditor
+                  value={draft.query}
+                  onChange={(value) => update('query', value)}
+                  invalid={Boolean(shown.errors.query)}
+                  describedBy={queryMessage}
+                  readOnly={mutation.pending}
+                  onRun={() => previewButton.current?.click()}
+                />
+              )}
+            </div>
             <p
               id={queryMessage}
-              className={errors.query ? 'error-text' : 'muted'}
-              role={errors.query ? 'alert' : undefined}
+              className={shown.errors.query ? 'error-text' : 'muted'}
+              role={shown.errors.query ? 'alert' : undefined}
             >
-              {errors.query
-                ? errors.query
+              {shown.errors.query
+                ? shown.errors.query
                 : draft.type === 'promql'
                   ? 'Use an instant-vector expression. Each series is evaluated independently.'
                   : 'Use exactly one numeric aggregate expression, optionally with GROUP BY; subqueries are not supported. The server validates the query on save.'}
@@ -334,7 +355,8 @@ function AlertFormFields({
                 label="Threshold operator"
                 value={draft.operator}
                 disabled={mutation.pending}
-                error={errors.operator}
+                error={shown.errors.operator}
+                onBlur={() => shown.touch('operator')}
                 onChange={(event) =>
                   update('operator', event.target.value as AlertDraft['operator'])
                 }
@@ -351,7 +373,8 @@ function AlertFormFields({
                 step="any"
                 value={draft.threshold}
                 disabled={mutation.pending}
-                error={errors.threshold}
+                error={shown.errors.threshold}
+                onBlur={() => shown.touch('threshold')}
                 onChange={(event) => update('threshold', event.target.value)}
               />
               <Input
@@ -362,7 +385,8 @@ function AlertFormFields({
                 step={1}
                 value={draft.frequency}
                 disabled={mutation.pending}
-                error={errors.frequency}
+                error={shown.errors.frequency}
+                onBlur={() => shown.touch('frequency')}
                 onChange={(event) => update('frequency', event.target.value)}
               />
               <Input
@@ -374,7 +398,8 @@ function AlertFormFields({
                     ? 'Required by the server; PromQL evaluates the current instant.'
                     : 'Query the last duration, for example 10m or 1h.'
                 }
-                error={errors.window}
+                error={shown.errors.window}
+                onBlur={() => shown.touch('window')}
                 onChange={(event) => update('window', event.target.value)}
               />
             </div>
@@ -385,7 +410,8 @@ function AlertFormFields({
                   value={draft.hold}
                   disabled={mutation.pending}
                   hint="Continuous breach duration; 0s fires immediately. Maximum 30 days."
-                  error={errors.hold}
+                  error={shown.errors.hold}
+                  onBlur={() => shown.touch('hold')}
                   onChange={(event) => update('hold', event.target.value)}
                 />
                 <p className="muted">
@@ -459,10 +485,10 @@ function AlertFormFields({
             </fieldset>
             <p
               id={targetsMessage}
-              className={errors.targets ? 'error-text' : 'muted'}
-              role={errors.targets ? 'alert' : undefined}
+              className={shown.errors.targets ? 'error-text' : 'muted'}
+              role={shown.errors.targets ? 'alert' : undefined}
             >
-              {errors.targets ??
+              {shown.errors.targets ??
                 (!draft.targets.length
                   ? 'State tracking only: no notifications until a target is selected.'
                   : 'Notify the selected targets when the threshold rule triggers.')}
@@ -483,7 +509,8 @@ function AlertFormFields({
               label="Title"
               value={draft.title}
               disabled={mutation.pending}
-              error={errors.title}
+              error={shown.errors.title}
+              onBlur={() => shown.touch('title')}
               onChange={(event) => update('title', event.target.value)}
             />
             <Select
@@ -524,7 +551,7 @@ function AlertFormFields({
             >
               Cancel
             </Button>
-            <Button type="submit" variant="primary" disabled={!canSubmit}>
+            <Button type="submit" variant="primary" disabled={!ready}>
               {mutation.pending ? 'Saving…' : original ? 'Save alert' : 'Create alert'}
             </Button>
           </div>
