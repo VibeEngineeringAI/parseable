@@ -98,11 +98,11 @@ test('chart figure and keyboard cursor expose values and Escape hides the toolti
   const tooltip = page.getByRole('tooltip');
   await expect(tooltip).toBeVisible();
   await expect(tooltip.locator('strong')).toHaveCount(3);
-  await expect(tooltip.locator('strong').last()).toHaveText('2.50');
+  await expect(tooltip.locator('strong').last()).toHaveText('2.5');
   await chart.press('ArrowRight');
   await expect(tooltip.locator('strong').last()).toHaveText('2.98');
   await chart.press('ArrowLeft');
-  await expect(tooltip.locator('strong').last()).toHaveText('2.50');
+  await expect(tooltip.locator('strong').last()).toHaveText('2.5');
   await chart.press('Escape');
   await expect(tooltip).toHaveCount(0);
 });
@@ -224,7 +224,7 @@ test('inline thresholds and ranges retain the plot across renders and update whe
   await expect(page.getByRole('status')).toHaveText('Render 1');
   await expect(plot).toHaveAttribute('data-retained', 'true');
   await page.getByRole('button', { name: 'Raise threshold' }).click();
-  await expect(page.locator('.charts-thresholds')).toHaveText('Threshold: 3.00');
+  await expect(page.locator('.charts-thresholds')).toHaveText('Threshold: 3');
   await expect(plot).not.toHaveAttribute('data-retained');
   await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
   await page.getByRole('button', { name: 'Extend range' }).click();

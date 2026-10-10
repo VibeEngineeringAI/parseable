@@ -5,6 +5,7 @@ import { Badge, Card, CardHeader, CardBody } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
+import { formatChartValue } from '../../components/charts/format';
 import { useAsync } from '../../hooks/useAsync';
 import type { Alert } from '../../lib/types';
 import { AlertActions } from './AlertActions';
@@ -93,8 +94,8 @@ export function AlertDetail({ alert, onChanged }: { alert: Alert; onChanged: () 
           <CardBody className="stack">
             <dl>
               <dt>Threshold</dt>
-              <dd>
-                {alert.thresholdConfig.operator} {alert.thresholdConfig.value}
+              <dd title={String(alert.thresholdConfig.value)}>
+                {alert.thresholdConfig.operator} {formatChartValue(alert.thresholdConfig.value)}
               </dd>
               <dt>Window</dt>
               <dd>{window.evalStart}</dd>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Badge, Card, CardHeader, CardBody } from '../../components/ui';
+import { formatChartValue } from '../../components/charts/format';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
@@ -69,8 +70,8 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
         </CardHeader>
         <CardBody className="stack">
           <p className="muted">
-            Threshold: {alert.thresholdConfig.operator} {alert.thresholdConfig.value}. Times are
-            UTC.
+            Threshold: {alert.thresholdConfig.operator}{' '}
+            {formatChartValue(alert.thresholdConfig.value)}. Times are UTC.
           </p>
           <QueryState loading={range.loading && !shown} error={range.error} retry={range.reload} />
           {chart && (
@@ -158,7 +159,7 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                               }
                             </Badge>
                           </td>
-                          <td>{instance.value}</td>
+                          <td title={String(instance.value)}>{formatChartValue(instance.value)}</td>
                           <td>
                             <DateText value={instance.pendingSince} />
                           </td>

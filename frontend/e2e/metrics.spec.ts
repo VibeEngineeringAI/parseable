@@ -894,7 +894,7 @@ test('instant matrix and scalar rows have sample hints and formatted values', as
   await editor(page).fill('2.5');
   await run(page);
   await expect(page.getByRole('table', { name: 'Instant results' })).toContainText('scalar');
-  await expect(page.getByRole('table', { name: 'Instant results' })).toContainText('2.50');
+  await expect(page.getByRole('table', { name: 'Instant results' })).toContainText('2.5');
 });
 
 test('empty instant and range responses use the requested empty strings', async ({ page }) => {

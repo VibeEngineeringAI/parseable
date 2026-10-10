@@ -1,3 +1,4 @@
+import { formatChartValue } from '../components/charts/format';
 import type { PromqlLabels, PromqlRangeResult } from './types';
 
 const units: Array<[string, number]> = [
@@ -168,15 +169,7 @@ export function parseSampleValue(value: string | number): number {
 }
 
 export function formatValue(value: string | number): string {
-  const number = parseSampleValue(value);
-  if (!Number.isFinite(number)) return '-';
-  if (number === 0) return '0';
-  const magnitude = Math.abs(number);
-  if (magnitude >= 1e9) return number.toExponential(2);
-  if (magnitude >= 1e3) return number.toFixed(0);
-  if (magnitude >= 1) return number.toFixed(2);
-  if (magnitude >= 0.001) return number.toFixed(4);
-  return number.toExponential(2);
+  return formatChartValue(parseSampleValue(value));
 }
 
 export function toChartSeries(

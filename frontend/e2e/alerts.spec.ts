@@ -1379,6 +1379,33 @@ for (const theme of ['light', 'dark'])
         await expect(page.getByRole('table', { name: 'Alert instances' })).toBeVisible();
       await axe(page);
     });
+// The row actions must be on screen and clickable at 390px without scrolling the table sideways.
+async function expectRowActionsReachable(page: Page, name: string) {
+  const region = page.getByRole('region', {
+    name: page.url().endsWith('/targets') ? 'Targets table' : 'Alerts table',
+  });
+  const actions = namedRow(page, name).getByRole('button', { name: `Actions for ${name}` });
+  await region.evaluate((element) => (element.scrollLeft = 0));
+  await expect(actions).toBeVisible();
+  const box = (await actions.boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(390);
+  expect(await region.evaluate((element) => element.scrollLeft)).toBe(0);
+  // Nothing covers the button: a click at its centre reaches it.
+  expect(
+    await actions.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      return element.contains(hit);
+    }),
+  ).toBe(true);
+  await actions.click();
+  await expect(page.getByRole('menu', { name: `Actions for ${name}`, exact: true })).toBeVisible();
+  expect(await region.evaluate((element) => element.scrollLeft)).toBe(0);
+  await page.keyboard.press('Escape');
+  await expect(actions).toBeFocused();
+}
+
 test('list, detail, form, targets and an open sheet fit 390px without horizontal overflow', async ({
   page,
 }) => {
@@ -1405,6 +1432,11 @@ test('list, detail, form, targets and an open sheet fit 390px without horizontal
         }),
       ).toBeFocused();
     }
+    if (path === '/alerts' || path === '/alerts/targets')
+      await expectRowActionsReachable(
+        page,
+        path === '/alerts' ? 'High host load' : 'Operations Slack',
+      );
     if (path.endsWith('/new'))
       await expect(page.getByRole('textbox', { name: 'PromQL query', exact: true })).toBeVisible();
     if (path === detailPath)
