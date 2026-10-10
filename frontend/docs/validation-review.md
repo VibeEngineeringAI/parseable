@@ -233,3 +233,14 @@ Cross-browser behavior, production deployment, real-provider interoperability, p
 The README build/embed section and unrelated packaging/Rust/Docker/CI changes belong to concurrent work and were preserved. The final full check preceded only documentation and live-suite assertion adjustments; application source was unchanged afterward. No Rust authorization changes, external publishing, commits or deployed-service changes were made for this frontend iteration.
 
 A final review run initially assumed the restricted reader would receive HTTP 403 for another stream's schema. The real backend returned HTTP 200 instead. This is metadata visibility, not proof of event-query access, and the frontend does not change existing backend privileges. The acceptance assertion was corrected to use an administrative resource rather than treating globally visible metadata as a denial boundary. After this correction the final live run passed 7 tests with the one expected missing-provider skip, as recorded above.
+
+## Alerts cleanup validation (2026-10-10)
+
+Results from `fix/frontend-alerts-cleanup`, run in Chromium (`/usr/bin/chromium`) under the shared Playwright lock.
+
+- `npm run format` then `npm run check` passed: format check, `tsc` build, 819 unit tests in 24 files, 173 browser tests and 42 Storybook tests.
+- The Alerts 390px no-overflow test now also asserts, for the Alerts list and Targets tables, that the row actions button is visible, inside the 390px viewport with the table scrolled to its left edge, not covered, and opens its menu without scrolling. Before the sticky Actions column was kept on mobile, the same assertions failed (button at x = 535px).
+- Pristine Alert and Target forms show no errors. Blurring a field or attempting to submit reveals them, focuses the first invalid control and keeps `aria-invalid`/`aria-describedby` in step; Create and Save stay enabled for validation errors and are disabled only while saving or loading.
+- Numbers share `formatChartValue` (trailing zeros dropped): preview table, PromQL runtime instances, thresholds, chart axis, tooltip and threshold labels. The Metrics results table delegates to it, so `2.50` now reads `2.5` there too.
+- The PromQL editor story flake was a click on a completion list that CodeMirror had disabled while re-querying. It is fixed in the test by waiting for the live list. `story-tests/metrics-components.spec.ts` passed 720 of 720 with `--repeat-each=30 --workers=4`, and the editor tests passed 280 of 280 with `--repeat-each=40 --workers=8` under about 10 busy-loop CPU burners.
+- Not fixed here: `e2e/alerts.spec.ts` "detail, preview and target sheet have padded cards..." failed 5 of 15 runs with `--repeat-each=15 --workers=4` (`.uplot` lost its `data-retained` marker after Unmute). It fails the same way on `origin/main` (4 of 15).

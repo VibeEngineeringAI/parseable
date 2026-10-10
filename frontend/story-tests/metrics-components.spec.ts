@@ -6,6 +6,18 @@ async function story(page: Page, component: 'promqleditor' | 'timeserieschart', 
   await expect(page.locator('#storybook-root')).not.toBeEmpty();
 }
 
+// While CodeMirror re-queries its completion sources (after Control+Space on a list that typing
+// already opened) it keeps the old list on screen but ignores clicks on it: the tooltip carries
+// `cm-tooltip-autocomplete-disabled` until the new result is accepted. Click only once it is live.
+async function pickCompletion(page: Page, name: string | RegExp) {
+  const option = page.getByRole('option', { name, exact: typeof name === 'string' });
+  await expect(option).toBeVisible();
+  await expect(page.locator('.cm-tooltip-autocomplete')).not.toHaveClass(
+    /cm-tooltip-autocomplete-disabled/,
+  );
+  await option.click();
+}
+
 test('editor has an accessible name and placeholder, and Tab leaves it', async ({ page }) => {
   await story(page, 'promqleditor', 'empty');
   const editor = page.getByRole('textbox', { name: 'PromQL query', exact: true });
@@ -29,19 +41,17 @@ test('editor offers supported functions and quoted dotted metric completions', a
   await expect(page.getByRole('listbox')).toHaveCount(0);
   await editor.fill('syst');
   await editor.press('Control+Space');
-  const metric = page.getByRole('option', { name: 'system.cpu.load_average.1m', exact: true });
-  await expect(metric).toBeVisible();
-  await metric.click();
+  await pickCompletion(page, 'system.cpu.load_average.1m');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m"}');
   await editor.fill('system.cpu.l');
   await editor.press('Control+Space');
-  await metric.click();
+  await pickCompletion(page, 'system.cpu.load_average.1m');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m"}');
   await editor.fill('{"syst"}');
   await editor.press('ArrowLeft');
   await editor.press('ArrowLeft');
   await editor.press('Control+Space');
-  await metric.click();
+  await pickCompletion(page, 'system.cpu.load_average.1m');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m"}');
 });
 
@@ -50,14 +60,14 @@ test('editor quotes dotted label names inside selectors', async ({ page }) => {
   const editor = page.getByRole('textbox', { name: 'PromQL query', exact: true });
   await editor.fill('{"system.cpu.load_average.1m",ser');
   await editor.press('Control+Space');
-  await page.getByRole('option', { name: 'service.name', exact: true }).click();
+  await pickCompletion(page, 'service.name');
   await expect(editor).toContainText('"service.name"');
   await editor.press('Escape');
   await page.keyboard.insertText('="gateway"}');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m","service.name"="gateway"}');
   await editor.fill('{"system.cpu.load_average.1m","ser');
   await editor.press('Control+Space');
-  await page.getByRole('option', { name: 'service.name', exact: true }).click();
+  await pickCompletion(page, 'service.name');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m","service.name"');
 });
 
