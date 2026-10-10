@@ -1165,6 +1165,10 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   page,
 }) => {
   await mocked(page);
+  // The chart's window ends at "now" and moves forward whenever the alert reloads, which rebuilds
+  // the plot with the new range. Pin the clock so Mute does not move the window and the test
+  // checks only that the plot is kept when nothing about the expression changed.
+  await page.clock.setFixedTime(new Date('2026-10-10T12:00:00Z'));
   await page.route('**/prometheus/api/v1/query_range', (route) => {
     const end = Number(new URLSearchParams(route.request().postData()!).get('end'));
     return route.fulfill({
