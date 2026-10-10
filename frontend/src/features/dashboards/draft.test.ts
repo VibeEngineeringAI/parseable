@@ -6,6 +6,7 @@ import {
   loadDraft,
   applyTile,
   applyVariable,
+  duplicateTile,
   removeVariable,
   variableNames,
 } from './draft';
@@ -19,7 +20,7 @@ import {
 import { knownTile, promqlQueries, sqlQuery, tileStep } from './tiles';
 import { ulid } from '../../lib/dashboardsContract';
 import { classicTimeRange } from './timeRange';
-import type { DashboardVariable } from '../../lib/types';
+import type { DashboardTile, DashboardVariable } from '../../lib/types';
 
 describe('production dashboard draft and save payload', () => {
   it('round-trips the loaded full classic document through tile editing and the save payload', () => {
@@ -186,6 +187,29 @@ describe('production dashboard draft and save payload', () => {
     expect(() =>
       convertBuilder({ ...tile, chartQuery: { ...tile.chartQuery, x: { groupBy: [1] } } }),
     ).toThrow('cannot be converted faithfully');
+  });
+  it('saves rows from stored heights so tiles taller than the display clamp never overlap', () => {
+    type Box = { x: number; y: number; w: number; h: number };
+    const overlapping = (tiles: DashboardTile[]) =>
+      tiles.some((one, i) =>
+        tiles.slice(i + 1).some((other) => {
+          const a = one.layout as Box,
+            b = other.layout as Box;
+          return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+        }),
+      );
+    const tall = { ...classic.tiles[0], tile_id: 'a', layout: { x: 0, y: 0, w: 12, h: 30 } };
+    const below = { ...classic.tiles[1], tile_id: 'b', layout: { x: 0, y: 30, w: 12, h: 4 } };
+    const draft = { ...classic, sections: [], tiles: [tall, below] };
+    const resized = applyTile(draft, { ...below, layout: { ...below.layout, h: 5 } });
+    expect(resized.tiles!.map((tile) => tile.layout)).toEqual([
+      tall.layout,
+      { x: 0, y: 30, w: 12, h: 5 },
+    ]);
+    const duplicated = duplicateTile({ ...draft, tiles: [tall] }, tall);
+    expect(duplicated.tiles![1].layout).toMatchObject({ y: 30, h: 30 });
+    expect(overlapping(resized.tiles!)).toBe(false);
+    expect(overlapping(duplicated.tiles!)).toBe(false);
   });
 });
 

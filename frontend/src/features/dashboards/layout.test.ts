@@ -39,6 +39,23 @@ it('swaps neighbours beside a tall tile without repacking unrelated columns', ()
   ]);
   expect(moveTile(moved, 'c', 1)).toEqual(mixed);
 });
+it('changes reading order when tiles of unequal widths would compact back into place', () => {
+  const source = [tile('A', 4, 0, 4, 4), tile('B', 0, 4, 6, 4)];
+  const order = (tiles: DashboardTile[]) => compactLayouts(tiles).map((row) => row.tile.tile_id);
+  expect(order(source)).toEqual(['A', 'B']);
+  for (const moved of [moveTile(source, 'A', 1), moveTile(source, 'B', -1)]) {
+    expect(order(moved)).toEqual(['B', 'A']);
+    expect(moved.map((row) => row.layout)).toEqual([
+      { x: 0, y: 4, w: 4, h: 4, future: true },
+      { x: 0, y: 0, w: 6, h: 4, future: true },
+    ]);
+    expect(order(moveTile(moved, 'A', -1))).toEqual(['A', 'B']);
+    expect(order(moveTile(moved, 'B', 1))).toEqual(['A', 'B']);
+  }
+  const wide = [tile('A', 0, 0, 8, 4), tile('B', 8, 0, 4, 4), tile('C', 0, 4, 12, 4)];
+  expect(order(moveTile(wide, 'A', 1))).toEqual(['B', 'A', 'C']);
+  expect(order(moveTile(wide, 'B', -1))).toEqual(['B', 'A', 'C']);
+});
 it('resolves resize collisions and closes deletion gaps with mixed heights', () => {
   const dashboard = { ...classic, sections: [], tiles: mixed };
   const resized = applyTile(dashboard, { ...mixed[1], layout: { x: 6, y: 0, w: 6, h: 8 } });
