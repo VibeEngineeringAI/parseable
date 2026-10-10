@@ -2,8 +2,14 @@ import { describe, expect, it } from 'vitest';
 import classic from './__fixtures__/classic.json';
 import demoTile from './__fixtures__/ingest-demo-tile.json';
 import { dashboardPayload, loadDraft, applyTile } from './draft';
-import { convertBuilder, setQueryLanguage, addPromqlQuery, removePromqlQuery } from './tileEditing';
-import { knownTile, sqlQuery } from './tiles';
+import {
+  convertBuilder,
+  setQueryLanguage,
+  addPromqlQuery,
+  removePromqlQuery,
+  promqlRows,
+} from './tileEditing';
+import { knownTile, promqlQueries, sqlQuery, tileStep } from './tiles';
 import { ulid } from '../../lib/dashboardsContract';
 import { classicTimeRange } from './timeRange';
 
@@ -101,6 +107,34 @@ describe('production dashboard draft and save payload', () => {
       chartQuery: [''],
       promqlQueryType: ['range'],
     });
+  });
+  it.each([
+    { tile_id: 'x', tileType: 'promql', chartQuery: { query: 'up', step: '5m', type: 'instant' } },
+    { tile_id: 'x', tileType: 'promql', promqlQuery: { query: 'up', step: '5m', type: 'instant' } },
+  ])('keeps a legacy PromQL step and query type through every edit path', (tile) => {
+    const rows = promqlQueries(tile);
+    const edits = [
+      { ...tile, ...promqlRows(tile, [{ ...rows[0], query: 'up + 1' }]) },
+      { ...tile, ...promqlRows(tile, [{ ...rows[0], type: 'both' }]) },
+      addPromqlQuery(tile),
+      removePromqlQuery(addPromqlQuery(tile), 1),
+      removePromqlQuery({ ...tile, ...promqlRows(tile, [...rows, ...rows]) }, 0),
+      setQueryLanguage(tile, 'promql'),
+    ];
+    expect(tileStep(tile, 0, 3600, 'up')).toBe('5m');
+    for (const edited of edits) expect(tileStep(edited, 0, 3600, 'up')).toBe('5m');
+    expect(edits.map((edited) => promqlQueries(edited))).toEqual([
+      [{ query: 'up + 1', type: 'instant' }],
+      [{ query: 'up', type: 'both' }],
+      [
+        { query: 'up', type: 'instant' },
+        { query: '', type: 'range' },
+      ],
+      [{ query: 'up', type: 'instant' }],
+      [{ query: 'up', type: 'instant' }],
+      [{ query: 'up', type: 'instant' }],
+    ]);
+    expect(promqlRows({ tile_id: 'x', chartQuery: ['up'] }, rows)).not.toHaveProperty('promqlStep');
   });
   it('converts classic scalar filters, sorting and limits without dropping their semantics', () => {
     const tile = {

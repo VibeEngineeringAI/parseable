@@ -19,6 +19,7 @@ import {
   tileVariableNames,
   record,
   promqlQueries,
+  storedStep,
   sqlQuery,
   tileDatasets,
   type TileLayout,
@@ -93,7 +94,7 @@ export function DashboardTile({
     ...(tile.tileType === 'promql'
       ? {
           stat: tile.chartType === 'query-value',
-          step: tile.promqlStep ?? record(tile.promqlQuery).step ?? record(tile.chartQuery).step,
+          step: storedStep(tile),
           maxDataPoints:
             record(tile.config).maxDataPoints ?? record(record(tile.config).layout).maxDataPoints,
         }

@@ -1,5 +1,5 @@
 import type { DashboardTile } from '../../lib/types';
-import { promqlQueries, sqlQuery, tileDatasets } from './tiles';
+import { promqlQueries, sqlQuery, storedStep, tileDatasets, type QueryMode } from './tiles';
 
 export function convertBuilder(tile: DashboardTile): DashboardTile {
   const chartQuery = sqlQuery(tile);
@@ -21,19 +21,27 @@ export function setQueryLanguage(tile: DashboardTile, language: 'code' | 'promql
     ...(language === 'promql' ? { promqlQueryType: ['range'] } : {}),
   };
 }
-export function addPromqlQuery(tile: DashboardTile): DashboardTile {
-  const rows = promqlQueries(tile);
+/** Write PromQL rows in the array shape, keeping a legacy object's step in promqlStep. */
+export function promqlRows(
+  tile: DashboardTile,
+  rows: Array<{ query: string; type: QueryMode }>,
+): Partial<DashboardTile> {
+  const step = storedStep(tile);
   return {
-    ...tile,
-    chartQuery: [...rows.map((row) => row.query), ''],
-    promqlQueryType: [...rows.map((row) => row.type), 'range'],
-  };
-}
-export function removePromqlQuery(tile: DashboardTile, index: number): DashboardTile {
-  const rows = promqlQueries(tile).filter((_, i) => i !== index);
-  return {
-    ...tile,
     chartQuery: rows.map((row) => row.query),
     promqlQueryType: rows.map((row) => row.type),
+    ...(step === undefined ? {} : { promqlStep: step }),
+  };
+}
+export function addPromqlQuery(tile: DashboardTile): DashboardTile {
+  return { ...tile, ...promqlRows(tile, [...promqlQueries(tile), { query: '', type: 'range' }]) };
+}
+export function removePromqlQuery(tile: DashboardTile, index: number): DashboardTile {
+  return {
+    ...tile,
+    ...promqlRows(
+      tile,
+      promqlQueries(tile).filter((_, i) => i !== index),
+    ),
   };
 }

@@ -5,7 +5,7 @@ import type { PromqlMetadataSource } from '../../lib/promqlMetadata';
 import type { DashboardTile } from '../../lib/types';
 import { createId } from '../../lib/ids';
 import { SqlEditor } from '../sql/SqlEditor';
-import { addPromqlQuery, removePromqlQuery } from './tileEditing';
+import { addPromqlQuery, promqlRows, removePromqlQuery } from './tileEditing';
 import { promqlQueries, type QueryMode } from './tiles';
 export function TileQueryFields({
   draft,
@@ -34,10 +34,12 @@ export function TileQueryFields({
                 label={`PromQL query ${String.fromCharCode(65 + index)}`}
                 value={row.query}
                 onChange={(query) =>
-                  change({
-                    chartQuery: queries.map((row, i) => (i === index ? query : row.query)),
-                    promqlQueryType: queries.map((row) => row.type),
-                  })
+                  change(
+                    promqlRows(
+                      draft,
+                      queries.map((row, i) => (i === index ? { ...row, query } : row)),
+                    ),
+                  )
                 }
                 metadata={metadata}
                 onRun={runPreview}
@@ -47,11 +49,14 @@ export function TileQueryFields({
                   label={`Query ${String.fromCharCode(65 + index)} type`}
                   value={row.type}
                   onChange={(event) =>
-                    change({
-                      promqlQueryType: queries.map((row, i) =>
-                        i === index ? (event.target.value as QueryMode) : row.type,
+                    change(
+                      promqlRows(
+                        draft,
+                        queries.map((row, i) =>
+                          i === index ? { ...row, type: event.target.value as QueryMode } : row,
+                        ),
                       ),
-                    })
+                    )
                   }
                 >
                   <option value="range">Range</option>

@@ -55,8 +55,10 @@ export function promqlQueries(tile: DashboardTile): Array<{ query: string; type:
     return { query, type: mode === 'instant' || mode === 'both' ? mode : 'range' };
   });
 }
+export const storedStep = (tile: DashboardTile) =>
+  tile.promqlStep ?? record(tile.promqlQuery).step ?? record(tile.chartQuery).step;
 export function tileStep(tile: DashboardTile, start: number, end: number, query: string): string {
-  const legacy = tile.promqlStep ?? record(tile.promqlQuery).step ?? record(tile.chartQuery).step;
+  const legacy = storedStep(tile);
   if (typeof legacy === 'string' && (parseDuration(legacy) ?? 0) > 0) return legacy;
   if (typeof legacy === 'number' && Number.isFinite(legacy) && legacy > 0) return `${legacy}s`;
   const maxDP = Number(
