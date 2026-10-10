@@ -90,6 +90,11 @@
   padding: 4px 12px;
   color: var(--color-muted);
 }
+.charts-axis-title {
+  margin: 4px 12px;
+  text-align: center;
+  color: var(--color-muted);
+}
 
 .charts-toggle,
 .charts-legend-item {

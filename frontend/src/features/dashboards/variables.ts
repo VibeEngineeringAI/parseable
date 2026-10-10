@@ -4,6 +4,17 @@ import type { DashboardVariable, ParseableClient, QueryRequest } from '../../lib
 
 export type VariableValues = Record<string, string | string[]>;
 const placeholder = /\$\{?(\w+)\}?/g;
+const valueFor = (values: VariableValues, name: string) =>
+  Object.hasOwn(values, name) ? values[name] : undefined;
+/** Classic leaves every token without a dashboard definition untouched. */
+export function referencedVariables(source: string, variables: DashboardVariable[]): string[] {
+  const names = new Set(variables.map((variable) => variable.name));
+  return [
+    ...new Set(
+      [...source.matchAll(placeholder)].map((match) => match[1]).filter((name) => names.has(name)),
+    ),
+  ];
+}
 const regexEscape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const sqlEscape = (value: string) => value.replaceAll("'", "''");
 const identifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
@@ -18,7 +29,7 @@ export const readVariables = (value: unknown): DashboardVariable[] =>
   Array.isArray(value) ? value.filter(dashboardVariable) : [];
 export function interpolate(value: string, values: VariableValues): string {
   return value.replace(placeholder, (token, name) => {
-    const selection = values[name];
+    const selection = valueFor(values, name);
     return selection === undefined || (Array.isArray(selection) && !selection.length)
       ? token
       : Array.isArray(selection)
@@ -29,7 +40,7 @@ export function interpolate(value: string, values: VariableValues): string {
 export function interpolatePromql(query: string, values: VariableValues): string {
   return query
     .replace(placeholder, (token, name) => {
-      const selection = values[name];
+      const selection = valueFor(values, name);
       return selection === undefined || (Array.isArray(selection) && !selection.length)
         ? token
         : Array.isArray(selection)
@@ -47,7 +58,7 @@ export function interpolateSql(
   const datasets = variables.filter((variable) => variable.type === 'dataset');
   let resolved = query;
   for (const variable of datasets) {
-    const value = values[variable.name],
+    const value = valueFor(values, variable.name),
       selection = Array.isArray(value) ? value[0] : value;
     if (!selection) continue;
     const name = regexEscape(variable.name),
@@ -66,7 +77,7 @@ export function interpolateSql(
         const contents = token.slice(1, -1),
           exact = /^\$\{?(\w+)\}?$/.exec(contents);
         if (exact && !datasetNames.has(exact[1])) {
-          const value = values[exact[1]];
+          const value = valueFor(values, exact[1]);
           if (value === undefined || (Array.isArray(value) && !value.length)) return token;
           return (Array.isArray(value) ? value : [value])
             .map((value) => `'${sqlEscape(value)}'`)
@@ -74,14 +85,14 @@ export function interpolateSql(
         }
         return `'${contents.replace(placeholder, (token, name) => {
           if (datasetNames.has(name)) return token;
-          const value = values[name],
+          const value = valueFor(values, name),
             selection = Array.isArray(value) ? value[0] : value;
           return selection === undefined ? token : sqlEscape(selection);
         })}'`;
       }
       const variable = name ?? bare;
       if (!variable || datasetNames.has(variable)) return token;
-      const value = values[variable];
+      const value = valueFor(values, variable);
       if (value === undefined || (Array.isArray(value) && !value.length)) return token;
       const selections = Array.isArray(value) ? value : [value];
       return name ? selections.map(identifier).join(',') : selections.join(',');
@@ -127,7 +138,7 @@ export function variableInputs(
   const source = variableSource(variable);
   return Object.fromEntries(
     [...source.matchAll(/\$\{?(\w+)\}?/g)]
-      .map((match) => [match[1], values[match[1]]])
+      .map((match) => [match[1], valueFor(values, match[1])])
       .filter((entry) => entry[1] !== undefined),
   );
 }
@@ -257,10 +268,11 @@ function variableSource(variable: DashboardVariable) {
 export function setVariableType(variable: DashboardVariable, type: DashboardVariable['type']) {
   return serializeVariable({ ...variable, type }, variable);
 }
-export function variableDependencies(variable: DashboardVariable): string[] {
-  return [
-    ...new Set([...variableSource(variable).matchAll(/\$\{?(\w+)\}?/g)].map((match) => match[1])),
-  ];
+export function variableDependencies(
+  variable: DashboardVariable,
+  variables: DashboardVariable[],
+): string[] {
+  return referencedVariables(variableSource(variable), variables);
 }
 export function variableDependencyError(variables: DashboardVariable[]): string | undefined {
   const byName = new Map(variables.map((variable) => [variable.name, variable]));
@@ -270,9 +282,7 @@ export function variableDependencyError(variables: DashboardVariable[]): string 
     if (visiting.has(name)) return `Variable dependencies contain a cycle at ${name}.`;
     if (visited.has(name)) return;
     visiting.add(name);
-    for (const dependency of variableDependencies(byName.get(name)!)) {
-      if (!byName.has(dependency))
-        return `Variable ${name} references a variable that does not exist: ${dependency}.`;
+    for (const dependency of variableDependencies(byName.get(name)!, variables)) {
       const error = visit(dependency);
       if (error) return error;
     }

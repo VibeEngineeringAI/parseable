@@ -7,7 +7,7 @@ import type {
   LogRecord,
 } from '../../lib/types';
 import type { QueryResult } from '../../lib/promqlResults';
-import { promqlQueries, sqlQuery, tileDatasets, tileStep } from './tiles';
+import { promqlQueries, sqlQuery, tileDatasets, tileStep, tileVariableNames } from './tiles';
 import {
   interpolatePromql,
   interpolateSql,
@@ -24,22 +24,27 @@ export async function loadTile(
   limit: QueryLimiter,
   signal: AbortSignal,
 ): Promise<TileResults> {
+  if (
+    [...tileVariableNames(tile, variables)].some(
+      (name) =>
+        !Object.hasOwn(values, name) || (Array.isArray(values[name]) && !values[name].length),
+    )
+  )
+    throw new Error('Select values for all query variables.');
   if (tile.tileType !== 'promql') {
     const sql = interpolateSql(sqlQuery(tile), values, variables);
-    if (/\$\{?\w+\}?/.test(sql)) throw new Error('Select values for all query variables.');
     if (!sql.trim()) throw new Error('This tile has no SQL query.');
     return { rows: await limit(() => client.query({ sql, ...bounds }, signal), signal) };
   }
   const stream = resolveDataset(tileDatasets(tile)[0] ?? '', values),
     queries = promqlQueries(tile);
-  if (!stream || /\$\{?\w+\}?/.test(stream)) throw new Error('Select a dataset for this tile.');
+  if (!stream) throw new Error('Select a dataset for this tile.');
   if (!queries.length) throw new Error('This tile has no PromQL query.');
   const start = Date.parse(bounds.startTime) / 1000,
     end = Date.parse(bounds.endTime) / 1000;
   const promql = await Promise.all(
     queries.map(async ({ query: template, type }, index): Promise<QueryResult> => {
       const query = interpolatePromql(template, values);
-      if (/\$\{?\w+\}?/.test(query)) throw new Error('Select values for all query variables.');
       const stat = tile.chartType === 'query-value';
       const [range, instant] = await Promise.all([
         !stat && type !== 'instant'

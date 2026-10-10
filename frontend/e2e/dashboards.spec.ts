@@ -58,6 +58,7 @@ async function mockServer(
     rows?: DashboardSummary[];
     failTitle?: string;
     privilege?: string;
+    queryRows?: Record<string, unknown>[];
   } = {},
 ) {
   let current = structuredClone(options.document ?? classic) as Dashboard,
@@ -182,7 +183,9 @@ async function mockServer(
       );
     }
     if (path === '/api/v1/query')
-      return route.fulfill({ json: [{ time: '2026-10-10T08:00:00Z', events: 12 }] });
+      return route.fulfill({
+        json: options.queryRows ?? [{ time: '2026-10-10T08:00:00Z', events: 12 }],
+      });
     if (path.startsWith('/prometheus/api/v1/label/'))
       return route.fulfill({
         json: {
@@ -470,9 +473,9 @@ test('non-owners see read-only tiles, including unknown and unavailable chart pl
   ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Add tile', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
-  await expect(tile(page, 'AI summary')).toContainText('ai tiles cannot be shown');
+  await expect(tile(page, 'AI summary')).toContainText('AI tiles cannot be shown');
   await expect(tile(page, 'Distribution')).toContainText(
-    'pie charts are not available in /next yet.',
+    'Pie charts are not available in /next yet.',
   );
   await expect(tile(page, 'Distribution').getByRole('link', { name: /classic UI/ })).toHaveCount(0);
   await page.getByRole('button', { name: 'Actions for tile Host load', exact: true }).click();
@@ -943,6 +946,27 @@ test('390px contains list, tiles and the editor; keyboard tile actions remain re
     await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
   ).toBeLessThanOrEqual(1);
   await axe(page);
+  await page.keyboard.press('Escape');
+  await page.goto('/dashboards/01M4J000000000000000000002');
+  const metrics = tile(page, 'Host load');
+  await expect(metrics.getByRole('img')).toHaveAccessibleName(/4 series from/);
+  const legend = metrics.getByRole('list', { name: 'Series visibility' });
+  expect(await legend.evaluate((element) => getComputedStyle(element).overflowY)).toBe('auto');
+  expect(
+    await legend.evaluate((element) => element.scrollHeight - element.clientHeight),
+  ).toBeGreaterThan(0);
+  await legend.hover();
+  await page.mouse.wheel(0, 500);
+  await expect.poll(() => legend.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  const last = legend.getByRole('button').last();
+  await last.focus();
+  await expect(last).toBeFocused();
+  const lastBox = (await last.boundingBox())!,
+    legendBox = (await legend.boundingBox())!;
+  expect(lastBox.y).toBeGreaterThanOrEqual(legendBox.y);
+  expect(lastBox.y + lastBox.height).toBeLessThanOrEqual(legendBox.y + legendBox.height + 1);
+  await last.press('Enter');
+  await expect(last).toHaveAttribute('aria-pressed', 'false');
 });
 
 test('sections have independent grids at identical coordinates; moves preserve other sections', async ({
@@ -1018,6 +1042,162 @@ test('legacy object builder from ingest_demo_data renders, converts and saves a 
   await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
   expect(server.writes[0].tiles).toEqual([
     { ...source, title: 'Converted builder', tileType: 'code', chartQuery: query },
+  ]);
+});
+
+test('unknown dollar tokens reach SQL and label_replace tile queries unchanged', async ({
+  page,
+}) => {
+  const sql =
+    "SELECT COUNT(*) AS events FROM \"app-logs\" WHERE message='$ $1 $unknown ${missing} $__interval' AND host='$host'";
+  const promql = 'label_replace(up{host="$host"}, "copy", "$1", "host", "(.*)$") + $__interval';
+  const server = await mockServer(page, {
+    document: {
+      ...classic,
+      variables: [{ name: 'host', label: 'Host', type: 'list', options: ['node-a'] }],
+      sections: [],
+      tiles: [
+        {
+          ...classic.tiles[1],
+          title: 'Dollar SQL',
+          tileType: 'code',
+          chartType: 'query-value',
+          chartQuery: sql,
+        },
+        {
+          ...classic.tiles[0],
+          title: 'Dollar PromQL',
+          chartQuery: [promql],
+          dbName: 'otel-metrics',
+        },
+      ],
+    },
+  });
+  await page.goto(detail);
+  await expect(tile(page, 'Dollar SQL').getByLabel('Dollar SQL value')).toHaveText('12');
+  await expect(tile(page, 'Dollar PromQL').getByRole('img')).toHaveAccessibleName(/1 series from/);
+  await page.waitForLoadState('networkidle');
+  expect(
+    server.calls.filter((call) => call.path === '/api/v1/query').map((call) => call.body?.query),
+  ).toEqual([sql.replace('$host', 'node-a')]);
+  expect(
+    server.calls
+      .filter((call) => call.path === '/prometheus/api/v1/query_range')
+      .map((call) => call.body?.query),
+  ).toEqual([promql.replace('$host', 'node-a')]);
+  await expect(page.getByText(/Select a value for this tile/)).toHaveCount(0);
+});
+
+test('SQL and PromQL variable definitions with unknown dollar tokens load and remain editable', async ({
+  page,
+}) => {
+  const sql = 'SELECT \'$ $1 $unknown ${missing} $__interval\' FROM "app-logs"';
+  const promql = 'label_replace(up, "copy", "$1", "host", "(.*)$")';
+  const variables = [
+    { name: 'literal', label: 'Literal', type: 'sql' as const, sqlQuery: sql },
+    {
+      name: 'replacement',
+      label: 'Replacement',
+      type: 'promql_query' as const,
+      promqlQuery: promql,
+      promqlQueryDataset: 'otel-metrics',
+      promqlQueryLabel: 'host',
+    },
+  ];
+  const server = await mockServer(page, {
+    queryRows: [{ events: 12 }],
+    document: {
+      ...classic,
+      variables,
+      sections: [],
+      tiles: [
+        {
+          ...classic.tiles[1],
+          tileType: 'code',
+          chartType: 'query-value',
+          chartQuery:
+            "SELECT COUNT(*) AS events FROM \"app-logs\" WHERE host='$replacement' AND value='$literal'",
+        },
+      ],
+    },
+  });
+  await page.goto(detail);
+  await expect(page.getByLabel('Literal', { exact: true })).toHaveValue('12');
+  await expect(page.getByLabel('Replacement', { exact: true })).toHaveValue('node-a');
+  await expect(tile(page, 'Errors').getByLabel('Errors value')).toHaveText('12');
+  await page.waitForLoadState('networkidle');
+  expect(
+    server.calls.some((call) => call.path === '/api/v1/query' && call.body?.query === sql),
+  ).toBe(true);
+  expect(
+    server.calls.some(
+      (call) => call.path === '/prometheus/api/v1/query' && call.body?.query === promql,
+    ),
+  ).toBe(true);
+  for (const variable of variables) {
+    await page
+      .getByRole('button', { name: `Actions for variable ${variable.label}`, exact: true })
+      .click();
+    await page.getByRole('menuitem', { name: 'Edit variable', exact: true }).click();
+    const editor = page.getByRole('dialog', { name: 'Edit variable', exact: true });
+    await expect(editor.getByRole('button', { name: 'Apply variable', exact: true })).toBeEnabled();
+    await editor.getByLabel('Variable label').fill(`${variable.label} edited`);
+    await editor.getByRole('button', { name: 'Apply variable', exact: true }).click();
+  }
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  expect(server.writes[0].variables).toEqual(
+    variables.map((variable) => ({ ...variable, label: `${variable.label} edited` })),
+  );
+});
+
+test('Move earlier and later follow compacted reading order on a stored layout with gaps', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const tiles = ['A', 'B', 'C'].map((title, index) => ({
+    ...classic.tiles[1],
+    tile_id: createUlid(),
+    title,
+    tileType: 'code',
+    chartType: 'query-value',
+    layout: { x: index === 1 ? 6 : 0, y: [0, 10, 5][index], w: 6, h: 2, future: title },
+  }));
+  const server = await mockServer(page, {
+    document: { ...classic, variables: [], sections: [], tiles },
+  });
+  const order = () =>
+    page.locator('[data-tile-id]').evaluateAll((elements) =>
+      elements
+        .map((element) => {
+          const bounds = element.getBoundingClientRect();
+          return { title: element.querySelector('h2')!.textContent, x: bounds.x, y: bounds.y };
+        })
+        .sort((a, b) => a.y - b.y || a.x - b.x)
+        .map((row) => row.title),
+    );
+  await page.goto(detail);
+  for (const title of ['A', 'B', 'C'])
+    await expect(tile(page, title).getByLabel(`${title} value`)).toHaveText('12');
+  await expect.poll(order).toEqual(['A', 'B', 'C']);
+  await page.getByRole('button', { name: 'Actions for tile C', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: 'Move later', exact: true })).toBeDisabled();
+  await page.keyboard.press('Escape');
+  await tileAction(page, 'B', 'Move earlier');
+  await expect.poll(order).toEqual(['B', 'A', 'C']);
+  await page.getByRole('button', { name: 'Actions for tile B', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: 'Move earlier', exact: true })).toBeDisabled();
+  await page.keyboard.press('Escape');
+  await tileAction(page, 'B', 'Move later');
+  await expect.poll(order).toEqual(['A', 'B', 'C']);
+  await tileAction(page, 'B', 'Move later');
+  await expect.poll(order).toEqual(['A', 'C', 'B']);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  expect(server.writes[0].tiles!.map((row) => row.layout)).toEqual([
+    { ...tiles[0].layout, y: 0 },
+    { ...tiles[1].layout, x: 0, y: 2 },
+    { ...tiles[2].layout, x: 6, y: 0 },
   ]);
 });
 
@@ -1180,7 +1360,48 @@ test('duplicate and nil tile ids are repaired on load, so editing and deleting a
     },
   });
   await page.goto(detail);
-  await expect(page.getByText(/Saving will assign new IDs to 2 tiles/)).toBeVisible();
+  await expect(page.getByText(/The next save will assign new IDs to 2 tiles/)).toBeVisible();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Discard', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
+  await expect(
+    page.getByRole('menuitem', { name: 'Duplicate dashboard', exact: true }),
+  ).not.toHaveAttribute('aria-disabled', 'true');
+  await page.keyboard.press('Escape');
+  const prompts: string[] = [];
+  page.on('dialog', async (dialog) => {
+    prompts.push(dialog.message());
+    await dialog.dismiss();
+  });
+  await page
+    .getByRole('navigation', { name: 'Dashboard breadcrumb' })
+    .getByRole('link', { name: 'Dashboards', exact: true })
+    .click();
+  await expect(page).toHaveURL('/dashboards');
+  expect(prompts).toEqual([]);
+  await page.getByRole('link', { name: classic.title, exact: true }).click();
+  await expect(page.getByText(/assign new IDs to 2 tiles/)).toBeVisible();
+  const repairedIds = await page
+    .locator('[data-tile-id]')
+    .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-tile-id')));
+  await tileAction(page, 'Second', 'Edit');
+  await page.getByRole('dialog').getByLabel('Tile title').fill('Discard this edit');
+  await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await expect(page.getByText('Unsaved changes', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Discard', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  await expect(tile(page, 'Second')).toBeVisible();
+  expect(
+    await page
+      .locator('[data-tile-id]')
+      .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-tile-id'))),
+  ).toEqual(repairedIds);
+  await expect(page.getByText(/The next save will assign new IDs/)).toBeVisible();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText(/The next save will assign new IDs/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+  expect(server.writes[0].tiles!.map((row) => row.tile_id)).toEqual(repairedIds);
   await tileAction(page, 'Second', 'Edit');
   await page.getByRole('dialog').getByLabel('Tile title').fill('Second edited');
   await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
@@ -1192,10 +1413,81 @@ test('duplicate and nil tile ids are repaired on load, so editing and deleting a
   ).toBeFocused();
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
-  expect(server.writes[0].tiles!.map((tile) => tile.title)).toEqual(['Second edited', 'Nil']);
-  expect(new Set(server.writes[0].tiles!.map((tile) => tile.tile_id)).size).toBe(2);
-  await expect(page.getByText(/Saving will assign new IDs/)).toHaveCount(0);
+  expect(server.writes.at(-1)!.tiles!.map((tile) => tile.title)).toEqual(['Second edited', 'Nil']);
+  expect(new Set(server.writes.at(-1)!.tiles!.map((tile) => tile.tile_id)).size).toBe(2);
+  await expect(page.getByText(/The next save will assign new IDs/)).toHaveCount(0);
 });
+
+for (const privilege of ['reader', 'admin'])
+  test(`${privilege} non-owners with repaired tile IDs can leave and duplicate without unsaved changes`, async ({
+    page,
+  }) => {
+    const first = {
+      ...classic.tiles[1],
+      title: 'First',
+      tileType: 'code',
+      chartType: 'query-value',
+    };
+    const server = await mockServer(page, {
+      privilege,
+      document: {
+        ...classic,
+        author: 'other',
+        variables: [],
+        sections: [],
+        tiles: [
+          first,
+          { ...first, title: 'Second' },
+          { ...first, title: 'Nil', tile_id: '00000000000000000000000000' },
+        ],
+      },
+    });
+    const prompts: string[] = [];
+    page.on('dialog', async (dialog) => {
+      prompts.push(dialog.message());
+      await dialog.dismiss();
+    });
+    await page.goto(detail);
+    await expect(page.getByText(/This dashboard is read-only/)).toBeVisible();
+    for (const title of ['First', 'Second', 'Nil'])
+      await expect(tile(page, title).getByLabel(`${title} value`)).toHaveText('12');
+    await expect(page.getByText(/Saving will assign|next save will assign/)).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
+    const repairedIds = await page
+      .locator('[data-tile-id]')
+      .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-tile-id')));
+    expect(new Set(repairedIds).size).toBe(3);
+    await page
+      .getByRole('navigation', { name: 'Dashboard breadcrumb' })
+      .getByRole('link', { name: 'Dashboards', exact: true })
+      .click();
+    await expect(page).toHaveURL('/dashboards');
+    expect(prompts).toEqual([]);
+    await page.getByRole('link', { name: classic.title, exact: true }).click();
+    await page.waitForLoadState('networkidle');
+    const workingIds = await page
+      .locator('[data-tile-id]')
+      .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-tile-id')));
+    await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
+    const duplicate = page.getByRole('menuitem', { name: 'Duplicate dashboard', exact: true });
+    await expect(duplicate).not.toHaveAttribute('aria-disabled', 'true');
+    await duplicate.click();
+    await expect(
+      page.getByRole('heading', { name: `${classic.title} (Copy)`, exact: true }),
+    ).toBeVisible();
+    const ids = server.creates[0].tiles!.map((tile) => tile.tile_id);
+    expect(new Set(ids).size).toBe(3);
+    expect(
+      ids.every(
+        (id) =>
+          /^[0-9A-HJKMNP-TV-Z]{26}$/.test(id) &&
+          id !== '00000000000000000000000000' &&
+          !workingIds.includes(id),
+      ),
+    ).toBe(true);
+    expect(server.writes).toEqual([]);
+    expect(prompts).toEqual([]);
+  });
 
 test('conflict Cancel after an overwrite error keeps the draft dirty and editable', async ({
   page,
@@ -1222,7 +1514,7 @@ test('conflict Cancel after an overwrite error keeps the draft dirty and editabl
   await expect(page.getByLabel('Tile title')).toHaveValue('Keep this edit');
 });
 
-test('dependent variables wait for upstream validation; editor rejects cycles and unknown references', async ({
+test('dependent variables wait for upstream validation; editor allows unknown tokens and rejects cycles', async ({
   page,
 }) => {
   const server = await mockServer(page, { document: { ...classic, tiles: [classic.tiles[0]] } });
@@ -1254,8 +1546,8 @@ test('dependent variables wait for upstream validation; editor rejects cycles an
   await editor.getByLabel('Variable label').fill('Cycle');
   await editor.getByLabel('Variable type').selectOption('sql');
   await editor.getByRole('textbox', { name: 'SQL query', exact: true }).fill("SELECT '$missing'");
-  await expect(editor).toContainText('references a variable that does not exist: missing');
-  await expect(editor.locator('[data-dialog-confirm]')).toBeDisabled();
+  await expect(editor).not.toContainText('references a variable that does not exist');
+  await expect(editor.locator('[data-dialog-confirm]')).toBeEnabled();
   await editor.getByRole('textbox', { name: 'SQL query', exact: true }).fill("SELECT '$cycle'");
   await expect(editor).toContainText('contain a cycle');
   await expect(editor.locator('[data-dialog-confirm]')).toBeDisabled();
@@ -1309,6 +1601,7 @@ test('variable load errors stay compact and named; tiles explain failed values w
   const document = {
     ...classic,
     variables: [
+      { name: 'healthy', label: 'Healthy', type: 'text', defaultValue: 'Ready' },
       {
         name: 'host',
         label: 'Host',
@@ -1332,6 +1625,10 @@ test('variable load errors stay compact and named; tiles explain failed values w
   await page.goto(detail);
   const error = page.locator('.dashboard-variable-error');
   await expect(error).toContainText('Could not load values for Host: Values unavailable');
+  await expect(page.getByLabel('Healthy', { exact: true })).toHaveValue('Ready');
+  const healthy = (await page.getByLabel('Healthy', { exact: true }).boundingBox())!,
+    failed = (await page.getByLabel('Host', { exact: true }).boundingBox())!;
+  expect(healthy.y).toBe(failed.y);
   expect((await error.boundingBox())!.height).toBeLessThan(120);
   await expect(page.getByLabel('Host', { exact: true })).toHaveAccessibleDescription(
     /Host: Values unavailable/,
@@ -1536,6 +1833,11 @@ test('1440px titles stay inside their cells and charts fit with visible axis tit
     .toBeLessThanOrEqual(1);
   const bounds = (await chart.boundingBox())!,
     axis = (await chart.getByText('Time', { exact: true }).boundingBox())!;
+  const plot = (await chart.locator('.charts-plot-box').boundingBox())!,
+    legend = (await chart.locator('.charts-legend').boundingBox())!;
+  expect(axis.y).toBeGreaterThanOrEqual(plot.y + plot.height);
+  expect(axis.y + axis.height).toBeLessThanOrEqual(legend.y);
+  expect((await chart.locator('.u-over').boundingBox())!.height).toBeGreaterThanOrEqual(80);
   expect(axis.y + axis.height).toBeLessThanOrEqual(bounds.y + bounds.height - 16);
   expect(await chart.evaluate((element) => getComputedStyle(element).padding)).toBe('16px');
   // Formatted millisecond labels need more room than the shared 64px default.

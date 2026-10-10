@@ -26,6 +26,10 @@ import {
 import { storedRange } from './timeRange';
 import { tileHandoffs } from './handoffs';
 import type { VariableValues } from './variables';
+const typeLabel = (value: unknown) => {
+  const name = text(value) || 'Unknown';
+  return name.toLowerCase() === 'ai' ? 'AI' : name.charAt(0).toUpperCase() + name.slice(1);
+};
 export function DashboardTile({
   tile,
   layout,
@@ -72,7 +76,7 @@ export function DashboardTile({
     () => (tile.timeRange ? timeBounds(storedRange(tile.timeRange, anchor), anchor) : bounds),
     [JSON.stringify(tile.timeRange), anchor, bounds.startTime, bounds.endTime],
   );
-  const names = tileVariableNames(tile);
+  const names = tileVariableNames(tile, variables);
   let query: unknown;
   try {
     query = tile.tileType === 'promql' ? promqlQueries(tile) : sqlQuery(tile);
@@ -207,16 +211,15 @@ export function DashboardTile({
         {!knownTile(tile) ? (
           <div className="dashboard-placeholder">
             <p>
-              {text(tile.tileType, 'Unknown')} tiles cannot be shown in /next. The tile is kept
-              unchanged.
+              {typeLabel(tile.tileType)} tiles cannot be shown in /next. The tile is kept unchanged.
             </p>
             {classicLink}
           </div>
         ) : !supported ? (
           <div className="dashboard-placeholder">
             <p>
-              {text(tile.chartType, 'Unknown')} charts are not available in /next yet. The tile is
-              kept unchanged.
+              {typeLabel(tile.chartType)} charts are not available in /next yet. The tile is kept
+              unchanged.
             </p>
             <pre>{handoff.queries.join('\n\n') || JSON.stringify(tile.chartQuery, null, 2)}</pre>
             {classicLink}

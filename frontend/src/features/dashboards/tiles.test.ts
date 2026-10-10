@@ -9,7 +9,12 @@ import {
   tileStep,
   tileVariableNames,
 } from './tiles';
-import type { DashboardTile } from '../../lib/types';
+import type { DashboardTile, DashboardVariable } from '../../lib/types';
+const variables: DashboardVariable[] = ['dataset', 'level', 'host', 'zone'].map((name) => ({
+  name,
+  label: name,
+  type: 'text',
+}));
 const make = (id: string, layout: unknown): DashboardTile => ({
   tile_id: id,
   layout,
@@ -18,22 +23,49 @@ const make = (id: string, layout: unknown): DashboardTile => ({
 describe('classic tile helpers', () => {
   it('tracks only variables used in the tile query and dataset', () => {
     expect([
-      ...tileVariableNames({
-        tile_id: 'x',
-        tileType: 'code',
-        chartQuery: 'SELECT * FROM "$dataset" WHERE level=\'${level}\'',
-        dbName: ['$dataset'],
-      }),
+      ...tileVariableNames(
+        {
+          tile_id: 'x',
+          tileType: 'code',
+          chartQuery: 'SELECT * FROM "$dataset" WHERE level=\'${level}\'',
+          dbName: ['$dataset'],
+        },
+        variables,
+      ),
     ]).toEqual(['dataset', 'level']);
     expect([
-      ...tileVariableNames({
-        tile_id: 'x',
-        tileType: 'promql',
-        chartQuery: ['up{host="$host"}', 'rate(up{zone="${zone}"}[5m])'],
-        dbName: '$dataset',
-      }),
+      ...tileVariableNames(
+        {
+          tile_id: 'x',
+          tileType: 'promql',
+          chartQuery: ['up{host="$host"}', 'rate(up{zone="${zone}"}[5m])'],
+          dbName: '$dataset',
+        },
+        variables,
+      ),
     ]).toEqual(['host', 'zone', 'dataset']);
-    expect([...tileVariableNames(classic.tiles[1])]).toEqual([]);
+    expect([...tileVariableNames(classic.tiles[1], variables)]).toEqual([]);
+  });
+  it('counts only defined names, leaving replacement groups, SQL literals and built-in tokens alone', () => {
+    const promql = {
+      tile_id: 'promql',
+      tileType: 'promql',
+      chartQuery: ['label_replace(up{host="$host"}, "copy", "$1", "host", "(.*)$") + $__interval'],
+      dbName: '$dataset',
+    };
+    const sql = {
+      tile_id: 'sql',
+      tileType: 'code',
+      chartQuery:
+        "SELECT '$ $1 $unknown ${missing} $__interval' FROM $dataset WHERE level='$level'",
+    };
+    expect([...tileVariableNames(promql, variables)]).toEqual(['host', 'dataset']);
+    expect([...tileVariableNames(sql, variables)]).toEqual(['dataset', 'level']);
+    expect([...tileVariableNames(promql, [])]).toEqual([]);
+    expect([...tileVariableNames(sql, [])]).toEqual([]);
+    expect([...tileVariableNames(promql, [{ name: '1', label: 'One', type: 'text' }])]).toEqual([
+      '1',
+    ]);
   });
   it('orders by y,x and appends null, missing and non-finite y without mutating originals', () => {
     const tiles = [

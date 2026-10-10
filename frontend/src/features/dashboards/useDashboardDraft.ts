@@ -13,7 +13,9 @@ export function useDashboardDraft(original: Dashboard, focusHeading: () => void)
   const [loaded, setLoaded] = useState(original),
     [repair] = useState(() => loadDraft(original));
   const [repaired, setRepaired] = useState(repair.repaired);
-  const [draft, setDraft] = useState(repair.draft),
+  // Server identity is kept in loaded for conflicts; ID repair is a clean working baseline.
+  const [baseline, setBaseline] = useState(repair.draft),
+    [draft, setDraft] = useState(repair.draft),
     [rangeDirty, setRangeDirty] = useState(false);
   const [editorDirty, setEditorDirty] = useState(false),
     [conflict, setConflict] = useState<Dashboard>();
@@ -27,7 +29,7 @@ export function useDashboardDraft(original: Dashboard, focusHeading: () => void)
     },
     [],
   );
-  const dirty = JSON.stringify(draft) !== JSON.stringify(loaded) || rangeDirty;
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baseline) || rangeDirty;
   const markSaved = useLeaveGuard(dirty || editorDirty, 'dashboard');
   useEffect(() => {
     if (dirty && status === 'Dashboard saved.') setStatus('');
@@ -42,17 +44,21 @@ export function useDashboardDraft(original: Dashboard, focusHeading: () => void)
     setDraft(next);
     if (message) announce(message);
   }
-  function accept(document: Dashboard, message: string) {
-    const next = loadDraft(document);
-    setRepaired(next.repaired);
-    setLoaded(document);
-    setDraft(next.draft);
+  function resetEdits(document: Dashboard, message: string) {
+    setDraft(document);
     setRangeDirty(false);
     setConflict(undefined);
     mutation.reset();
     markSaved();
     announce(message);
     focusHeading();
+  }
+  function accept(document: Dashboard, message: string) {
+    const next = loadDraft(document);
+    setRepaired(next.repaired);
+    setLoaded(document);
+    setBaseline(next.draft);
+    resetEdits(next.draft, message);
   }
   function save(range: TimeRange, overwrite = false) {
     void mutation.run(async () => {
@@ -90,7 +96,7 @@ export function useDashboardDraft(original: Dashboard, focusHeading: () => void)
     announce,
     changeDraft,
     save,
-    discard: () => accept(loaded, 'Changes discarded.'),
+    discard: () => resetEdits(baseline, 'Changes discarded.'),
     reload: () => {
       if (conflict) accept(conflict, 'Loaded the server copy.');
     },

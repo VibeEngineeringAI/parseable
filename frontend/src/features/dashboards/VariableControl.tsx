@@ -87,7 +87,7 @@ export function VariableControl({
 }) {
   const { client } = useApp(),
     errorId = useId();
-  const dependencies = variableDependencies(variable);
+  const dependencies = variableDependencies(variable, variables);
   const upstreamError = dependencies.map((name) => resolutions[name]?.error).find(Boolean);
   const pendingDependencies = dependencies.some(
     (name) => !resolutions[name]?.ready || resolutions[name]?.value !== values[name],

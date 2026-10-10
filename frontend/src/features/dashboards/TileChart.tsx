@@ -87,7 +87,7 @@ export function TileChart({
   const xRange = useMemo(() => [start, end] as const, [start, end]);
   const fitted = useChartHeight(
     height,
-    JSON.stringify([tile.config, chart.series.map((series) => series.id)]),
+    JSON.stringify([tile.config, chart.categorical, chart.series.map((series) => series.id)]),
   );
   if (tile.chartType === 'table')
     return (
@@ -122,6 +122,8 @@ export function TileChart({
         series={chart.series}
         title={`${tileTitle(tile)} chart`}
         showTitle={false}
+        xAxisTitle={text(record(axes.x).title)}
+        showSeriesCount={false}
         height={fitted.pixels}
         yAxisSize={chart.series.reduce<number>(
           (size, series) =>
@@ -139,9 +141,6 @@ export function TileChart({
         formatValue={formatValue}
         emptyMessage="No results for the selected time range"
       />
-      {text(record(axes.x).title) && (
-        <p className="muted dashboard-axis-title">{text(record(axes.x).title)}</p>
-      )}
       {chart.categorical && (
         <p className="muted dashboard-chart-note">Values are shown in query row order.</p>
       )}

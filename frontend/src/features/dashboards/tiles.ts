@@ -1,11 +1,12 @@
 import { object, strings } from '../../lib/guards';
 import { parseEventTimestamp } from '../../components/explorer/timestamp';
 import { legacySql } from './legacySql';
+import { referencedVariables } from './variables';
 import { appendLayout } from './layout';
 export { appendLayout, resolvedLayouts, moveTile, type TileLayout } from './layout';
 import { createUlid } from '../../lib/ids';
 import { autoStep, formatStep, parseDuration } from '../../lib/promql';
-import type { DashboardTile, LogRecord } from '../../lib/types';
+import type { DashboardTile, DashboardVariable, LogRecord } from '../../lib/types';
 
 export const record = (value: unknown): Record<string, unknown> => (object(value) ? value : {});
 export const text = (value: unknown, fallback = '') =>
@@ -18,7 +19,10 @@ export const knownTile = (tile: DashboardTile) =>
 export const tileDatasets = (tile: DashboardTile): string[] =>
   strings(tile.dbName) ? tile.dbName : typeof tile.dbName === 'string' ? [tile.dbName] : [];
 export type QueryMode = 'range' | 'instant' | 'both';
-export function tileVariableNames(tile: DashboardTile): Set<string> {
+export function tileVariableNames(
+  tile: DashboardTile,
+  variables: DashboardVariable[],
+): Set<string> {
   let query = '';
   try {
     query =
@@ -31,7 +35,7 @@ export function tileVariableNames(tile: DashboardTile): Set<string> {
     /* Legacy query errors are shown by the tile loader. */
   }
   const source = [query, ...tileDatasets(tile)].join(' ');
-  return new Set([...source.matchAll(/\$\{?(\w+)\}?/g)].map((match) => match[1]));
+  return new Set(referencedVariables(source, variables));
 }
 export function promqlQueries(tile: DashboardTile): Array<{ query: string; type: QueryMode }> {
   const legacy = { ...record(tile.chartQuery), ...record(tile.promqlQuery) };

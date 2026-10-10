@@ -47,7 +47,7 @@ export function DashboardSections({
             {group.id && <h2>{group.title}</h2>}
             <div className="dashboard-server-grid">
               {compactLayouts(group.tiles).map(({ tile, layout }, index, rows) => {
-                const names = [...tileVariableNames(tile)];
+                const names = [...tileVariableNames(tile, url.variables)];
                 const ready = names.every(
                   (name) =>
                     resolutions[name]?.ready && resolutions[name].value === url.values[name],

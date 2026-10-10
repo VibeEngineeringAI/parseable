@@ -13,6 +13,22 @@ const mixed = [
   tile('c', 6, 4, 6, 4),
   tile('d', 0, 8, 12, 4),
 ];
+it('moves through compacted reading order when stored rows contain gaps', () => {
+  const source = [tile('a', 0, 0, 6, 2), tile('b', 6, 10, 6, 2), tile('c', 0, 5, 6, 2)];
+  const before = structuredClone(source);
+  const order = (tiles: DashboardTile[]) => compactLayouts(tiles).map((row) => row.tile.tile_id);
+  expect(order(source)).toEqual(['a', 'b', 'c']);
+  expect(order(moveTile(source, 'b', -1))).toEqual(['b', 'a', 'c']);
+  expect(order(moveTile(source, 'b', 1))).toEqual(['a', 'c', 'b']);
+  expect(moveTile(source, 'a', -1)).toBe(source);
+  expect(moveTile(source, 'c', 1)).toBe(source);
+  expect(moveTile(moveTile(source, 'b', -1), 'b', 1).map((row) => row.layout)).toEqual([
+    { ...(source[0].layout as object), y: 0 },
+    { ...(source[1].layout as object), y: 0 },
+    { ...(source[2].layout as object), y: 2 },
+  ]);
+  expect(source).toEqual(before);
+});
 it('swaps neighbours beside a tall tile without repacking unrelated columns', () => {
   const moved = moveTile(mixed, 'c', -1);
   expect(moved).toEqual([

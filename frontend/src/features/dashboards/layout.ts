@@ -80,7 +80,7 @@ export function compactLayouts(tiles: DashboardTile[]): Positioned[] {
     );
     placed.push({ tile: row.tile, layout });
   }
-  return placed;
+  return placed.sort((a, b) => a.layout.y - b.layout.y || a.layout.x - b.layout.x);
 }
 function writePositions(tiles: DashboardTile[], positions: Positioned[]) {
   const layouts = new Map(positions.map((row) => [row.tile.tile_id, row.layout]));
@@ -109,12 +109,12 @@ export function moveTile(
   const group = sectionGroups(tiles, sections).find((group) =>
     group.tiles.some((tile) => tile.tile_id === id),
   );
-  const ordered = resolvedLayouts(group?.tiles ?? []),
+  const ordered = compactLayouts(group?.tiles ?? []),
     index = ordered.findIndex((row) => row.tile.tile_id === id);
   const neighbour = ordered[index + direction],
     current = ordered[index];
   if (!current || !neighbour) return tiles;
-  const swapped = tiles.map((tile) => {
+  const swapped = writePositions(tiles, ordered).map((tile) => {
     const target =
       tile.tile_id === id
         ? neighbour

@@ -222,11 +222,13 @@ test('create SQL and PromQL tiles and variables through /next; verify exact clas
   await editor.getByRole('textbox', { name: 'PromQL query A', exact: true }).fill(promql);
   await editor.getByLabel('Width (columns)').selectOption('12');
   await editor.locator('[data-dialog-confirm]').click();
-  // Newly ingested staging data can briefly disappear while it is converted.
-  // Exercise the real manual refresh and require real values from both queries.
+  // Staging conversion can briefly empty both query data and host options, causing All.
+  // Reselect the concrete host on recovery and require its single nonempty series.
+  const host = page.getByLabel('Host', { exact: true });
   await expect
     .poll(
       async () => {
+        if (await host.locator('option[value="node-a"]').count()) await host.selectOption('node-a');
         const rows = page
           .waitForResponse((response) => new URL(response.url()).pathname === '/api/v1/query', {
             timeout: 5000,
@@ -242,10 +244,14 @@ test('create SQL and PromQL tiles and variables through /next; verify exact clas
           .catch(() => undefined);
         await page.getByRole('button', { name: 'Refresh', exact: true }).click();
         const [logsResult, metricsResult] = await Promise.all([rows, matrix]);
+        await page.waitForLoadState('networkidle');
         return (
           logsResult.length === 12 &&
           metricsResult?.status === 'success' &&
-          metricsResult.data.result.some((row: { values?: unknown[] }) => row.values?.length)
+          metricsResult.data.result.length === 1 &&
+          metricsResult.data.result[0].metric.host === 'node-a' &&
+          metricsResult.data.result[0].values?.length > 0 &&
+          (await host.inputValue()) === 'node-a'
         );
       },
       { timeout: 30000, intervals: [1000, 2000] },

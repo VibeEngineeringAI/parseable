@@ -109,7 +109,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
                 <Button
                   variant="primary"
                   onClick={() => workspace.save(url.range)}
-                  disabled={!dirty || mutation.pending}
+                  disabled={(!dirty && !workspace.repaired) || mutation.pending}
                 >
                   {mutation.pending ? 'Saving…' : 'Save'}
                 </Button>
@@ -209,9 +209,9 @@ function DashboardFields({ original }: { original: Dashboard }) {
           {access.canCreate ? ' Duplicate it to make an editable copy.' : ''}
         </p>
       )}
-      {!!workspace.repaired && (
+      {writable && !!workspace.repaired && (
         <p className="notice">
-          This dashboard has duplicate or nil tile IDs. Saving will assign new IDs to{' '}
+          This dashboard has duplicate or nil tile IDs. The next save will assign new IDs to{' '}
           {workspace.repaired} {workspace.repaired === 1 ? 'tile' : 'tiles'}.
         </p>
       )}
