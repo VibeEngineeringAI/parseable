@@ -199,6 +199,7 @@ function AlertFormFields({
   const shown = useTouchedErrors(
     datasetError ? { ...errors, dataset: datasetError } : errors,
     alwaysShown,
+    initial,
   );
   useEffect(() => {
     if (shown.attempts) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();

@@ -924,7 +924,7 @@ for (const type of ['sql', 'code'])
     expect(api.writes[0]).toMatchObject({ queryType: 'code', query, datasets: ['logs'] });
   });
 
-test('an untouched invalid handoff and blank new form stay quiet until blur or a submit attempt', async ({
+test('an invalid handoff shows its error on load while a blank new form stays quiet until blur or a submit attempt', async ({
   page,
 }) => {
   await mocked(page);
@@ -933,10 +933,13 @@ test('an untouched invalid handoff and blank new form stay quiet until blur or a
   await page.goto(
     `/alerts/new?${new URLSearchParams({ dataset: 'metrics', alertQuery: 'sum by (host.name) (up)', title: 'Invalid handoff' })}`,
   );
-  await expect(query).toHaveAttribute('aria-invalid', 'false');
-  await expect(page.getByText('Enter a valid PromQL expression.')).toHaveCount(0);
-  await create.click();
   await expect(query).toHaveAttribute('aria-invalid', 'true');
+  await expect(query).toHaveAccessibleDescription('Enter a valid PromQL expression.');
+  await expect(page.getByLabel('Title', { exact: true })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await create.click();
   await expect(query).toBeFocused();
   await expect(query).toHaveAccessibleDescription('Enter a valid PromQL expression.');
   await expect(page.getByText('Enter a valid PromQL expression.', { exact: true })).toBeVisible();
