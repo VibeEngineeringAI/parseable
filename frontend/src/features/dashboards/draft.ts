@@ -1,3 +1,5 @@
+import { dashboardVariable } from '../../lib/dashboardsContract';
+import { strings } from '../../lib/guards';
 import { createUlid } from '../../lib/ids';
 import type { Dashboard, DashboardTile, DashboardVariable, TimeRange } from '../../lib/types';
 import { appendLayout, compactSection, sectionGroups } from './layout';
@@ -74,16 +76,71 @@ export function duplicateTile(draft: Dashboard, tile: DashboardTile): Dashboard 
   };
   return applyTile(draft, copy);
 }
+const storedVariables = (draft: Dashboard): unknown[] =>
+  Array.isArray(draft.variables) ? draft.variables : [];
+/** Every stored name, including definitions the editor cannot read; new names must avoid them. */
+export const variableNames = (draft: Dashboard): string[] =>
+  storedVariables(draft)
+    .map((row) => record(row).name)
+    .filter((name): name is string => typeof name === 'string');
+// Edits target one readable row so hidden definitions sharing its name survive.
+const variableIndex = (variables: unknown[], name: string) =>
+  variables.findIndex((row) => dashboardVariable(row) && row.name === name);
+const renameTokens = (value: string, from: string, to: string) =>
+  value.replace(/\$(\{?)(\w+)(\}?)/g, (token, open: string, name: string, close: string) =>
+    name === from ? `$${open}${to}${close}` : token,
+  );
+const renameIn = (value: unknown, from: string, to: string) =>
+  typeof value === 'string'
+    ? renameTokens(value, from, to)
+    : strings(value)
+      ? value.map((row) => renameTokens(row, from, to))
+      : value;
+const variableSources = ['sqlQuery', 'promqlQuery', 'promqlQueryDataset', 'dataset'] as const;
+/** Rewrites $from and ${from} in tile queries, datasets and other variables' sources. */
+function renameReferences(draft: Dashboard, index: number, from: string, to: string): Dashboard {
+  const variables = storedVariables(draft);
+  if (variables.some((row, i) => i !== index && record(row).name === from)) return draft;
+  return {
+    ...draft,
+    tiles: draft.tiles?.map((tile) => {
+      const next = { ...tile };
+      for (const field of ['chartQuery', 'dbName'])
+        if (field in tile) next[field] = renameIn(tile[field], from, to);
+      return JSON.stringify(next) === JSON.stringify(tile) ? tile : next;
+    }),
+    variables: variables.map((row, i) => {
+      if (i === index || !dashboardVariable(row)) return row;
+      const next: DashboardVariable = { ...row };
+      for (const field of variableSources)
+        if (typeof row[field] === 'string') next[field] = renameTokens(row[field], from, to);
+      if (row.labelFilters)
+        next.labelFilters = row.labelFilters.map((filter) => ({
+          ...filter,
+          value: renameTokens(filter.value, from, to),
+        }));
+      return JSON.stringify(next) === JSON.stringify(row) ? row : next;
+    }),
+  };
+}
 export function applyVariable(
   draft: Dashboard,
   variable: DashboardVariable,
   original?: DashboardVariable,
 ): Dashboard {
-  const variables = Array.isArray(draft.variables) ? draft.variables : [];
-  return {
+  const variables = storedVariables(draft);
+  const index = original ? variableIndex(variables, original.name) : -1;
+  if (index < 0) return { ...draft, variables: [...variables, variable] };
+  const next = {
     ...draft,
-    variables: original
-      ? variables.map((row) => (record(row).name === original.name ? variable : row))
-      : [...variables, variable],
+    variables: variables.map((row, i) => (i === index ? variable : row)),
   };
+  return original && original.name !== variable.name
+    ? renameReferences(next, index, original.name, variable.name)
+    : next;
+}
+export function removeVariable(draft: Dashboard, variable: DashboardVariable): Dashboard {
+  const variables = storedVariables(draft);
+  const index = variableIndex(variables, variable.name);
+  return index < 0 ? draft : { ...draft, variables: variables.filter((_, i) => i !== index) };
 }

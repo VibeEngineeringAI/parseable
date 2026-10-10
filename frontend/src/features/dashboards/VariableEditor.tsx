@@ -16,6 +16,7 @@ const types: Array<[DashboardVariable['type'], string]> = [
 export function VariableEditor({
   original,
   variables,
+  names,
   datasets,
   promqlEnabled,
   onClose,
@@ -24,6 +25,8 @@ export function VariableEditor({
 }: {
   original?: DashboardVariable;
   variables: DashboardVariable[];
+  /** All stored names, including definitions this editor cannot read. */
+  names: string[];
   datasets: string[];
   promqlEnabled?: boolean;
   onClose: () => void;
@@ -56,7 +59,7 @@ export function VariableEditor({
   ];
   const validation = !/^\w+$/.test(draft.name)
     ? 'Use letters, numbers and underscores for the variable name.'
-    : variables.some((variable) => variable.name === draft.name && variable.name !== original?.name)
+    : names.some((name) => name === draft.name && name !== original?.name)
       ? 'Variable names must be unique.'
       : !draft.label.trim()
         ? 'Enter a variable label.'

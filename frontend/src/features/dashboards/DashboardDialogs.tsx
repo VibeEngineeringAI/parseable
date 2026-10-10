@@ -4,12 +4,12 @@ import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import type { DashboardTile, DashboardVariable } from '../../lib/types';
 import type { QueryLimiter } from '../../lib/concurrency';
-import { applyTile, applyVariable, removeTile } from './draft';
+import { applyTile, applyVariable, removeTile, removeVariable, variableNames } from './draft';
 import { DashboardForm } from './DashboardForm';
 import { ConflictDialog } from './ConflictDialog';
 import { dashboardError, editDashboardMetadata } from './helpers';
 import { convertBuilder } from './tileEditing';
-import { record, tileTitle } from './tiles';
+import { tileTitle } from './tiles';
 import type { useDashboardDraft } from './useDashboardDraft';
 import type { useDashboardUrl } from './useDashboardUrl';
 
@@ -88,6 +88,7 @@ export function DashboardDialogs({
           <VariableEditor
             original={dialog.variable}
             variables={url.variables}
+            names={variableNames(draft)}
             datasets={(datasets.data ?? []).map((dataset) => dataset.name)}
             promqlEnabled={promqlEnabled}
             onDirty={workspace.setEditorDirty}
@@ -185,12 +186,7 @@ export function DashboardDialogs({
               if (dialog.variable) {
                 onVariableDeleted(dialog.variable.name);
                 workspace.changeDraft(
-                  (current) => ({
-                    ...current,
-                    variables: (Array.isArray(current.variables) ? current.variables : []).filter(
-                      (variable) => record(variable).name !== dialog.variable!.name,
-                    ),
-                  }),
+                  (current) => removeVariable(current, dialog.variable!),
                   'Variable deleted. Save to keep this change.',
                 );
               }

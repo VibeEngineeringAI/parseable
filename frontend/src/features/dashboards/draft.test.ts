@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import classic from './__fixtures__/classic.json';
 import demoTile from './__fixtures__/ingest-demo-tile.json';
-import { dashboardPayload, loadDraft, applyTile } from './draft';
+import {
+  dashboardPayload,
+  loadDraft,
+  applyTile,
+  applyVariable,
+  removeVariable,
+  variableNames,
+} from './draft';
 import {
   convertBuilder,
   setQueryLanguage,
@@ -12,6 +19,7 @@ import {
 import { knownTile, promqlQueries, sqlQuery, tileStep } from './tiles';
 import { ulid } from '../../lib/dashboardsContract';
 import { classicTimeRange } from './timeRange';
+import type { DashboardVariable } from '../../lib/types';
 
 describe('production dashboard draft and save payload', () => {
   it('round-trips the loaded full classic document through tile editing and the save payload', () => {
@@ -178,5 +186,97 @@ describe('production dashboard draft and save payload', () => {
     expect(() =>
       convertBuilder({ ...tile, chartQuery: { ...tile.chartQuery, x: { groupBy: [1] } } }),
     ).toThrow('cannot be converted faithfully');
+  });
+});
+
+describe('variable editing on the stored document', () => {
+  const host: DashboardVariable = { name: 'host', label: 'Host', type: 'list', options: ['a'] };
+  const hidden = { name: 'host', label: 'Classic host', type: 'mystery', sqlQuery: '$host' };
+  const region = { name: 'region', label: 'Region', type: 'list', defaultValue: 3 };
+  const base = { ...classic, tiles: [], variables: [hidden, host, region] };
+
+  it('reserves hidden names and edits or deletes only the readable row', () => {
+    expect(variableNames(base)).toEqual(['host', 'host', 'region']);
+    const edited = applyVariable(base, { ...host, label: 'Edited' }, host);
+    expect(edited.variables).toEqual([hidden, { ...host, label: 'Edited' }, region]);
+    expect(removeVariable(base, host).variables).toEqual([hidden, region]);
+    const added: DashboardVariable = { name: 'level', label: 'Level', type: 'text' };
+    expect(applyVariable(base, added).variables).toEqual([hidden, host, region, added]);
+  });
+
+  it('rewrites whole $name and ${name} tokens when a variable is renamed', () => {
+    const sql = {
+      tile_id: '01HZ0000000000000000000001',
+      tileType: 'code',
+      chartQuery: `SELECT * FROM "$host" WHERE h = '\${host}' AND n = $hostname`,
+      dbName: ['$host'],
+    };
+    const promql = {
+      tile_id: '01HZ0000000000000000000002',
+      tileType: 'promql',
+      chartQuery: ['up{host="$host"}', 'up{host=~"${host}|$hostname"}'],
+      dbName: '${host}',
+    };
+    const legacy = {
+      tile_id: '01HZ0000000000000000000003',
+      chartQuery: { query: 'SELECT $host' },
+      dbName: ['logs'],
+    };
+    const others: DashboardVariable[] = [
+      { name: 'q', label: 'Q', type: 'sql', sqlQuery: "SELECT x WHERE h = '$host'" },
+      {
+        name: 'p',
+        label: 'P',
+        type: 'promql_query',
+        promqlQuery: 'up{host="${host}"}',
+        promqlQueryDataset: '$host',
+      },
+      {
+        name: 'l',
+        label: 'L',
+        type: 'promql',
+        dataset: '$host',
+        labelName: 'job',
+        labelFilters: [{ label: 'host', operator: '=', value: '$host' }],
+      },
+    ];
+    const draft = {
+      ...classic,
+      tiles: [sql, promql, legacy],
+      variables: [host, ...others, { ...hidden, name: 'old' }],
+    };
+    const renamed = applyVariable(draft, { ...host, name: 'node' }, host);
+    expect(renamed.tiles).toEqual([
+      {
+        ...sql,
+        chartQuery: `SELECT * FROM "$node" WHERE h = '\${node}' AND n = $hostname`,
+        dbName: ['$node'],
+      },
+      {
+        ...promql,
+        chartQuery: ['up{host="$node"}', 'up{host=~"${node}|$hostname"}'],
+        dbName: '${node}',
+      },
+      legacy,
+    ]);
+    expect(renamed.tiles![2]).toBe(legacy);
+    expect(renamed.variables).toEqual([
+      { ...host, name: 'node' },
+      { ...others[0], sqlQuery: "SELECT x WHERE h = '$node'" },
+      { ...others[1], promqlQuery: 'up{host="${node}"}', promqlQueryDataset: '$node' },
+      {
+        ...others[2],
+        dataset: '$node',
+        labelFilters: [{ label: 'host', operator: '=', value: '$node' }],
+      },
+      { ...hidden, name: 'old' },
+    ]);
+  });
+
+  it('leaves references alone when another stored row still defines the old name', () => {
+    const tile = { tile_id: '01HZ0000000000000000000001', tileType: 'code', chartQuery: '$host' };
+    const renamed = applyVariable({ ...base, tiles: [tile] }, { ...host, name: 'node' }, host);
+    expect(renamed.tiles).toEqual([tile]);
+    expect(renamed.variables).toEqual([hidden, { ...host, name: 'node' }, region]);
   });
 });
