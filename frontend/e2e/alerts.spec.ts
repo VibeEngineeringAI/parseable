@@ -851,6 +851,45 @@ test('header inputs focus additions, surviving neighbours and Add after the last
   await expect(add).toBeFocused();
 });
 
+test('a header error marks and focuses only the invalid header field', async ({ page }) => {
+  await demo(page, '/alerts/targets');
+  await page.getByRole('button', { name: 'New target', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+  await sheet.getByLabel('Target name').fill('Hook');
+  await sheet.getByLabel('Endpoint URL').fill('https://example.com/hook');
+  const add = sheet.getByRole('button', { name: 'Add header', exact: true });
+  await add.click();
+  await sheet.getByLabel('Header 1 name', { exact: true }).fill('X-One');
+  await sheet.getByLabel('Header 1 value', { exact: true }).fill('one');
+  await add.click();
+  await sheet.getByLabel('Header 2 name', { exact: true }).fill('X-Two');
+  await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
+  const message = 'Each header needs a valid name and a non-empty value without line breaks.';
+  await expect(sheet.getByRole('alert')).toHaveText(message);
+  const value = sheet.getByLabel('Header 2 value', { exact: true });
+  await expect(value).toBeFocused();
+  await expect(value).toHaveAttribute('aria-invalid', 'true');
+  await expect(value).toHaveAccessibleDescription(message);
+  for (const label of ['Header 1 name', 'Header 1 value', 'Header 2 name']) {
+    const input = sheet.getByLabel(label, { exact: true });
+    await expect(input).not.toHaveAttribute('aria-invalid', 'true');
+    await expect(input).not.toHaveAccessibleDescription(message);
+  }
+  // A duplicate name marks the repeated name, not its value or the first row.
+  await value.fill('two');
+  await sheet.getByLabel('Header 2 name', { exact: true }).fill('x-one');
+  await expect(sheet.getByRole('alert')).toHaveText('Header names must be unique.');
+  await expect(sheet.getByLabel('Header 2 name', { exact: true })).toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await expect(value).not.toHaveAttribute('aria-invalid', 'true');
+  await expect(sheet.getByLabel('Header 1 name', { exact: true })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+});
+
 test('trailing-slash alert routes reach the intended list, targets, form, detail and edit views', async ({
   page,
 }) => {
