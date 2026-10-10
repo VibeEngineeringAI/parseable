@@ -30,6 +30,11 @@ export function prefilledInvalid<K extends string>(
   });
 }
 
+/** Move focus to the first invalid control that can take it; disabled controls are skipped. */
+export function focusFirstInvalid(root: ParentNode | null) {
+  root?.querySelector<HTMLElement>('[aria-invalid="true"]:not(:disabled)')?.focus();
+}
+
 /**
  * Defers validation messages until a field has been touched or a submit was attempted. `attempts`
  * counts submit attempts so a form can move focus to the first invalid field after each one.

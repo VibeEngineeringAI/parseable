@@ -472,6 +472,50 @@ test('validation errors describe their controls and block invalid thresholds, fr
   await expect(page).toHaveURL(/\/alerts\/new$/);
   await expect(query).toBeFocused();
 });
+test('saving with a deleted target focuses that target and sends nothing', async ({ page }) => {
+  const api = await mocked(page, { original: { ...alertFixture, targets: ['deleted'] } });
+  await page.goto(`${detailPath}/edit`);
+  const deleted = page.getByRole('checkbox', { name: 'Unavailable target deleted', exact: true });
+  const message = 'Remove unavailable targets or select existing targets.';
+  await expect(deleted).toHaveAttribute('aria-invalid', 'true');
+  await expect(deleted).toHaveAccessibleDescription(message);
+  await expect(page.getByRole('checkbox', { name: 'Operations' })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(deleted).toBeFocused();
+  await expect(page).toHaveURL(/\/edit$/);
+  expect(api.writes).toHaveLength(0);
+  await deleted.click();
+  await expect(deleted).toHaveCount(0);
+  await expect(page.getByRole('checkbox', { name: 'Operations' })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: alertFixture.title, exact: true })).toBeVisible();
+  expect(api.writes).toHaveLength(1);
+  expect(api.writes[0]).toMatchObject({ targets: [] });
+});
+test('a submit attempt skips the disabled invalid Alert type and focuses the stored query', async ({
+  page,
+}) => {
+  const api = await mocked(page, {
+    enabled: false,
+    original: { ...alertFixture, query: 'sum by (host.name) (up)' },
+  });
+  await page.goto(`${detailPath}/edit`);
+  const type = page.getByLabel('Alert type');
+  const query = page.getByRole('textbox', { name: 'PromQL query', exact: true });
+  await expect(type).toBeDisabled();
+  await expect(type).toHaveAttribute('aria-invalid', 'true');
+  // The stored query is not typed here, so its error shows on load.
+  await expect(query).toHaveAccessibleDescription('Enter a valid PromQL expression.');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(query).toBeFocused();
+  expect(api.writes).toHaveLength(0);
+});
 test('dirty form blocks sidebar navigation and browser Back until confirmed', async ({ page }) => {
   await demo(page);
   await createPromql(page);

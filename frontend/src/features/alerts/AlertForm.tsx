@@ -36,7 +36,7 @@ import {
 import { useAlertAccess, useLeaveGuard } from './shared';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
-import { useTouchedErrors } from '../../hooks/useTouchedErrors';
+import { focusFirstInvalid, useTouchedErrors } from '../../hooks/useTouchedErrors';
 
 // Not typed by the user, so they are explained from the start.
 const alwaysShown: (keyof AlertDraft)[] = ['type', 'targets'];
@@ -131,11 +131,10 @@ function AlertFormFields({
     targetsMessage = useId();
   const previewButton = useRef<HTMLButtonElement>(null);
   const errors = validateAlert(draft, promqlEnabled);
-  if (
-    targets.data &&
-    draft.targets.some((id) => !targets.data!.some(({ target }) => target.id === id))
-  )
-    errors.targets = 'Remove unavailable targets or select existing targets.';
+  const unavailable = draft.targets.filter(
+    (id) => targets.data && !targets.data.some(({ target }) => target.id === id),
+  );
+  if (unavailable.length) errors.targets = 'Remove unavailable targets or select existing targets.';
   const choices = draft.type === 'promql' ? (metrics.data?.datasets ?? []) : (datasets.data ?? []);
   const unchecked = draft.type === 'promql' ? (metrics.data?.unchecked ?? []) : [];
   // Keep completion scoped to the selected dataset; changing the query does not reset it.
@@ -202,8 +201,12 @@ function AlertFormFields({
     initial,
   );
   useEffect(() => {
-    if (shown.attempts) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+    if (shown.attempts) focusFirstInvalid(form.current);
   }, [shown.attempts]);
+  // A targets error marks the checkboxes to clear: unavailable ones, or else every selected one.
+  const invalidTarget = (id: string) =>
+    Boolean(shown.errors.targets) &&
+    (unavailable.length ? unavailable.includes(id) : draft.targets.includes(id));
   const invalidPreview = Boolean(
     errors.query ||
     errors.dataset ||
@@ -456,6 +459,8 @@ function AlertFormFields({
                       type="checkbox"
                       checked={draft.targets.includes(target.id)}
                       disabled={!enabled && !draft.targets.includes(target.id)}
+                      aria-invalid={invalidTarget(target.id)}
+                      aria-describedby={invalidTarget(target.id) ? targetsMessage : undefined}
                       onChange={(event) =>
                         update(
                           'targets',
@@ -471,25 +476,23 @@ function AlertFormFields({
                     </span>
                   </label>
                 ))}
-                {draft.targets
-                  .filter(
-                    (id) => targets.data && !targets.data.some(({ target }) => target.id === id),
-                  )
-                  .map((id) => (
-                    <label className="alerts-checkbox" key={id}>
-                      <input
-                        type="checkbox"
-                        checked
-                        onChange={() =>
-                          update(
-                            'targets',
-                            draft.targets.filter((value) => value !== id),
-                          )
-                        }
-                      />
-                      Unavailable target {id}
-                    </label>
-                  ))}
+                {unavailable.map((id) => (
+                  <label className="alerts-checkbox" key={id}>
+                    <input
+                      type="checkbox"
+                      checked
+                      aria-invalid={invalidTarget(id)}
+                      aria-describedby={invalidTarget(id) ? targetsMessage : undefined}
+                      onChange={() =>
+                        update(
+                          'targets',
+                          draft.targets.filter((value) => value !== id),
+                        )
+                      }
+                    />
+                    Unavailable target {id}
+                  </label>
+                ))}
                 {targets.data && !targets.data.length && <p className="muted">No targets yet.</p>}
               </div>
             </fieldset>

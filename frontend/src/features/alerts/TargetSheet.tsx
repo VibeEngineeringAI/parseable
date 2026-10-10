@@ -12,7 +12,7 @@ import {
   type TargetDraft,
 } from './targetHelpers';
 import { useMutation } from '../../hooks/useMutation';
-import { useTouchedErrors } from '../../hooks/useTouchedErrors';
+import { focusFirstInvalid, useTouchedErrors } from '../../hooks/useTouchedErrors';
 
 export function TargetSheet({
   target,
@@ -43,7 +43,7 @@ export function TargetSheet({
     badHeader?.index === index && badHeader.fields.includes(field);
   const form = useRef<HTMLFormElement>(null);
   useEffect(() => {
-    if (shown.attempts) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+    if (shown.attempts) focusFirstInvalid(form.current);
   }, [shown.attempts]);
   function update<K extends keyof TargetDraft>(key: K, value: TargetDraft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
