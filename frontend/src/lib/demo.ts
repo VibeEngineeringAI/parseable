@@ -12,6 +12,7 @@ import { ApiError } from './client';
 import { createDemoMetrics } from './demoMetrics';
 import { createDemoAlerts } from './demoAlerts';
 import { createDemoDashboards } from './demoDashboards';
+import { createDemoDatasets } from './demoDatasets';
 import { alertDuration } from '../features/alerts/helpers';
 import { validateName } from '../features/team/helpers';
 
@@ -105,7 +106,11 @@ function likeRegex(pattern: string, escape: string): RegExp {
   return new RegExp(`^${expression}$`, 'i');
 }
 
-export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): LogRecord[] {
+export function executeDemoQuery(
+  request: QueryRequest,
+  records: LogRecord[],
+  datasets: Dataset[] = demoDatasets,
+): LogRecord[] {
   const aggregate =
     /^\s*SELECT\s+(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(\*|[a-zA-Z_][\w]*|"[^"]+")\s*\)\s*(?:AS\s+([\w]+|"[^"]+"))?\s+FROM\s+([\s\S]+)$/i.exec(
       request.sql,
@@ -117,7 +122,7 @@ export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): L
     if (field !== '*' && records.length && !Object.hasOwn(records[0], field))
       throw new Error(`Unknown demo field: ${field}`);
     if (field === '*' && fn.toUpperCase() !== 'COUNT') throw unsupported();
-    const rows = executeDemoQuery({ ...request, sql: `SELECT * FROM ${tail}` }, records);
+    const rows = executeDemoQuery({ ...request, sql: `SELECT * FROM ${tail}` }, records, datasets);
     const values = rows
       .map((row) => row[field])
       .filter((value): value is number => typeof value === 'number');
@@ -164,8 +169,9 @@ export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): L
   expect('*');
   expect('FROM');
   const dataset = identifier();
-  if (!demoDatasets.some((item) => item.name === dataset))
+  if (!datasets.some((item) => item.name === dataset))
     throw new Error(`Unknown demo dataset: ${dataset}`);
+  if (!demoDatasets.some((item) => item.name === dataset)) records = [];
   const predicates: ((row: LogRecord) => boolean)[] = [];
   if (peek('WHERE')) {
     position++;
@@ -257,6 +263,7 @@ export function executeDemoQuery(request: QueryRequest, records: LogRecord[]): L
 export function createDemoClient(): ParseableClient {
   const fixtureTime = Date.now();
   const records = createDemoRecords(fixtureTime - 1_000);
+  const datasets = createDemoDatasets(demoDatasets, records, fixtureTime);
   const metrics = createDemoMetrics(fixtureTime);
   const alerts = createDemoAlerts(fixtureTime);
   const dashboards = createDemoDashboards(fixtureTime);
@@ -420,6 +427,7 @@ export function createDemoClient(): ParseableClient {
     signal?.throwIfAborted();
   }
   return {
+    ...datasets,
     ...metrics,
     ...alerts,
     ...dashboards,
@@ -587,33 +595,10 @@ export function createDemoClient(): ParseableClient {
       const key = findKey(id);
       keys.splice(keys.indexOf(key), 1);
     },
-    async listDatasets(signal) {
-      await ready(signal);
-      return demoDatasets.map((dataset) => ({ ...dataset }));
-    },
-    async datasetInfo(name, signal) {
-      await ready(signal);
-      const dataset = demoDatasets.find((item) => item.name === name);
-      if (!dataset) throw new ApiError(`Unknown demo dataset: ${name}`, 404);
-      return {
-        name,
-        telemetryType: dataset.type,
-        logSourceFormats: [dataset.type === 'metrics' ? 'otel-metrics' : 'json'],
-        latestEventAt:
-          dataset.type === 'metrics'
-            ? new Date(Math.floor(fixtureTime / 15000) * 15000).toISOString()
-            : String(records[0].p_timestamp),
-      };
-    },
-    async schema(dataset, signal) {
-      await ready(signal);
-      if (!demoDatasets.some((item) => item.name === dataset))
-        throw new Error(`Unknown demo dataset: ${dataset}`);
-      return Object.keys(records[0]);
-    },
     async query(request, signal) {
       await ready(signal);
-      return executeDemoQuery(request, records);
+      const current = await datasets.listDatasets(signal);
+      return executeDemoQuery(request, records, current);
     },
     async identity(signal) {
       await ready(signal);

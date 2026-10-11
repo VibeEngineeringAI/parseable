@@ -1,51 +1,39 @@
 import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Database, ArrowUpRight, Search, RefreshCw } from 'lucide-react';
-import { Badge, Button, Card, Input, Sheet, EmptyState } from '../../components/ui';
+import { Database, ArrowUpRight, Search, RefreshCw, Plus } from 'lucide-react';
+import { Badge, Button, Card, Input, EmptyState } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
-function DatasetSchema({ dataset }: { dataset: string }) {
-  const { client } = useApp();
-  const schema = useAsync(
-    useCallback((signal) => client.schema(dataset, signal), [client, dataset]),
-  );
-  return (
-    <>
-      <QueryState loading={schema.loading} error={schema.error} retry={schema.reload} />
-      <div className="schema-list">
-        {schema.data?.map((field) => (
-          <div key={field} data-field-node={field}>
-            <code>{field}</code>
-            <Badge>field</Badge>
-          </div>
-        ))}
-      </div>
-      <Link className="text-link" to={`/logs/explore/${encodeURIComponent(dataset)}`}>
-        Explore dataset <ArrowUpRight size={14} />
-      </Link>
-    </>
-  );
-}
+import { CreateDatasetDialog } from './CreateDatasetDialog';
+import { ManageDatasetSheet } from './ManageDatasetSheet';
+import './datasets.css';
 export function DatasetsPage() {
   const { client } = useApp();
   const data = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<string>();
+  const [creating, setCreating] = useState(false);
   const datasets =
     data.data?.filter((d) => d.name.toLowerCase().includes(search.toLowerCase())) || [];
   return (
-    <div className="page">
+    <div className="page datasets-page">
       <PageHeader
         title="Datasets"
         description="Queryable containers where your logs, metrics, or traces live."
 
         actions={
-          <Button variant="secondary" onClick={data.reload}>
-            <RefreshCw size={15} />
-            Refresh
-          </Button>
+          <>
+            <Button variant="secondary" onClick={data.reload}>
+              <RefreshCw size={15} aria-hidden="true" />
+              Refresh
+            </Button>
+            <Button variant="primary" onClick={() => setCreating(true)}>
+              <Plus size={15} aria-hidden="true" />
+              Create dataset
+            </Button>
+          </>
         }
       />
       <div className="list-toolbar">
@@ -93,9 +81,9 @@ export function DatasetsPage() {
                         variant="ghost"
                         size="sm"
                         onClick={() => setSelected(d.name)}
-                        aria-label={`View schema for ${d.name}`}
+                        aria-label={`Manage ${d.name}`}
                       >
-                        View schema
+                        Manage
                       </Button>
                       <Link
                         className="text-link"
@@ -114,19 +102,26 @@ export function DatasetsPage() {
       {!data.loading && !data.error && !datasets.length && (
         <EmptyState
           title="No datasets found"
-          description="Change your search or ingest data into your server."
+          description="Change your search or create a dataset."
         />
       )}
-      <Sheet
-        open={!!selected}
-        onOpenChange={(v) => {
-          if (!v) setSelected(undefined);
-        }}
-        title={selected || 'Dataset'}
-        description="Fields available in this dataset."
-      >
-        {selected && <DatasetSchema dataset={selected} />}
-      </Sheet>
+      {creating && (
+        <CreateDatasetDialog
+          onClose={() => setCreating(false)}
+          onCreated={() => {
+            setSearch('');
+            data.reload();
+          }}
+        />
+      )}
+      {selected && (
+        <ManageDatasetSheet
+          key={selected}
+          dataset={selected}
+          onClose={() => setSelected(undefined)}
+          onDeleted={data.reload}
+        />
+      )}
     </div>
   );
 }

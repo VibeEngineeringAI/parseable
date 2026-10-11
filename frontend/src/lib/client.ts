@@ -5,6 +5,7 @@ import { apiKey, groupRoles, object, roles, roleSources, strings, userRoles } fr
 import { instantResult, rangeResult, successEnvelope } from './promqlContract';
 import { alert, alertSummary, alertTarget, alertTargetStatus } from './alertsContract';
 import { dashboard, dashboardSummary } from './dashboardsContract';
+import { datasetHotTier, datasetRetention, datasetStats } from './datasetsContract';
 import type {
   AlertSeverity,
   Dataset,
@@ -139,6 +140,7 @@ export function createClient({
   const targetPath = (id: string) => `${base}/targets/${encodeURIComponent(id)}`;
   const dashboardPath = (id: string) => `${base}/dashboards/${encodeURIComponent(id)}`;
   const user = (id: string) => `${base}/user/${encodeURIComponent(id)}`;
+  const datasetPath = (name: string) => `${base}/logstream/${encodeURIComponent(name)}`;
   const role = (name: string) => {
     if (name.toLowerCase() === 'default')
       throw new ApiError(
@@ -381,6 +383,47 @@ export function createClient({
       return data;
     },
     deleteApiKey: (id) => mutate(`${keys}/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    createDataset: (name, options) => {
+      const headers: Record<string, string> = { 'X-P-Telemetry-Type': options.telemetryType };
+      if (options.customPartition) headers['X-P-Custom-Partition'] = options.customPartition;
+      return mutate(datasetPath(name), { method: 'PUT', headers });
+    },
+    deleteDataset: (name) => mutate(datasetPath(name), { method: 'DELETE' }),
+    async datasetStats(name, signal) {
+      const endpoint = `${datasetPath(name)}/stats`;
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (!datasetStats(data)) return malformed(endpoint);
+      return data;
+    },
+    async datasetRetention(name, signal) {
+      const endpoint = `${datasetPath(name)}/retention`;
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (!datasetRetention(data)) return malformed(endpoint);
+      return data;
+    },
+    setDatasetRetention: (name, retention) =>
+      mutate(`${datasetPath(name)}/retention`, jsonBody('PUT', retention)),
+    async datasetHotTier(name, signal) {
+      const endpoint = `${datasetPath(name)}/hottier`;
+      let data: unknown;
+      try {
+        data = await readJson(endpoint, { signal }, onUnauthorized);
+      } catch (error) {
+        // A configured server reports a missing per-dataset hot tier as a validation error.
+        if (
+          error instanceof ApiError &&
+          [400, 404, 500].includes(error.status) &&
+          /Hot tier not found for stream /.test(error.message)
+        )
+          return null;
+        throw error;
+      }
+      if (!datasetHotTier(data)) return malformed(endpoint);
+      return data;
+    },
+    setDatasetHotTier: (name, size) =>
+      mutate(`${datasetPath(name)}/hottier`, jsonBody('PUT', { size })),
+    clearDatasetHotTier: (name) => mutate(`${datasetPath(name)}/hottier`, { method: 'DELETE' }),
     async listDatasets(signal) {
       const endpoint = `${base}/logstream`;
       const data = await readJson(endpoint, { signal }, onUnauthorized);
@@ -399,6 +442,16 @@ export function createClient({
         !object(data) ||
         (data.telemetryType !== undefined && typeof data.telemetryType !== 'string') ||
         (data.latestEventAt != null && typeof data.latestEventAt !== 'string') ||
+        [
+          'createdAt',
+          'firstEventAt',
+          'timePartition',
+          'timePartitionLimit',
+          'customPartition',
+          'streamType',
+        ].some((key) => data[key] != null && typeof data[key] !== 'string') ||
+        (data.hotTierEnabled !== undefined && typeof data.hotTierEnabled !== 'boolean') ||
+        (data.staticSchemaFlag !== undefined && data.staticSchemaFlag !== 'true') ||
         (data.logSource !== undefined &&
           (!Array.isArray(data.logSource) ||
             !data.logSource.every(
@@ -413,6 +466,16 @@ export function createClient({
           ? data.logSource.map((source) => source.log_source_format as string)
           : [],
         latestEventAt: typeof data.latestEventAt === 'string' ? data.latestEventAt : undefined,
+        createdAt: typeof data.createdAt === 'string' ? data.createdAt : undefined,
+        firstEventAt: typeof data.firstEventAt === 'string' ? data.firstEventAt : undefined,
+        timePartition: typeof data.timePartition === 'string' ? data.timePartition : undefined,
+        timePartitionLimit:
+          typeof data.timePartitionLimit === 'string' ? data.timePartitionLimit : undefined,
+        customPartition:
+          typeof data.customPartition === 'string' ? data.customPartition : undefined,
+        streamType: typeof data.streamType === 'string' ? data.streamType : undefined,
+        staticSchemaFlag: data.staticSchemaFlag === 'true' ? true : undefined,
+        hotTierEnabled: typeof data.hotTierEnabled === 'boolean' ? data.hotTierEnabled : undefined,
       };
     },
     async promqlQuery({ stream, query, time }, signal) {

@@ -1,4 +1,30 @@
 export type Dataset = { name: string; type: 'logs' | 'metrics' | 'traces' };
+export type DatasetCreateOptions = {
+  telemetryType: Dataset['type'];
+  customPartition?: string;
+};
+export type DatasetStats = {
+  stream: string;
+  time: string;
+  ingestion: {
+    count: number;
+    size: number;
+    format: string;
+    lifetime_count: number;
+    lifetime_size: number;
+    deleted_count: number;
+    deleted_size: number;
+  };
+  storage: { size: number; format: string; lifetime_size: number; deleted_size: number };
+};
+export type DatasetRetention = Array<{ description: string; action: 'delete'; duration: string }>;
+export type DatasetHotTier = {
+  version: string | null;
+  size: string;
+  used_size: string;
+  available_size: string;
+  oldest_date_time_entry?: string;
+};
 export type PromqlLabels = Record<string, string>;
 export type PromqlSample = [number, string]; // [unix seconds, value string]
 export type PromqlInstantResult =
@@ -30,6 +56,14 @@ export type DatasetInfo = {
   telemetryType?: string;
   logSourceFormats: string[];
   latestEventAt?: string;
+  createdAt?: string;
+  firstEventAt?: string;
+  timePartition?: string;
+  timePartitionLimit?: string;
+  customPartition?: string;
+  streamType?: string;
+  staticSchemaFlag?: boolean;
+  hotTierEnabled?: boolean;
 };
 export type LogRecord = Record<string, unknown>;
 export type TimeRange =
@@ -246,6 +280,14 @@ export interface ParseableClient {
   identity(signal?: AbortSignal): Promise<SessionIdentity | undefined>;
   listDatasets(signal?: AbortSignal): Promise<Dataset[]>;
   datasetInfo(name: string, signal?: AbortSignal): Promise<DatasetInfo>;
+  createDataset(name: string, options: DatasetCreateOptions): Promise<void>;
+  deleteDataset(name: string): Promise<void>;
+  datasetStats(name: string, signal?: AbortSignal): Promise<DatasetStats>;
+  datasetRetention(name: string, signal?: AbortSignal): Promise<DatasetRetention>;
+  setDatasetRetention(name: string, retention: DatasetRetention): Promise<void>;
+  datasetHotTier(name: string, signal?: AbortSignal): Promise<DatasetHotTier | null>;
+  setDatasetHotTier(name: string, size: string): Promise<void>;
+  clearDatasetHotTier(name: string): Promise<void>;
   promqlQuery(request: PromqlQueryRequest, signal?: AbortSignal): Promise<PromqlInstantResult>;
   promqlQueryRange(request: PromqlRangeRequest, signal?: AbortSignal): Promise<PromqlRangeResult>;
   promqlLabels(request: PromqlMetadataRequest, signal?: AbortSignal): Promise<PromqlMetadataResult>;
