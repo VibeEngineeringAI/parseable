@@ -97,10 +97,11 @@ An initial React/TypeScript frontend and reusable component library live in
 dashboards, Storybook, and browser tests. Billing and payment collection are
 excluded.
 
-While it reaches parity, Parseable serves it beside the classic UI: the classic
-UI stays at `/` and the new frontend is mounted at `/next/`, sharing the same
-session. Docker images and build/release workflows build it with Node 24 and
-embed `frontend/dist` through `NEXT_ASSETS_PATH`. To build locally from the
+Parseable serves it at `/`, and links to its earlier `/next/` mount redirect
+there. For one release, `P_UI_ROOT=classic` restores the classic UI at `/` and
+mounts the new frontend beside it at `/next/`, sharing the same session. Docker
+images and build/release workflows build it with Node 24 and embed
+`frontend/dist` through `NEXT_ASSETS_PATH`. To build locally from the
 repository root:
 
 ```sh
@@ -108,6 +109,6 @@ repository root:
 NEXT_ASSETS_PATH="$PWD/frontend/dist" cargo build --release
 ```
 
-Then open `/next/` for the new frontend and `/` for the classic UI. See the
+Then open `/`. See the
 [frontend README](frontend/README.md#build-and-embed-in-parseable) for build
-details, PowerShell instructions, and the eventual switch to `/`.
+details, PowerShell instructions, and the classic UI's rollback setting.

@@ -129,7 +129,7 @@ export function DashboardDialogs({
           }
         }}
         title="Edit builder tile as SQL?"
-        description="The visual builder isn't available in /next. Applying this edit converts the tile to SQL; its query and chart settings are kept."
+        description="The visual builder isn't available in this UI. Applying this edit converts the tile to SQL; its query and chart settings are kept."
       >
         <div className="stack">
           <InlineError error={conversionError} />

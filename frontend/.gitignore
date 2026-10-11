@@ -1,6 +1,6 @@
 node_modules/
 dist/
-dist-preview/
+dist-e2e/
 build.zip
 build.zip.sha1
 storybook-static/

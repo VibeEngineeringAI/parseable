@@ -482,7 +482,7 @@ test('non-owners see read-only tiles, including unknown and unavailable chart pl
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
   await expect(tile(page, 'AI summary')).toContainText('AI tiles cannot be shown');
   await expect(tile(page, 'Distribution')).toContainText(
-    'Pie charts are not available in /next yet.',
+    'Pie charts are not available in this UI yet.',
   );
   await expect(tile(page, 'Distribution').getByRole('link', { name: /classic UI/ })).toHaveCount(0);
   await page.getByRole('button', { name: 'Actions for tile Host load', exact: true }).click();

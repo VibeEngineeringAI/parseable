@@ -6,7 +6,7 @@ import type { PromqlInstantResult } from '../src/lib/types';
 const live = process.env.PARSEABLE_LIVE_URL;
 const username = process.env.PARSEABLE_LIVE_USERNAME || 'frontend-smoke';
 const password = process.env.PARSEABLE_LIVE_PASSWORD || 'local-smoke-password';
-const base = (process.env.PARSEABLE_LIVE_BASE ?? '/next').replace(/\/+$/, '');
+const base = (process.env.PARSEABLE_LIVE_BASE ?? '').replace(/\/+$/, '');
 const app = (route: string) => `${base}${route}`;
 const appUrl = (route: string) => new URL(app(route), live).href;
 const headers = {

@@ -411,7 +411,8 @@ for (const range of ['6h', '1h']) {
       window.history.pushState(
         { ...window.history.state, idx: window.history.state.idx + 1, key: 'metrics-memory' },
         '',
-        `?query=memory&type=instant&step=90s&range=${range}`,
+        // Absolute, since `<base href>` would resolve a bare query against the root.
+        `${window.location.pathname}?query=memory&type=instant&step=90s&range=${range}`,
       );
       window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
     }, range);

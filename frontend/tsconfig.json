@@ -21,7 +21,7 @@
     "e2e",
     "playwright.live.config.ts",
     "e2e-live",
-    "playwright.preview.config.ts",
-    "e2e-preview"
+    "playwright.prod.config.ts",
+    "e2e-prod"
   ]
 }

@@ -69,8 +69,9 @@ mod ui {
         }
     }
 
-    /// Embeds an optional second UI, served under `/next` beside the primary UI so
-    /// both can be compared. Without one, `generate_next` returns no files.
+    /// Embeds the native frontend, served at `/` or, with `P_UI_ROOT=classic`,
+    /// under `/next` beside the classic UI. Without one, `generate_next` returns
+    /// no files and the classic UI serves `/`.
     pub fn setup_next() -> io::Result<()> {
         println!("cargo:rerun-if-env-changed={NEXT_ASSETS_PATH}");
         let out_dir = PathBuf::from(env::var(OUT_DIR).unwrap());
@@ -82,8 +83,14 @@ mod ui {
             );
         };
         let path = PathBuf::from(path);
-        if !path.join("index.html").exists() {
+        let Ok(index) = fs::read_to_string(path.join("index.html")) else {
             panic!("Directory specified in NEXT_ASSETS_PATH has no index.html")
+        };
+        // The server points this base at whichever mount serves the build.
+        if !index.contains(r#"<base href="/""#) {
+            panic!(
+                "NEXT_ASSETS_PATH index.html has no <base href=\"/\">; rebuild it with `npm run build`"
+            )
         }
         println!("cargo:rerun-if-changed={}", path.display());
         let mut next = resource_dir(path);
