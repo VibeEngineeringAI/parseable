@@ -69,6 +69,9 @@ export function LogsPage() {
     setAppliedLink(link);
     setRange(linked.range ?? '1h');
     setFilters(linked.filters.map((filter) => ({ ...filter, id: createId() })));
+    // A search typed before the link would narrow its results without showing why.
+    setSearch('');
+    setDebounced({ dataset, search: '' });
     setDropped(linked.dropped);
   }
   // Once applied, they come out of the address so they cannot disagree with the

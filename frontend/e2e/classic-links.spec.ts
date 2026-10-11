@@ -236,8 +236,57 @@ test('a page whose code fails to load keeps the shell, reload and sign out', asy
   await page.getByTestId('sidebar-datasets').click();
   await expect(page).toHaveURL('/datasets');
   await expect(page.getByRole('alert')).toHaveCount(0);
+  // Navigating back to the failing page shows the error in the shell again.
   await page.getByTestId('sidebar-logs').click();
-  await expect(error.getByRole('heading', { name: 'This page could not be loaded' })).toBeVisible();
+  await expect(
+    page
+      .locator('main#main-section')
+      .getByRole('alert')
+      .getByRole('heading', { name: 'This page could not be loaded' }),
+  ).toBeVisible();
+  await expect(page.getByTestId('sidebar-datasets')).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(1);
+});
+
+test('a page that throws as soon as it is navigated to keeps the shell', async ({ page }) => {
+  await server(page);
+  await page.goto('/logs/explore/app');
+  await expect(page.getByLabel('Time range', { exact: true })).toBeVisible();
+  await page.getByTestId('sidebar-datasets').click();
+  await expect(page).toHaveURL('/datasets');
+  // Logs creates filter IDs while it renders a classic link, in the navigation's own render.
+  await page.evaluate(() => {
+    const original = crypto.getRandomValues.bind(crypto);
+    Object.assign(window, { restoreRandom: () => (crypto.getRandomValues = original) });
+    crypto.getRandomValues = () => {
+      throw new Error('No randomness');
+    };
+  });
+  await navigateInApp(page, link('app', '10m', 'error'));
+  const error = page.locator('main#main-section').getByRole('alert');
+  await expect(error.getByRole('heading', { name: 'Something went wrong' })).toBeVisible();
+  await expect(error).toContainText('No randomness');
+  await expect(page.getByRole('alert')).toHaveCount(1);
+  await expect(page.getByTestId('sidebar-datasets')).toBeVisible();
+  await page.evaluate(() => (window as unknown as { restoreRandom: () => void }).restoreRandom());
+  await page.getByTestId('sidebar-datasets').click();
+  await expect(page).toHaveURL('/datasets');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('a page that fails on its first navigation keeps the shell', async ({ page }) => {
+  await server(page);
+  await page.route('**/src/features/team/TeamPage.tsx*', (route) => route.abort());
+  await page.goto('/datasets');
+  await expect(page.getByRole('heading', { name: 'Datasets' }).first()).toBeVisible();
+  await page.getByTestId('sidebar-team').click();
+  await expect(
+    page
+      .locator('main#main-section')
+      .getByRole('alert')
+      .getByRole('heading', { name: 'This page could not be loaded' }),
+  ).toBeVisible();
+  await expect(page.getByTestId('sidebar-datasets')).toBeVisible();
   await page.route('**/api/v1/o/logout?**', (route) =>
     route.fulfill({ contentType: 'text/html', body: '<h1>Signed out</h1>' }),
   );
