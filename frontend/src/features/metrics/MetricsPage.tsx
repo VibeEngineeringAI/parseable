@@ -129,7 +129,7 @@ export function MetricsPage() {
       <Navigate
         replace
         to={`${datasetPath(datasets[0].name)}${location.search}${location.hash}`}
-        state={ownNavigation.state}
+        state={{ ...(location.state as object | null), ...ownNavigation.state }}
       />
     );
   if (enabled && datasets?.some((entry) => entry.name === dataset))

@@ -257,7 +257,10 @@ test('a classic Metrics link to a missing dataset keeps its notice when another 
 test('a notice dismissed while datasets load stays dismissed', async ({ page }) => {
   let discover = () => {};
   await metricsServer(page, true, new Promise<void>((resolve) => (discover = resolve)));
-  await page.goto(`/metrics?start=1h&end=now&type=fixed&query=${hostFilter}`);
+  await page.goto('/datasets');
+  await navigateInApp(page, `/metrics?start=1h&end=now&type=fixed&query=${hostFilter}`, {
+    from: 'test',
+  });
   await expect(notice(page)).toHaveText(/1 filter\./);
   await notice(page).getByRole('button', { name: 'Dismiss' }).click();
   await expect(notice(page)).toHaveCount(0);
@@ -265,6 +268,8 @@ test('a notice dismissed while datasets load stays dismissed', async ({ page }) 
   await expect(page).toHaveURL('/metrics/explore/otel?range=1h');
   await expect(page.getByRole('textbox', { name: 'PromQL query A', exact: true })).toBeVisible();
   await expect(notice(page)).toHaveCount(0);
+  // The redirects keep the rest of the history state.
+  expect(await page.evaluate(() => window.history.state.usr.from)).toBe('test');
 });
 
 test('back and forward show the notice of each Metrics entry', async ({ page }) => {
