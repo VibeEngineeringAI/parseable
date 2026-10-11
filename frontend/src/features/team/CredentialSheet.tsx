@@ -1,10 +1,11 @@
 import { useCallback, useState, type FormEvent } from 'react';
-import { Button, Input, Sheet } from '../../components/ui';
+import { Button, Input, Sheet, InlineError } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { validateName } from './helpers';
-import { InlineError, RoleCheckboxes, SecretResult, useMutation } from './shared';
+import { RoleCheckboxes, SecretResult } from './shared';
+import { useMutation } from '../../hooks/useMutation';
 
 export function CredentialSheet({
   kind,

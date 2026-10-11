@@ -1,57 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type FocusEvent } from 'react';
 import { useBlocker } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { displayDate, formatAlertDate } from './helpers';
 
-export function useCollection<T>(loader: (signal: AbortSignal) => Promise<T>) {
-  const result = useAsync(loader);
-  const [previous, setPrevious] = useState<{ loader: typeof loader; data: T }>();
-  useEffect(() => {
-    if (result.error) setPrevious(undefined);
-    else if (result.data !== undefined) setPrevious({ loader, data: result.data });
-  }, [loader, result.data, result.error]);
-  return {
-    ...result,
-    data: result.error
-      ? undefined
-      : (result.data ?? (previous?.loader === loader ? previous.data : undefined)),
-  };
-}
-export function useMutation() {
-  const [pending, setPending] = useState(false),
-    [error, setError] = useState<string>();
-  const active = useRef(true),
-    running = useRef(false);
-  useEffect(() => {
-    active.current = true;
-    return () => {
-      active.current = false;
-    };
-  }, []);
-  async function run(operation: () => Promise<void>) {
-    if (running.current) return;
-    running.current = true;
-    setPending(true);
-    setError(undefined);
-    try {
-      await operation();
-    } catch (failure) {
-      if (active.current) setError(failure instanceof Error ? failure.message : String(failure));
-    } finally {
-      running.current = false;
-      if (active.current) setPending(false);
-    }
-  }
-  return { pending, error, run, reset: () => setError(undefined), isActive: () => active.current };
-}
-export function InlineError({ error }: { error?: string }) {
-  return error ? (
-    <p role="alert" className="error-text">
-      {error}
-    </p>
-  ) : null;
-}
 export function DateText({ value }: { value?: string | null }) {
   const iso = displayDate(value);
   return iso ? (
@@ -94,6 +46,23 @@ export function useRowDeletionFocus(ids: string[], refreshing: boolean) {
     return () => cancelAnimationFrame(frame);
   }, [deleted, refreshing, ids.join('\n')]);
   return { root, onDeleted };
+}
+/**
+ * Browsers leave a focused control alone while any of it is inside the scroll area, even when
+ * the sticky Actions column covers it, so scroll it and its focus ring clear of that column.
+ */
+export function revealBesideStickyColumn(event: FocusEvent<HTMLElement>) {
+  const scroller = event.currentTarget;
+  const cell = event.target.closest('th, td');
+  const sticky = scroller.querySelector('thead th:last-child');
+  if (!cell || !sticky || getComputedStyle(sticky).position !== 'sticky') return;
+  if (getComputedStyle(cell).position === 'sticky') return;
+  const ring = 5; // focus outline width plus offset
+  const box = event.target.getBoundingClientRect();
+  const covered = box.right + ring - sticky.getBoundingClientRect().left;
+  const clipped = scroller.getBoundingClientRect().left - (box.left - ring);
+  if (covered > 0) scroller.scrollLeft += covered;
+  else if (clipped > 0) scroller.scrollLeft -= clipped;
 }
 export function useAlertAccess() {
   const { client, identity, mode } = useApp();

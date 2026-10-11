@@ -7,12 +7,15 @@ import {
   EmptyState,
   Pagination,
   TypedConfirmDialog,
+  InlineError,
 } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import type { ApiKey } from '../../lib/types';
 import { CredentialSheet } from './CredentialSheet';
-import { InlineError, TeamSearch, useMutation, useTeamCollection, useTeamSearch } from './shared';
+import { TeamSearch, useTeamSearch } from './shared';
+import { useCollection } from '../../hooks/useCollection';
+import { useMutation } from '../../hooks/useMutation';
 
 export async function copyApiKey(key: Promise<ApiKey>, active: { current: boolean }) {
   try {
@@ -113,7 +116,7 @@ export function ApiKeysTab({
   closeCreate: () => void;
 }) {
   const { client } = useApp();
-  const keys = useTeamCollection(useCallback((signal) => client.listApiKeys(signal), [client]));
+  const keys = useCollection(useCallback((signal) => client.listApiKeys(signal), [client]));
   const [deleting, setDeleting] = useState<ApiKey>();
   const list = useTeamSearch(
     [...(keys.data ?? [])].sort((a, b) => a.keyName.localeCompare(b.keyName)),

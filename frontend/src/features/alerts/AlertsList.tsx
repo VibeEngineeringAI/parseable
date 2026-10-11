@@ -13,7 +13,7 @@ import {
 } from '../../components/ui';
 import type { AlertSummary } from '../../lib/types';
 import { AlertActions } from './AlertActions';
-import { useRowDeletionFocus } from './shared';
+import { revealBesideStickyColumn, useRowDeletionFocus } from './shared';
 import {
   filterSortAlerts,
   muteState,
@@ -107,7 +107,13 @@ export function AlertsList({
       ) : (
         <Card className="alerts-table alerts-list-table" aria-busy={refreshing}>
           <p className="alerts-scroll-hint muted">Scroll horizontally for more columns.</p>
-          <div className="table-scroll" role="region" aria-label="Alerts table" tabIndex={0}>
+          <div
+            className="table-scroll"
+            role="region"
+            aria-label="Alerts table"
+            tabIndex={0}
+            onFocus={revealBesideStickyColumn}
+          >
             <table>
               <caption className="sr-only">Alerts</caption>
               <thead>

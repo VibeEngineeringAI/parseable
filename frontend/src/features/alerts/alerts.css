@@ -239,11 +239,7 @@
   }
 }
 @media (max-width: 760px) {
-  .alerts-table th:last-child,
-  .alerts-table td:last-child {
-    position: static;
-    box-shadow: none;
-  }
+  /* The sticky Actions column stays reachable while the other columns scroll. */
   .alerts-scroll-hint {
     display: block;
     margin: 0;

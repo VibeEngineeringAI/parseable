@@ -40,6 +40,33 @@ const deniedHeaders = [
   'proxy-authenticate',
   'cookie',
 ];
+/** The first header row that fails validation, with the fields in it that need fixing. */
+export function invalidHeader(
+  headers: TargetDraft['headers'],
+): { index: number; fields: Array<'key' | 'value'>; message: string } | undefined {
+  const names = new Set<string>();
+  for (const [index, header] of headers.entries()) {
+    if (!header.key && !header.value) continue;
+    const name = header.key.trim().toLowerCase();
+    const fields: Array<'key' | 'value'> = [];
+    if (!/^[!#$%&'*+.^_`|~\w-]+$/.test(header.key.trim())) fields.push('key');
+    if (!header.value || /[\r\n]/.test(header.value)) fields.push('value');
+    if (fields.length)
+      return {
+        index,
+        fields,
+        message: 'Each header needs a valid name and a non-empty value without line breaks.',
+      };
+    if (deniedHeaders.includes(name))
+      return {
+        index,
+        fields: ['key'],
+        message: `The ${header.key} header is blocked by outbound policy.`,
+      };
+    if (names.has(name)) return { index, fields: ['key'], message: 'Header names must be unique.' };
+    names.add(name);
+  }
+}
 export function validateTarget(draft: TargetDraft): Partial<Record<keyof TargetDraft, string>> {
   const errors: Partial<Record<keyof TargetDraft, string>> = {};
   if (!draft.name.trim()) errors.name = 'Enter a target name.';
@@ -65,22 +92,8 @@ export function validateTarget(draft: TargetDraft): Partial<Record<keyof TargetD
   if (draft.type === 'alertManager' && Boolean(draft.username) !== Boolean(draft.password))
     errors.password = 'Enter both username and password, or leave both empty.';
   if (draft.type === 'webhook') {
-    const names = new Set<string>();
-    for (const header of draft.headers) {
-      if (!header.key && !header.value) continue;
-      const name = header.key.trim().toLowerCase();
-      if (
-        !/^[!#$%&'*+.^_`|~\w-]+$/.test(header.key.trim()) ||
-        !header.value ||
-        /[\r\n]/.test(header.value)
-      )
-        errors.headers =
-          'Each header needs a valid name and a non-empty value without line breaks.';
-      else if (deniedHeaders.includes(name))
-        errors.headers = `The ${header.key} header is blocked by outbound policy.`;
-      else if (names.has(name)) errors.headers = 'Header names must be unique.';
-      names.add(name);
-    }
+    const header = invalidHeader(draft.headers);
+    if (header) errors.headers = header.message;
   }
   return errors;
 }

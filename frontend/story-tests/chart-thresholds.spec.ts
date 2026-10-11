@@ -4,8 +4,8 @@ test('thresholds outside the data range are visible as horizontal canvas lines a
   page,
 }) => {
   await page.goto('/iframe.html?id=metrics-timeserieschart--with-thresholds&viewMode=story');
-  await expect(page.getByText('Lower threshold: 2.00', { exact: true })).toBeVisible();
-  await expect(page.getByText('Upper threshold: 6.00', { exact: true })).toBeVisible();
+  await expect(page.getByText('Lower threshold: 2', { exact: true })).toBeVisible();
+  await expect(page.getByText('Upper threshold: 6', { exact: true })).toBeVisible();
   const canvas = page.locator('.uplot canvas');
   await expect(canvas).toBeVisible();
   // Verify the actual reference strokes, including range expansion in both directions.

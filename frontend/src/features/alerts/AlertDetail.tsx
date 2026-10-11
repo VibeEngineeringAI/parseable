@@ -93,6 +93,7 @@ export function AlertDetail({ alert, onChanged }: { alert: Alert; onChanged: () 
           <CardBody className="stack">
             <dl>
               <dt>Threshold</dt>
+              {/* A configured value, so it is shown exactly rather than rounded. */}
               <dd>
                 {alert.thresholdConfig.operator} {alert.thresholdConfig.value}
               </dd>

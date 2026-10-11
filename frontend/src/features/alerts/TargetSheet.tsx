@@ -1,11 +1,18 @@
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Plus, X } from 'lucide-react';
-import { Button, Input, Select, Sheet } from '../../components/ui';
+import { Button, Input, Select, Sheet, InlineError } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { createId } from '../../lib/ids';
 import type { AlertTarget } from '../../lib/types';
-import { buildTargetPayload, targetDraft, validateTarget, type TargetDraft } from './targetHelpers';
-import { InlineError, useMutation } from './shared';
+import {
+  buildTargetPayload,
+  invalidHeader,
+  targetDraft,
+  validateTarget,
+  type TargetDraft,
+} from './targetHelpers';
+import { useMutation } from '../../hooks/useMutation';
+import { focusFirstInvalid, useTouchedErrors } from '../../hooks/useTouchedErrors';
 
 export function TargetSheet({
   target,
@@ -28,7 +35,16 @@ export function TargetSheet({
     pendingFocus.current = undefined;
   }, [draft.headers]);
   const mutation = useMutation();
-  const errors = validateTarget(draft);
+  const invalid = validateTarget(draft);
+  const shown = useTouchedErrors(invalid);
+  const errors = shown.errors;
+  const badHeader = errors.headers ? invalidHeader(draft.headers) : undefined;
+  const headerInvalid = (index: number, field: 'key' | 'value') =>
+    badHeader?.index === index && badHeader.fields.includes(field);
+  const form = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    if (shown.attempts) focusFirstInvalid(form.current);
+  }, [shown.attempts]);
   function update<K extends keyof TargetDraft>(key: K, value: TargetDraft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
   }
@@ -47,12 +63,17 @@ export function TargetSheet({
       className="alerts-target-sheet"
     >
       <form
+        ref={form}
         className="stack"
         noValidate
         onSubmit={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          if (Object.keys(errors).length) return;
+          if (mutation.pending) return;
+          if (Object.keys(invalid).length) {
+            shown.attempt();
+            return;
+          }
           void mutation.run(async () => {
             const body = buildTargetPayload(draft);
             const saved = target
@@ -71,6 +92,7 @@ export function TargetSheet({
           readOnly={Boolean(target)}
           disabled={mutation.pending}
           error={errors.name}
+          onBlur={() => shown.touch('name')}
           onChange={(event) => update('name', event.target.value)}
         />
         <Select
@@ -95,6 +117,7 @@ export function TargetSheet({
           value={draft.endpoint}
           disabled={mutation.pending}
           error={errors.endpoint}
+          onBlur={() => shown.touch('endpoint')}
           hint={
             target
               ? undefined
@@ -126,8 +149,9 @@ export function TargetSheet({
                   autoComplete="off"
                   value={header.key}
                   disabled={mutation.pending}
-                  aria-invalid={Boolean(errors.headers)}
-                  aria-describedby={errors.headers ? headersError : undefined}
+                  aria-invalid={headerInvalid(index, 'key')}
+                  aria-describedby={headerInvalid(index, 'key') ? headersError : undefined}
+                  onBlur={() => shown.touch('headers')}
                   onChange={(event) =>
                     update(
                       'headers',
@@ -143,8 +167,9 @@ export function TargetSheet({
                   autoComplete="new-password"
                   value={header.value}
                   disabled={mutation.pending}
-                  aria-invalid={Boolean(errors.headers)}
-                  aria-describedby={errors.headers ? headersError : undefined}
+                  aria-invalid={headerInvalid(index, 'value')}
+                  aria-describedby={headerInvalid(index, 'value') ? headersError : undefined}
+                  onBlur={() => shown.touch('headers')}
                   onChange={(event) =>
                     update(
                       'headers',
@@ -212,6 +237,7 @@ export function TargetSheet({
                   : 'Username and password must both be set, or both empty.'
               }
               error={errors.password}
+              onBlur={() => shown.touch('password')}
               onChange={(event) => update('password', event.target.value)}
             />
           </>
@@ -232,12 +258,7 @@ export function TargetSheet({
           <Button onClick={close} disabled={mutation.pending}>
             Cancel
           </Button>
-          <Button
-            type="submit"
-            variant="primary"
-            data-dialog-confirm
-            disabled={mutation.pending || Object.keys(errors).length > 0}
-          >
+          <Button type="submit" variant="primary" data-dialog-confirm disabled={mutation.pending}>
             {mutation.pending ? 'Saving…' : target ? 'Save target' : 'Create target'}
           </Button>
         </div>

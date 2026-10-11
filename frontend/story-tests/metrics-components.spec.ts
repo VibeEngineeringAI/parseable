@@ -6,6 +6,18 @@ async function story(page: Page, component: 'promqleditor' | 'timeserieschart', 
   await expect(page.locator('#storybook-root')).not.toBeEmpty();
 }
 
+// While CodeMirror re-queries its completion sources (after Control+Space on a list that typing
+// already opened) it keeps the old list on screen but ignores clicks on it: the tooltip carries
+// `cm-tooltip-autocomplete-disabled` until the new result is accepted. Click only once it is live.
+async function pickCompletion(page: Page, name: string | RegExp) {
+  const option = page.getByRole('option', { name, exact: typeof name === 'string' });
+  await expect(option).toBeVisible();
+  await expect(page.locator('.cm-tooltip-autocomplete')).not.toHaveClass(
+    /cm-tooltip-autocomplete-disabled/,
+  );
+  await option.click();
+}
+
 test('editor has an accessible name and placeholder, and Tab leaves it', async ({ page }) => {
   await story(page, 'promqleditor', 'empty');
   const editor = page.getByRole('textbox', { name: 'PromQL query', exact: true });
@@ -29,19 +41,17 @@ test('editor offers supported functions and quoted dotted metric completions', a
   await expect(page.getByRole('listbox')).toHaveCount(0);
   await editor.fill('syst');
   await editor.press('Control+Space');
-  const metric = page.getByRole('option', { name: 'system.cpu.load_average.1m', exact: true });
-  await expect(metric).toBeVisible();
-  await metric.click();
+  await pickCompletion(page, 'system.cpu.load_average.1m');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m"}');
   await editor.fill('system.cpu.l');
   await editor.press('Control+Space');
-  await metric.click();
+  await pickCompletion(page, 'system.cpu.load_average.1m');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m"}');
   await editor.fill('{"syst"}');
   await editor.press('ArrowLeft');
   await editor.press('ArrowLeft');
   await editor.press('Control+Space');
-  await metric.click();
+  await pickCompletion(page, 'system.cpu.load_average.1m');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m"}');
 });
 
@@ -50,14 +60,14 @@ test('editor quotes dotted label names inside selectors', async ({ page }) => {
   const editor = page.getByRole('textbox', { name: 'PromQL query', exact: true });
   await editor.fill('{"system.cpu.load_average.1m",ser');
   await editor.press('Control+Space');
-  await page.getByRole('option', { name: 'service.name', exact: true }).click();
+  await pickCompletion(page, 'service.name');
   await expect(editor).toContainText('"service.name"');
   await editor.press('Escape');
   await page.keyboard.insertText('="gateway"}');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m","service.name"="gateway"}');
   await editor.fill('{"system.cpu.load_average.1m","ser');
   await editor.press('Control+Space');
-  await page.getByRole('option', { name: 'service.name', exact: true }).click();
+  await pickCompletion(page, 'service.name');
   await expect(editor).toHaveText('{"system.cpu.load_average.1m","service.name"');
 });
 
@@ -98,11 +108,11 @@ test('chart figure and keyboard cursor expose values and Escape hides the toolti
   const tooltip = page.getByRole('tooltip');
   await expect(tooltip).toBeVisible();
   await expect(tooltip.locator('strong')).toHaveCount(3);
-  await expect(tooltip.locator('strong').last()).toHaveText('2.50');
+  await expect(tooltip.locator('strong').last()).toHaveText('2.5');
   await chart.press('ArrowRight');
   await expect(tooltip.locator('strong').last()).toHaveText('2.98');
   await chart.press('ArrowLeft');
-  await expect(tooltip.locator('strong').last()).toHaveText('2.50');
+  await expect(tooltip.locator('strong').last()).toHaveText('2.5');
   await chart.press('Escape');
   await expect(tooltip).toHaveCount(0);
 });
@@ -119,6 +129,29 @@ test('legend toggle updates aria-pressed and the count, and Alt-click isolates',
   await alpha.click({ modifiers: ['Alt'] });
   await expect(alpha).toHaveAttribute('aria-pressed', 'true');
   await expect(page.getByText('1 of 3 series', { exact: true })).toBeVisible();
+});
+
+test('the legend leaves room for the focus ring of its first row', async ({ page }) => {
+  await story(page, 'timeserieschart', 'three-series');
+  const alpha = page.getByRole('button', { name: '{host="alpha"}', exact: true });
+  await alpha.focus();
+  await expect(alpha).toBeFocused();
+  await expect(alpha).toHaveCSS('outline-style', 'solid');
+  // The legend scrolls, so any part of the ring outside its box is clipped.
+  const overflow = await alpha.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const ring = parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset);
+    const item = element.getBoundingClientRect();
+    const legend = element.closest('.charts-legend')!.getBoundingClientRect();
+    return {
+      top: legend.top - (item.top - ring),
+      left: legend.left - (item.left - ring),
+      bottom: item.bottom + ring - legend.bottom,
+    };
+  });
+  expect(overflow.top).toBeLessThanOrEqual(0);
+  expect(overflow.left).toBeLessThanOrEqual(0);
+  expect(overflow.bottom).toBeLessThanOrEqual(0);
 });
 
 test('requested range leaves space before and after samples without repeating a card title', async ({
@@ -224,7 +257,7 @@ test('inline thresholds and ranges retain the plot across renders and update whe
   await expect(page.getByRole('status')).toHaveText('Render 1');
   await expect(plot).toHaveAttribute('data-retained', 'true');
   await page.getByRole('button', { name: 'Raise threshold' }).click();
-  await expect(page.locator('.charts-thresholds')).toHaveText('Threshold: 3.00');
+  await expect(page.locator('.charts-thresholds')).toHaveText('Threshold: 3');
   await expect(plot).not.toHaveAttribute('data-retained');
   await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
   await page.getByRole('button', { name: 'Extend range' }).click();

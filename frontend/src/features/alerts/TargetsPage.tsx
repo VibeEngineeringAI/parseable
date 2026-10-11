@@ -18,7 +18,9 @@ import { useApp } from '../../app/AppProvider';
 import type { AlertTarget } from '../../lib/types';
 import { TargetSheet } from './TargetSheet';
 import { targetType, targetTypeLabel } from './targetHelpers';
-import { useAlertAccess, useCollection, useMutation, useRowDeletionFocus } from './shared';
+import { revealBesideStickyColumn, useAlertAccess, useRowDeletionFocus } from './shared';
+import { useCollection } from '../../hooks/useCollection';
+import { useMutation } from '../../hooks/useMutation';
 
 export function TargetsPage() {
   const { client } = useApp(),
@@ -111,7 +113,13 @@ export function TargetsPage() {
         ) : (
           <Card className="alerts-table" aria-busy={targets.loading}>
             <p className="alerts-scroll-hint muted">Scroll horizontally for more columns.</p>
-            <div className="table-scroll" role="region" aria-label="Targets table" tabIndex={0}>
+            <div
+              className="table-scroll"
+              role="region"
+              aria-label="Targets table"
+              tabIndex={0}
+              onFocus={revealBesideStickyColumn}
+            >
               <table>
                 <caption className="sr-only">Alert targets</caption>
                 <thead>

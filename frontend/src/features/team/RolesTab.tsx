@@ -9,6 +9,7 @@ import {
   Pagination,
   Sheet,
   TypedConfirmDialog,
+  InlineError,
 } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
@@ -17,7 +18,9 @@ import type { Privilege } from '../../lib/types';
 import { privilegeLabel } from './helpers';
 import { RoleEditor } from './RoleEditor';
 import { DefaultRoleDialog } from './DefaultRoleDialog';
-import { InlineError, TeamSearch, useMutation, useTeamCollection, useTeamSearch } from './shared';
+import { TeamSearch, useTeamSearch } from './shared';
+import { useCollection } from '../../hooks/useCollection';
+import { useMutation } from '../../hooks/useMutation';
 
 export function RolesTab({
   creating,
@@ -33,7 +36,7 @@ export function RolesTab({
   oidcActive: boolean;
 }) {
   const { client } = useApp();
-  const roles = useTeamCollection(useCallback((signal) => client.listRoles(signal), [client]));
+  const roles = useCollection(useCallback((signal) => client.listRoles(signal), [client]));
   const defaultRole = useAsync(
     useCallback(
       (signal) => (oidcActive ? client.defaultRole(signal) : Promise.resolve(null)),

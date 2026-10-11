@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Badge, Card, CardHeader, CardBody } from '../../components/ui';
+import { formatChartValue } from '../../components/charts/format';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
@@ -158,7 +159,7 @@ export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: Alert
                               }
                             </Badge>
                           </td>
-                          <td>{instance.value}</td>
+                          <td title={String(instance.value)}>{formatChartValue(instance.value)}</td>
                           <td>
                             <DateText value={instance.pendingSince} />
                           </td>
