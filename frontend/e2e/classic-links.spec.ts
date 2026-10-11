@@ -162,6 +162,53 @@ test('a classic metric drilldown opens its metric and names the filter it drops'
   await expect(page.getByText('Not carried over')).toHaveCount(0);
 });
 
+/** A live server whose one metrics dataset is `otel`, with or without PromQL. */
+async function metricsServer(page: Page, promql = true) {
+  await page.route('**/api/v1/**', (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/v1/about') return route.fulfill({ json: { capabilities: { promql } } });
+    if (path === '/api/v1/logstream') return route.fulfill({ json: [{ name: 'otel' }] });
+    if (path.endsWith('/info'))
+      return route.fulfill({ json: { logSource: [{ log_source_format: 'otel-metrics' }] } });
+    return route.fulfill({ status: 404 });
+  });
+  await page.route('**/prometheus/**', (route) =>
+    route.fulfill({
+      json: {
+        status: 'success',
+        data: route.request().url().includes('query') ? { resultType: 'matrix', result: [] } : [],
+      },
+    }),
+  );
+}
+
+const hostFilter = encodeURIComponent("WHERE text host = 'node-a'");
+const notice = (page: Page) => page.getByRole('status').filter({ hasText: 'Not carried over' });
+
+test('a classic Metrics link names its filter on every state of the page', async ({ page }) => {
+  await metricsServer(page, false);
+  await page.goto(`/metrics/explore/otel?start=1h&end=now&type=fixed&query=${hostFilter}`);
+  await expect(page.getByText('PromQL is not available on this server')).toBeVisible();
+  await expect(notice(page)).toHaveText(/1 filter\./);
+});
+
+test('a classic Metrics link to a missing dataset keeps its notice when another opens', async ({
+  page,
+}) => {
+  await metricsServer(page);
+  await page.goto(`/metrics/explore/gone?start=1h&end=now&type=fixed&query=${hostFilter}`);
+  await expect(page.getByText('The selected dataset could not be found.')).toBeVisible();
+  await expect(notice(page)).toHaveText(/1 filter\./);
+  await page.getByRole('button', { name: 'Open otel' }).click();
+  await expect(page).toHaveURL('/metrics/explore/otel?range=1h');
+  await expect(page.getByRole('textbox', { name: 'PromQL query A', exact: true })).toBeVisible();
+  await expect(notice(page)).toHaveText(/1 filter\./);
+  // A later link from elsewhere in the app is not the one the notice is about.
+  await navigateInApp(page, '/metrics/explore/otel?query=up&type=range');
+  await expect(page.getByRole('textbox', { name: 'PromQL query A', exact: true })).toHaveText('up');
+  await expect(notice(page)).toHaveCount(0);
+});
+
 test('a classic Metrics link keeps no classic filter as a PromQL query', async ({ page }) => {
   await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
   const filter = encodeURIComponent("WHERE text host = 'node-a' AND text env = 'prod'");
