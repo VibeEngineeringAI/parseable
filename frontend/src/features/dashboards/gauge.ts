@@ -1,5 +1,6 @@
 import type { DashboardTile, LogRecord, PromqlInstantResult } from '../../lib/types';
 import { chartValue } from './chartValue';
+import { gaugeRange as layoutRange } from './chartPicker';
 import { paletteColour, tilePalette } from './palettes';
 import type { TileResults } from './queries';
 import { record, text } from './tiles';
@@ -31,15 +32,8 @@ export const GAUGE_TEXT = {
 } as const;
 
 export function gaugeRange(tile: DashboardTile): GaugeRange {
-  const layout = record(record(tile.config).layout);
-  return {
-    min:
-      typeof layout.rangeFrom === 'number' && Number.isFinite(layout.rangeFrom)
-        ? layout.rangeFrom
-        : 0,
-    max:
-      typeof layout.rangeTo === 'number' && Number.isFinite(layout.rangeTo) ? layout.rangeTo : 100,
-  };
+  const { from, to } = layoutRange(record(record(tile.config).layout));
+  return { min: from, max: to };
 }
 
 /** Unlike classic, deliberately guard zero, reversed and NaN spans. The same step
@@ -53,6 +47,8 @@ export function gaugeFraction(value: number, range: GaugeRange): number {
   return Math.max(0, Math.min(1, gaugeShare(value, range)));
 }
 
+/** Thresholds are read here rather than with chartPicker's gaugeSegments: the editor reader keeps only
+ * two thresholds, whereas the renderer must see them all (more than two means the palette colour). */
 export function gaugeLevel(value: number, range: GaugeRange, segments?: unknown): GaugeLevel {
   const stored = record(segments);
   const values = Array.isArray(stored.value) ? stored.value : undefined;
