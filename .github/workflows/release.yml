@@ -2,6 +2,9 @@
 # and publishes the artifacts to the GitHub release page.
 # Automatic tag builds are temporarily paused. Run this workflow manually
 # with an existing release tag (e.g., v1.0.0, v2.3.4).
+# Binaries build on GitHub-hosted runners because this fork has no
+# self-hosted runners. The Docker images publish to upstream's Quay
+# repository, so that job runs only in parseablehq/parseable.
 # It also creates a checksum file for the artifacts and publishes it to the release page.
 # It also builds and pushes a Docker image to Docker Hub with the same version tag.
 
@@ -68,7 +71,7 @@ jobs:
 
   build-linux:
     name: Build for ${{matrix.target}}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: write
@@ -266,7 +269,7 @@ jobs:
 
   build-kafka-linux:
     name: Build Kafka for x86_64-unknown-linux-gnu
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: write
@@ -470,6 +473,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-push-docker-image:
+    if: github.repository == 'parseablehq/parseable'
     runs-on: self-hosted
     steps:
       - name: Checkout
