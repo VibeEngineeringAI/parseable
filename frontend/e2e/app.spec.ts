@@ -453,3 +453,12 @@ test('an earlier copy finishing late keeps the reopened sheet status', async ({ 
   await page.evaluate(() => new Promise(requestAnimationFrame));
   await expect(sheet.getByRole('status')).toHaveText('Event copied');
 });
+
+test('skip to content stays on the page under the base element', async ({ page }) => {
+  await demo(page, '/datasets?view=list');
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('link', { name: 'Skip to content' })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#main-section')).toBeFocused();
+  await expect(page).toHaveURL('/datasets?view=list');
+});

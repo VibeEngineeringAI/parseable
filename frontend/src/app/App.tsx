@@ -67,7 +67,15 @@ export function App() {
   }
   return (
     <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''}`}>
-      <a className="skip-link" href="#main-section">
+      <a
+        className="skip-link"
+        href="#main-section"
+        // With a `<base href>`, the fragment alone would navigate to the mount.
+        onClick={(e) => {
+          e.preventDefault();
+          document.getElementById('main-section')?.focus();
+        }}
+      >
         Skip to content
       </a>
       <Sidebar
