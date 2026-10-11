@@ -125,6 +125,8 @@ export function validateRange({
 }
 
 const legacyIdentifier = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
+// Unlike metric names, label names cannot contain colons.
+const labelIdentifier = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const quoted = (value: string) =>
   `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n').replaceAll('\r', '\\r').replaceAll('\t', '\\t')}"`;
 
@@ -133,7 +135,7 @@ export function metricSelector(name: string): string {
 }
 
 export function matcher(label: string, value: string, op: '=' | '!=' | '=~' | '!~' = '='): string {
-  return `${legacyIdentifier.test(label) ? label : quoted(label)}${op}${quoted(value)}`;
+  return `${labelIdentifier.test(label) ? label : quoted(label)}${op}${quoted(value)}`;
 }
 
 export function varyingLabelKeys(metrics: PromqlLabels[]): string[] {
