@@ -175,13 +175,19 @@ test('a classic metric drilldown opens its metric and names the filter it drops'
 });
 
 /** A live server whose one metrics dataset is `otel`, with or without PromQL. */
-async function metricsServer(page: Page, promql = true) {
-  await page.route('**/api/v1/**', (route) => {
+async function metricsServer(
+  page: Page,
+  promql = true,
+  discovered: Promise<void> = Promise.resolve(),
+) {
+  await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === '/api/v1/about') return route.fulfill({ json: { capabilities: { promql } } });
     if (path === '/api/v1/logstream') return route.fulfill({ json: [{ name: 'otel' }] });
-    if (path.endsWith('/info'))
+    if (path.endsWith('/info')) {
+      await discovered;
       return route.fulfill({ json: { logSource: [{ log_source_format: 'otel-metrics' }] } });
+    }
     return route.fulfill({ status: 404 });
   });
   await page.route('**/prometheus/**', (route) =>
@@ -246,6 +252,36 @@ test('a classic Metrics link to a missing dataset keeps its notice when another 
   await navigateInApp(page, '/metrics/explore/otel?query=up&type=range');
   await expect(page.getByRole('textbox', { name: 'PromQL query A', exact: true })).toHaveText('up');
   await expect(notice(page)).toHaveCount(0);
+});
+
+test('a notice dismissed while datasets load stays dismissed', async ({ page }) => {
+  let discover = () => {};
+  await metricsServer(page, true, new Promise<void>((resolve) => (discover = resolve)));
+  await page.goto(`/metrics?start=1h&end=now&type=fixed&query=${hostFilter}`);
+  await expect(notice(page)).toHaveText(/1 filter\./);
+  await notice(page).getByRole('button', { name: 'Dismiss' }).click();
+  await expect(notice(page)).toHaveCount(0);
+  discover();
+  await expect(page).toHaveURL('/metrics/explore/otel?range=1h');
+  await expect(page.getByRole('textbox', { name: 'PromQL query A', exact: true })).toBeVisible();
+  await expect(notice(page)).toHaveCount(0);
+});
+
+test('back and forward show the notice of each Metrics entry', async ({ page }) => {
+  await metricsServer(page);
+  const editor = page.getByRole('textbox', { name: 'PromQL query A', exact: true });
+  await page.goto('/metrics/explore/otel');
+  await editor.fill('up');
+  await expect(page).toHaveURL(/query=up/);
+  await navigateInApp(page, `/metrics/explore/otel?query=${hostFilter}&query=cpu`);
+  await expect(editor).toHaveText('cpu');
+  await expect(notice(page)).toHaveText(/1 filter\./);
+  await page.goBack();
+  await expect(editor).toHaveText('up');
+  await expect(notice(page)).toHaveCount(0);
+  await page.goForward();
+  await expect(editor).toHaveText('cpu');
+  await expect(notice(page)).toHaveText(/1 filter\./);
 });
 
 test('a classic Metrics link keeps no classic filter as a PromQL query', async ({ page }) => {

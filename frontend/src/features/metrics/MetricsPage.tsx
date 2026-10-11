@@ -1,6 +1,13 @@
 import { createPromqlMetadata } from '../../lib/promqlMetadata';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Navigate, useLocation, useNavigate, useParams } from 'react-router-dom';
+import {
+  Navigate,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  useParams,
+  type NavigateOptions,
+} from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import { Button, EmptyState, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
@@ -35,16 +42,18 @@ import './metrics.css';
 
 const datasetPath = (name: string) => `/metrics/explore/${encodeURIComponent(name)}`;
 
-/** History state of a Metrics location. */
+/**
+ * History state of a Metrics location: the classic link notice that belongs to
+ * the entry, and whether the page made the navigation itself.
+ */
 type PageState = { classicDropped?: string[]; metricsOwnNavigation?: boolean } | null;
-/** Marks a navigation the page makes itself, which keeps the classic link notice. */
-const ownNavigation = { replace: true, state: { metricsOwnNavigation: true } };
 
 export function MetricsPage() {
   const { client } = useApp();
   const { dataset } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
+  const navigationType = useNavigationType();
   const about = useAsync(useCallback((signal) => client.about(signal), [client]));
   const enabled = about.data?.capabilities.promql === true;
   const discovery = useAsync(
@@ -66,8 +75,9 @@ export function MetricsPage() {
     <DiscoveryWarning unchecked={discovery.data.unchecked} retry={rescan} />
   ) : null;
   // What the latest classic link could not carry over. It is kept here, not in the
-  // explorer, so every state of the page shows it. A navigation either brings a
-  // link's notice, is one of this page's own, which keeps it, or replaces it.
+  // explorer, so every state of the page shows it. Each history entry records its
+  // notice. A navigation the page makes itself keeps the current one, so a dismissal
+  // holds; back and forward restore the entry's own; anything else brings its own.
   const pageState = location.state as PageState;
   const [notice, setNotice] = useState({
     key: location.key,
@@ -76,15 +86,22 @@ export function MetricsPage() {
   if (notice.key !== location.key)
     setNotice({
       key: location.key,
-      dropped: pageState?.classicDropped ?? (pageState?.metricsOwnNavigation ? notice.dropped : []),
+      dropped:
+        pageState?.metricsOwnNavigation && navigationType !== 'POP'
+          ? notice.dropped
+          : (pageState?.classicDropped ?? []),
     });
+  const ownNavigation: NavigateOptions = {
+    replace: true,
+    state: { metricsOwnNavigation: true, classicDropped: notice.dropped },
+  };
   const linkNotice = (
     <LinkNotice
       dropped={notice.dropped}
       onDismiss={() => {
         setNotice({ key: notice.key, dropped: [] });
-        // Remove it from this history entry too, so a reload does not bring it back.
-        // This does not navigate, so an edit whose navigation is pending is kept.
+        // Remove it from this history entry too, so a reload or Back does not bring
+        // it back. This does not navigate, so an edit whose navigation is pending is kept.
         const entry = window.history.state as { usr?: PageState } | null;
         if (entry?.usr?.classicDropped) {
           const { classicDropped: _, ...usr } = entry.usr;
@@ -100,7 +117,11 @@ export function MetricsPage() {
       <Navigate
         replace
         to={{ pathname: location.pathname, search: classicLink.search, hash: location.hash }}
-        state={{ ...(location.state as object | null), classicDropped: classicLink.dropped }}
+        state={{
+          ...(location.state as object | null),
+          metricsOwnNavigation: false,
+          classicDropped: classicLink.dropped,
+        }}
       />
     );
   if (enabled && datasets?.length && !dataset)
@@ -108,14 +129,19 @@ export function MetricsPage() {
       <Navigate
         replace
         to={`${datasetPath(datasets[0].name)}${location.search}${location.hash}`}
-        state={location.state}
+        state={ownNavigation.state}
       />
     );
   if (enabled && datasets?.some((entry) => entry.name === dataset))
     return (
       <>
         {warning && <div className="page metrics-discovery">{warning}</div>}
-        <MetricsExplorer dataset={dataset!} datasets={datasets} notice={linkNotice} />
+        <MetricsExplorer
+          dataset={dataset!}
+          datasets={datasets}
+          notice={linkNotice}
+          ownNavigation={ownNavigation}
+        />
       </>
     );
   return (
@@ -192,11 +218,14 @@ function MetricsExplorer({
   dataset,
   datasets,
   notice,
+  ownNavigation,
 }: {
   dataset: string;
   datasets: DatasetInfo[];
   /** The page's notice about the latest classic link. */
   notice: ReactNode;
+  /** Options for the explorer's own navigations, which keep that notice. */
+  ownNavigation: NavigateOptions;
 }) {
   const { client } = useApp();
   const location = useLocation();
