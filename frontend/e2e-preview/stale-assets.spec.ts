@@ -51,6 +51,10 @@ for (const [path, asset] of [
       'href',
       '/next',
     );
+    // Shown inside the shell, whose navigation and sign-out stay.
+    await expect(page.locator('main#main-section').getByRole('alert')).toBeVisible();
+    await expect(page.getByTestId('sidebar-datasets')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
     expect(removed.length).toBeGreaterThan(0);
   });
 }

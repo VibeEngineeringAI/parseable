@@ -176,7 +176,7 @@ test('a classic Metrics link keeps no classic filter as a PromQL query', async (
   );
 });
 
-test('a page whose code fails to load keeps reload and sign out', async ({ page }) => {
+test('a page whose code fails to load keeps the shell, reload and sign out', async ({ page }) => {
   await server(page);
   await page.route('**/src/features/logs/LogsPage.tsx*', (route) => route.abort());
   await page.goto('/logs/explore/app');
@@ -184,9 +184,35 @@ test('a page whose code fails to load keeps reload and sign out', async ({ page 
   await expect(error.getByRole('heading', { name: 'This page could not be loaded' })).toBeVisible();
   await expect(error.getByRole('button', { name: 'Reload' })).toBeVisible();
   await expect(error.getByRole('link', { name: 'Back to overview' })).toHaveAttribute('href', '/');
+  // The error is inside the shell, so its navigation still works.
+  await expect(page.locator('main#main-section').getByRole('alert')).toBeVisible();
+  await page.getByTestId('sidebar-datasets').click();
+  await expect(page).toHaveURL('/datasets');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.getByTestId('sidebar-logs').click();
+  await expect(error.getByRole('heading', { name: 'This page could not be loaded' })).toBeVisible();
   await page.route('**/api/v1/o/logout?**', (route) =>
     route.fulfill({ contentType: 'text/html', body: '<h1>Signed out</h1>' }),
   );
-  await error.getByRole('button', { name: 'Sign out' }).click();
+  await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByRole('heading', { name: 'Signed out' })).toBeVisible();
+});
+
+test('an error outside a page still offers reload and sign out', async ({ page }) => {
+  await server(page);
+  // The shell reads the theme while it renders; make that throw.
+  await page.addInitScript(() => {
+    const getItem = Storage.prototype.getItem;
+    Storage.prototype.getItem = function (key) {
+      if (key === 'parseable-theme') throw new Error('Storage is unavailable');
+      return getItem.call(this, key);
+    };
+  });
+  await page.goto('/datasets');
+  const error = page.getByRole('alert');
+  await expect(error.getByRole('heading', { name: 'Something went wrong' })).toBeVisible();
+  await expect(error).toContainText('Storage is unavailable');
+  await expect(page.getByTestId('sidebar-datasets')).toHaveCount(0);
+  await expect(error.getByRole('button', { name: 'Reload' })).toBeVisible();
+  await expect(error.getByRole('button', { name: 'Sign out' })).toBeVisible();
 });

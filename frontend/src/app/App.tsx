@@ -6,6 +6,7 @@ import { Sidebar } from './Sidebar';
 import { ConnectionDialog } from './ConnectionDialog';
 import { useApp } from './AppProvider';
 import { LoginPage } from './LoginPage';
+import { PageErrorBoundary } from './RouteError';
 import { safeReturnPath } from '../lib/auth';
 import { classicRoute, classicUiAvailable, classicUiPath, nativePath } from '../lib/classicUi';
 import '../styles/auth-shell.css';
@@ -150,49 +151,51 @@ export function App() {
           </div>
         )}
         <main id="main-section" tabIndex={-1} key={`${mode}-${session}`}>
-          <Suspense
-            fallback={
-              <div className="loading-state" role="status">
-                <Spinner />
-                Loading view…
-              </div>
-            }
-          >
-            <Routes>
-              <Route path="/" element={<OverviewPage onConnect={() => setConnect(true)} />} />
-              <Route path="/logs" element={<LogsPage />} />
-              <Route path="/logs/:view/:currentDataset" element={<LogsPage />} />
-              <Route path="/metrics" element={<MetricsPage />} />
-              <Route path="/metrics/explore/:dataset" element={<MetricsPage />} />
-              <Route path="/sql-editor" element={<SqlPage />} />
-              <Route path="/datasets" element={<DatasetsPage />} />
-              <Route path="/dashboards" element={<DashboardsPage />} />
-              <Route path="/dashboards/:id" element={<DashboardView />} />
-              <Route path="/team" element={<TeamPage />} />
-              <Route path="/alerts" element={<AlertsPage />} />
-              <Route path="/alerts/new" element={<AlertsPage />} />
-              <Route path="/alerts/targets" element={<AlertsPage />} />
-              <Route path="/alerts/:id/edit" element={<AlertsPage />} />
-              <Route path="/alerts/:id" element={<AlertsPage />} />
-              <Route path="/components" element={<LibraryPage />} />
-              <Route
-                path="*"
-                element={
-                  <div className="page">
-                    <EmptyState
-                      title="Page not found"
-                      description={
-                        classicRoute(location.pathname)?.kind === 'classic-only'
-                          ? 'This page is only available in the classic UI.'
-                          : 'This route is not part of this frontend iteration.'
-                      }
-                      action={<Link to="/">Back to overview</Link>}
-                    />
-                  </div>
-                }
-              />
-            </Routes>
-          </Suspense>
+          <PageErrorBoundary resetKey={location.key}>
+            <Suspense
+              fallback={
+                <div className="loading-state" role="status">
+                  <Spinner />
+                  Loading view…
+                </div>
+              }
+            >
+              <Routes>
+                <Route path="/" element={<OverviewPage onConnect={() => setConnect(true)} />} />
+                <Route path="/logs" element={<LogsPage />} />
+                <Route path="/logs/:view/:currentDataset" element={<LogsPage />} />
+                <Route path="/metrics" element={<MetricsPage />} />
+                <Route path="/metrics/explore/:dataset" element={<MetricsPage />} />
+                <Route path="/sql-editor" element={<SqlPage />} />
+                <Route path="/datasets" element={<DatasetsPage />} />
+                <Route path="/dashboards" element={<DashboardsPage />} />
+                <Route path="/dashboards/:id" element={<DashboardView />} />
+                <Route path="/team" element={<TeamPage />} />
+                <Route path="/alerts" element={<AlertsPage />} />
+                <Route path="/alerts/new" element={<AlertsPage />} />
+                <Route path="/alerts/targets" element={<AlertsPage />} />
+                <Route path="/alerts/:id/edit" element={<AlertsPage />} />
+                <Route path="/alerts/:id" element={<AlertsPage />} />
+                <Route path="/components" element={<LibraryPage />} />
+                <Route
+                  path="*"
+                  element={
+                    <div className="page">
+                      <EmptyState
+                        title="Page not found"
+                        description={
+                          classicRoute(location.pathname)?.kind === 'classic-only'
+                            ? 'This page is only available in the classic UI.'
+                            : 'This route is not part of this frontend iteration.'
+                        }
+                        action={<Link to="/">Back to overview</Link>}
+                      />
+                    </div>
+                  }
+                />
+              </Routes>
+            </Suspense>
+          </PageErrorBoundary>
         </main>
       </div>
       <ConnectionDialog open={connect} onOpenChange={setConnect} />
