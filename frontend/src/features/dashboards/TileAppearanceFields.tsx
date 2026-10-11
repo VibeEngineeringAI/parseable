@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { Input, Select } from '../../components/ui';
 import type { DashboardTile } from '../../lib/types';
+import { fillStyle } from './chartValue';
 import { record, resolvedLayouts, text, supportedCharts } from './tiles';
 export function TileAppearanceFields({
   draft,
@@ -122,6 +123,18 @@ export function TileAppearanceFields({
           }
         }}
       />
+      {draft.chartType === 'query-value' && (
+        <Select
+          label="Percent fill"
+          value={fillStyle(draft)}
+          onChange={(event) => configLayout('percentFill', event.target.value)}
+        >
+          <option value="horizontal">Horizontal</option>
+          <option value="vertical">Vertical</option>
+          <option value="diagonal">Diagonal from top left</option>
+          <option value="none">None</option>
+        </Select>
+      )}
       <Select
         label="Legend position"
         value={text(layout.legendPosition, 'bottom')}

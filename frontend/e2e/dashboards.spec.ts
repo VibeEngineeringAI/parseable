@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import { readFile } from 'node:fs/promises';
 import { createUlid } from '../src/lib/ids';
@@ -858,6 +858,104 @@ test('a late tile response cannot replace the result of a new variable selection
   await expect(tile(page, 'Errors').getByLabel('Errors value')).toHaveText('222');
 });
 
+test('percent query values fill horizontally, vertically, diagonally or not at all in tiles and previews; other units do not fill', async ({
+  page,
+}) => {
+  const stat = (title: string, unit: string, x: number) => ({
+    ...classic.tiles[1],
+    tile_id: createUlid(),
+    title,
+    tileType: 'code',
+    chartType: 'query-value',
+    chartQuery: `SELECT 75 AS value -- ${title}`,
+    layout: { x, y: 0, w: 6, h: 3 },
+    config: { type: 'query-value', layout: { unit, precision: 0 } },
+  });
+  await mockServer(page, {
+    document: { ...classic, tiles: [stat('CPU', '%', 0), stat('Latency', 'ms', 6)] },
+  });
+  await page.route('**/api/v1/query', (route) => route.fulfill({ json: [{ value: 75 }] }));
+  await page.goto(detail);
+  const cpu = tile(page, 'CPU').getByRole('group', { name: 'CPU value' });
+  await expect(cpu).toHaveText('75 %');
+  // Grid tiles fill their card and the editor preview fills its stat box, both inside any border.
+  // At 75% every style covers the value's centre, where the value must paint above the fill,
+  // and the fill's bottom-left corner, where nothing may hide the fill.
+  const geometry = async (value: Locator, container: string) => {
+    await value.scrollIntoViewIfNeeded();
+    return value.evaluate((element, selector) => {
+      const fill = element.querySelector('.dashboard-stat-fill')!,
+        box = element.closest(selector)!,
+        outer = box.getBoundingClientRect(),
+        inner = fill.getBoundingClientRect(),
+        centre = element.getBoundingClientRect(),
+        round = (number: number) => Math.round(number * 100) / 100;
+      return {
+        style: fill.getAttribute('data-direction'),
+        width: round(inner.width / box.clientWidth),
+        height: round(inner.height / box.clientHeight),
+        left: round(inner.left - outer.left - box.clientLeft),
+        bottom: round(outer.top + box.clientTop + box.clientHeight - inner.bottom),
+        valueOnTop:
+          document.elementFromPoint(
+            centre.left + centre.width / 2,
+            centre.top + centre.height / 2,
+          ) === element,
+        fillOnTop: document.elementFromPoint(inner.left + 2, inner.bottom - 2) === fill,
+      };
+    }, container);
+  };
+  // The title paints above a fill that covers the whole card.
+  expect(await geometry(cpu, '[data-tile-id]')).toMatchObject({ width: 0.75, height: 1 });
+  expect(
+    await tile(page, 'CPU')
+      .getByRole('heading', { name: 'CPU' })
+      .evaluate((heading) => {
+        const box = heading.getBoundingClientRect();
+        return document.elementFromPoint(box.left + 4, box.top + box.height / 2)?.textContent;
+      }),
+  ).toBe('CPU');
+  await expect(tile(page, 'Latency').getByRole('group', { name: 'Latency value' })).toHaveText(
+    '75 ms',
+  );
+  await expect(tile(page, 'Latency').locator('.dashboard-stat-fill')).toHaveCount(0);
+  await axe(page);
+  const sizes = {
+    horizontal: { width: 0.75, height: 1 },
+    vertical: { width: 1, height: 0.75 },
+    diagonal: { width: 1, height: 1 },
+    none: undefined,
+  };
+  for (const [style, size] of Object.entries(sizes)) {
+    await tileAction(page, 'CPU', 'Edit');
+    const editor = page.getByRole('dialog', { name: 'Edit tile', exact: true });
+    await editor.getByLabel('Percent fill', { exact: true }).selectOption(style);
+    await editor.getByRole('button', { name: 'Run query', exact: true }).click();
+    const preview = editor.getByRole('group', { name: 'CPU value' });
+    await expect(preview).toHaveText('75 %');
+    const expected = size && {
+      style,
+      ...size,
+      left: 0,
+      bottom: 0,
+      valueOnTop: true,
+      fillOnTop: true,
+    };
+    if (expected) expect(await geometry(preview, '.dashboard-stat')).toEqual(expected);
+    else await expect(preview.locator('.dashboard-stat-fill')).toHaveCount(0);
+    await editor.getByRole('button', { name: 'Apply tile', exact: true }).click();
+    await expect(editor).toBeHidden();
+    await expect(cpu).toHaveText('75 %');
+    if (expected) expect(await geometry(cpu, '[data-tile-id]')).toEqual(expected);
+    else await expect(cpu.locator('.dashboard-stat-fill')).toHaveCount(0);
+    // 75% of the tile lies below the line x + y = 2 - sqrt(0.5) in tile-relative coordinates.
+    if (style === 'diagonal')
+      await expect(cpu.locator('.dashboard-stat-fill')).toHaveCSS(
+        'clip-path',
+        'polygon(0% 0%, 100% 0%, 100% 29.29%, 29.29% 100%, 0% 100%)',
+      );
+  }
+});
 test('pending saves freeze document edits and a failed save keeps the complete draft', async ({
   page,
 }) => {

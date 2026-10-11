@@ -2,7 +2,7 @@ import { useCallback, useMemo } from 'react';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
-import { chartValue } from './chartValue';
+import { chartValue, diagonalFill, fillStyle, percentFill } from './chartValue';
 import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
@@ -91,8 +91,24 @@ export function TileChart({
     );
   if (tile.chartType === 'query-value') {
     const value = chartValue(rows, tile, !!result.promql);
+    const fill = value === undefined ? undefined : percentFill(value, tile);
+    const style = fillStyle(tile);
     return (
       <div className="dashboard-stat" role="group" aria-label={`${tileTitle(tile)} value`}>
+        {fill !== undefined && (
+          <span
+            className="dashboard-stat-fill"
+            data-direction={style}
+            style={
+              style === 'vertical'
+                ? { height: `${fill}%` }
+                : style === 'diagonal'
+                  ? { clipPath: diagonalFill(fill) }
+                  : { width: `${fill}%` }
+            }
+            aria-hidden="true"
+          />
+        )}
         {value === undefined ? 'No values returned' : formatValue(value)}
       </div>
     );
