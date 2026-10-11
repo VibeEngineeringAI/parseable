@@ -25,7 +25,7 @@ The proxy preserves the browser Host so the backend can validate the same-origin
 
 ## Build and embed in Parseable
 
-While this frontend reaches parity, Parseable serves it **beside** the classic Prism UI: Prism stays at `/` and this frontend is mounted at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both. Each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab. Classic links also open here: `src/lib/classicUi.ts` maps every route in Prism's router, so a moved page redirects (for example `/alerts/create` to `/alerts/new`), a Prism-only page says so, and a Logs link keeps its time range and `=`/`!=` filters and names anything it could not carry over. Alerts now has native navigation under Observe.
+While this frontend reaches parity, Parseable serves it **beside** the classic Prism UI: Prism stays at `/` and this frontend is mounted at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both. Each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab. Classic links also open here: `src/lib/classicUi.ts` maps every route in Prism's router, so a moved page redirects (for example `/alerts/create` to `/alerts/new`), a Prism-only page says so, a Logs link keeps its time range and `=`/`!=` filters, a Metrics link keeps its time range, and both name anything they could not carry over. Alerts now has native navigation under Observe.
 
 Release builds use **Node 24**. `npm run build` targets the `/next/` base path. From this directory:
 
