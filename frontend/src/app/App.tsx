@@ -61,7 +61,8 @@ export function App() {
     )[location.pathname.split('/')[1]] || 'Overview';
   const path = `${location.pathname}${location.search}${location.hash}`;
   // Classic links to pages that live at another path here.
-  if (nativePath(path) !== path) return <Navigate replace to={nativePath(path)} />;
+  if (nativePath(path) !== path)
+    return <Navigate replace to={nativePath(path)} state={location.state} />;
   if (location.pathname === '/login' || location.pathname === '/oidc-not-configured') {
     return <LoginPage oidcUnavailable={location.pathname === '/oidc-not-configured'} />;
   }

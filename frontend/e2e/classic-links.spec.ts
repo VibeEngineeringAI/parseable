@@ -132,6 +132,13 @@ test('classic paths that moved open their page here', async ({ page }) => {
   await expect(page).toHaveURL('/logs/explore/app');
   await page.goto('/settings');
   await expect(page).toHaveURL('/alerts/targets');
+  // A redirect keeps the query, hash and history state of the link.
+  await navigateInApp(page, '/logs/search/app?keep=1#row-3', { from: 'test' });
+  await expect(page).toHaveURL('/logs/explore/app?keep=1#row-3');
+  expect(await page.evaluate(() => window.history.state.usr)).toEqual({ from: 'test' });
+  await navigateInApp(page, `/metrics/explore/x/metric/cpu?keep=1#m`, { from: 'test' });
+  await expect(page).toHaveURL(/\/metrics\/explore\/x\?keep=1&query=cpu#m$/);
+  expect(await page.evaluate(() => window.history.state.usr)).toEqual({ from: 'test' });
   // The dev server rejects a malformed escape itself, so these open from inside the app.
   await page.goto('/');
   for (const [path, target] of [
