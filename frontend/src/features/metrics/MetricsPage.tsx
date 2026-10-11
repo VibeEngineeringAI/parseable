@@ -1,6 +1,13 @@
 import { createPromqlMetadata } from '../../lib/promqlMetadata';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Navigate, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  Navigate,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  useParams,
+  type NavigateOptions,
+} from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import { Button, EmptyState, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
@@ -8,6 +15,8 @@ import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
+import { LinkNotice } from '../../components/explorer/LinkNotice';
+import { classicMetricsSearch } from '../../lib/classicUi';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
 import { autoStep, formatStep, loadHistory } from '../../lib/promql';
 import type { DatasetInfo } from '../../lib/types';
@@ -33,11 +42,23 @@ import './metrics.css';
 
 const datasetPath = (name: string) => `/metrics/explore/${encodeURIComponent(name)}`;
 
+/**
+ * History state of a Metrics location: the classic link notice that belongs to
+ * the entry, and whether the page made the navigation itself.
+ */
+type PageState = {
+  classicDropped?: string[];
+  metricsOwnNavigation?: boolean;
+  /** Set on the location a classic link was rewritten to, which is not rewritten again. */
+  classicTranslated?: boolean;
+} | null;
+
 export function MetricsPage() {
   const { client } = useApp();
   const { dataset } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
+  const navigationType = useNavigationType();
   const about = useAsync(useCallback((signal) => client.about(signal), [client]));
   const enabled = about.data?.capabilities.promql === true;
   const discovery = useAsync(
@@ -58,18 +79,92 @@ export function MetricsPage() {
   const warning = discovery.data?.unchecked.length ? (
     <DiscoveryWarning unchecked={discovery.data.unchecked} retry={rescan} />
   ) : null;
+  // What the latest classic link could not carry over. It is kept here, not in the
+  // explorer, so every state of the page shows it. Each history entry records its
+  // notice. A navigation the page makes itself keeps the current one, so a dismissal
+  // holds; back and forward restore the entry's own; anything else brings its own.
+  const pageState = location.state as PageState;
+  const [notice, setNotice] = useState(() => {
+    // Dismissing removes the notice from the history entry, but not from the
+    // router's copy of its state, so a remount (such as after reconnecting)
+    // reads the entry when it is the current location.
+    const entry = window.history.state as { key?: string; usr?: PageState } | null;
+    const state = entry?.key === location.key ? entry.usr : pageState;
+    return { key: location.key, dropped: state?.classicDropped ?? [] };
+  });
+  if (notice.key !== location.key)
+    setNotice({
+      key: location.key,
+      dropped:
+        pageState?.metricsOwnNavigation && navigationType !== 'POP'
+          ? notice.dropped
+          : (pageState?.classicDropped ?? []),
+    });
+  const ownNavigation: NavigateOptions = {
+    replace: true,
+    state: { metricsOwnNavigation: true, classicDropped: notice.dropped },
+  };
+  const linkNotice = (
+    <LinkNotice
+      dropped={notice.dropped}
+      onDismiss={() => {
+        setNotice({ key: notice.key, dropped: [] });
+        // Remove it from this history entry too, so a reload or Back does not bring
+        // it back. This does not navigate, so an edit whose navigation is pending is kept.
+        const entry = window.history.state as { usr?: PageState } | null;
+        if (entry?.usr?.classicDropped) {
+          const { classicDropped: _, ...usr } = entry.usr;
+          window.history.replaceState({ ...entry, usr }, '');
+        }
+      }}
+    />
+  );
+  // A classic link's range and filters are rewritten before the explorer reads the
+  // address. The page's own navigations carry its own queries, which can look like
+  // a classic filter while being typed (a metric named WHERE), so they are skipped.
+  // The result of a rewrite is not rewritten again, so a classic `promql` that is
+  // not valid PromQL, such as `WHERE >`, stays as classic shows it.
+  const classicLink =
+    pageState?.metricsOwnNavigation || pageState?.classicTranslated
+      ? undefined
+      : classicMetricsSearch(location.search);
+  if (classicLink)
+    return (
+      <Navigate
+        replace
+        to={{ pathname: location.pathname, search: classicLink.search, hash: location.hash }}
+        state={{
+          ...(location.state as object | null),
+          metricsOwnNavigation: false,
+          classicTranslated: true,
+          classicDropped: classicLink.dropped,
+        }}
+      />
+    );
   if (enabled && datasets?.length && !dataset)
-    return <Navigate replace to={`${datasetPath(datasets[0].name)}${location.search}`} />;
+    return (
+      <Navigate
+        replace
+        to={`${datasetPath(datasets[0].name)}${location.search}${location.hash}`}
+        state={{ ...(location.state as object | null), ...ownNavigation.state }}
+      />
+    );
   if (enabled && datasets?.some((entry) => entry.name === dataset))
     return (
       <>
         {warning && <div className="page metrics-discovery">{warning}</div>}
-        <MetricsExplorer dataset={dataset!} datasets={datasets} />
+        <MetricsExplorer
+          dataset={dataset!}
+          datasets={datasets}
+          notice={linkNotice}
+          ownNavigation={ownNavigation}
+        />
       </>
     );
   return (
     <div className="page metrics-page">
       <PageHeader title="Metrics" />
+      {linkNotice}
       <QueryState
         loading={about.loading || (enabled && discovery.loading)}
         error={about.error || (enabled ? discovery.error : undefined)}
@@ -106,9 +201,7 @@ export function MetricsPage() {
             <div className="inline">
               <Button
                 onClick={() =>
-                  navigate(`${datasetPath(datasets[0].name)}${location.search}`, {
-                    replace: true,
-                  })
+                  navigate(`${datasetPath(datasets[0].name)}${location.search}`, ownNavigation)
                 }
               >
                 Open {datasets[0].name}
@@ -138,7 +231,19 @@ function DiscoveryWarning({ unchecked, retry }: { unchecked: string[]; retry: ()
   );
 }
 
-function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: DatasetInfo[] }) {
+function MetricsExplorer({
+  dataset,
+  datasets,
+  notice,
+  ownNavigation,
+}: {
+  dataset: string;
+  datasets: DatasetInfo[];
+  /** The page's notice about the latest classic link. */
+  notice: ReactNode;
+  /** Options for the explorer's own navigations, which keep that notice. */
+  ownNavigation: NavigateOptions;
+}) {
   const { client } = useApp();
   const location = useLocation();
   const navigate = useNavigate();
@@ -176,7 +281,7 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
     setRunError(undefined);
     writtenSearch.current = serializeExplorerState(next);
     pendingSearches.current.add(writtenSearch.current);
-    navigate({ pathname: location.pathname, search: writtenSearch.current }, { replace: true });
+    navigate({ pathname: location.pathname, search: writtenSearch.current }, ownNavigation);
   }
 
   function removeQuery(index: number) {
@@ -269,9 +374,10 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
               onChange={(event) => {
                 writtenSearch.current = serializeExplorerState(draft.current);
                 pendingSearches.current.add(writtenSearch.current);
-                navigate(`${datasetPath(event.target.value)}${writtenSearch.current}`, {
-                  replace: true,
-                });
+                navigate(
+                  `${datasetPath(event.target.value)}${writtenSearch.current}`,
+                  ownNavigation,
+                );
               }}
             >
               {datasets.map((entry) => (
@@ -299,6 +405,7 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
           </>
         }
       />
+      {notice}
       <div className={`metrics-layout ${showBrowser ? '' : 'metrics-browser-hidden'}`}>
         <QueryPanel
           state={state}

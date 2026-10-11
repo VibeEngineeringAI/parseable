@@ -24,6 +24,9 @@ export { chartResults, instantRows } from '../../lib/promqlResults';
 import { chartResults } from '../../lib/promqlResults';
 export const queryId = (index: number) => String.fromCharCode(65 + index);
 
+// The picker's presets, and the classic quick ranges a classic link brings.
+const urlPresets = ['10m', '15m', '30m', '1h', '5h', '6h', '24h', '3d', '7d'];
+
 export function parseExplorerSearch(search: string): ExplorerState {
   const params = new URLSearchParams(search);
   const queries = params.getAll('query').slice(0, maxQueries);
@@ -31,7 +34,7 @@ export function parseExplorerSearch(search: string): ExplorerState {
   const step = params.get('step') ?? '';
   let range: TimeRange = '1h';
   const preset = params.get('range');
-  if (preset && ['15m', '1h', '6h', '24h', '7d'].includes(preset)) range = preset as TimeRange;
+  if (preset && urlPresets.includes(preset)) range = preset as TimeRange;
   const start = params.get('start'),
     end = params.get('end');
   if (start && end && /^\d{4}-\d{2}-\d{2}T/.test(start) && /^\d{4}-\d{2}-\d{2}T/.test(end)) {

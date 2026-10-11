@@ -1,9 +1,10 @@
 import { createPortal } from 'react-dom';
 import { createId } from '../../lib/ids';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { PanelLeft, RefreshCw, Terminal, WrapText, Download } from 'lucide-react';
 import { Button, EmptyState, Select } from '../../components/ui';
+import { LinkNotice } from '../../components/explorer/LinkNotice';
 import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
 import { ColumnPicker } from '../../components/explorer/ColumnPicker';
@@ -16,6 +17,7 @@ import { useApp } from '../../app/AppProvider';
 import { ApiError } from '../../lib/client';
 import { useAsync } from '../../hooks/useAsync';
 import { buildLogQuery, timeBounds } from '../../lib/query';
+import { classicLogsParams, classicLogsState } from '../../lib/classicUi';
 import type { LogRecord, TimeRange } from '../../lib/types';
 export function LogsPage() {
   const { client } = useApp();
@@ -23,6 +25,9 @@ export function LogsPage() {
   const navigate = useNavigate();
   const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
   const dataset = currentDataset || datasets.data?.[0]?.name || '';
+  const location = useLocation();
+  const [params] = useSearchParams();
+  const [dropped, setDropped] = useState<string[]>([]);
   const [range, setRange] = useState<TimeRange>('1h');
   const [search, setSearch] = useState('');
   // Tagged with its dataset so a timer left over from the previous dataset is ignored.
@@ -54,6 +59,33 @@ export function LogsPage() {
     setRow(undefined);
     setRowFields({ fields: [] });
   }
+  // A classic Logs link carries its range and filters in the query string. Each
+  // one is applied once, including one that arrives while this page is open,
+  // and after the dataset reset above so a link to another dataset keeps them.
+  const link = classicLogsParams.some((name) => params.has(name)) ? location.key : undefined;
+  const [appliedLink, setAppliedLink] = useState<string>();
+  if (link && dataset && appliedLink !== link) {
+    const linked = classicLogsState(params);
+    setAppliedLink(link);
+    setRange(linked.range ?? '1h');
+    setFilters(linked.filters.map((filter) => ({ ...filter, id: createId() })));
+    // A search typed before the link would narrow its results without showing why.
+    setSearch('');
+    setDebounced({ dataset, search: '' });
+    setDropped(linked.dropped);
+  }
+  // Once applied, they come out of the address so they cannot disagree with the
+  // page. The replacement has none of them, so it is not read as another link.
+  useEffect(() => {
+    if (!link || appliedLink !== link) return;
+    const rest = new URLSearchParams(location.search);
+    for (const name of classicLogsParams) rest.delete(name);
+    const query = rest.toString();
+    navigate(
+      { pathname: location.pathname, search: query ? `?${query}` : '', hash: location.hash },
+      { replace: true, state: location.state },
+    );
+  }, [link, appliedLink, location, navigate]);
   const schema = useAsync(
     useCallback(
       (signal) => (dataset ? client.schema(dataset, signal) : Promise.resolve([])),
@@ -184,6 +216,7 @@ export function LogsPage() {
                 <Terminal size={15} />
               </Link>
             </div>
+            <LinkNotice dropped={dropped} onDismiss={() => setDropped([])} />
             <>
               {schema.error && (
                 <p role="status" className="notice">

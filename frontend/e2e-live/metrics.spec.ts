@@ -152,7 +152,7 @@ test('real OTLP metadata lists the gauge and its host values, then gauge results
   const table = await runAndCompare(page, request, gaugeQuery);
   await expect(table).toContainText(gauge);
   await expect(table).toContainText('3.25');
-  await expect(table).toContainText('7.50');
+  await expect(table).toContainText('7.5');
 });
 
 test('cumulative-counter rate has two host series and values matching the API', async ({

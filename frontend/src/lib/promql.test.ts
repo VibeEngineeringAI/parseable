@@ -167,12 +167,15 @@ describe('PromQL names, matchers and values', () => {
     expect(matcher('service.name', 'checkout', '!=')).toBe('"service.name"!="checkout"');
     expect(matcher('host', 'node-.*', '=~')).toBe('host=~"node-.*"');
     expect(matcher('host', 'node-.*', '!~')).toBe('host!~"node-.*"');
+    // A colon is allowed in a metric name but not in a label name.
+    expect(matcher('region:zone', 'api')).toBe('"region:zone"="api"');
     expect(metricSelector('a"b\\c\n')).toBe('{"a\\"b\\\\c\\n"}');
   });
   it('the installed Lezer grammar parses dotted metric selectors and quoted label matchers', () => {
     for (const query of [
       metricSelector('system.cpu.load_average.1m'),
       `{${matcher('service.name', 'checkout')}}`,
+      `up{${matcher('region:zone', 'api', '!~')}}`,
       `{${matcher('service.name', 'a\\b"c\n')}}`,
     ]) {
       const errors: number[] = [];
