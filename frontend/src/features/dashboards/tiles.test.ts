@@ -1,0 +1,232 @@
+import { describe, expect, it } from 'vitest';
+import classic from './__fixtures__/classic.json';
+import ingestDemoTile from './__fixtures__/ingest-demo-tile.json';
+import {
+  appendLayout,
+  moveTile,
+  promqlQueries,
+  resolvedLayouts,
+  sqlChart,
+  sqlQuery,
+  tileStep,
+  tileVariableNames,
+} from './tiles';
+import type { DashboardTile, DashboardVariable } from '../../lib/types';
+const variables: DashboardVariable[] = ['dataset', 'level', 'host', 'zone'].map((name) => ({
+  name,
+  label: name,
+  type: 'text',
+}));
+const make = (id: string, layout: unknown): DashboardTile => ({
+  tile_id: id,
+  layout,
+  unknown: 'keep',
+});
+describe('classic tile helpers', () => {
+  it('tracks only variables used in the tile query and dataset', () => {
+    expect([
+      ...tileVariableNames(
+        {
+          tile_id: 'x',
+          tileType: 'code',
+          chartQuery: 'SELECT * FROM "$dataset" WHERE level=\'${level}\'',
+          dbName: ['$dataset'],
+        },
+        variables,
+      ),
+    ]).toEqual(['dataset', 'level']);
+    expect([
+      ...tileVariableNames(
+        {
+          tile_id: 'x',
+          tileType: 'promql',
+          chartQuery: ['up{host="$host"}', 'rate(up{zone="${zone}"}[5m])'],
+          dbName: '$dataset',
+        },
+        variables,
+      ),
+    ]).toEqual(['host', 'zone', 'dataset']);
+    expect([...tileVariableNames(classic.tiles[1], variables)]).toEqual([]);
+  });
+  it('counts only defined names, leaving replacement groups, SQL literals and built-in tokens alone', () => {
+    const promql = {
+      tile_id: 'promql',
+      tileType: 'promql',
+      chartQuery: ['label_replace(up{host="$host"}, "copy", "$1", "host", "(.*)$") + $__interval'],
+      dbName: '$dataset',
+    };
+    const sql = {
+      tile_id: 'sql',
+      tileType: 'code',
+      chartQuery:
+        "SELECT '$ $1 $unknown ${missing} $__interval' FROM $dataset WHERE level='$level'",
+    };
+    expect([...tileVariableNames(promql, variables)]).toEqual(['host', 'dataset']);
+    expect([...tileVariableNames(sql, variables)]).toEqual(['dataset', 'level']);
+    expect([...tileVariableNames(promql, [])]).toEqual([]);
+    expect([...tileVariableNames(sql, [])]).toEqual([]);
+    expect([...tileVariableNames(promql, [{ name: '1', label: 'One', type: 'text' }])]).toEqual([
+      '1',
+    ]);
+  });
+  it('orders by y,x and appends null, missing and non-finite y without mutating originals', () => {
+    const tiles = [
+      make('a', { x: 6, y: 0, w: 6, h: 3 }),
+      make('b', { x: 0, y: 0, w: 6, h: 4 }),
+      make('c', { x: 0, y: null, w: 4, h: 2 }),
+      make('d', {}),
+      make('e', { y: Infinity }),
+    ];
+    const before = structuredClone(tiles),
+      resolved = resolvedLayouts(tiles);
+    expect(resolved.map((row) => row.tile.tile_id)).toEqual(['b', 'a', 'c', 'd', 'e']);
+    expect(resolved.map((row) => row.layout.y)).toEqual([0, 0, 4, 6, 10]);
+    expect(appendLayout(tiles)).toEqual({ x: 0, y: 14, w: 6, h: 4 });
+    expect(tiles).toEqual(before);
+  });
+  it('moves earlier and later with finite integer layouts and keeps layout extras', () => {
+    const tiles = [
+      make('a', { x: 0, y: 0, w: 6, h: 3, static: true }),
+      make('b', { x: 6, y: 0, w: 6, h: 3 }),
+    ];
+    const moved = moveTile(tiles, 'b', -1);
+    expect(resolvedLayouts(moved).map((row) => row.tile.tile_id)).toEqual(['b', 'a']);
+    expect(moved[0].layout).toMatchObject({ static: true });
+    expect(moved[0].unknown).toBe('keep');
+    expect(moveTile(tiles, 'a', -1)).toBe(tiles);
+    expect(resolvedLayouts(moveTile(moved, 'b', 1)).map((row) => row.tile.tile_id)).toEqual([
+      'a',
+      'b',
+    ]);
+  });
+  it('reads legacy PromQL query, object chartQuery and steps', () => {
+    expect(
+      promqlQueries({ tile_id: 'x', promqlQuery: { query: 'up', type: 'instant', step: '30s' } }),
+    ).toEqual([{ query: 'up', type: 'instant' }]);
+    expect(promqlQueries({ tile_id: 'x', chartQuery: { query: 'up' } })).toEqual([
+      { query: 'up', type: 'range' },
+    ]);
+    expect(promqlQueries(classic.tiles[0])[0].type).toBe('range');
+    expect(tileStep({ tile_id: 'x', promqlQuery: { step: '30s' } }, 0, 3600, 'up')).toBe('30s');
+    expect(tileStep({ tile_id: 'x' }, 0, 3600, 'up')).toBe('15s');
+    expect(tileStep({ tile_id: 'x' }, NaN, NaN, 'up')).toBe('60s');
+  });
+  it('reads builder SQL and derives a legacy histogram without altering the object', () => {
+    expect(sqlQuery(classic.tiles[1])).toBe(classic.tiles[1].chartQuery);
+    const tile = {
+      tile_id: 'x',
+      dbName: ['logs'],
+      chartQuery: {
+        x: { fields: [{ name: 'p_timestamp', type: 'time' }], granularity: 'minute' },
+        y: { fields: [{ name: '*', aggregate: 'COUNT' }] },
+      },
+    };
+    const original = structuredClone(tile);
+    expect(sqlQuery({ ...tile, chartType: 'timeseries' })).toBe(
+      'SELECT DATE_TRUNC(\'minute\', \"p_timestamp\") AS \"time_bucket\", COUNT(*) AS \"COUNT_STAR\" FROM \"logs\" GROUP BY \"time_bucket\" ORDER BY \"time_bucket\" DESC',
+    );
+    expect(tile).toEqual(original);
+  });
+  it('groups legacy builder rows only by the declared groupBy fields', () => {
+    const t0 = '2026-10-10T10:00:00.000',
+      t1 = '2026-10-10T10:01:00.000';
+    const row = (time_bucket: string, severity_text: string, count: number) => ({
+      time_bucket,
+      COUNT_severity_number: count,
+      severity_text,
+      note: `${severity_text} at ${time_bucket}`,
+    });
+    const chart = sqlChart(
+      [row(t1, 'ERROR', 9), row(t1, 'INFO', 300), row(t0, 'INFO', 280), row(t0, 'WARN', 7)],
+      ingestDemoTile,
+    );
+    expect(chart.categorical).toBe(false);
+    expect(chart.timestamps).toEqual(
+      [Date.UTC(2026, 9, 10, 10), Date.UTC(2026, 9, 10, 10, 1)].map((ms) => ms / 1000),
+    );
+    expect(chart.series.map(({ label, values }) => ({ label, values }))).toEqual([
+      { label: 'ERROR', values: [null, 9] },
+      { label: 'INFO', values: [280, 300] },
+      { label: 'WARN', values: [7, null] },
+    ]);
+    expect(new Set(chart.series.map(({ id }) => id)).size).toBe(3);
+  });
+  it('keeps raw rows with distinct x values as one series per y field', () => {
+    const rows = Array.from({ length: 30 }, (_, index) => ({
+      p_timestamp: new Date(Date.UTC(2026, 9, 10, 10, index)).toISOString(),
+      level: index % 2 ? 'info' : 'error',
+      message: `request ${index}`,
+      trace_id: `trace-${index}`,
+      duration_ms: index,
+    }));
+    const chart = sqlChart(rows, {
+      tile_id: 'x',
+      chartQuery: 'SELECT * FROM "application_logs"',
+      config: { axes: { x: { field: 'p_timestamp' }, y: { field: 'duration_ms' } } },
+    });
+    expect(chart.timestamps).toHaveLength(30);
+    expect(chart.series).toEqual([
+      { id: 'duration_ms', label: 'duration_ms', values: rows.map((row) => row.duration_ms) },
+    ]);
+  });
+  it('splits repeated x values by low-cardinality columns only', () => {
+    const t0 = '2026-10-10T10:00:00.000',
+      t1 = '2026-10-10T10:01:00.000';
+    const rows = [
+      { time: t0, level: 'error', request_id: 'r1', hits: 1, errors: 0 },
+      { time: t0, level: null, request_id: 'r2', hits: 2, errors: 1 },
+      { time: t1, level: 'error', request_id: 'r3', hits: 3, errors: 2 },
+    ];
+    const chart = sqlChart(rows, { tile_id: 'x' });
+    expect(chart.series.map(({ label, values }) => ({ label, values }))).toEqual([
+      { label: 'hits: error', values: [1, 3] },
+      { label: 'errors: error', values: [0, 2] },
+      { label: 'hits: (empty)', values: [2, null] },
+      { label: 'errors: (empty)', values: [1, null] },
+    ]);
+    const many = Array.from({ length: 42 }, (_, index) => ({
+      time: index % 2 ? t1 : t0,
+      host: `host-${index % 21}`,
+      hits: index,
+    }));
+    expect(sqlChart(many, { tile_id: 'x' }).series.map(({ id }) => id)).toEqual(['hits']);
+  });
+  it('marks SQL rows with non-time x values as categorical instead of plotting fake times', () => {
+    const empty = { categorical: true, timestamps: [], series: [] };
+    expect(
+      sqlChart(
+        [
+          { method: 'GET', count: 10 },
+          { method: 'POST', count: 4 },
+        ],
+        { tile_id: 'x', config: { axes: { x: { field: 'method' } } } },
+      ),
+    ).toEqual(empty);
+    expect(
+      sqlChart(
+        [
+          { status: 200, count: 10 },
+          { status: 404, count: 4 },
+        ],
+        { tile_id: 'x', config: { axes: { x: { field: 'status' } } } },
+      ),
+    ).toEqual(empty);
+    expect(
+      sqlChart([{ status: '404', count: 1 }], {
+        tile_id: 'x',
+        config: { axes: { x: { field: 'status' } } },
+      }),
+    ).toEqual(empty);
+    expect(sqlChart([{ errors: 3 }], { tile_id: 'x' })).toEqual(empty);
+    expect(
+      sqlChart(
+        [
+          { ts: 1_791_000_000, n: 1 },
+          { ts: 1_791_000_060_000, n: 2 },
+        ],
+        { tile_id: 'x' },
+      ),
+    ).toMatchObject({ categorical: false, timestamps: [1_791_000_000, 1_791_000_060] });
+    expect(sqlChart([], { tile_id: 'x' })).toMatchObject({ categorical: false, timestamps: [] });
+  });
+});

@@ -1,0 +1,143 @@
+{
+  "version": "v1",
+  "title": "Dashboards live mv2l3ix7_4c1b439a",
+  "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+  "dashboardId": "01M4K8WXWV60JHPAC7FNZEYJYE",
+  "created": "2026-10-10T16:03:53.371681040Z",
+  "modified": "2026-10-10T16:03:55.076120105Z",
+  "tags": ["parity", "live"],
+  "isFavorite": false,
+  "dashboardType": "Dashboard",
+  "tiles": [
+    {
+      "tile_id": "01M4K8WYW40H6JN8KV9G6PB6NR",
+      "title": "Live log events",
+      "authorMode": "manual",
+      "tileType": "code",
+      "chartType": "table",
+      "chartQuery": "SELECT * FROM \"dash_logs_mv2l3ix7_4c1b439a\" ORDER BY \"p_timestamp\" DESC LIMIT 12",
+      "dbName": ["dash_logs_mv2l3ix7_4c1b439a"],
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 4
+      },
+      "config": {
+        "type": "table",
+        "colourScheme": "classic",
+        "layout": {
+          "legendPosition": "bottom",
+          "segments": {
+            "value": [10, 90],
+            "isPercent": true
+          },
+          "label": false
+        },
+        "axes": {
+          "x": {
+            "field": "",
+            "title": "",
+            "display": true
+          },
+          "y": {
+            "field": "",
+            "title": "",
+            "display": true,
+            "beginAtZero": false
+          }
+        },
+        "advanced": {
+          "dataLabels": {
+            "enabled": false
+          },
+          "tooltip": {
+            "enabled": true,
+            "mode": "index",
+            "intersect": false
+          }
+        }
+      }
+    },
+    {
+      "tile_id": "01M4K8WZ42QWC5QXVWW3JBPP57",
+      "title": "Live host load",
+      "authorMode": "manual",
+      "tileType": "promql",
+      "chartType": "timeseries",
+      "chartQuery": ["{__name__=\"frontend.dashboards.load_mv2l3ix7_4c1b439a\",host=~\"$host\"}"],
+      "dbName": "$metrics_dataset",
+      "layout": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 4
+      },
+      "config": {
+        "type": "timeseries",
+        "colourScheme": "classic",
+        "layout": {
+          "legendPosition": "bottom",
+          "segments": {
+            "value": [10, 90],
+            "isPercent": true
+          },
+          "label": false
+        },
+        "axes": {
+          "x": {
+            "field": "",
+            "title": "",
+            "display": true
+          },
+          "y": {
+            "field": "",
+            "title": "",
+            "display": true,
+            "beginAtZero": false
+          }
+        },
+        "advanced": {
+          "dataLabels": {
+            "enabled": false
+          },
+          "tooltip": {
+            "enabled": true,
+            "mode": "index",
+            "intersect": false
+          }
+        }
+      },
+      "promqlQueryType": ["range"]
+    }
+  ],
+  "tenantId": null,
+  "description": "SQL and PromQL classic interchangeability",
+  "variables": [
+    {
+      "name": "metrics_dataset",
+      "label": "Metrics dataset",
+      "type": "dataset",
+      "defaultValue": "dash_metrics_mv2l3ix7_4c1b439a"
+    },
+    {
+      "name": "host",
+      "label": "Host",
+      "type": "promql",
+      "dataset": "$metrics_dataset",
+      "labelName": "host",
+      "metric": "frontend.dashboards.load_mv2l3ix7_4c1b439a",
+      "includeAll": true,
+      "defaultValue": "node-a"
+    }
+  ],
+  "sections": [],
+  "timeRange": {
+    "startTime": "1h",
+    "endTime": "now",
+    "type": "fixed",
+    "label": "Last 1 hour",
+    "interval": 3600000,
+    "shiftInterval": 1
+  }
+}

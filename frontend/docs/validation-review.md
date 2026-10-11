@@ -2,6 +2,295 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Dashboards validation (2026-10-10)
+
+The required full `npm run check` passed: **946 unit tests in 41 files, 224 app browser tests and 46 Storybook browser tests**, without retries. The app total includes **51 dashboard browser cases**. Formatting, TypeScript, the production build and the Storybook build also passed.
+
+Dashboard coverage now includes the real full-document save payload; sections with identical coordinates; the untyped builder fixture copied from `resources/ingest_demo_data.sh`; faithful legacy-object conversion and explicit blocked cases; ID repair; Include All defaults; removal of recognized old-type fields; UTC SQL timestamps tested in Europe/Berlin; mixed-height vertical compaction; dependency validation; capability loading/retry; file size and permissions; inline errors; focus and live-region behavior; and clipping checks at 390px and 1440px. The six axe scans wait for the lazy editor to be visible. New stories cover focusable disabled reasons, dashboard time presets/disabled state, and chart sizing. [Finding-by-finding report](#dashboards-review-dispositions) records the disposition of all four reviews and changed files.
+
+### Second fix round
+
+All four requested items were reverified before changes and fixed; none was rejected. The supplied verifier reproduced dollar-token blocking, incorrect movement across layout gaps and the visual defects. Regression tests reproduced the repaired-ID dirty state for owners and non-owners. Classic's `te`/`ae`/`oe` interpolators leave unknown tokens unchanged, and its variable schema allows them inside definitions.
+
+| Item               | Status | Evidence / resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Dollar tokens   | fixed  | Only defined dashboard variable names gate tile and variable queries. Unknown `$1`, `$__interval`, SQL/regex dollars and inherited-property names remain literal. Dependency cycles are checked only in consumed definition fields. Unit tests exercise interpolation, dependencies and the real query loader; browser tests render SQL and `label_replace(..., "$1", ...)` tiles and load/edit SQL and PromQL variable definitions with unknown tokens, asserting exact request and save payloads. |
+| 2. ID repair       | fixed  | Repaired IDs form a clean working baseline, separate from user edits. Owner coverage verifies the next-save notice, repair-only Save, no leave prompt and Discard restoring the same IDs. Reader and admin non-owner cases verify no notice/prompt and enabled Duplicate producing fresh IDs.                                                                                                                                                                                                       |
+| 3. Move order      | fixed  | Movement and first/last actions use the compacted displayed reading order. Unit and browser gap fixtures display A/B/C despite stored A/C/B; moving B earlier gives B/A/C, and later restores A/B/C. Sizes and unrelated sections remain intact.                                                                                                                                                                                                                                                    |
+| 4. Layout and copy | fixed  | The x-axis title precedes the scrollable legend, dashboard charts omit the count row, and measured height reserves legend/title space. Browser checks cover wheel/keyboard access to entries beyond 64px, axis/legend bounds and aligned variable controls with errors. AI/Pie placeholders start with capitals.                                                                                                                                                                                    |
+
+Added **10 unit tests and 5 dashboard browser cases**. The required repeated run, `npx playwright test e2e/dashboards.spec.ts --repeat-each=5 --workers=4`, passed **255/255 in 3.0m**, without retries. The dashboard unit subset passed **66 tests in 11 files** and the focused browser run passed **10/10**. The full-check totals above and the **4/4 live run against :8030** below are the final results. A transient live ingestion conversion initially reset the host options; the live retry now reselects `node-a` through the UI and requires exactly one nonempty `node-a` matrix series after network idle.
+
+The [equivalent verification script](../scripts/verify-dashboards.mjs) completed successfully and saved 18 surface screenshots, two probes and [geometry/probe results](parity-screenshots/dashboard-round-two/report.json). Fresh [1440 light](parity-screenshots/dashboard-round-two/1440-light-02-sql-view.png), [1440 dark](parity-screenshots/dashboard-round-two/1440-dark-02-sql-view.png) and [390](parity-screenshots/dashboard-round-two/390-light-02-sql-view.png) captures were inspected directly, along with PromQL, imported-classic and mobile-editor views. The SQL plot is 85px tall at desktop and 109px at 390; its title ends above the legend. Desktop variable control tops are all 263px even with inline errors, and tile content has no measured overflow. The dollar-token demo probes reach the adapter and show its unsupported-query errors; successful query execution is verified by the mocked browser cases rather than claimed for the demo adapter.
+
+This round changes **51 paths**, all inside `frontend/`, left uncommitted. Files below are relative to that directory:
+
+- Variable/query handling and tests: `src/features/dashboards/variables.ts`, `variables.test.ts`, `tiles.ts`, `tiles.test.ts`, `queries.ts`, new `queries.test.ts`, `DashboardSections.tsx`, `DashboardTile.tsx`, `VariableControl.tsx`.
+- Draft repair and movement: `src/features/dashboards/useDashboardDraft.ts`, `DashboardView.tsx`, `layout.ts`, `layout.test.ts`.
+- Chart/layout styling: `src/features/dashboards/TileChart.tsx`, `useChartHeight.ts`, `dashboards.css`, `src/components/charts/TimeSeriesChart.tsx`, `src/components/charts/charts.css`.
+- Browser verification: `e2e/dashboards.spec.ts`, `e2e-live/dashboards.spec.ts`, new `scripts/verify-dashboards.mjs`.
+- Documentation: `README.md`, `docs/api-contracts.md`, `docs/component-map.md`, `docs/prism-parity.md`, `docs/validation-review.md`, `docs/wiki-drafts/prism-frontend-parity.md`.
+- Evidence: 21 new files in `docs/parity-screenshots/dashboard-round-two/`, plus refreshed `docs/parity-screenshots/server-dashboard-classic.png`, `server-dashboard-created.json` and `server-dashboard-response.txt`.
+
+### Request counts and live validation
+
+The request-count browser case observes three tiles (filtered SQL, independent SQL and host-dependent PromQL). These are cumulative counts after each action and after network idle:
+
+| Action                | Filtered SQL | Independent SQL | PromQL |
+| --------------------- | ------------ | --------------- | ------ |
+| Initial load          | 1            | 1               | 1      |
+| Time range            | 2            | 2               | 2      |
+| Host variable         | 2            | 2               | 3      |
+| Level variable        | 3            | 2               | 3      |
+| Refresh               | 4            | 3               | 4      |
+| Move                  | 4            | 3               | 4      |
+| Variable label edit   | 4            | 3               | 4      |
+| Other tile title edit | 4            | 3               | 4      |
+| Save                  | 4            | 3               | 4      |
+
+The case asserts no alert flash on initial load and no native leave prompt during dirty search-only navigation, and attaches `tile-request-counts.json`; the [actual request-count attachment](parity-screenshots/dashboard-request-counts.json) is saved here. It counts tile requests separately from variable metadata queries. Text typing tests check caret position, all characters, debounce, Enter and blur.
+
+The dashboard live suite passed **4/4 in 16.0s**, without retries. It ingested twelve logs and two OTLP gauge series, created SQL/table and PromQL/timeseries tiles and dataset/label-values variables through the UI, and compared each stored tile exactly, including config and layout. Classic hard-load showed log rows, the selected `node-a`, and nonempty PromQL matrix data, with no captured page errors. The reverse check uses a literal JSON fixture copied from research report 2.6, adapted only for this run's datasets and test extras; it verifies data and exact preservation after a title edit. The fourth case confirms all created IDs appear with `limit=0`, and admin DELETE succeeds while PUT of another owner's document returns the exact owner-permission 400 text. Cleanup removed all created dashboards, both datasets, the reader user and its role.
+
+[Classic capture](parity-screenshots/server-dashboard-classic.png), [formatted stored JSON](parity-screenshots/server-dashboard-created.json), and the [verbatim server response](parity-screenshots/server-dashboard-response.txt) record the new live run. The author hash is SHA-256 of the disposable username `admin`; the capture contains test data. The formatted JSON is not described as verbatim bytes.
+
+Vite used `http://127.0.0.1:8271`, proxying only to disposable `http://127.0.0.1:8030`. Both origins must use the same host to share login cookies across ports; the live spec fails clearly before ingest if their hostnames differ. Completed checks and fresh captures used Chromium `/usr/bin/chromium` and `TMPDIR=/home/ajs/.cache/dash-tmp`. Browser invocations used `flock /home/ajs/.cache/parseable-playwright.lock` and checked ports 5173/6006 inside the lock. No request was sent to ports 8000, 8011 or 8012. Vite was stopped afterwards and port 8271 is free.
+
+Import and Duplicate strip `tenantId` and preserve `dashboardType`, so Report copies can be created; the Create form creates Dashboard documents. Sections render in stored order with independent grids; section creation, renaming, reordering and collapsing remain out of scope. AI/Enterprise/templates, visual builder authoring, drag/resize, present/PNG and auto-refresh remain excluded. Bar/area still use the shared line renderer. Complex legacy filters are conservatively blocked from SQL conversion. No deployment, embedded `/next` rebuild, cross-browser run or pixel-parity claim is included.
+
+The requested follow-ups are **per-item local-import progress and per-account offering**, and **relative-range re-anchoring without Refresh**. The import marker remains batch-level, with an explanatory code comment. Relative ranges hold their anchor until a range change or Refresh, matching classic. No commits, pushes or git-state changes were made.
+
+### Dashboards review dispositions
+
+Findings were rechecked against the original source, Rust handlers and classic chunks before changes. No reported behavioral defect was rejected. The two requested deferrals are explicit below; quality #24 records a positive informational observation rather than a requested change.
+
+**Contract review**
+
+| Finding | Status   | Evidence / resolution                                                                                                                                                   |
+| ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1      | fixed    | Each section has its own grid in classic order; orphan/unsectioned tiles are first. Pure and browser tests use identical x/y in two sections; definitions remain exact. |
+| #2      | fixed    | Missing tileType is builder. Literal ingest_demo_data.sh fixture renders and converts in unit/browser tests.                                                            |
+| #3      | fixed    | Include All is first and selected without a stored default; unit coverage and demo assertions verify it.                                                                |
+| #4      | fixed    | Moves swap neighbour coordinates and compact only that section. Mixed-height tests retain unrelated columns and stored w/h.                                             |
+| #5      | fixed    | Legacy-object conversion matches classic time_bucket, uppercase aliases, grouping, order and limits. Unsupported filters are blocked; SQL Apply always writes a string. |
+| #6      | deferred | As requested: per-item import persistence and per-account offering. LocalImportNotice explains its batch-level marker and interrupted-batch behavior.                   |
+| #7      | fixed    | Classic builder (and AI) alert URLs open SQL mode; exact unit and browser handoff checks.                                                                               |
+| #8      | fixed    | Language/type changes remove only recognized fields of the old type; unknown fields survive exact unit comparisons.                                                     |
+
+**Functional review**
+
+| Finding | Status   | Evidence / resolution                                                                                                                                                                                                                                                |
+| ------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1      | fixed    | SQL chart timestamps use parseEventTimestamp. Europe/Berlin unit case checks offset-less UTC and explicit offsets.                                                                                                                                                   |
+| #2      | fixed    | Query inputs use committed URL values; readiness requires validated selection already in that URL. Request counters and a MutationObserver prove one round and no initial alert flash.                                                                               |
+| #3      | fixed    | Text has a local draft, 400ms debounce and Enter/blur commits; browser assertions check characters and caret.                                                                                                                                                        |
+| #4      | fixed    | Loaders key only consumed query/option fields, referenced values, effective bounds and refresh; variable labels, defaults and stale fields of other types are excluded. Static options do not reload for time bounds; valid options/data remain during revalidation. |
+| #5      | fixed    | Pure vertical compaction pushes resize collisions and closes deletion gaps. Mixed-height unit tests and browser geometry show no overlaps.                                                                                                                           |
+| #6      | fixed    | Moves swap neighbours before vertical compaction, rather than repacking rows. Unrelated columns retain their positions.                                                                                                                                              |
+| #7      | fixed    | Load repairs repeated and nil IDs in a clean working baseline; only owners see the next-save notice. Discard retains those IDs, and non-owners can leave/duplicate. Editing/deleting affect only the chosen tile.                                                    |
+| #8      | fixed    | Conflict Cancel preserves the dirty draft after a failed Overwrite; list recovery also retains its dirty flag. Browser cases return to editing and reject an attempted navigation.                                                                                   |
+| #9      | fixed    | Dependent options wait for upstream readiness and validated URL value. DFS rejects cycles among defined variables in consumed option fields; unknown dollar tokens pass through like classic. Unit and delayed-source browser tests.                                 |
+| #10     | fixed    | Unknown capabilities show loading, failures offer Retry, and ownership loading suppresses the read-only note; MutationObserver checks owner flash.                                                                                                                   |
+| #11     | fixed    | Import rejects files over 5 MB before file.text(); browser case verifies no POST and empty paste field.                                                                                                                                                              |
+| #12     | fixed    | Stat follows the user decision: configured field, otherwise first numeric column of last row, numeric strings accepted; PromQL reads Value rather than Samples. Hint and tests document it.                                                                          |
+| #13     | deferred | As requested: relative ranges retain their anchor until range change or Refresh, matching classic. Documented here and in API/parity docs.                                                                                                                           |
+| #14     | fixed    | List Duplicate respects create permission. Favourite negates the freshly fetched row; stale-row and ingestor browser tests.                                                                                                                                          |
+| #15     | fixed    | Demo GET/PUT/DELETE missing-ID messages and existence/tile-validation/owner order match Rust exactly; unit tests assert the text/order.                                                                                                                              |
+| #16     | fixed    | Height keeps a clearable local string and validates before Apply; browser backspace/type-8 test persists h:8.                                                                                                                                                        |
+
+**Accessibility and UX review**
+
+| Finding | Status | Evidence / resolution                                                                                                                                                                                                                                 |
+| ------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1      | fixed  | Scoped dashboard title-cell override; actual link/cell bounding boxes at 390/1440 catch ancestor clipping. Global rules are unchanged for Logs, Team and Alerts.                                                                                      |
+| #2      | fixed  | Server tiles use their own class, restoring 16px padding. Axis space scales to formatted label length; desktop geometry verifies it exceeds 64px.                                                                                                     |
+| #3      | fixed  | Measured chart body height reserves axis titles and a scrollable legend; the x title precedes the legend and compact tiles omit the visible count row. Browser checks compare scrollHeight/clientHeight and x-title bounds; only table bodies scroll. |
+| #4      | fixed  | Shared useRowDeletionFocus restores neighbour/Add focus. Save, Discard and Reload focus the heading; explicit browser assertions cover each.                                                                                                          |
+| #5      | fixed  | Reasons are visible, focusable aria-disabled items with aria-describedby. Create alert, unsaved Duplicate, capability-disabled Edit and favourite are guarded against activation.                                                                     |
+| #6      | fixed  | Saved status clears on dirty state. Move/Duplicate/Delete/Refresh and Apply announce through one polite region; repeats reset the message and initial load stays empty.                                                                               |
+| #7      | fixed  | Compact inline variable error names its label, describes its select and offers a named Retry; browser checks height and accessible description.                                                                                                       |
+| #8      | fixed  | Tiles distinguish failed variables from unselected values; query failures remain inline with Retry/View query and no Explore demo data.                                                                                                               |
+| #9      | fixed  | Placeholders name their chart/tile type and preservation. Classic link uses server-root dashboard path only under a non-root base in live mode, with new-tab cue.                                                                                     |
+| #10     | fixed  | Add variable/Add tile share one spaced action row and button size; variable controls remain aligned even when inline errors appear.                                                                                                                   |
+| #11     | fixed  | Header buttons share sizing, filters group together, and column-header sort buttons were removed in favor of select/direction controls.                                                                                                               |
+| #12     | fixed  | Visible and accessible sort labels are both Sort ascending/descending; date-order browser tests use those labels.                                                                                                                                     |
+| #13     | fixed  | Clearable height local string; validation and type-8 browser regression.                                                                                                                                                                              |
+| #14     | fixed  | SQL and PromQL editors have visible labels in tile and variable dialogs.                                                                                                                                                                              |
+| #15     | fixed  | Editor/import fields autofocus; deletion/conversion/conflict dialogs focus Cancel. Browser/story tests verify initial focus.                                                                                                                          |
+| #16     | fixed  | Detail rename uses Apply and explicitly says Save keeps the changes.                                                                                                                                                                                  |
+| #17     | fixed  | Non-scrolling tile cards no longer add tabindex=0; scrolling tables retain their result-region focus stop.                                                                                                                                            |
+| #18     | fixed  | Read-only viewers get a duplication suggestion when allowed and appropriate empty states. No variables means no empty variables landmark.                                                                                                             |
+| #19     | fixed  | Singular/plural copy is correct; permanent dismissal says Don’t ask again; failed local imports share one alert.                                                                                                                                      |
+| #20     | fixed  | Stat uses role=group with its contextual accessible label.                                                                                                                                                                                            |
+| #21     | fixed  | Left/right legends occupy actual side columns; browser resize/config test compares legend and plot geometry.                                                                                                                                          |
+| #22     | fixed  | Tile loading uses aria-busy/plain text; chart series announcements are off for dashboard tiles. Refresh uses the one page status region.                                                                                                              |
+
+**Tests and quality review**
+
+| Finding | Status   | Evidence / resolution                                                                                                                                                                                                                                |
+| ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1      | fixed    | Production uses extracted loadDraft/applyTile/dashboardPayload; round-trip test reaches real GET-conflict/PUT client path. Test-only patchTile removed; missing timeRange case retained.                                                             |
+| #2      | fixed    | Charts assert series counts; tables/stat assert data. Live reverse also inspects successful nonempty matrix results.                                                                                                                                 |
+| #3      | fixed    | Live reverse fixture is literal JSON copied from report 2.6 and does not import chartConfig.                                                                                                                                                         |
+| #4      | fixed    | Each editor axe scan waits for the lazy dialog before analysis.                                                                                                                                                                                      |
+| #5      | fixed    | Demo stat asserts numeric text; edit/delete waits for saved state and deletion is checked after leaving/reopening.                                                                                                                                   |
+| #6      | fixed    | Adapter isolation is asserted before deletion, and saved title is exact.                                                                                                                                                                             |
+| #7      | fixed    | Live spec checks matching hostname before ingest; README and this runbook explain host-scoped cross-port cookies.                                                                                                                                    |
+| #8      | fixed    | Untyped legacy-object builder is converted/saved exactly with string SQL; unit negative cases block unsupported semantics. Old PromQL fields are removed.                                                                                            |
+| #9      | fixed    | Import/Duplicate strip tenantId and retain dashboardType; docs explicitly include creation of Report copies.                                                                                                                                         |
+| #10     | fixed    | Dashboard counts now match the completed required check: 946 unit, 224 app browser, 46 Storybook browser, including 51 dashboard cases. Earlier dated validation results remain historical records. Metadata has named unit coverage.                |
+| #11     | fixed    | Vacuous guard assertion dropped; readVariables test proves unknown types skip the UI while full document keeps them. Guard comment corrected.                                                                                                        |
+| #12     | fixed    | Live stored tiles use toEqual with full literal config/layout and only generated IDs matched flexibly.                                                                                                                                               |
+| #13     | fixed    | Negative network cases wait for populated options and network idle before checking absent requests.                                                                                                                                                  |
+| #14     | fixed    | Reader/admin/ingestor cases inspect all owner controls, non-owner favourites and create permission; list conflict Cancel retains its dirty navigation guard, and stale favourite is covered.                                                         |
+| #15     | fixed    | 390px checks action and Apply boxes before focus, plus title-cell clipping and chart content.                                                                                                                                                        |
+| #16     | fixed    | Exact handoff params, SQL strings and sort order; unsupported conversion, SQL All and placeholder-prefix cases added. Created/updated sorts use distinct dates.                                                                                      |
+| #17     | fixed    | Metadata request/bounds helpers and source type moved to lib and reused by Metrics/Alerts/Dashboards; six unit cases; dead imports removed.                                                                                                          |
+| #18     | fixed    | DashboardView and TileEditor are below about 300 lines, with cohesive URL/draft/dialog/layout/query/appearance modules and pure transitions. Per-domain client splitting remains an eventual suggestion outside this dashboard task.                 |
+| #19     | fixed    | Result helpers moved to lib/promqlResults, guards to lib/guards; exported storage key; merged imports and removed owner alias. hasConflict is private and tested through production caller. Shared SqlEditor remains reused, consistent with Alerts. |
+| #20     | fixed    | New ActionsMenu and TimeRangePicker stories/tests exercise reason, presets and disabled props; existing story tests/count assertions are unchanged. A chart sizing story covers new chart props too.                                                 |
+| #21     | fixed    | Request-count case explicitly observes zero native prompts during dirty URL/search-only changes. Existing shared hook/runtime/worker settings were not edited; no commit splitting because user forbids git changes.                                 |
+| #22     | fixed    | Independent reverse/ownership checks no longer skip after primary failure; list verifies all created IDs; classic checks page errors, selected host and successful matrix data.                                                                      |
+| #23     | fixed    | Updated artifact is called formatted JSON; verbatim bytes have their own .txt artifact. Disposable admin SHA-256 is documented, with no secret credential in the artifact.                                                                           |
+| #24     | rejected | Informational clean-areas finding, not a defect/change request. Verified shared hooks, independent mocks and no any/eslint-disable/ts-expect-error additions.                                                                                        |
+
+The conservative legacy conversion boundary is deliberate: unsupported complex filter operators produce a clear blocking message and preserve the original tile. The pre-save GET/PUT conflict check still has a server-side race window because the API has no conditional revision write. No uncertainty remains about the tested core behaviors; broader renderer/pixel parity and real screen-reader behavior were not validated by this Chromium run.
+
+### Stored server response
+
+Verbatim JSON from the successful live create/save/GET run:
+
+<!-- prettier-ignore -->
+```json
+{"version":"v1","title":"Dashboards live mv2l3ix7_4c1b439a","author":"8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918","dashboardId":"01M4K8WXWV60JHPAC7FNZEYJYE","created":"2026-10-10T16:03:53.371681040Z","modified":"2026-10-10T16:03:55.076120105Z","tags":["parity","live"],"isFavorite":false,"dashboardType":"Dashboard","tiles":[{"tile_id":"01M4K8WYW40H6JN8KV9G6PB6NR","title":"Live log events","authorMode":"manual","tileType":"code","chartType":"table","chartQuery":"SELECT * FROM \"dash_logs_mv2l3ix7_4c1b439a\" ORDER BY \"p_timestamp\" DESC LIMIT 12","dbName":["dash_logs_mv2l3ix7_4c1b439a"],"layout":{"x":0,"y":0,"w":12,"h":4},"config":{"type":"table","colourScheme":"classic","layout":{"legendPosition":"bottom","segments":{"value":[10,90],"isPercent":true},"label":false},"axes":{"x":{"field":"","title":"","display":true},"y":{"field":"","title":"","display":true,"beginAtZero":false}},"advanced":{"dataLabels":{"enabled":false},"tooltip":{"enabled":true,"mode":"index","intersect":false}}}},{"tile_id":"01M4K8WZ42QWC5QXVWW3JBPP57","title":"Live host load","authorMode":"manual","tileType":"promql","chartType":"timeseries","chartQuery":["{__name__=\"frontend.dashboards.load_mv2l3ix7_4c1b439a\",host=~\"$host\"}"],"dbName":"$metrics_dataset","layout":{"x":0,"y":4,"w":12,"h":4},"config":{"type":"timeseries","colourScheme":"classic","layout":{"legendPosition":"bottom","segments":{"value":[10,90],"isPercent":true},"label":false},"axes":{"x":{"field":"","title":"","display":true},"y":{"field":"","title":"","display":true,"beginAtZero":false}},"advanced":{"dataLabels":{"enabled":false},"tooltip":{"enabled":true,"mode":"index","intersect":false}}},"promqlQueryType":["range"]}],"tenantId":null,"description":"SQL and PromQL classic interchangeability","variables":[{"name":"metrics_dataset","label":"Metrics dataset","type":"dataset","defaultValue":"dash_metrics_mv2l3ix7_4c1b439a"},{"name":"host","label":"Host","type":"promql","dataset":"$metrics_dataset","labelName":"host","metric":"frontend.dashboards.load_mv2l3ix7_4c1b439a","includeAll":true,"defaultValue":"node-a"}],"sections":[],"timeRange":{"startTime":"1h","endTime":"now","type":"fixed","label":"Last 1 hour","interval":3600000,"shiftInterval":1}}
+```
+
+### First fix round changed files
+
+The first fix round changed 80 paths inside `frontend/`; this historical list is relative to that directory. The second round's files are recorded above. Git state was only read for inspection.
+
+- `README.md`
+- `docs/api-contracts.md`
+- `docs/component-map.md`
+- `docs/parity-screenshots/dashboard-request-counts.json`
+- `docs/parity-screenshots/server-dashboard-classic.png`
+- `docs/parity-screenshots/server-dashboard-created.json`
+- `docs/parity-screenshots/server-dashboard-response.txt`
+- `docs/prism-parity.md`
+- `docs/validation-review.md`
+- `docs/wiki-drafts/prism-frontend-parity.md`
+- `e2e-live/dashboards.spec.ts`
+- `e2e-live/fixtures/classic-dashboard.json`
+- `e2e/dashboards.spec.ts`
+- `src/components/charts/TimeSeriesChart.stories.tsx`
+- `src/components/charts/TimeSeriesChart.tsx`
+- `src/components/explorer/TimeRangePicker.stories.tsx`
+- `src/components/explorer/TimeRangePicker.tsx`
+- `src/components/promql/completion.ts`
+- `src/components/ui/ActionsMenu.stories.tsx`
+- `src/components/ui/ActionsMenu.tsx`
+- `src/components/ui/ui.css`
+- `src/features/alerts/helpers.test.ts`
+- `src/features/alerts/helpers.ts`
+- `src/features/dashboards/ConflictDialog.tsx`
+- `src/features/dashboards/DashboardDialogs.tsx`
+- `src/features/dashboards/DashboardForm.tsx`
+- `src/features/dashboards/DashboardSections.tsx`
+- `src/features/dashboards/DashboardTile.tsx`
+- `src/features/dashboards/DashboardView.tsx`
+- `src/features/dashboards/DashboardsList.tsx`
+- `src/features/dashboards/DashboardsPage.tsx`
+- `src/features/dashboards/ImportDialog.tsx`
+- `src/features/dashboards/LocalImportNotice.tsx`
+- `src/features/dashboards/TileAppearanceFields.tsx`
+- `src/features/dashboards/TileChart.tsx`
+- `src/features/dashboards/TileEditor.tsx`
+- `src/features/dashboards/TileQueryFields.tsx`
+- `src/features/dashboards/VariableControl.tsx`
+- `src/features/dashboards/VariableEditor.tsx`
+- `src/features/dashboards/VariablesBar.tsx`
+- `src/features/dashboards/__fixtures__/ingest-demo-tile.json`
+- `src/features/dashboards/chartValue.test.ts`
+- `src/features/dashboards/chartValue.ts`
+- `src/features/dashboards/dashboards.css`
+- `src/features/dashboards/draft.test.ts`
+- `src/features/dashboards/draft.ts`
+- `src/features/dashboards/handoffs.test.ts`
+- `src/features/dashboards/helpers.test.ts`
+- `src/features/dashboards/helpers.ts`
+- `src/features/dashboards/importExport.test.ts`
+- `src/features/dashboards/importExport.ts`
+- `src/features/dashboards/layout.test.ts`
+- `src/features/dashboards/layout.ts`
+- `src/features/dashboards/legacySql.ts`
+- `src/features/dashboards/owner.ts`
+- `src/features/dashboards/queries.ts`
+- `src/features/dashboards/storage.ts`
+- `src/features/dashboards/tileEditing.ts`
+- `src/features/dashboards/tiles.test.ts`
+- `src/features/dashboards/tiles.ts`
+- `src/features/dashboards/timeRange.ts`
+- `src/features/dashboards/useChartHeight.ts`
+- `src/features/dashboards/useDashboardDraft.ts`
+- `src/features/dashboards/useDashboardUrl.ts`
+- `src/features/dashboards/variables.test.ts`
+- `src/features/dashboards/variables.ts`
+- `src/features/metrics/LabelBrowser.tsx`
+- `src/features/metrics/MetricsPage.tsx`
+- `src/features/metrics/helpers.ts`
+- `src/lib/dashboardsClient.test.ts`
+- `src/lib/dashboardsContract.test.ts`
+- `src/lib/dashboardsContract.ts`
+- `src/lib/demoDashboards.test.ts`
+- `src/lib/demoDashboards.ts`
+- `src/lib/guards.ts`
+- `src/lib/promqlMetadata.test.ts`
+- `src/lib/promqlMetadata.ts`
+- `src/lib/promqlResults.ts`
+- `src/lib/teamContract.ts`
+- `story-tests/dashboard-controls.spec.ts`
+
+Commands from `frontend/`:
+
+```sh
+npm run format
+flock /home/ajs/.cache/parseable-playwright.lock bash -c '
+  while ss -H -ltn "( sport = :5173 or sport = :6006 )" | rg -q .; do sleep 2; done
+  export TMPDIR=/home/ajs/.cache/dash-tmp
+  export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+  export PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030
+  npm run check
+  while ss -H -ltn "( sport = :5173 or sport = :6006 )" | rg -q .; do sleep 2; done
+  npx playwright test e2e/dashboards.spec.ts --repeat-each=5 --workers=4
+'
+
+flock /home/ajs/.cache/parseable-playwright.lock bash -c '
+  while ss -H -ltn "( sport = :5173 or sport = :6006 )" | rg -q .; do sleep 2; done
+  export TMPDIR=/home/ajs/.cache/dash-tmp
+  export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+  export PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030
+  export PARSEABLE_DEMO=true
+  npx vite --host 127.0.0.1 --port 5173 --strictPort > "$TMPDIR/dashboard-capture-vite.log" 2>&1 &
+  dashboard_capture_pid=$!
+  trap "kill $dashboard_capture_pid; wait $dashboard_capture_pid" EXIT
+  until curl -fsS http://127.0.0.1:5173/ > /dev/null; do sleep 1; done
+  node scripts/verify-dashboards.mjs
+'
+
+PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030 \
+  npx vite --host 127.0.0.1 --port 8271 --strictPort
+
+flock /home/ajs/.cache/parseable-playwright.lock bash -c '
+  while ss -H -ltn "( sport = :5173 or sport = :6006 )" | rg -q .; do sleep 2; done
+  export TMPDIR=/home/ajs/.cache/dash-tmp
+  export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+  export PARSEABLE_LIVE_URL=http://127.0.0.1:8271 PARSEABLE_LIVE_BASE=
+  export PARSEABLE_LIVE_SERVER_URL=http://127.0.0.1:8030
+  export PARSEABLE_LIVE_USERNAME=admin PARSEABLE_LIVE_PASSWORD=admin
+  npx playwright test -c playwright.live.config.ts e2e-live/dashboards.spec.ts
+'
+```
+
 ## Alerts validation (2026-10-09)
 
 This section records the frontend fixes and completed checks for the four supplied Opus reviews.
@@ -215,7 +504,7 @@ Production demo gating passed in a separate Chromium script against production b
 
 The gate builds used `VITE_ENABLE_DEMO=false` or `true`, `npm_config_cache=/tmp/astra-item2-npm`, `TMPDIR=/tmp/astra-item2-tmp`, and `npx vite build --outDir /tmp/astra-item2-production-no-demo` or `/tmp/astra-item2-production-demo`. Final source also passed the default production build in `npm run check`. Final screenshots are linked from [prism-parity.md](prism-parity.md).
 
-Cross-browser behavior, production deployment, real-provider interoperability, provider membership/refresh revocation, complete accessibility conformance and every original Prism interaction are not covered. Dashboards remain browser-local; server-backed dashboards, saved views, metrics, traces, alerts, administration and other excluded feature areas are not implemented. Wide-schema virtualization, arbitrary timezones and exact pixel equality remain parity gaps.
+Cross-browser behavior, production deployment, real-provider interoperability, provider membership/refresh revocation, complete accessibility conformance and every original Prism interaction are not covered. The 2026-10-07 baseline used browser-local dashboards. Subsequent dated sections record Team, Metrics, Alerts and server-backed Dashboards; saved views, traces and remaining feature areas are still outside scope. Wide-schema virtualization, arbitrary timezones and exact pixel equality remain parity gaps.
 
 ## Files and test coverage added in this iteration
 
@@ -223,7 +512,7 @@ Cross-browser behavior, production deployment, real-provider interoperability, p
 | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Authentication and shell    | `src/app/{App,AppProvider,Sidebar,ConnectionDialog,LoginPage,LoginForm}.tsx`, `src/lib/{auth,client,config,demo,types}.ts`, `src/styles/auth-shell.css`                                                                           | Standalone login, safe SSO/document navigation, missing-provider recovery, session/identity handling, production demo gate and measured shell layout                  |
 | Logs and shared explorer    | `src/features/logs/{LogsPage,FieldSidebar,FilterBar}.tsx`, `src/components/explorer/{ColumnPicker,DataTable,TimeRangePicker,RecordSheet,LogHistogram,QueryState}.tsx`, `src/components/explorer/timestamp.ts`, `src/lib/query.ts` | Compact summary results, columns/sort/wrap/export, edit/clear filters, absolute UTC ranges, event actions, explicit auth states and timezone-less backend UTC parsing |
-| Existing route presentation | `src/features/sql/SqlPage.tsx`, `src/features/datasets/DatasetsPage.tsx`, `src/features/dashboards/DashboardsPage.tsx`, `src/styles/global.css`                                                                                   | SQL explorer/empty live editor/results controls, inventory table and local dashboard layout refinements                                                               |
+| Existing route presentation | `src/features/sql/SqlPage.tsx`, `src/features/datasets/DatasetsPage.tsx`, `src/features/dashboards/DashboardsPage.tsx`, `src/styles/global.css`                                                                                   | SQL explorer/empty live editor/results controls, inventory table and historical browser-local dashboard layout refinements                                            |
 | Unit coverage               | `src/lib/{auth,client,query}.test.ts`, `src/components/explorer/timestamp.test.ts`                                                                                                                                                | Safe return paths, cookies/identity/auth request contracts, query bounds and backend timestamp handling; existing dashboard storage coverage retained                 |
 | App browser coverage        | `e2e/auth.spec.ts`, `e2e/explorer-parity.spec.ts`, `e2e/app.spec.ts`, `playwright.config.ts`                                                                                                                                      | Six auth and five explorer parity cases added; existing flows updated and regression coverage retained                                                                |
 | Real-server coverage        | `e2e-live/server.spec.ts`, `playwright.live.config.ts`, `e2e-live/fixtures/{mock-oidc,prism-proxy}.mjs`, `package.json`                                                                                                           | Opt-in live tests, protocol fixture, original-asset proxy and `test:live`; excluded from default check                                                                |

@@ -137,18 +137,21 @@ describe('alert forms and payloads', () => {
       title: 'Availability',
     });
   });
-  it.each(['sql', 'code'])('honours the %s dashboard handoff even with PromQL enabled', (type) => {
-    expect(
-      newAlertDraft(
-        true,
-        new URLSearchParams({
-          queryBuilderType: type,
-          dataset: 'logs',
-          alertQuery: 'SELECT COUNT(*) FROM "logs"',
-        }),
-      ),
-    ).toMatchObject({ type: 'code', dataset: 'logs', query: 'SELECT COUNT(*) FROM "logs"' });
-  });
+  it.each(['sql', 'code', 'builder', 'ai'])(
+    'honours the %s dashboard handoff even with PromQL enabled',
+    (type) => {
+      expect(
+        newAlertDraft(
+          true,
+          new URLSearchParams({
+            queryBuilderType: type,
+            dataset: 'logs',
+            alertQuery: 'SELECT COUNT(*) FROM "logs"',
+          }),
+        ),
+      ).toMatchObject({ type: 'code', dataset: 'logs', query: 'SELECT COUNT(*) FROM "logs"' });
+    },
+  );
   it.each(['10mins', '2hrs', '30secs', '0', '5millis'])(
     'saves existing duration %s unchanged in both fields',
     (duration) => {

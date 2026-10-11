@@ -81,8 +81,8 @@ export function OverviewPage({ onConnect }: { onConnect: () => void }) {
         ))}
       </div>
       <div className="notice">
-        This editable frontend starts with logs, SQL, datasets, local dashboards, and reusable
-        components. Traces and other advanced views will follow in later iterations.
+        Explore logs, SQL, metrics, alerts, datasets, dashboards, and team settings. Traces and
+        other advanced views will follow in later iterations.
       </div>
     </div>
   );

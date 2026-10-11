@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { uniqueTitles, type Dashboard } from './storage';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { loadDashboards, uniqueTitles, type LocalDashboard } from './storage';
 
-const dashboard = (id: string, title: string): Dashboard => ({
+const dashboard = (id: string, title: string): LocalDashboard => ({
   id,
   title,
   description: '',
@@ -29,3 +29,14 @@ describe('uniqueTitles', () => {
     expect(titles).toEqual(['API errors', 'API errors (3)', 'API errors (2)']);
   });
 });
+
+afterEach(() => vi.unstubAllGlobals());
+it.each(['not json', '{}', 'null', '1'])(
+  'local import reads corrupt/non-array storage without changing it: %s',
+  (json) => {
+    const setItem = vi.fn();
+    vi.stubGlobal('localStorage', { getItem: () => json, setItem });
+    expect(loadDashboards('legacy')).toEqual([]);
+    expect(setItem).not.toHaveBeenCalled();
+  },
+);

@@ -101,7 +101,11 @@ export type AlertDraft = {
 export function newAlertDraft(promql: boolean, params = new URLSearchParams()): AlertDraft {
   const handoffType = params.get('queryBuilderType');
   return {
-    type: handoffType === 'sql' || handoffType === 'code' ? 'code' : promql ? 'promql' : 'code',
+    type: ['sql', 'code', 'builder', 'ai'].includes(handoffType ?? '')
+      ? 'code'
+      : promql
+        ? 'promql'
+        : 'code',
     dataset: params.get('dataset') ?? '',
     query: params.get('alertQuery') ?? '',
     operator: '>',

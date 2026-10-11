@@ -61,13 +61,13 @@ This creates `build.zip` with a top-level `dist/` directory, including `dist/ind
 - Metrics: OTLP metrics dataset discovery, PromQL editor and label browser, up to five queries, Range/Instant/Both execution, automatic or explicit step, time range and refresh, line chart with legend, sortable instant and range-summary tables, JSON/CSV export, dataset history, and shareable URLs. PromQL availability follows the server capability.
 - Alerts: searchable, sortable lists with tag filters and 25-row pagination; PromQL and SQL threshold creation/editing, query previews without notifications, hold duration, runtime instances and delivery errors, evaluate/enable/mute/duplicate/delete actions, and Slack/Webhook/Alertmanager targets with masked secrets. PromQL creation requires explicit server capability; existing builder rules are read-only.
 - Datasets: search, schema inspection, explorer navigation.
-- Dashboards: create, persist/reload, and confirm deletion of browser-local event-volume tiles; demo and live definitions use separate storage keys. These are not synced to the server and do not yet support arbitrary layouts or queries.
+- Dashboards: server-backed lists and detail routes, search/tags/favourites/sort/pagination, ownership, full-document saves with conflict resolution, SQL and PromQL tiles, six variable types, URL time ranges and selections, classic import/export, and explicit migration of old browser-local dashboards. Demo dashboards use independent in-memory state per client.
 - Team: native users and one-time passwords, role and privilege management, default OIDC role configuration, provider group mappings and role provenance, and API key creation/copy/deletion. Search and 25-row pagination apply to every tab; authorization stays with the backend.
 - Component gallery at `/components`, plus isolated Storybook stories for UI, PromQL and chart components.
 
 The default log query reads at most 100 rows, sorted by `p_timestamp`. Message search assumes a `message` field. The histogram represents returned rows, not total stream volume. Demo SQL intentionally supports only a small SELECT subset and rejects unsupported syntax. Full SQL requires a server.
 
-Traces, APM, ingestion setup, saved queries, server dashboards, virtualized tables, and original Prism pixel parity are future iterations. No unusable paid-feature navigation or upgrade controls are exposed.
+Traces, APM, ingestion setup, saved queries, virtualized tables, and original Prism pixel parity are future iterations. No unusable paid-feature navigation or upgrade controls are exposed.
 
 ## Components and selectors
 
@@ -113,6 +113,25 @@ PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
 npm run test:live
 ```
 
-Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DATASET` for a disposable server; defaults are `frontend-smoke`, `local-smoke-password` and `frontend_smoke`. Page paths use the `/next` mount of a server built with `NEXT_ASSETS_PATH`; set `PARSEABLE_LIVE_BASE=` (empty) when `PARSEABLE_LIVE_URL` points at `npm run dev` or another server at the root. API calls always go to the origin root. Omitting `PARSEABLE_LIVE_URL` skips the live tests. Add `PARSEABLE_LIVE_OIDC=true` only with the local fixture provider configured, or `PARSEABLE_LIVE_NO_OIDC=true` with a provider-free server to exercise the real missing-provider route. `npm run check` excludes this suite. The completed default check passed **800 unit, 172 app browser and 42 Storybook browser tests** (2026-10-09); the repeated dark axe run passed **60/60** cases, and all three Alerts live tests passed separately against the disposable v3.2.5 server. The Team live tests create uniquely named users, roles and API keys, remove them afterwards and restore the server's previous default OIDC role. Metrics and Alerts live tests ingest unique OTLP datasets and delete them afterwards. See [the live runbook and recorded results](docs/validation-review.md) for setup, exact commands, scope and limitations.
+Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DATASET` for a disposable server; defaults are `frontend-smoke`, `local-smoke-password` and `frontend_smoke`. Page paths use the `/next` mount of a server built with `NEXT_ASSETS_PATH`; set `PARSEABLE_LIVE_BASE=` (empty) when `PARSEABLE_LIVE_URL` points at `npm run dev` or another server at the root. API calls always go to the origin root. Omitting `PARSEABLE_LIVE_URL` skips the live tests. Add `PARSEABLE_LIVE_OIDC=true` only with the local fixture provider configured, or `PARSEABLE_LIVE_NO_OIDC=true` with a provider-free server to exercise the real missing-provider route. `npm run check` excludes this suite. The completed default check passed **946 unit tests in 41 files, 224 app browser tests and 46 Storybook browser tests** (2026-10-10), including **51 dashboard browser cases**. The earlier Alerts validation (2026-10-09) also recorded a **60/60** repeated dark axe run and three passing live tests. The Team live tests create uniquely named users, roles and API keys, remove them afterwards and restore the server's previous default OIDC role. Metrics, Alerts and Dashboards live tests ingest unique OTLP datasets and delete them afterwards. See [the live runbook and recorded results](docs/validation-review.md) for setup, exact commands, scope and limitations.
 
 The Alerts live spec (`e2e-live/alerts.spec.ts`) creates a unique OTLP dataset, webhook target and PromQL rule, checks preview values and mutations against the API, and cleans up all three in `afterAll`, including after failures. Run it only against a disposable server. Set `TMPDIR` to a disk-backed directory when `/tmp` is small. The current Alerts checks and counts are recorded in [validation-review.md](docs/validation-review.md).
+
+The Dashboards live spec (`e2e-live/dashboards.spec.ts`) ingests unique logs and OTLP metrics, creates SQL and PromQL tiles with variables through this frontend, verifies their stored classic shapes, and hard-loads the same dashboard on the classic origin. It also renders a literal classic-shaped Report fixture in this frontend, checks unknown-field preservation, and verifies admin ownership rules and `limit=0`. Cleanup removes all test dashboards, datasets, users and roles. Both origins must point at the same disposable server and use the same hostname to share login cookies across ports (use `127.0.0.1` for both; mixing it with `localhost` fails). The spec checks this before ingesting:
+
+```sh
+PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030 npx vite --host 127.0.0.1 --port 8271
+# In another terminal, from frontend/:
+flock /home/ajs/.cache/parseable-playwright.lock bash -c '
+  while [ -n "$(ss -H -ltn "( sport = :5173 or sport = :6006 )")" ]; do sleep 5; done
+  ss -ltn "( sport = :5173 or sport = :6006 )"
+  TMPDIR=/home/ajs/.cache/dash-tmp \
+  PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+  PARSEABLE_LIVE_URL=http://127.0.0.1:8271 PARSEABLE_LIVE_BASE= \
+  PARSEABLE_LIVE_SERVER_URL=http://127.0.0.1:8030 \
+  PARSEABLE_LIVE_USERNAME=admin PARSEABLE_LIVE_PASSWORD=admin \
+  npx playwright test -c playwright.live.config.ts e2e-live/dashboards.spec.ts
+'
+```
+
+On shared machines, run every Playwright invocation (including `npm run check`, `test:ui` and `test:stories`) under this lock, checking ports 5173 and 6006 inside the lock before running. Do not reuse another worktree's server.

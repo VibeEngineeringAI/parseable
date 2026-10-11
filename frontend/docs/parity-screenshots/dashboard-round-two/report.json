@@ -1,0 +1,405 @@
+{
+  "1440-light list title cells": [
+    ["Application signals", 213, 756, 268, 744],
+    ["Host metrics", 213, 756, 268, 744],
+    ["Shared operations", 213, 756, 268, 744]
+  ],
+  "1440-light sql geometry": [
+    {
+      "t": "Request duration",
+      "x": 212,
+      "y": 288,
+      "w": 801,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 85,
+      "xTitleBottom": 547.390625,
+      "legendTop": 551.390625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "Event count",
+      "x": 1025,
+      "y": 288,
+      "w": 395,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "Recent events",
+      "x": 212,
+      "y": 616,
+      "w": 1208,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    }
+  ],
+  "1440-light promql geometry": [
+    {
+      "t": "Host load",
+      "x": 212,
+      "y": 332,
+      "w": 1208,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 137,
+      "legendTop": 595.1875,
+      "legendOverflow": "auto"
+    }
+  ],
+  "1440-light sections geometry": [
+    {
+      "t": "Unsectioned",
+      "x": 212,
+      "y": 288,
+      "w": 1208,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "API first",
+      "x": 212,
+      "y": 660,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "API second",
+      "x": 822,
+      "y": 660,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 67,
+      "xTitleBottom": 901.390625,
+      "legendTop": 905.390625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "DB first",
+      "x": 212,
+      "y": 1032,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 67,
+      "xTitleBottom": 1273.390625,
+      "legendTop": 1277.390625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "DB second",
+      "x": 822,
+      "y": 1032,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    }
+  ],
+  "1440-light variable control tops": [
+    {
+      "name": "Metrics dataset",
+      "top": 263
+    },
+    {
+      "name": "Host",
+      "top": 263
+    },
+    {
+      "name": "Result",
+      "top": 263
+    }
+  ],
+  "1440-dark list title cells": [
+    ["Application signals", 213, 756, 268, 744],
+    ["Host metrics", 213, 756, 268, 744],
+    ["Shared operations", 213, 756, 268, 744]
+  ],
+  "1440-dark sql geometry": [
+    {
+      "t": "Request duration",
+      "x": 212,
+      "y": 288,
+      "w": 801,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 85,
+      "xTitleBottom": 547.390625,
+      "legendTop": 551.390625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "Event count",
+      "x": 1025,
+      "y": 288,
+      "w": 395,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "Recent events",
+      "x": 212,
+      "y": 616,
+      "w": 1208,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    }
+  ],
+  "1440-dark promql geometry": [
+    {
+      "t": "Host load",
+      "x": 212,
+      "y": 332,
+      "w": 1208,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 137,
+      "legendTop": 595.1875,
+      "legendOverflow": "auto"
+    }
+  ],
+  "1440-dark sections geometry": [
+    {
+      "t": "Unsectioned",
+      "x": 212,
+      "y": 288,
+      "w": 1208,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "API first",
+      "x": 212,
+      "y": 660,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "API second",
+      "x": 822,
+      "y": 660,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 67,
+      "xTitleBottom": 901.390625,
+      "legendTop": 905.390625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "DB first",
+      "x": 212,
+      "y": 1032,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 67,
+      "xTitleBottom": 1273.390625,
+      "legendTop": 1277.390625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "DB second",
+      "x": 822,
+      "y": 1032,
+      "w": 598,
+      "h": 316,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    }
+  ],
+  "1440-dark variable control tops": [
+    {
+      "name": "Metrics dataset",
+      "top": 263
+    },
+    {
+      "name": "Host",
+      "top": 263
+    },
+    {
+      "name": "Result",
+      "top": 263
+    }
+  ],
+  "390-light list title cells": [
+    ["Application signals", 77, 321, 124, 317],
+    ["Host metrics", 77, 321, 124, 317],
+    ["Shared operations", 77, 321, 124, 317]
+  ],
+  "390-light sql geometry": [
+    {
+      "t": "Request duration",
+      "x": 68,
+      "y": 395,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 109,
+      "xTitleBottom": 677.890625,
+      "legendTop": 681.890625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "Event count",
+      "x": 68,
+      "y": 747,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "Recent events",
+      "x": 68,
+      "y": 1099,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    }
+  ],
+  "390-light promql geometry": [
+    {
+      "t": "Host load",
+      "x": 68,
+      "y": 499,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 133,
+      "legendTop": 758.484375,
+      "legendOverflow": "auto"
+    }
+  ],
+  "390-light sections geometry": [
+    {
+      "t": "Unsectioned",
+      "x": 68,
+      "y": 395,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "API first",
+      "x": 68,
+      "y": 791,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    },
+    {
+      "t": "API second",
+      "x": 68,
+      "y": 1143,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 91,
+      "xTitleBottom": 1407.890625,
+      "legendTop": 1411.890625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "DB first",
+      "x": 68,
+      "y": 1539,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "plotHeight": 91,
+      "xTitleBottom": 1803.890625,
+      "legendTop": 1807.890625,
+      "legendOverflow": "auto"
+    },
+    {
+      "t": "DB second",
+      "x": 68,
+      "y": 1891,
+      "w": 310,
+      "h": 340,
+      "pad": "16px",
+      "inner": 0,
+      "legendOverflow": null
+    }
+  ],
+  "390-light variable control tops": [
+    {
+      "name": "Metrics dataset",
+      "top": 370
+    },
+    {
+      "name": "Host",
+      "top": 440
+    },
+    {
+      "name": "Result",
+      "top": 563
+    }
+  ],
+  "probe tile Plain SQL": "Plain SQL\n100.000 load",
+  "probe tile Dollar SQL": "Dollar SQL\n\nQuery failed: Demo SQL supports SELECT * FROM a sample dataset, AND filters (= or !=), message ILIKE search, ORDER BY and LIMIT. Connect to a server for other SQL.\n\nRetry query\nView query",
+  "probe tile Dollar PromQL": "Dollar PromQL\n\nQuery failed: Demo PromQL supports selectors, rate/increase/irate/delta, *_over_time and sum/avg/min/max/count. Connect to a server for other PromQL.\n\nRetry query\nView query",
+  "gap display order before": ["A", "B", "C"],
+  "gap B menu items": [
+    ["Edit", false, null],
+    ["Duplicate tile", false, null],
+    ["Move earlier", false, null],
+    ["Move later", false, null],
+    ["Delete tile", false, null],
+    ["View query", false, null],
+    ["Explore data", false, null],
+    ["Create alert", false, null]
+  ],
+  "gap display order after B Move earlier": ["B", "A", "C"],
+  "prom host options": [".*", "node-01", "node-02", "node-03", "node-04"],
+  "create alert attrs": [
+    false,
+    "true",
+    "_r_c_-alert-reason",
+    "Select explicit variable values instead of All to create an alert."
+  ],
+  "focused after End": "Create alert",
+  "after Enter on disabled: url same, menu open": [true, 1],
+  "after click on disabled: url same, menu open": [true, 1]
+}

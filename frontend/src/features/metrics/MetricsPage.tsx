@@ -1,3 +1,4 @@
+import { createPromqlMetadata } from '../../lib/promqlMetadata';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
@@ -5,7 +6,6 @@ import { Button, EmptyState, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
-import type { PromqlMetadataSource } from '../../components/promql/PromqlEditor';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
@@ -16,7 +16,6 @@ import {
   insertBrowserQuery,
   maxQueries,
   metadataAnchor,
-  metadataRequest,
   parseExplorerSearch,
   rangeBounds,
   removeSnapshotQuery,
@@ -245,21 +244,8 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
     }
   }, []);
 
-  const metadata = useMemo<PromqlMetadataSource>(
-    () => ({
-      metricNames: async (signal) => {
-        const request = metadataRequest(dataset, bounds);
-        return request ? (await client.promqlLabelValues('__name__', request, signal)).data : [];
-      },
-      labelNames: async (metric, signal) => {
-        const request = metadataRequest(dataset, bounds, metric ? [metric] : []);
-        return request ? (await client.promqlLabels(request, signal)).data : [];
-      },
-      labelValues: async (label, metric, signal) => {
-        const request = metadataRequest(dataset, bounds, metric ? [metric] : []);
-        return request ? (await client.promqlLabelValues(label, request, signal)).data : [];
-      },
-    }),
+  const metadata = useMemo(
+    () => createPromqlMetadata(client, dataset, bounds),
     [client, dataset, bounds],
   );
   const preview = createRunSnapshot(state, dataset, width, anchor.time);

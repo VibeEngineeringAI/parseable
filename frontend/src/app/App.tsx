@@ -7,7 +7,7 @@ import { ConnectionDialog } from './ConnectionDialog';
 import { useApp } from './AppProvider';
 import { LoginPage } from './LoginPage';
 import { safeReturnPath } from '../lib/auth';
-import { classicUiAvailable, classicUiPath } from '../lib/classicUi';
+import { classicUiAvailable, classicUiPath, nextUiPath } from '../lib/classicUi';
 import '../styles/auth-shell.css';
 const LogsPage = lazy(() =>
   import('../features/logs/LogsPage').then((m) => ({ default: m.LogsPage })),
@@ -18,6 +18,9 @@ const DatasetsPage = lazy(() =>
 );
 const DashboardsPage = lazy(() =>
   import('../features/dashboards/DashboardsPage').then((m) => ({ default: m.DashboardsPage })),
+);
+const DashboardView = lazy(() =>
+  import('../features/dashboards/DashboardView').then((m) => ({ default: m.DashboardView })),
 );
 const LibraryPage = lazy(() =>
   import('../features/library/LibraryPage').then((m) => ({ default: m.LibraryPage })),
@@ -161,8 +164,18 @@ export function App() {
               <Route path="/sql-editor" element={<SqlPage />} />
               <Route path="/datasets" element={<DatasetsPage />} />
               <Route path="/dashboards" element={<DashboardsPage />} />
+              <Route path="/dashboards/:id" element={<DashboardView />} />
               <Route path="/team" element={<TeamPage />} />
               <Route path="/alerts" element={<AlertsPage />} />
+              <Route
+                path="/alerts/create"
+                element={
+                  <Navigate
+                    replace
+                    to={nextUiPath(`${location.pathname}${location.search}${location.hash}`)}
+                  />
+                }
+              />
               <Route path="/alerts/new" element={<AlertsPage />} />
               <Route path="/alerts/targets" element={<AlertsPage />} />
               <Route path="/alerts/:id/edit" element={<AlertsPage />} />

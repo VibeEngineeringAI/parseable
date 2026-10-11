@@ -13,8 +13,9 @@ import { LabelChips } from './LabelChips';
 
 export function PromqlRuntime({ alert, targets }: { alert: Alert; targets: AlertTargetStatus[] }) {
   const { client } = useApp();
-  // Each reload of the alert moves the window forward; the last chart stays up while it loads.
-  const end = useMemo(() => Math.floor(Date.now() / 1000), [alert]);
+  // The window ends when the expression loads and moves only when the dataset or query changes,
+  // so unrelated reloads such as Mute keep the chart; the last chart stays up while it loads.
+  const end = useMemo(() => Math.floor(Date.now() / 1000), [alert.datasets[0], alert.query]);
   const range = useAsync(
     useCallback(
       async (signal) => ({

@@ -13,7 +13,8 @@ import {
 } from '../../components/ui';
 import type { AlertSummary } from '../../lib/types';
 import { AlertActions } from './AlertActions';
-import { revealBesideStickyColumn, useRowDeletionFocus } from './shared';
+import { useRowDeletionFocus } from '../../hooks/useRowDeletionFocus';
+import { revealBesideStickyColumn } from './shared';
 import {
   filterSortAlerts,
   muteState,

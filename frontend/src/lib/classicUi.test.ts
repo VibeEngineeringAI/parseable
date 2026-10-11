@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classicUiPath } from './classicUi';
+import { classicUiPath, nextUiPath } from './classicUi';
 import { appPath } from './config';
 
 describe('side-by-side classic UI', () => {
@@ -13,6 +13,7 @@ describe('side-by-side classic UI', () => {
     ['/sql-editor', '/sql-editor'],
     ['/datasets', '/datasets'],
     ['/dashboards', '/dashboards'],
+    ['/dashboards/01ABC/', '/dashboards/01ABC'],
     ['/team', '/team'],
     ['/alerts', '/alerts'],
     ['/alerts/new', '/alerts'],
@@ -27,4 +28,14 @@ describe('side-by-side classic UI', () => {
     expect(appPath('/login', '/next')).toBe('/next/login');
     expect(appPath('/login', '')).toBe('/login');
   });
+});
+
+it('maps classic alert create links with every query parameter and hash intact', () => {
+  expect(
+    nextUiPath(
+      '/alerts/create?dataset=x&queryBuilderType=sql&alertQuery=SELECT+1&title=Panel#draft',
+    ),
+  ).toBe('/alerts/new?dataset=x&queryBuilderType=sql&alertQuery=SELECT+1&title=Panel#draft');
+  expect(nextUiPath('/alerts/create/?dataset=x')).toBe('/alerts/new?dataset=x');
+  expect(nextUiPath('/dashboards/01ABC?range=30m')).toBe('/dashboards/01ABC?range=30m');
 });

@@ -4,6 +4,7 @@ import { demoEnabled } from './config';
 import { apiKey, groupRoles, object, roles, roleSources, strings, userRoles } from './teamContract';
 import { instantResult, rangeResult, successEnvelope } from './promqlContract';
 import { alert, alertSummary, alertTarget, alertTargetStatus } from './alertsContract';
+import { dashboard, dashboardSummary } from './dashboardsContract';
 import type {
   AlertSeverity,
   Dataset,
@@ -136,6 +137,7 @@ export function createClient({
   const keys = '/api/prism/v1/apikeys';
   const alertPath = (id: string) => `${base}/alerts/${encodeURIComponent(id)}`;
   const targetPath = (id: string) => `${base}/targets/${encodeURIComponent(id)}`;
+  const dashboardPath = (id: string) => `${base}/dashboards/${encodeURIComponent(id)}`;
   const user = (id: string) => `${base}/user/${encodeURIComponent(id)}`;
   const role = (name: string) => {
     if (name.toLowerCase() === 'default')
@@ -185,7 +187,24 @@ export function createClient({
     if (!alertTarget(data)) return malformed(endpoint);
     return data;
   };
+  const readDashboard = async (endpoint: string, init: RequestInit) => {
+    const data = await readJson(endpoint, init, onUnauthorized);
+    if (!dashboard(data)) return malformed(endpoint);
+    return data;
+  };
   return {
+    async listDashboards(signal) {
+      const endpoint = `${base}/dashboards?limit=0`;
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (!Array.isArray(data) || !data.every(dashboardSummary)) return malformed(endpoint);
+      return data;
+    },
+    getDashboard: (id, signal) => readDashboard(dashboardPath(id), { signal }),
+    createDashboard: (body) => readDashboard(`${base}/dashboards`, jsonBody('POST', body)),
+    updateDashboard: (id, body) => readDashboard(dashboardPath(id), jsonBody('PUT', body)),
+    setDashboardFavorite: (id, isFavorite) =>
+      readDashboard(`${dashboardPath(id)}?isFavorite=${isFavorite}`, { method: 'PUT' }),
+    deleteDashboard: (id) => mutate(dashboardPath(id), { method: 'DELETE' }),
     async listAlerts(signal) {
       // The server caps each page at 1000 and returns no total. Never silently truncate.
       // It sorts by state, severity and title before offsetting, so an alert changing state
@@ -245,7 +264,14 @@ export function createClient({
         return malformed(endpoint);
       const capabilities = object(data.capabilities) ? data.capabilities : {};
       if (
-        ['oidcRoleMapping', 'oidcRoleSync', 'promql', 'promqlAlerts'].some(
+        [
+          'oidcRoleMapping',
+          'oidcRoleSync',
+          'promql',
+          'promqlAlerts',
+          'promqlDashboard',
+          'promqlMetadata',
+        ].some(
           (field) => capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean',
         )
       )
@@ -256,6 +282,8 @@ export function createClient({
           oidcRoleMapping: capabilities.oidcRoleMapping === true,
           oidcRoleSync: capabilities.oidcRoleSync === true,
           promqlAlerts: capabilities.promqlAlerts === true,
+          promqlDashboard: capabilities.promqlDashboard === true,
+          promqlMetadata: capabilities.promqlMetadata === true,
           promql:
             typeof capabilities.promql === 'boolean'
               ? capabilities.promql

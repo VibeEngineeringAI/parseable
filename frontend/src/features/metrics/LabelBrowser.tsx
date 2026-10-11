@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Input } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useAsync } from '../../hooks/useAsync';
-import { metadataRequest, type Bounds } from './helpers';
+import { metadataRequest, type Bounds } from '../../lib/promqlMetadata';
 import type { ParseableClient } from '../../lib/types';
 
 function MetadataList({

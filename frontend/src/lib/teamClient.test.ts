@@ -283,6 +283,8 @@ describe('Team HTTP contracts', () => {
         oidcRoleSync: false,
         promql: false,
         promqlAlerts: false,
+        promqlDashboard: false,
+        promqlMetadata: false,
       },
     });
   });

@@ -21,9 +21,17 @@ export interface TimeSeriesChartProps {
   timestamps: number[];
   series: ChartSeries[];
   height?: number;
+  /** Reserve more axis space for formatted units in compact tiles. */
+  yAxisSize?: number;
+  /** A page with a shared live region can keep per-chart counts quiet. */
+  announceSeries?: boolean;
   title?: string;
   /** Hide the visible caption when a surrounding card already supplies a heading. */
   showTitle?: boolean;
+  /** Place a title immediately below the time axis, before counts and legend. */
+  xAxisTitle?: string;
+  /** Compact cards can omit counts while retaining the Show all control. */
+  showSeriesCount?: boolean;
   /** Fixed x-axis bounds in Unix seconds, independent of the sample timestamps. */
   xRange?: readonly [number, number];
   /** Series drawn before "Show all"; the ones with the highest peak value win. */
@@ -136,8 +144,12 @@ export function TimeSeriesChart({
   timestamps,
   series,
   height = 280,
+  yAxisSize = 64,
+  announceSeries = true,
   title = 'Time series',
   showTitle = true,
+  xAxisTitle,
+  showSeriesCount = true,
   xRange,
   maxSeries = 20,
   timeZone = 'UTC',
@@ -286,7 +298,7 @@ export function TimeSeriesChart({
             {
               stroke: muted,
               font,
-              size: 64,
+              size: yAxisSize,
               grid: { stroke: grid, width: 1 },
               ticks: { stroke: grid, width: 1 },
               values: (_, values) => values.map(formatValue),
@@ -377,6 +389,7 @@ export function TimeSeriesChart({
     timestamps,
     entries,
     height,
+    yAxisSize,
     timeZone,
     formatValue,
     hasData,
@@ -478,6 +491,7 @@ export function TimeSeriesChart({
           />
         )}
       </div>
+      {xAxisTitle && <p className="charts-axis-title">{xAxisTitle}</p>}
       {references.length > 0 && (
         <div className="charts-thresholds">
           {references.map(({ value, label }, index) => (
@@ -488,23 +502,27 @@ export function TimeSeriesChart({
           ))}
         </div>
       )}
-      <div className="charts-count-row">
-        <span aria-live="polite">
-          {visibleEntries.length === series.length
-            ? `${series.length} series`
-            : `${visibleEntries.length} of ${series.length} series`}
-        </span>
-        {series.length > limit && (
-          <button
-            type="button"
-            className="charts-toggle"
-            title={`Series are ranked by their highest value; the top ${limit} are drawn`}
-            onClick={() => setShowAll((previous) => !previous)}
-          >
-            {showAll ? `Show top ${limit}` : `Show all ${series.length}`}
-          </button>
-        )}
-      </div>
+      {(showSeriesCount || series.length > limit) && (
+        <div className="charts-count-row">
+          {showSeriesCount && (
+            <span aria-live={announceSeries ? 'polite' : 'off'}>
+              {visibleEntries.length === series.length
+                ? `${series.length} series`
+                : `${visibleEntries.length} of ${series.length} series`}
+            </span>
+          )}
+          {series.length > limit && (
+            <button
+              type="button"
+              className="charts-toggle"
+              title={`Series are ranked by their highest value; the top ${limit} are drawn`}
+              onClick={() => setShowAll((previous) => !previous)}
+            >
+              {showAll ? `Show top ${limit}` : `Show all ${series.length}`}
+            </button>
+          )}
+        </div>
+      )}
       {series.length > 0 && (series.length > 1 || !showTitle) && (
         <ul className="charts-legend" aria-label="Series visibility">
           {entries.map(({ series: entry, slot }, index) => (

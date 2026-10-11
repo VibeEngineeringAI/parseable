@@ -9,6 +9,7 @@ export function classicUiPath(pathname: string): string {
   if (section === 'logs' && view && dataset) return `/logs/explore/${dataset}`;
   if (section === 'metrics')
     return view === 'explore' && dataset ? `/metrics/explore/${dataset}` : '/metrics';
+  if (section === 'dashboards' && view) return `/dashboards/${view}`;
   if (
     section === 'team' ||
     section === 'sql-editor' ||
@@ -18,4 +19,9 @@ export function classicUiPath(pathname: string): string {
   )
     return `/${section}`;
   return '/';
+}
+
+/** Incoming classic links retain their query and hash when opened under /next. */
+export function nextUiPath(path: string): string {
+  return path.replace(/^\/alerts\/create\/?(?=[?#]|$)/, '/alerts/new');
 }

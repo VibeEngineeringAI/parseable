@@ -519,11 +519,17 @@ test('a submit attempt skips the disabled invalid Alert type and focuses the sto
 test('dirty form blocks sidebar navigation and browser Back until confirmed', async ({ page }) => {
   await demo(page);
   await createPromql(page);
-  const dismiss = (dialog: import('@playwright/test').Dialog) => dialog.dismiss();
+  let handled = 0;
+  const dismiss = async (dialog: import('@playwright/test').Dialog) => {
+    await dialog.dismiss();
+    handled++;
+  };
   page.on('dialog', dismiss);
   await page.getByTestId('sidebar-metrics').click();
+  await expect.poll(() => handled).toBe(1);
   await expect(page).toHaveURL(/\/alerts\/new$/);
   await page.goBack();
+  await expect.poll(() => handled).toBe(2);
   await expect(page).toHaveURL(/\/alerts\/new$/);
   await expect(page.getByLabel('Title', { exact: true })).toHaveValue('Test threshold');
   page.off('dialog', dismiss);
@@ -1280,9 +1286,8 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   page,
 }) => {
   await mocked(page);
-  // The chart's window ends at "now" and moves forward whenever the alert reloads, which rebuilds
-  // the plot with the new range. Pin the clock so Mute does not move the window and the test
-  // checks only that the plot is kept when nothing about the expression changed.
+  // The chart's window ends at "now" when the expression loads and moves only when the dataset or
+  // query changes. Pin the clock so the step below is deterministic.
   await page.clock.setFixedTime(new Date('2026-10-10T12:00:00Z'));
   let ranges = 0;
   await page.route('**/prometheus/api/v1/query_range', (route) => {
@@ -1317,6 +1322,8 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
   // StrictMode mounts the chart twice in development, so count from here rather than from 1.
   const loaded = ranges;
+  // Mute reloads the alert a minute later; the window must not move and the plot must be kept.
+  await page.clock.setFixedTime(new Date('2026-10-10T12:01:00Z'));
   await page.getByRole('button', { name: 'Mute', exact: true }).click();
   const reloaded = page.waitForResponse(
     (response) =>

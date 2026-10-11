@@ -111,3 +111,6 @@ export const WithThresholds: Story = {
     ],
   },
 };
+export const DashboardSizing: Story = {
+  args: { height: 180, yAxisSize: 112, announceSeries: false },
+};

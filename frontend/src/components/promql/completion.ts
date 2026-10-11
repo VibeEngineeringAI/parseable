@@ -7,11 +7,8 @@ import {
   type PrometheusClient,
 } from '@prometheus-io/codemirror-promql';
 
-export interface PromqlMetadataSource {
-  metricNames(signal?: AbortSignal): Promise<string[]>;
-  labelNames(metric?: string, signal?: AbortSignal): Promise<string[]>;
-  labelValues(label: string, metric?: string, signal?: AbortSignal): Promise<string[]>;
-}
+import type { PromqlMetadataSource } from '../../lib/promqlMetadata';
+export type { PromqlMetadataSource } from '../../lib/promqlMetadata';
 
 const supportedFunctions = new Set([
   'rate',

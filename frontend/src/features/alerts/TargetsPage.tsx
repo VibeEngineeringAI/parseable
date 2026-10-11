@@ -18,7 +18,8 @@ import { useApp } from '../../app/AppProvider';
 import type { AlertTarget } from '../../lib/types';
 import { TargetSheet } from './TargetSheet';
 import { targetType, targetTypeLabel } from './targetHelpers';
-import { revealBesideStickyColumn, useAlertAccess, useRowDeletionFocus } from './shared';
+import { revealBesideStickyColumn, useAlertAccess } from './shared';
+import { useRowDeletionFocus } from '../../hooks/useRowDeletionFocus';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 
