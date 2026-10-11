@@ -61,7 +61,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .charts-gauge-arc {
-    transition: none;
+    /* Keep duration at zero despite the app-wide 0.01ms override. */
+    transition: none !important;
   }
 }
 
