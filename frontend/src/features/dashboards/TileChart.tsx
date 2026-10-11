@@ -1,5 +1,8 @@
 import { useCallback, useMemo } from 'react';
+import { PieChart } from '../../components/charts/PieChart';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
+import { BubbleChart } from '../../components/charts/BubbleChart';
+import { GaugeChart } from '../../components/charts/GaugeChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
 import {
@@ -8,13 +11,17 @@ import {
   promqlCategoryChart,
   type CartesianChart,
 } from './cartesian';
+import { gaugeModel, gaugeValue } from './gauge';
 import { chartValue, diagonalFill, fillStyle, percentFill } from './chartValue';
-import { tilePalette } from './palettes';
+import { formatValue as formatTileValue, valueFormat } from './formatValue';
 import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
 import { record, text, tileTitle } from './tiles';
 import type { TileResults } from './queries';
+import { bubbleChart } from './bubble';
+import { tilePalette } from './palettes';
+import { tileSlices } from './slices';
 export function TileChart({
   tile,
   result,
@@ -69,21 +76,104 @@ export function TileChart({
     () => result.rows ?? (result.promql ? promqlTableRows(result.promql) : []),
     [result],
   );
-  const precision =
-    typeof layout.precision === 'number' && Number.isFinite(layout.precision)
-      ? Math.max(0, Math.min(20, Math.floor(layout.precision)))
-      : undefined;
-  const unit = text(layout.unit);
-  const formatValue = useCallback(
-    (value: number) =>
-      `${precision === undefined ? value.toLocaleString() : value.toFixed(precision)}${unit ? ` ${unit}` : ''}`,
-    [precision, unit],
+  const bubble = useMemo(
+    () =>
+      tile.chartType === 'bubble' && !result.promql && tile.tileType !== 'promql'
+        ? bubbleChart(result.rows ?? [], tile)
+        : undefined,
+    [result, tile],
   );
+  const slices = useMemo(
+    () => (['pie', 'donut'].includes(text(tile.chartType)) ? tileSlices(result, tile) : []),
+    [result, tile],
+  );
+  const unit = text(layout.unit),
+    precision = typeof layout.precision === 'number' ? layout.precision : undefined,
+    humanize = layout.humanize === true;
+  const format = useMemo(
+    () => valueFormat({ unit, precision, humanize }),
+    [unit, precision, humanize],
+  );
+  const formatValue = useCallback((value: number) => formatTileValue(value, format), [format]);
   const xRange = useMemo(() => [start, end] as const, [start, end]);
   const fitted = useChartHeight(
     height,
-    JSON.stringify([tile.config, chart.categorical, chart.series.map((series) => series.id)]),
+    JSON.stringify([
+      tile.config,
+      chart.categorical,
+      chart.series.map((series) => series.id),
+      bubble?.groups.map((group) => group.id),
+      bubble?.truncated,
+    ]),
   );
+  const chartType = text(tile.chartType);
+  if (chartType === 'pie' || chartType === 'donut') {
+    const legendPosition = text(layout.legendPosition);
+    return (
+      <PieChart
+        slices={slices}
+        variant={chartType}
+        palette={tilePalette(tile)}
+        showLabels={layout.label === true}
+        legendPosition={
+          legendPosition === 'top' || legendPosition === 'left' || legendPosition === 'right'
+            ? legendPosition
+            : 'bottom'
+        }
+        formatValue={formatValue}
+        title={`${tileTitle(tile)} chart`}
+        height={height === 'fit' ? undefined : height}
+      />
+    );
+  }
+  if (tile.chartType === 'bubble') {
+    if (result.promql || tile.tileType === 'promql')
+      return (
+        <p className="muted dashboard-chart-note" role="status">
+          Bubble charts are not available for PromQL tiles.
+        </p>
+      );
+    const legend = text(layout.legendPosition);
+    const legendPosition =
+      legend === 'top' || legend === 'left' || legend === 'right' ? legend : 'bottom';
+    const { xField, yField, sizeField, groupField, ...data } = bubble!;
+    return (
+      <div ref={fitted.root} className="dashboard-chart" data-legend-position={legendPosition}>
+        <BubbleChart
+          {...data}
+          xTitle={text(record(axes.x).title) || xField}
+          yTitle={text(record(axes.y).title) || yField}
+          xLabel={xField}
+          yLabel={yField}
+          sizeLabel={sizeField}
+          groupLabel={groupField}
+          legendPosition={legendPosition}
+          formatValue={formatValue}
+          title={`${tileTitle(tile)} chart`}
+          height={fitted.pixels}
+          emptyMessage="No results for the selected time range"
+        />
+      </div>
+    );
+  }
+  if (tile.chartType === 'gauge') {
+    const value = gaugeValue(tile, result, rows);
+    return value === undefined ? (
+      <div
+        className="charts-empty charts-gauge-empty"
+        role="group"
+        aria-label={`${tileTitle(tile)} value`}
+      >
+        No values returned
+      </div>
+    ) : (
+      <GaugeChart
+        label={tileTitle(tile)}
+        model={gaugeModel(value, tile)}
+        text={formatValue(value)}
+      />
+    );
+  }
   if (tile.chartType === 'table' || (chart.categorical && tile.chartType !== 'query-value'))
     return (
       <div

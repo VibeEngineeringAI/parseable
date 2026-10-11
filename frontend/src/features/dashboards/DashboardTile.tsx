@@ -73,6 +73,7 @@ export function DashboardTile({
     navigate = useNavigate();
   const [viewQuery, setViewQuery] = useState(false);
   const supported = knownTile(tile) && supportedCharts.includes(text(tile.chartType, 'timeseries'));
+  const unavailable = tile.tileType === 'promql' && tile.chartType === 'bubble';
   const locked = tile.tileType === 'promql' && promqlEnabled !== true;
   const effectiveBounds = useMemo(
     () => (tile.timeRange ? timeBounds(storedRange(tile.timeRange, anchor), anchor) : bounds),
@@ -104,13 +105,14 @@ export function DashboardTile({
     end: effectiveBounds.endTime,
     revision,
     supported,
+    unavailable,
     locked,
     ready,
   });
   const results = useAsync(
     useCallback(
       (signal) =>
-        supported && !locked && ready
+        supported && !unavailable && !locked && ready
           ? loadTile(client, tile, variables, values, effectiveBounds, limit, signal)
           : Promise.resolve(undefined),
       [client, limit, inputKey],
@@ -137,7 +139,7 @@ export function DashboardTile({
       className="dashboard-server-tile"
       role="region"
       aria-label={`Tile ${tileTitle(tile)}`}
-      aria-busy={supported && !locked && ready && results.loading}
+      aria-busy={supported && !unavailable && !locked && ready && results.loading}
       data-tile-id={tile.tile_id}
       style={{
         gridColumn: `${layout.x + 1} / span ${layout.w}`,
@@ -227,6 +229,14 @@ export function DashboardTile({
             <pre>{handoff.queries.join('\n\n') || JSON.stringify(tile.chartQuery, null, 2)}</pre>
             {classicLink}
           </div>
+        ) : unavailable ? (
+          <TileChart
+            tile={tile}
+            result={{}}
+            start={Date.parse(effectiveBounds.startTime) / 1000}
+            end={Date.parse(effectiveBounds.endTime) / 1000}
+            height="fit"
+          />
         ) : locked ? (
           <p className="notice">
             {promqlEnabled === undefined

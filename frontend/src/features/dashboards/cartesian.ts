@@ -1,7 +1,7 @@
-import { strings } from '../../lib/guards';
 import { parseSampleValue, seriesLabel } from '../../lib/promql';
 import type { QueryResult } from '../../lib/promqlResults';
 import type { DashboardTile, LogRecord } from '../../lib/types';
+import { fieldList } from './chartPicker';
 import { record, sqlChart, text } from './tiles';
 
 export type CartesianStyle = {
@@ -51,11 +51,9 @@ export function cartesianChart(rows: LogRecord[], tile: DashboardTile): Cartesia
   if (!chart.categorical || tile.chartType === 'table') return chart;
   const axes = record(record(tile.config).axes),
     xField = text(record(axes.x).field),
-    yField = record(axes.y).field;
-  const yFields = strings(yField) ? yField : text(yField) ? [text(yField)] : [];
-  if (!xField || !yFields.length || yFields.some((field) => !field)) return chart;
-  const configuredGroups = record(axes.groupBy).field;
-  const groupFields = strings(configuredGroups) ? configuredGroups : [];
+    yFields = fieldList(record(axes.y).field);
+  if (!xField || !yFields.length) return chart;
+  const groupFields = fieldList(record(axes.groupBy).field);
   let categories: string[], series: CartesianChart['series'];
   if (!groupFields.length) {
     const points = rows.filter((row) => row[xField] != null);
