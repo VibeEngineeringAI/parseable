@@ -140,7 +140,7 @@ test('SQL executes on DataFusion and reports an actual query error', async ({ pa
 test('dataset inventory and Arrow schema lead back to logs', async ({ page }) => {
   await signIn(page, '/datasets');
   await page.getByRole('textbox', { name: 'Search datasets' }).fill(dataset);
-  await page.getByRole('button', { name: `View schema for ${dataset}` }).click();
+  await page.getByRole('button', { name: `Manage ${dataset}` }).click();
   const schema = page.getByRole('dialog', { name: dataset, exact: true });
   await expect(schema.locator('[data-field-node="message"]')).toBeVisible();
   await expect(schema.locator('[data-field-node="request_id"]')).toBeVisible();

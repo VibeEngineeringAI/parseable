@@ -143,7 +143,7 @@ test('dataset search and schema inspection lead to the matching explorer', async
   await demo(page, '/datasets');
   await page.getByRole('textbox', { name: 'Search datasets' }).fill('api_logs');
   await expect(page.getByRole('heading', { name: 'application_logs', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: 'View schema for api_logs' }).click();
+  await page.getByRole('button', { name: 'Manage api_logs' }).click();
   const sheet = page.getByRole('dialog', { name: 'api_logs', exact: true });
   await expect(sheet.locator('[data-field-node="p_timestamp"]')).toBeVisible();
   await expect(sheet.locator('[data-field-node="trace_id"]')).toBeVisible();

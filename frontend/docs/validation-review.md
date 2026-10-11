@@ -2,6 +2,13 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Dataset management (2026-10-11)
+
+The Datasets page creates datasets (name, telemetry type, optional custom partition) and opens a Manage sheet with information and statistics, schema, retention, hot tier and typed deletion. Contracts were read from the server and checked against a running v3.2.5 server: `/info`, `/stats`, `/retention` (`[]` when unset) and `/hottier` (403 "Hot tier is not enabled at the server config" when the server has no hot tier). Creation does not offer a time partition, because `create_update_stream` passes an empty time partition to `create_stream` (`src/parseable/mod.rs`), so the header would be ignored.
+
+- Default check: **1263 unit tests in 45 files, 265 app browser tests, 16 production-build browser tests and 47 Storybook tests**, and `format:check` passes. The browser cases include validation, duplicate creation, retention set/clear, demo hot tier, typed deletion, keyboard focus, axe, and a 403 message per action.
+- Live, against a disposable server built from this branch: with the native UI at `/`, `datasets.spec.ts` and `server.spec.ts` passed (8, 1 SSO test skipped). With `P_UI_ROOT=classic` and `PARSEABLE_LIVE_BASE=/next`, the full live suite passed **23**, with **2 skipped** (OIDC provider tests). With the native UI at `/`, the Dashboards hard-load test fails by design, because no classic origin exists.
+
 ## Switch-over Phase A (2026-10-10)
 
 Phase A of the `/next` to `/` plan (wiki page `frontend/prism-retirement/switch-over`):

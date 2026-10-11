@@ -10,3 +10,7 @@ test-results/
 # The repository's data* rule is for backend data, not this source directory.
 !src/features/datasets/
 !src/features/datasets/**
+!src/lib/datasetsContract.ts
+!src/lib/datasetsClient.test.ts
+!e2e/datasets.spec.ts
+!e2e-live/datasets.spec.ts

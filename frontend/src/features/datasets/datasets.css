@@ -1,0 +1,48 @@
+.dataset-section + .dataset-section {
+  border-top: 1px solid var(--color-border);
+  padding-top: 20px;
+}
+.dataset-section h2 {
+  font-size: 14px;
+  margin: 0;
+}
+.dataset-section p {
+  margin: 0;
+  line-height: 1.6;
+}
+.dataset-info {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px 16px;
+  margin: 0;
+  font-size: 12px;
+}
+.dataset-info dt {
+  color: var(--color-muted);
+}
+.dataset-info dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.dataset-stats {
+  font-size: 12px;
+}
+.dataset-stats caption {
+  text-align: left;
+  margin-bottom: 8px;
+  color: var(--color-muted);
+}
+.dataset-stats td,
+.dataset-stats th {
+  padding: 8px;
+}
+.dataset-advanced summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.dataset-advanced > .stack {
+  margin-top: 16px;
+}
+.datasets-page .page-heading > .inline {
+  flex-wrap: wrap;
+}
