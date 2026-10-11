@@ -7,6 +7,8 @@
   --chart-series-6: #008300;
   --chart-series-7: #4a3aa7;
   --chart-series-8: #e34948;
+  /* Slightly darker than classic's #f7f7f8 so the track remains visible on white cards. */
+  --chart-gauge-track: #f1f2f6;
 }
 
 [data-theme='dark'] {
@@ -18,6 +20,50 @@
   --chart-series-6: #008300;
   --chart-series-7: #9085e9;
   --chart-series-8: #e66767;
+  --chart-gauge-track: #2d3040;
+}
+
+.charts-gauge {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  /* Match the stat's 120px default, while allowing short flex tiles to shrink. */
+  height: 120px;
+  max-height: 100%;
+  align-items: center;
+  justify-content: center;
+}
+
+.charts-gauge-meter {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.charts-gauge svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.charts-gauge-text {
+  font-family: var(--font-sans);
+}
+
+.charts-gauge-arc {
+  transition: stroke-dasharray 400ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .charts-gauge-arc {
+    /* Keep duration at zero despite the app-wide 0.01ms override. */
+    transition: none !important;
+  }
 }
 
 .charts-figure {

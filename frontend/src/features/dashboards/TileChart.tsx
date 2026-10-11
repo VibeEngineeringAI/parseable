@@ -1,7 +1,9 @@
 import { useCallback, useMemo } from 'react';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
+import { GaugeChart } from '../../components/charts/GaugeChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
+import { gaugeModel, gaugeValue } from './gauge';
 import { chartValue, diagonalFill, fillStyle, percentFill } from './chartValue';
 import { formatValue as formatTileValue, valueFormat } from './formatValue';
 import { useChartHeight } from './useChartHeight';
@@ -72,6 +74,20 @@ export function TileChart({
     height,
     JSON.stringify([tile.config, chart.categorical, chart.series.map((series) => series.id)]),
   );
+  if (tile.chartType === 'gauge') {
+    const value = gaugeValue(tile, result, rows);
+    return value === undefined ? (
+      <div className="dashboard-stat" role="group" aria-label={`${tileTitle(tile)} value`}>
+        No values returned
+      </div>
+    ) : (
+      <GaugeChart
+        label={tileTitle(tile)}
+        model={gaugeModel(value, tile)}
+        text={formatValue(value)}
+      />
+    );
+  }
   if (tile.chartType === 'table' || (chart.categorical && tile.chartType !== 'query-value'))
     return (
       <div
