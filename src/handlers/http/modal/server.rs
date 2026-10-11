@@ -51,11 +51,15 @@ use crate::sync;
 use crate::handlers::http::alert_target_policy;
 use actix_web::Resource;
 use actix_web::Scope;
-use actix_web::middleware::from_fn;
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
+use actix_web::http::StatusCode;
+use actix_web::http::header::{CACHE_CONTROL, HeaderValue};
+use actix_web::middleware::{Next, from_fn};
 use actix_web::web;
 use actix_web::web::resource;
 use actix_web_prometheus::PrometheusMetrics;
-use actix_web_static_files::ResourceFiles;
+use actix_web_static_files::{ResourceFiles, ResourceFilesCollection};
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -847,40 +851,124 @@ impl Server {
     /// Registers `/next` ahead of the catch-all `/` so each UI owns its own routes.
     fn mount_ui(config: &mut web::ServiceConfig, primary: UiFiles, next: UiFiles) {
         if !next.is_empty() {
-            config.service(ResourceFiles::new("/next", next).resolve_not_found_to_root());
+            config.service(Self::ui_scope("/next", next));
         }
-        config.service(ResourceFiles::new("/", primary).resolve_not_found_to_root());
+        config.service(Self::ui_scope("", primary));
+    }
+
+    fn ui_scope(
+        path: &str,
+        files: UiFiles,
+    ) -> Scope<
+        impl ServiceFactory<
+            ServiceRequest,
+            Config = (),
+            Response = ServiceResponse<impl MessageBody>,
+            Error = actix_web::Error,
+            InitError = (),
+        >,
+    > {
+        web::scope(path)
+            .wrap(from_fn(ui_cache_control))
+            .service(ResourceFiles::new("", UiBuild(files)))
     }
 }
 
 type UiFiles = std::collections::HashMap<&'static str, static_files::Resource>;
 
+/// A UI build served as a single-page app: any path that is not a file is a
+/// client-side route and gets `index.html`.
+struct UiBuild(UiFiles);
+
+impl ResourceFilesCollection for UiBuild {
+    type Resource = static_files::Resource;
+
+    /// A missing hashed asset stays a 404. A tab opened before a deploy asks for
+    /// chunks the new build no longer has, and HTML in their place fails to load
+    /// as a script without the browser ever seeing an error status.
+    fn get_resource(&self, path: &str) -> Option<&Self::Resource> {
+        let path = path.trim_start_matches('/');
+        self.0
+            .get(path)
+            .or_else(|| (!is_hashed_asset(path)).then(|| self.0.get("index.html"))?)
+    }
+
+    fn contains_key(&self, path: &str) -> bool {
+        self.0.contains_key(path)
+    }
+}
+
+/// Vite names every file it emits under `assets/` after a hash of its content,
+/// in both UIs. Only the prefix is checked: client routes such as Prism's
+/// `/apm/<service>` may end in a segment containing a dot.
+fn is_hashed_asset(path: &str) -> bool {
+    path.trim_start_matches('/').starts_with("assets/")
+}
+
+/// Hashed assets never change, so browsers may keep them for good. Everything
+/// else, `index.html` above all, is revalidated on each use so a deploy is
+/// picked up by the next navigation.
+async fn ui_cache_control(
+    req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
+    let hashed = is_hashed_asset(req.match_info().unprocessed());
+    let mut response = next.call(req).await?;
+    let status = response.status();
+    let value = if hashed && (status.is_success() || status == StatusCode::NOT_MODIFIED) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(value));
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
-    use actix_web::{App, body::to_bytes, test};
+    use actix_web::{App, body::to_bytes, dev::ServiceResponse, test};
 
     use super::*;
 
-    fn ui(index: &'static [u8]) -> UiFiles {
-        UiFiles::from([(
-            "index.html",
-            static_files::Resource {
-                data: index,
-                modified: 0,
-                mime_type: "text/html",
-            },
-        )])
+    fn file(data: &'static [u8], mime_type: &'static str) -> static_files::Resource {
+        static_files::Resource {
+            data,
+            modified: 0,
+            mime_type,
+        }
     }
 
-    async fn body_at(path: &str, next: UiFiles) -> Bytes {
+    fn ui(index: &'static [u8]) -> UiFiles {
+        UiFiles::from([
+            ("index.html", file(index, "text/html")),
+            ("assets/index-abc123.js", file(b"chunk", "text/javascript")),
+            ("favicon.ico", file(b"icon", "image/x-icon")),
+        ])
+    }
+
+    async fn get(path: &str, next: UiFiles) -> ServiceResponse {
         let app = test::init_service(
             App::new().configure(|config| Server::mount_ui(config, ui(b"classic"), next)),
         )
         .await;
-        let response =
-            test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+        test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await
+    }
+
+    async fn body_at(path: &str, next: UiFiles) -> Bytes {
+        let response = get(path, next).await;
         assert!(response.status().is_success(), "GET {path} failed");
         to_bytes(response.into_body()).await.unwrap()
+    }
+
+    fn cache_control(response: &ServiceResponse) -> &str {
+        response
+            .headers()
+            .get(CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap()
     }
 
     #[actix_web::test]
@@ -901,5 +989,54 @@ mod tests {
     #[actix_web::test]
     async fn without_a_next_build_the_classic_ui_serves_next_paths() {
         assert_eq!(body_at("/next/logs", UiFiles::new()).await, "classic");
+    }
+
+    #[actix_web::test]
+    async fn client_routes_get_index_html_even_with_a_dot_in_them() {
+        for path in [
+            "/apm/checkout.api",
+            "/errors/TypeError.x",
+            "/assetsfoo/a.js",
+        ] {
+            assert_eq!(body_at(path, UiFiles::new()).await, "classic", "GET {path}");
+        }
+        assert_eq!(body_at("/next/apm/a.b", ui(b"next")).await, "next");
+    }
+
+    #[actix_web::test]
+    async fn a_missing_hashed_asset_is_not_found() {
+        for path in ["/assets/index-gone.js", "/next/assets/index-gone.js"] {
+            let response = get(path, ui(b"next")).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+            assert_eq!(cache_control(&response), "no-cache", "GET {path}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn hashed_assets_are_immutable_and_everything_else_revalidates() {
+        for path in ["/assets/index-abc123.js", "/next/assets/index-abc123.js"] {
+            let response = get(path, ui(b"next")).await;
+            assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+            assert_eq!(
+                cache_control(&response),
+                "public, max-age=31536000, immutable",
+                "GET {path}"
+            );
+        }
+        for path in ["/", "/logs", "/favicon.ico", "/next", "/next/team"] {
+            let response = get(path, ui(b"next")).await;
+            assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+            assert_eq!(cache_control(&response), "no-cache", "GET {path}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn existing_files_are_served_as_themselves() {
+        assert_eq!(
+            body_at("/assets/index-abc123.js", UiFiles::new()).await,
+            "chunk"
+        );
+        assert_eq!(body_at("/favicon.ico", UiFiles::new()).await, "icon");
+        assert_eq!(body_at("/next/favicon.ico", ui(b"next")).await, "icon");
     }
 }
