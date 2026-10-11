@@ -415,7 +415,8 @@ describe('classic Metrics links', () => {
   it.each([
     ['?viewType=list', ['All metrics view']],
     ['?viewType=table', ['table view']],
-    ['?viewMode=chart', []],
+    ['?viewMode=chart', ['All metrics view']],
+    ['?viewMode=list&viewType=explorer', []],
     ['?fromSavedFilter=true', []],
     ['?suffix=bucket', ['histogram _bucket series']],
     ['?suffix=other', []],

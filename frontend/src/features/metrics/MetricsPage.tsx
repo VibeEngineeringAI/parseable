@@ -114,8 +114,12 @@ export function MetricsPage() {
       }}
     />
   );
-  // A classic link's range and filters are rewritten before the explorer reads the address.
-  const classicLink = classicMetricsSearch(location.search);
+  // A classic link's range and filters are rewritten before the explorer reads the
+  // address. The page's own navigations carry its own queries, which can look like
+  // a classic filter while being typed (a metric named WHERE), so they are skipped.
+  const classicLink = pageState?.metricsOwnNavigation
+    ? undefined
+    : classicMetricsSearch(location.search);
   if (classicLink)
     return (
       <Navigate

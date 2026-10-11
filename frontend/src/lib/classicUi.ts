@@ -483,7 +483,9 @@ export function classicMetricsSearch(
   const promql = params.get('promql');
   const viewType = params.get('viewType');
   const explorer = !!promql || viewType === 'explorer';
-  if (viewType === 'list') dropped.push('All metrics view');
+  // `viewMode` lays out the All metrics view, which is also classic's default.
+  if (viewType === 'list' || (!viewType && !explorer && params.has('viewMode')))
+    dropped.push('All metrics view');
   if (viewType === 'table') dropped.push('table view');
   const suffix = params.get('suffix');
   if (suffix && histogramSuffixes.includes(suffix)) dropped.push(`histogram _${suffix} series`);

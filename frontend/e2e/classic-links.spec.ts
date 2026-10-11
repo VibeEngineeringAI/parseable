@@ -282,6 +282,18 @@ test('classic explorer bookmarks open their PromQL queries', async ({ page }) =>
   await expect(notice(page)).toHaveText(/1 query built with operations\./);
 });
 
+test('a query being typed is never taken for a classic filter', async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  await page.goto('/metrics/explore/demo_metrics');
+  const editor = page.getByRole('textbox', { name: 'PromQL query A', exact: true });
+  // A metric named WHERE, part-way through `WHERE > 5`: not PromQL yet, and
+  // shaped like a classic filter, but this page's own edit.
+  await editor.fill('WHERE >');
+  await expect(page).toHaveURL(/query=WHERE\+%3E/);
+  await expect(editor).toHaveText('WHERE >');
+  await expect(notice(page)).toHaveCount(0);
+});
+
 test('a dismissed Metrics notice stays dismissed after reconnecting', async ({ page }) => {
   await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
   await page.goto(`/metrics/explore/demo_metrics?start=1h&end=now&type=fixed&query=${hostFilter}`);
