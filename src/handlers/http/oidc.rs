@@ -46,7 +46,10 @@ use url::Url;
 use crate::{
     handlers::{
         COOKIE_AGE_DAYS, SESSION_COOKIE_NAME, USER_COOKIE_NAME, USER_ID_COOKIE_NAME,
-        http::{cluster::sync_user_creation, modal::OIDC_CLIENT, rbac::UPDATE_LOCK},
+        http::{
+            API_BASE_PATH, API_VERSION, cluster::sync_user_creation, modal::OIDC_CLIENT,
+            rbac::UPDATE_LOCK,
+        },
     },
     oauth::{OAuthProvider, OAuthSession},
     parseable::{DEFAULT_TENANT, PARSEABLE},
@@ -81,9 +84,18 @@ pub struct RedirectAfterLogin {
     pub redirect: Url,
 }
 
+/// Query params for /login: the redirect target, and whether `login` already
+/// moved the browser to the `P_ORIGIN_URI` host.
+#[derive(Deserialize, Debug)]
+pub struct LoginQuery {
+    pub redirect: Url,
+    #[serde(default)]
+    pub at_origin: bool,
+}
+
 pub async fn login(
     req: HttpRequest,
-    query: web::Query<RedirectAfterLogin>,
+    query: web::Query<LoginQuery>,
 ) -> Result<HttpResponse, OIDCError> {
     if !is_valid_redirect_url(&request_base_url(&req), query.redirect.as_str()) {
         return Err(OIDCError::BadRequest(
@@ -96,7 +108,7 @@ pub async fn login(
     let session_key = extract_session_key_from_req(&req).ok();
     let (session_key, oidc_client) = match (session_key, oidc_client) {
         (None, None) => return Ok(redirect_no_oauth_setup(query.redirect.clone())),
-        (None, Some(client)) => return Ok(redirect_to_idp(client, &query.redirect).await),
+        (None, Some(client)) => return Ok(redirect_to_idp(&req, client, &query).await),
         (Some(session_key), client) => (session_key, client),
     };
     // if control flow is here then it is most likely basic auth
@@ -142,7 +154,7 @@ pub async fn login(
             } else {
                 Users.remove_session(&key);
                 if let Some(oidc_client) = oidc_client {
-                    redirect_to_idp(oidc_client, &query.redirect).await
+                    redirect_to_idp(&req, oidc_client, &query).await
                 } else {
                     redirect_to_client(query.redirect.as_str(), None)
                 }
@@ -329,10 +341,17 @@ fn is_xhr(req: &HttpRequest) -> bool {
 /// state cookie set by `login` may finish the login, and only toward an
 /// allowed origin.
 fn login_redirect(req: &HttpRequest, state: Option<&str>) -> Result<String, OIDCError> {
-    let cookie = req.cookie(LOGIN_STATE_COOKIE_NAME);
+    // `login` sets the cookie on the host it was reached by, which can differ
+    // from the host the IdP returns to; say so rather than invite a retry.
+    let Some(cookie) = req.cookie(LOGIN_STATE_COOKIE_NAME) else {
+        return Err(OIDCError::BadRequest(
+            "Bad Request, no sign-in is pending in this browser on this host. Sign in again; \
+             if this repeats, set P_ORIGIN_URI to the address browsers use for Parseable."
+                .to_string(),
+        ));
+    };
     let redirect = state
-        .zip(cookie.as_ref())
-        .and_then(|(state, cookie)| verify_login_state(state, cookie.value()))
+        .and_then(|state| verify_login_state(state, cookie.value()))
         .ok_or_else(|| {
             OIDCError::BadRequest(
                 "Bad Request, login state does not match this browser. Sign in again.".to_string(),
@@ -411,9 +430,17 @@ fn build_login_response(
 /// Send the browser to the IdP with a fresh state token that only this
 /// browser holds, so the callback can reject codes obtained elsewhere.
 async fn redirect_to_idp(
+    req: &HttpRequest,
     client: &Arc<RwLock<Box<dyn OAuthProvider>>>,
-    redirect: &Url,
+    query: &LoginQuery,
 ) -> HttpResponse {
+    if let Some(url) = login_at_origin(req, query) {
+        return HttpResponse::TemporaryRedirect()
+            .insert_header((actix_web::http::header::LOCATION, url.as_str()))
+            .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
+            .finish();
+    }
+    let redirect = &query.redirect;
     let token = Ulid::new().to_string();
     let scope = PARSEABLE.options.scope.to_string();
     let mut auth_url: String = client
@@ -432,6 +459,35 @@ async fn redirect_to_idp(
         .cookie(cookie_login_state(&token))
         .insert_header((actix_web::http::header::LOCATION, auth_url))
         .finish()
+}
+
+/// The IdP returns browsers to `P_ORIGIN_URI`, so the state cookie must be set
+/// on that host. A login reached under another name (`localhost` for
+/// `127.0.0.1`, an internal DNS name) moves there first, but only once: a
+/// proxy that rewrites `Host` would otherwise bounce the browser forever.
+fn login_at_origin(req: &HttpRequest, query: &LoginQuery) -> Option<Url> {
+    let origin = PARSEABLE.options.domain_address.as_ref()?;
+    if query.at_origin {
+        return None;
+    }
+    origin_login_url(origin, req.connection_info().host(), &query.redirect)
+}
+
+/// `/o/login` on `origin`, if `request_host` names another host. Cookies are
+/// not scoped by scheme or port, so only the host name counts.
+fn origin_login_url(origin: &Url, request_host: &str, redirect: &Url) -> Option<Url> {
+    let request = Url::parse(&format!("http://{request_host}/")).ok()?;
+    if request.host_str() == origin.host_str() {
+        return None;
+    }
+    // Joined like the callback's `redirect_uri`, so a path prefix carries over.
+    let mut url = origin
+        .join(&format!("{API_BASE_PATH}/{API_VERSION}/o/login"))
+        .ok()?;
+    url.query_pairs_mut()
+        .append_pair("redirect", redirect.as_str())
+        .append_pair("at_origin", "true");
+    Some(url)
 }
 
 fn request_base_url(req: &HttpRequest) -> String {
@@ -890,6 +946,42 @@ mod tests {
             Some(&state)
         )));
         assert!(rejected(login_redirect(&callback(Some("01JTOKEN")), None)));
+    }
+
+    #[test]
+    fn login_moves_to_the_origin_host_only_when_the_host_differs() {
+        let origin = Url::parse("http://127.0.0.1:8000/").unwrap();
+        let redirect = Url::parse("http://localhost:8000/next/logs?q=a&b=1").unwrap();
+        let url = origin_login_url(&origin, "localhost:8000", &redirect).unwrap();
+        assert_eq!(url.origin(), origin.origin());
+        assert_eq!(url.path(), "/api/v1/o/login");
+        let query: Vec<_> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            query,
+            [
+                ("redirect".to_owned(), redirect.to_string()),
+                ("at_origin".to_owned(), "true".to_owned()),
+            ]
+        );
+        // Ports and case don't scope cookies, so these already share them.
+        for host in ["127.0.0.1:8000", "127.0.0.1", "127.0.0.1:3000"] {
+            assert_eq!(origin_login_url(&origin, host, &redirect), None, "{host}");
+        }
+        let origin = Url::parse("https://Parseable.Example/").unwrap();
+        assert_eq!(
+            origin_login_url(&origin, "parseable.example:443", &redirect),
+            None
+        );
+        assert!(origin_login_url(&origin, "10.0.0.5:8000", &redirect).is_some());
+        assert!(origin_login_url(&origin, "[::1]:8000", &redirect).is_some());
+    }
+
+    #[test]
+    fn login_keeps_the_origin_path_prefix() {
+        let origin = Url::parse("https://host.example/parseable/").unwrap();
+        let redirect = Url::parse("https://host.example/parseable/").unwrap();
+        let url = origin_login_url(&origin, "internal:8000", &redirect).unwrap();
+        assert_eq!(url.path(), "/parseable/api/v1/o/login");
     }
 
     #[test]

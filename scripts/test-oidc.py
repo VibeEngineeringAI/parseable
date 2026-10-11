@@ -943,6 +943,28 @@ def test_browser_callback(smoke: Smoke, issuer: MockIssuer, info_path: str) -> N
     if status != 200:
         fail(f"JSON callback from an allowed UI origin was rejected (HTTP {status})")
 
+    # The IdP returns to the P_ORIGIN_URI host, so a login reached under
+    # another host name moves there before setting the state cookie, once.
+    alias = {"Host": f"localhost:{urllib.parse.urlsplit(smoke.base_url).port}"}
+    status, set_cookie, location = browser_get(
+        f"{smoke.base_url}/api/v1/o/login?{urllib.parse.urlencode({'redirect': allowed_redirect})}",
+        None,
+        alias,
+    )
+    if status != 307 or cookie_value(set_cookie, "oidc_state") is not None:
+        fail(f"OIDC login on another host name did not move to P_ORIGIN_URI first (HTTP {status})")
+    parts = urllib.parse.urlsplit(location or "")
+    if (
+        f"{parts.scheme}://{parts.netloc}" != smoke.base_url
+        or parts.path != "/api/v1/o/login"
+        or urllib.parse.parse_qs(parts.query) != {"redirect": [allowed_redirect], "at_origin": ["true"]}
+    ):
+        fail(f"OIDC login on another host name moved to an unexpected URL: {location}")
+    # A proxy that rewrites Host must not bounce the browser again.
+    status, set_cookie, location = browser_get(location, None, alias)
+    if status != 307 or not cookie_value(set_cookie, "oidc_state") or not location or location.startswith(smoke.base_url):
+        fail(f"OIDC login after moving to P_ORIGIN_URI did not continue to the provider (HTTP {status})")
+
 
 def main() -> int:
     if shutil.which("openssl") is None:
@@ -973,6 +995,7 @@ def main() -> int:
             "P_OIDC_CLIENT_SECRET": CLIENT_SECRET,
             "P_OIDC_ISSUER": issuer_url,
             "P_OIDC_SCOPE": "openid profile email groups",
+            "P_ORIGIN_URI": base_url,
             "P_ALLOW_ORIGINS": f"{ALLOWED_UI}/app",
             "P_CHECK_UPDATE": "false",
             "P_SEND_ANONYMOUS_USAGE_DATA": "false",
