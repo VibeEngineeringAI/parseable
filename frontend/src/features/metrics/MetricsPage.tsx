@@ -79,9 +79,13 @@ export function MetricsPage() {
   // notice. A navigation the page makes itself keeps the current one, so a dismissal
   // holds; back and forward restore the entry's own; anything else brings its own.
   const pageState = location.state as PageState;
-  const [notice, setNotice] = useState({
-    key: location.key,
-    dropped: pageState?.classicDropped ?? [],
+  const [notice, setNotice] = useState(() => {
+    // Dismissing removes the notice from the history entry, but not from the
+    // router's copy of its state, so a remount (such as after reconnecting)
+    // reads the entry when it is the current location.
+    const entry = window.history.state as { key?: string; usr?: PageState } | null;
+    const state = entry?.key === location.key ? entry.usr : pageState;
+    return { key: location.key, dropped: state?.classicDropped ?? [] };
   });
   if (notice.key !== location.key)
     setNotice({

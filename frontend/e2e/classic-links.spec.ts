@@ -245,6 +245,18 @@ test('untyped and indented classic Metrics filters are reported, not run', async
   }
 });
 
+test('a dismissed Metrics notice stays dismissed after reconnecting', async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  await page.goto(`/metrics/explore/demo_metrics?start=1h&end=now&type=fixed&query=${hostFilter}`);
+  await expect(notice(page)).toHaveText(/1 filter\./);
+  await notice(page).getByRole('button', { name: 'Dismiss' }).click();
+  await expect(notice(page)).toHaveCount(0);
+  await page.getByRole('button', { name: 'Connection settings' }).click();
+  await page.getByRole('button', { name: 'Explore demo data' }).click();
+  await expect(page.getByRole('textbox', { name: 'PromQL query A', exact: true })).toBeVisible();
+  await expect(notice(page)).toHaveCount(0);
+});
+
 test('editing after a classic Metrics link keeps its notice, and dismissing keeps the edit', async ({
   page,
 }) => {
