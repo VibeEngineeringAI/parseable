@@ -202,6 +202,33 @@ test('a classic Metrics link names its filter on every state of the page', async
   await page.goto(`/metrics/explore/otel?start=1h&end=now&type=fixed&query=${hostFilter}`);
   await expect(page.getByText('PromQL is not available on this server')).toBeVisible();
   await expect(notice(page)).toHaveText(/1 filter\./);
+  // Opening the same page again from inside the app is a new visit.
+  await navigateInApp(page, '/metrics/explore/otel?range=1h');
+  await expect(page.getByText('PromQL is not available on this server')).toBeVisible();
+  await expect(notice(page)).toHaveCount(0);
+});
+
+test('editing after a classic Metrics link keeps its notice, and dismissing keeps the edit', async ({
+  page,
+}) => {
+  await metricsServer(page);
+  await page.goto(`/metrics/explore/otel?start=1h&end=now&type=fixed&query=${hostFilter}`);
+  const editor = page.getByRole('textbox', { name: 'PromQL query A', exact: true });
+  await expect(editor).toBeVisible();
+  await expect(notice(page)).toHaveText(/1 filter\./);
+  await editor.fill('up');
+  await page.getByLabel('Time range', { exact: true }).selectOption('6h');
+  await expect(page).toHaveURL(/query=up.*range=6h/);
+  await expect(notice(page)).toHaveText(/1 filter\./);
+  // Dismissing right after an edit does not navigate, so it cannot undo the edit.
+  await editor.fill('down');
+  await notice(page).getByRole('button', { name: 'Dismiss' }).click();
+  await expect(notice(page)).toHaveCount(0);
+  await expect(page).toHaveURL(/query=down/);
+  await expect(editor).toHaveText('down');
+  await page.reload();
+  await expect(editor).toHaveText('down');
+  await expect(notice(page)).toHaveCount(0);
 });
 
 test('a classic Metrics link to a missing dataset keeps its notice when another opens', async ({

@@ -35,6 +35,11 @@ import './metrics.css';
 
 const datasetPath = (name: string) => `/metrics/explore/${encodeURIComponent(name)}`;
 
+/** History state of a Metrics location. */
+type PageState = { classicDropped?: string[]; metricsOwnNavigation?: boolean } | null;
+/** Marks a navigation the page makes itself, which keeps the classic link notice. */
+const ownNavigation = { replace: true, state: { metricsOwnNavigation: true } };
+
 export function MetricsPage() {
   const { client } = useApp();
   const { dataset } = useParams();
@@ -61,27 +66,30 @@ export function MetricsPage() {
     <DiscoveryWarning unchecked={discovery.data.unchecked} retry={rescan} />
   ) : null;
   // What the latest classic link could not carry over. It is kept here, not in the
-  // explorer, so every state of the page shows it, until dismissed or replaced.
-  const linkDropped = (location.state as { classicDropped?: string[] } | null)?.classicDropped;
-  const [notice, setNotice] = useState({ key: location.key, dropped: linkDropped ?? [] });
-  if (linkDropped && notice.key !== location.key)
-    setNotice({ key: location.key, dropped: linkDropped });
-  const clearNotice = useCallback(
-    () => setNotice((current) => (current.dropped.length ? { ...current, dropped: [] } : current)),
-    [],
-  );
+  // explorer, so every state of the page shows it. A navigation either brings a
+  // link's notice, is one of this page's own, which keeps it, or replaces it.
+  const pageState = location.state as PageState;
+  const [notice, setNotice] = useState({
+    key: location.key,
+    dropped: pageState?.classicDropped ?? [],
+  });
+  if (notice.key !== location.key)
+    setNotice({
+      key: location.key,
+      dropped: pageState?.classicDropped ?? (pageState?.metricsOwnNavigation ? notice.dropped : []),
+    });
   const linkNotice = (
     <LinkNotice
       dropped={notice.dropped}
       onDismiss={() => {
-        clearNotice();
-        // Clear it from history too, so a reload does not bring it back.
-        if (!linkDropped) return;
-        const { classicDropped: _, ...rest } = location.state as Record<string, unknown>;
-        navigate(
-          { pathname: location.pathname, search: location.search, hash: location.hash },
-          { replace: true, state: rest },
-        );
+        setNotice({ key: notice.key, dropped: [] });
+        // Remove it from this history entry too, so a reload does not bring it back.
+        // This does not navigate, so an edit whose navigation is pending is kept.
+        const entry = window.history.state as { usr?: PageState } | null;
+        if (entry?.usr?.classicDropped) {
+          const { classicDropped: _, ...usr } = entry.usr;
+          window.history.replaceState({ ...entry, usr }, '');
+        }
       }}
     />
   );
@@ -107,12 +115,7 @@ export function MetricsPage() {
     return (
       <>
         {warning && <div className="page metrics-discovery">{warning}</div>}
-        <MetricsExplorer
-          dataset={dataset!}
-          datasets={datasets}
-          notice={linkNotice}
-          onIncomingLink={clearNotice}
-        />
+        <MetricsExplorer dataset={dataset!} datasets={datasets} notice={linkNotice} />
       </>
     );
   return (
@@ -155,9 +158,7 @@ export function MetricsPage() {
             <div className="inline">
               <Button
                 onClick={() =>
-                  navigate(`${datasetPath(datasets[0].name)}${location.search}`, {
-                    replace: true,
-                  })
+                  navigate(`${datasetPath(datasets[0].name)}${location.search}`, ownNavigation)
                 }
               >
                 Open {datasets[0].name}
@@ -191,14 +192,11 @@ function MetricsExplorer({
   dataset,
   datasets,
   notice,
-  onIncomingLink,
 }: {
   dataset: string;
   datasets: DatasetInfo[];
   /** The page's notice about the latest classic link. */
   notice: ReactNode;
-  /** Called when a navigation from outside the explorer brings another search. */
-  onIncomingLink: () => void;
 }) {
   const { client } = useApp();
   const location = useLocation();
@@ -237,7 +235,7 @@ function MetricsExplorer({
     setRunError(undefined);
     writtenSearch.current = serializeExplorerState(next);
     pendingSearches.current.add(writtenSearch.current);
-    navigate({ pathname: location.pathname, search: writtenSearch.current }, { replace: true });
+    navigate({ pathname: location.pathname, search: writtenSearch.current }, ownNavigation);
   }
 
   function removeQuery(index: number) {
@@ -266,9 +264,6 @@ function MetricsExplorer({
       pendingSearches.current.delete(location.search);
       if (location.search === writtenSearch.current) pendingSearches.current.clear();
     } else if (location.search !== writtenSearch.current) {
-      // Not this explorer's own edit: a notice about an earlier link no longer applies.
-      if (!(location.state as { classicDropped?: string[] } | null)?.classicDropped)
-        onIncomingLink();
       pendingSearches.current.clear();
       writtenSearch.current = location.search;
       const next = parseExplorerSearch(location.search);
@@ -333,9 +328,10 @@ function MetricsExplorer({
               onChange={(event) => {
                 writtenSearch.current = serializeExplorerState(draft.current);
                 pendingSearches.current.add(writtenSearch.current);
-                navigate(`${datasetPath(event.target.value)}${writtenSearch.current}`, {
-                  replace: true,
-                });
+                navigate(
+                  `${datasetPath(event.target.value)}${writtenSearch.current}`,
+                  ownNavigation,
+                );
               }}
             >
               {datasets.map((entry) => (

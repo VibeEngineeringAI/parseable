@@ -13,7 +13,7 @@ Phase A of the `/next` to `/` plan (wiki page `frontend/prism-retirement/switch-
 - **A6, sign-out:** the not-found page, `QueryState` errors and 403s render inside the shell, whose top bar has Sign out. A page that failed to render, including one whose chunk is gone after a deploy, used to show React Router's developer screen; a page's error now shows inside the shell, with Reload and Back to overview, and the navigation and Sign out stay. `RouteError` handles errors outside a page and also offers Sign out. A missing stylesheet (Vite's "Unable to preload CSS") counts as a missing page, which only a production build shows; `npm run test:preview` covers it against `vite build` and `vite preview`.
 - **A7, root build:** `vite build --base=/` into a temporary directory has no `/next/` references. Served by `vite preview` on port 8271 and proxied to a disposable v3.2.5 server on 8030 (classic at `/`, `PARSEABLE_LIVE_SERVER_URL`), the live suite passed **22**, with **2 skipped** (`PARSEABLE_LIVE_OIDC` provider tests). The first run failed only on `metrics.spec.ts` asserting `7.50`. That assertion predates the trailing-zero formatter change in `1bdcbc85` and now expects `7.5`.
 
-Default check on this branch: **1079 unit tests in 42 files, 244 app browser tests, 5 production-build browser tests and 47 Storybook tests**, and `format:check` passes.
+Default check on this branch: **1079 unit tests in 42 files, 245 app browser tests, 5 production-build browser tests and 47 Storybook tests**, and `format:check` passes.
 
 ## Dashboards validation (2026-10-10)
 
