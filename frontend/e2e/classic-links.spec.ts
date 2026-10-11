@@ -245,6 +245,38 @@ test('untyped and indented classic Metrics filters are reported, not run', async
   }
 });
 
+test('classic explorer bookmarks open their PromQL queries', async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  const metric = 'system.cpu.load_average.1m';
+  const editor = (id: string) =>
+    page.getByRole('textbox', { name: `PromQL query ${id}`, exact: true });
+  // Prism's own link: /metrics/explore/<dataset>?promql=<query>.
+  await page.goto(
+    `/metrics/explore/demo_metrics?${new URLSearchParams({ promql: `{"${metric}"}` })}`,
+  );
+  await expect(editor('A')).toHaveText(`{"${metric}"}`);
+  await expect(page.getByRole('img', { name: /PromQL range result/ })).toBeVisible();
+  await expect(notice(page)).toHaveCount(0);
+  // Its serialized explorer state, with a builder query it cannot translate.
+  const state = JSON.stringify({
+    step: '1m',
+    queryType: 'range',
+    tiles: [
+      { id: 'A', editorMode: 'promql', promqlQuery: `{"${metric}"}` },
+      { id: 'B', editorMode: 'builder', promqlMetric: metric, promqlMatchers: [], operations: [] },
+      { id: 'C', editorMode: 'builder', promqlMetric: metric, operations: [{ id: 'rate' }] },
+    ],
+  });
+  await page.goto(
+    `/metrics/explore/demo_metrics?${new URLSearchParams({ viewType: 'explorer', type: 'fixed', start: '1h', end: 'now', state })}`,
+  );
+  await expect(editor('A')).toHaveText(`{"${metric}"}`);
+  await expect(editor('B')).toHaveText(`{"${metric}"}`);
+  await expect(page.getByRole('radio', { name: 'Range', exact: true })).toBeChecked();
+  await expect(page.getByLabel('Step', { exact: true })).toHaveValue('1m');
+  await expect(notice(page)).toHaveText(/1 query built with operations\./);
+});
+
 test('a dismissed Metrics notice stays dismissed after reconnecting', async ({ page }) => {
   await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
   await page.goto(`/metrics/explore/demo_metrics?start=1h&end=now&type=fixed&query=${hostFilter}`);

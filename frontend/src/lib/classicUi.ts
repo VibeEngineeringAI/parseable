@@ -1,6 +1,6 @@
 import { parser } from '@prometheus-io/lezer-promql';
 import { basePath } from './config';
-import { metricSelector, validateRange } from './promql';
+import { matcher, metricSelector, validateRange } from './promql';
 import type { LogFilter, TimeRange } from './types';
 
 /** The classic (Prism) UI owns the root while this frontend is mounted under a prefix. */
@@ -21,10 +21,11 @@ export type ClassicRoute = {
   native?: string;
   kind: ClassicRouteKind;
   /**
-   * Query parameters added on the way here, from the decoded classic captures.
-   * A value is appended, so a parameter already on the link is kept.
+   * Query parameters added on the way here, from the decoded classic captures
+   * and the link's query, which it may also edit. A value is appended, so a
+   * parameter already on the link is kept.
    */
-  params?: (captures: Record<string, string>) => Record<string, string>;
+  params?: (captures: Record<string, string>, search: URLSearchParams) => Record<string, string>;
 };
 
 /**
@@ -33,6 +34,9 @@ export type ClassicRoute = {
  * parameters are translated by `classicLogsState`, and classic Metrics ones by
  * `classicMetricsSearch`, since the path is unchanged.
  */
+/** The histogram series a classic drilldown can chart, by its `suffix`. */
+const histogramSuffixes = ['bucket', 'sum', 'count'];
+
 export const classicRoutes: readonly ClassicRoute[] = [
   { classic: '/', native: '/', kind: 'same' },
   { classic: '/login', native: '/login', kind: 'same' },
@@ -43,7 +47,13 @@ export const classicRoutes: readonly ClassicRoute[] = [
     classic: '/metrics/explore/:dataset/metric/:metric',
     native: '/metrics/explore/:dataset',
     kind: 'redirect',
-    params: ({ metric }) => ({ query: metricSelector(metric) }),
+    params: ({ metric }, search) => {
+      // Classic adds `suffix` only for a histogram, whose chart is that series.
+      const suffix = search.get('suffix');
+      search.delete('suffix');
+      const series = suffix && histogramSuffixes.includes(suffix) ? `${metric}_${suffix}` : metric;
+      return { query: metricSelector(series) };
+    },
   },
   { classic: '/metrics/search/:dataset', native: '/metrics/explore/:dataset', kind: 'redirect' },
   { classic: '/sql-editor', native: '/sql-editor', kind: 'same' },
@@ -140,7 +150,7 @@ export function nativePath(path: string): string {
         return path;
       }
     }
-    for (const [name, value] of Object.entries(found.route.params(decoded)))
+    for (const [name, value] of Object.entries(found.route.params(decoded, search)))
       search.append(name, value);
   }
   const query = search.toString();
@@ -304,8 +314,105 @@ function isClassicMetricsFilter(query: string): boolean {
   return invalid;
 }
 
-/** Classic Metrics parameters with no meaning here. */
-const classicMetricsOnly = ['tz', 'groupBy', 'view', 'viewType', 'viewMode', 'fromSavedFilter'];
+/**
+ * Classic Metrics parameters that this page does not read under the same name.
+ * Every parameter Prism v3.2.5's Metrics pages read (`Metrics-DYr03wWH.js`,
+ * `MetricsExploreView-DmrgxGoz.js`) is either here, translated below, or
+ * `start`, `end`, `type` and `query`: `tz`, `groupBy` and `view` are reported;
+ * `viewType`, `viewMode` and `fromSavedFilter` only choose classic's layout;
+ * `suffix` matters only on a drilldown, which the redirect handles; `promql` and
+ * `state` hold the explorer's queries.
+ */
+const classicMetricsOnly = [
+  'tz',
+  'groupBy',
+  'view',
+  'viewType',
+  'viewMode',
+  'fromSavedFilter',
+  'suffix',
+  'promql',
+  'state',
+];
+
+/** The most queries this page runs; mirrors `maxQueries` in the Metrics helpers. */
+const metricsQueryLimit = 5;
+
+const plural = (count: number, one: string, many: string) =>
+  count === 1 ? `1 ${one}` : `${count} ${many}`;
+
+/**
+ * The queries, step and query type in classic's serialized explorer `state`,
+ * as Prism v3.2.5 reads it, and what does not translate. Undefined when
+ * classic would not read it either.
+ */
+function classicExplorerState(value: string) {
+  let state: unknown;
+  try {
+    state = JSON.parse(value);
+  } catch {
+    return;
+  }
+  const { tiles, step, queryType } = (state ?? {}) as Record<string, unknown>;
+  if (
+    !Array.isArray(tiles) ||
+    !tiles.length ||
+    (queryType && !['range', 'instant', 'both'].includes(queryType as string)) ||
+    tiles.some(
+      (tile) =>
+        !tile ||
+        typeof tile !== 'object' ||
+        !['promql', 'builder'].includes((tile as Record<string, unknown>).editorMode as string),
+    )
+  )
+    return;
+  const queries: string[] = [];
+  let untranslated = 0;
+  for (const tile of tiles as Record<string, unknown>[]) {
+    if (tile.editorMode === 'promql') {
+      queries.push(typeof tile.promqlQuery === 'string' ? tile.promqlQuery : '');
+      continue;
+    }
+    const selector = builderSelector(tile.promqlMetric, tile.promqlMatchers, tile.operations);
+    if (selector === undefined) untranslated++;
+    else queries.push(selector);
+  }
+  return {
+    queries,
+    step: typeof step === 'string' ? step : '',
+    type: queryType as string | undefined,
+    untranslated,
+  };
+}
+
+/**
+ * The selector a classic builder query without operations stands for, as
+ * classic writes it, or undefined if it has operations or cannot be read.
+ */
+function builderSelector(metric: unknown, matchers: unknown, operations: unknown) {
+  if (Array.isArray(operations) && operations.length) return;
+  if (metric !== undefined && typeof metric !== 'string') return;
+  if (matchers !== undefined && !Array.isArray(matchers)) return;
+  const parts: string[] = [];
+  for (const entry of (matchers ?? []) as Record<string, unknown>[]) {
+    const { label, operator, value } = entry ?? {};
+    // Classic skips a matcher without a label or value.
+    if (!label || value === undefined || value === '') continue;
+    if (
+      typeof label !== 'string' ||
+      typeof value !== 'string' ||
+      !['=', '!=', '=~', '!~'].includes(operator as string)
+    )
+      return;
+    parts.push(matcher(label, value, operator as '=' | '!=' | '=~' | '!~'));
+  }
+  if (!metric) return parts.length ? `{${parts.join(', ')}}` : '';
+  const name = metricSelector(metric);
+  if (!parts.length) return name;
+  return name.startsWith('{')
+    ? `{${name.slice(1, -1)}, ${parts.join(', ')}}`
+    : `${name}{${parts.join(', ')}}`;
+}
 
 /**
  * The Metrics search for a classic Metrics link, and what could not be carried
@@ -323,7 +430,8 @@ export function classicMetricsSearch(
   const type = params.get('type');
   const classicTime = type === 'fixed' || type === 'custom';
   const filters = params.getAll('query').filter((query) => isClassicMetricsFilter(query));
-  if (!classicTime && !filters.length) return;
+  if (!classicTime && !filters.length && !classicMetricsOnly.some((name) => params.has(name)))
+    return;
   const next = new URLSearchParams();
   for (const [name, value] of params) {
     if (name === 'query' ? isClassicMetricsFilter(value) : classicMetricsOnly.includes(name))
@@ -349,9 +457,25 @@ export function classicMetricsSearch(
     const { filters, skipped } = classicLogFilters(query);
     return count + filters.length + skipped;
   }, 0);
+  const dropped = droppedFromLink(params, unread, conditions);
+  // Classic's explorer reads `state` and, without a readable one, `promql`.
+  const saved = params.has('state') ? classicExplorerState(params.get('state')!) : undefined;
+  if (params.has('state') && !saved) dropped.push('saved queries');
+  const promql = params.get('promql');
+  const queries = saved?.queries ?? (promql ? [promql] : []);
+  for (const query of queries) next.append('query', query);
+  if (saved?.untranslated)
+    dropped.push(
+      plural(saved.untranslated, 'query built with operations', 'queries built with operations'),
+    );
+  if (saved?.type) next.set('type', saved.type);
+  if (saved?.step) {
+    if (validateRange({ start: 0, end: 0, step: saved.step })) dropped.push('step');
+    else next.set('step', saved.step);
+  }
+  const extra = next.getAll('query').length - metricsQueryLimit;
+  if (extra > 0)
+    dropped.push(plural(extra, 'query beyond the first five', 'queries beyond the first five'));
   const query = next.toString();
-  return {
-    search: query ? `?${query}` : '',
-    dropped: droppedFromLink(params, unread, conditions),
-  };
+  return { search: query ? `?${query}` : '', dropped };
 }

@@ -397,10 +397,10 @@ describe('classic Metrics links', () => {
   it('removes classic-only parameters and keeps the rest', () => {
     expect(
       translate(
-        `?${host}&tz=Asia%2FKolkata&groupBy=host&view=v1&viewType=list&viewMode=chart&fromSavedFilter=true&step=30s&promql=up`,
+        `?${host}&tz=Asia%2FKolkata&groupBy=host&view=v1&viewType=list&viewMode=chart&fromSavedFilter=true&suffix=sum&step=30s&promql=up`,
       ),
     ).toEqual({
-      search: '?step=30s&promql=up',
+      search: '?step=30s&query=up',
       dropped: [
         'time zone Asia/Kolkata (times are shown in UTC)',
         '1 filter',
@@ -410,10 +410,119 @@ describe('classic Metrics links', () => {
     });
   });
 
+  it.each(['?viewType=list', '?viewMode=chart', '?fromSavedFilter=true', '?suffix=bucket'])(
+    'recognises %s alone as a classic link',
+    (search) => {
+      expect(translate(search)).toEqual({ search: '', dropped: [] });
+    },
+  );
+
+  it('opens the query of a classic PromQL link', () => {
+    // As Prism's own link builder writes it: /metrics/explore/<dataset>?promql=<query>.
+    const link = `/metrics/explore/otel?${new URLSearchParams({ promql: 'rate(up[5m])' })}`;
+    expect(nativePath(link)).toBe(link);
+    expect(translate(new URL(link, 'http://x').search)).toEqual({
+      search: `?${new URLSearchParams({ query: 'rate(up[5m])' })}`,
+      dropped: [],
+    });
+  });
+
+  /** Classic's serialized explorer `state`, as its encoder writes it. */
+  const state = (value: unknown) => `state=${encodeURIComponent(JSON.stringify(value))}`;
+
+  it('opens the queries, step and query type of classic explorer state', () => {
+    const link = state({
+      step: '30s',
+      queryType: 'range',
+      tiles: [
+        { id: 'A', editorMode: 'promql', promqlQuery: 'sum(rate(http.requests[5m]))' },
+        {
+          id: 'B',
+          editorMode: 'builder',
+          promqlMetric: 'system.cpu.load_average.1m',
+          promqlMatchers: [
+            { label: 'host', operator: '=', value: 'node-a' },
+            { label: 'service.name', operator: '!~', value: 'db.*' },
+            { label: 'skipped', operator: '=', value: '' },
+          ],
+          operations: [],
+        },
+        {
+          id: 'C',
+          editorMode: 'builder',
+          promqlMetric: 'up',
+          promqlMatchers: [{ label: 'job', operator: '=', value: 'api' }],
+          operations: [],
+        },
+        { id: 'D', editorMode: 'builder', promqlMetric: 'up', operations: [{ id: 'rate' }] },
+      ],
+    });
+    const result = translate(`?${link}&start=1h&end=now&type=fixed&viewType=explorer`)!;
+    const next = new URLSearchParams(result.search);
+    expect(next.getAll('query')).toEqual([
+      'sum(rate(http.requests[5m]))',
+      '{"system.cpu.load_average.1m", host="node-a", "service.name"!~"db.*"}',
+      'up{job="api"}',
+    ]);
+    expect(Object.fromEntries([...next].filter(([name]) => name !== 'query'))).toEqual({
+      range: '1h',
+      type: 'range',
+      step: '30s',
+    });
+    expect(result.dropped).toEqual(['1 query built with operations']);
+    for (const query of next.getAll('query').slice(1))
+      expect(promqlErrors(query), query).toEqual([]);
+  });
+
+  it('prefers readable state over promql, as classic does', () => {
+    const tiles = [{ id: 'A', editorMode: 'promql', promqlQuery: 'up' }];
+    expect(translate(`?${state({ tiles })}&promql=down`)).toEqual({
+      search: '?query=up',
+      dropped: [],
+    });
+  });
+
+  it.each([
+    ['not JSON', 'state=%7B'],
+    ['no tiles', state({ tiles: [] })],
+    ['an unknown query type', state({ queryType: 'table', tiles: [{ editorMode: 'promql' }] })],
+    ['an unknown editor', state({ tiles: [{ editorMode: 'sql' }] })],
+  ])('reports state with %s and falls back to promql', (_, link) => {
+    expect(translate(`?${link}&promql=down`)).toEqual({
+      search: '?query=down',
+      dropped: ['saved queries'],
+    });
+  });
+
+  it('reports a step this page cannot use and queries beyond five', () => {
+    const tiles = Array.from({ length: 7 }, (_, index) => ({
+      id: String(index),
+      editorMode: 'promql',
+      promqlQuery: `q${index}`,
+    }));
+    const result = translate(`?${state({ step: 'soon', tiles })}`)!;
+    expect(new URLSearchParams(result.search).getAll('query')).toHaveLength(7);
+    expect(result.dropped).toEqual(['step', '2 queries beyond the first five']);
+  });
+
+  it('opens the histogram series a classic drilldown chose', () => {
+    expect(nativePath('/metrics/explore/otel/metric/http.server.duration?suffix=count')).toBe(
+      `/metrics/explore/otel?query=${encodeURIComponent('{"http.server.duration_count"}')}`,
+    );
+    expect(nativePath('/metrics/explore/otel/metric/latency?suffix=bucket&x=1')).toBe(
+      '/metrics/explore/otel?x=1&query=latency_bucket',
+    );
+    expect(nativePath('/metrics/explore/otel/metric/latency?suffix=max')).toBe(
+      '/metrics/explore/otel?query=latency',
+    );
+  });
+
   it('produces a search it would not translate again', () => {
     for (const search of [
       `?${host}&start=1h&end=now&type=fixed`,
       '?start=2026-10-10T11:00:00.000Z&end=now&type=custom',
+      '?promql=up&viewType=explorer',
+      `?${state({ queryType: 'instant', step: '1m', tiles: [{ editorMode: 'promql', promqlQuery: 'up' }] })}`,
     ])
       expect(translate(translate(search)!.search)).toBeUndefined();
   });
