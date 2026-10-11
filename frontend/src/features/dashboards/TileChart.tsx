@@ -1,4 +1,5 @@
 import { useCallback, useMemo } from 'react';
+import { PieChart } from '../../components/charts/PieChart';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { BubbleChart } from '../../components/charts/BubbleChart';
 import { GaugeChart } from '../../components/charts/GaugeChart';
@@ -13,6 +14,8 @@ import type { DashboardTile } from '../../lib/types';
 import { record, sqlChart, text, tileTitle } from './tiles';
 import type { TileResults } from './queries';
 import { bubbleChart } from './bubble';
+import { tilePalette } from './palettes';
+import { tileSlices } from './slices';
 export function TileChart({
   tile,
   result,
@@ -70,6 +73,10 @@ export function TileChart({
         : undefined,
     [result, tile],
   );
+  const slices = useMemo(
+    () => (['pie', 'donut'].includes(text(tile.chartType)) ? tileSlices(result, tile) : []),
+    [result, tile],
+  );
   const unit = text(layout.unit),
     precision = typeof layout.precision === 'number' ? layout.precision : undefined,
     humanize = layout.humanize === true;
@@ -89,6 +96,26 @@ export function TileChart({
       bubble?.truncated,
     ]),
   );
+  const chartType = text(tile.chartType);
+  if (chartType === 'pie' || chartType === 'donut') {
+    const legendPosition = text(layout.legendPosition);
+    return (
+      <PieChart
+        slices={slices}
+        variant={chartType}
+        palette={tilePalette(tile)}
+        showLabels={layout.label === true}
+        legendPosition={
+          legendPosition === 'top' || legendPosition === 'left' || legendPosition === 'right'
+            ? legendPosition
+            : 'bottom'
+        }
+        formatValue={formatValue}
+        title={`${tileTitle(tile)} chart`}
+        height={height === 'fit' ? undefined : height}
+      />
+    );
+  }
   if (tile.chartType === 'bubble') {
     if (result.promql || tile.tileType === 'promql')
       return (
