@@ -1,3 +1,4 @@
+import { parser } from '@prometheus-io/lezer-promql';
 import { describe, expect, it } from 'vitest';
 import {
   classicLogFilters,
@@ -120,10 +121,39 @@ describe('classic routes opened here', () => {
     expect(nativePath('/dashboards/01ABC?range=30m')).toBe('/dashboards/01ABC?range=30m');
   });
 
-  it('decodes a captured metric name before adding it as the query', () => {
-    expect(nativePath('/metrics/explore/otel/metric/a%20b')).toBe(
-      '/metrics/explore/otel?query=a+b',
-    );
+  it.each([
+    ['http_requests_total', 'http_requests_total'],
+    ['a%20b', '{"a b"}'],
+    ['system.cpu.load_average.1m', '{"system.cpu.load_average.1m"}'],
+    ['a%2Fb', '{"a/b"}'],
+    ['say%22hi%22', '{"say\\"hi\\""}'],
+  ])('opens the metric %s as the PromQL selector %s', (metric, selector) => {
+    const target = new URL(nativePath(`/metrics/explore/otel/metric/${metric}`), 'http://x');
+    expect(target.pathname).toBe('/metrics/explore/otel');
+    const query = target.searchParams.get('query')!;
+    expect(query).toBe(selector);
+    const errors: number[] = [];
+    parser.parse(query).iterate({
+      enter(node) {
+        if (node.type.isError) errors.push(node.from);
+      },
+    });
+    expect(errors, query).toEqual([]);
+  });
+
+  it.each(['/metrics/explore/otel/metric/100%', '/metrics/explore/otel/metric/%E0%A4%A'])(
+    'leaves %s with a malformed escape unchanged',
+    (path) => {
+      expect(nativePath(path)).toBe(path);
+    },
+  );
+
+  it.each([
+    ['/logs/search/100%', '/logs/explore/100%'],
+    ['/logs/search/%E0%A4%A?x=1', '/logs/explore/%E0%A4%A?x=1'],
+    ['/logs/search/a%2Fb', '/logs/explore/a%2Fb'],
+  ])('moves %s without decoding its dataset', (path, target) => {
+    expect(nativePath(path)).toBe(target);
   });
 
   it('never redirects a path it produced', () => {
@@ -201,6 +231,12 @@ describe('classic Logs links', () => {
       dropped: ['time range'],
     });
     expect(state('start=later&end=now&type=custom').dropped).toEqual(['time range']);
+    for (const start of ['constructor', 'toString', '__proto__', 'hasOwnProperty'])
+      expect(state(`type=fixed&start=${start}&end=now`), start).toEqual({
+        range: undefined,
+        filters: [],
+        dropped: ['time range'],
+      });
     expect(state('start=1h&end=now').range).toBeUndefined();
   });
 
@@ -248,6 +284,17 @@ describe('classic Logs filters', () => {
       { field: 'ok', operator: '=', value: 'true' },
       { field: 'k', operator: '=', value: '1.5' },
     ]);
+  });
+
+  it('skips a field or value containing NUL', () => {
+    expect(
+      classicLogFilters(
+        "WHERE text msg = 'a\0b' AND text \"a\0b\" = 'x' AND `c\0d` != 1 AND text level = 'error'",
+      ),
+    ).toEqual({ filters: [{ field: 'level', operator: '=', value: 'error' }], skipped: 3 });
+    expect(
+      classicLogsState(new URLSearchParams("query=WHERE+text+msg+%3D+'a%00b'")).dropped,
+    ).toEqual(['1 filter']);
   });
 
   it('has nothing to read without a condition', () => {

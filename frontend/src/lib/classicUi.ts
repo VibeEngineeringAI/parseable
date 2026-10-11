@@ -1,4 +1,5 @@
 import { basePath } from './config';
+import { metricSelector } from './promql';
 import type { LogFilter, TimeRange } from './types';
 
 /** The classic (Prism) UI owns the root while this frontend is mounted under a prefix. */
@@ -18,7 +19,7 @@ export type ClassicRoute = {
   /** Path here, using the classic captures. Absent for `classic-only`. */
   native?: string;
   kind: ClassicRouteKind;
-  /** Query parameters added on the way here, from the classic captures. */
+  /** Query parameters added on the way here, from the decoded classic captures. */
   params?: (captures: Record<string, string>) => Record<string, string>;
 };
 
@@ -37,7 +38,7 @@ export const classicRoutes: readonly ClassicRoute[] = [
     classic: '/metrics/explore/:dataset/metric/:metric',
     native: '/metrics/explore/:dataset',
     kind: 'redirect',
-    params: ({ metric }) => ({ query: metric }),
+    params: ({ metric }) => ({ query: metricSelector(metric) }),
   },
   { classic: '/metrics/search/:dataset', native: '/metrics/explore/:dataset', kind: 'redirect' },
   { classic: '/sql-editor', native: '/sql-editor', kind: 'same' },
@@ -124,11 +125,19 @@ export function nativePath(path: string): string {
   const { pathname, search, hash } = splitPath(path);
   const found = bestMatch('classic', pathname);
   if (!found?.route.native || found.route.kind === 'same') return path;
-  const decoded = Object.fromEntries(
-    Object.entries(found.captures).map(([name, value]) => [name, decodeURIComponent(value)]),
-  );
-  for (const [name, value] of Object.entries(found.route.params?.(decoded) ?? {}))
-    search.set(name, value);
+  if (found.route.params) {
+    const decoded: Record<string, string> = {};
+    for (const [name, value] of Object.entries(found.captures)) {
+      try {
+        decoded[name] = decodeURIComponent(value);
+      } catch {
+        // A malformed escape is not a link classic produced; the not-found page handles it.
+        return path;
+      }
+    }
+    for (const [name, value] of Object.entries(found.route.params(decoded)))
+      search.set(name, value);
+  }
   const query = search.toString();
   return `${fill(found.route.native, found.captures)}${query ? `?${query}` : ''}${hash}`;
 }
@@ -199,11 +208,14 @@ export function classicLogFilters(query: string): {
       continue;
     }
     const [, doubleQuoted, backticked, bare, operator, quoted, literal] = m;
-    filters.push({
-      field: doubleQuoted?.replaceAll('""', '"') ?? backticked ?? bare,
-      operator: operator as LogFilter['operator'],
-      value: quoted !== undefined ? quoted.replaceAll("''", "'") : literal,
-    });
+    const field = doubleQuoted?.replaceAll('""', '"') ?? backticked ?? bare,
+      value = quoted !== undefined ? quoted.replaceAll("''", "'") : literal;
+    // The query builder rejects NUL, and classic never writes it.
+    if (field.includes('\0') || value.includes('\0')) {
+      skipped++;
+      continue;
+    }
+    filters.push({ field, operator: operator as LogFilter['operator'], value });
   }
   return { filters, skipped };
 }
@@ -240,7 +252,8 @@ export function classicLogsState(
     type = params.get('type');
   let range: TimeRange | undefined;
   if (start && end && type) {
-    if (type === 'fixed') range = classicPresets[start];
+    if (type === 'fixed')
+      range = Object.hasOwn(classicPresets, start) ? classicPresets[start] : undefined;
     else {
       const from = Date.parse(start),
         to = end === 'now' ? now : Date.parse(end);
