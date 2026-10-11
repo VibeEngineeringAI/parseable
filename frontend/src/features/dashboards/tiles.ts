@@ -107,6 +107,7 @@ export function chartConfig(chartType: string) {
     axes: {
       x: { field: '', title: '', display: true },
       y: { field: '', title: '', display: true, beginAtZero: false },
+      groupBy: { field: [] },
     },
     advanced: {
       dataLabels: { enabled: false },
