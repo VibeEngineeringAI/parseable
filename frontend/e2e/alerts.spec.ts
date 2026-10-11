@@ -472,6 +472,50 @@ test('validation errors describe their controls and block invalid thresholds, fr
   await expect(page).toHaveURL(/\/alerts\/new$/);
   await expect(query).toBeFocused();
 });
+test('saving with a deleted target focuses that target and sends nothing', async ({ page }) => {
+  const api = await mocked(page, { original: { ...alertFixture, targets: ['deleted'] } });
+  await page.goto(`${detailPath}/edit`);
+  const deleted = page.getByRole('checkbox', { name: 'Unavailable target deleted', exact: true });
+  const message = 'Remove unavailable targets or select existing targets.';
+  await expect(deleted).toHaveAttribute('aria-invalid', 'true');
+  await expect(deleted).toHaveAccessibleDescription(message);
+  await expect(page.getByRole('checkbox', { name: 'Operations' })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(deleted).toBeFocused();
+  await expect(page).toHaveURL(/\/edit$/);
+  expect(api.writes).toHaveLength(0);
+  await deleted.click();
+  await expect(deleted).toHaveCount(0);
+  await expect(page.getByRole('checkbox', { name: 'Operations' })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: alertFixture.title, exact: true })).toBeVisible();
+  expect(api.writes).toHaveLength(1);
+  expect(api.writes[0]).toMatchObject({ targets: [] });
+});
+test('a submit attempt skips the disabled invalid Alert type and focuses the stored query', async ({
+  page,
+}) => {
+  const api = await mocked(page, {
+    enabled: false,
+    original: { ...alertFixture, query: 'sum by (host.name) (up)' },
+  });
+  await page.goto(`${detailPath}/edit`);
+  const type = page.getByLabel('Alert type');
+  const query = page.getByRole('textbox', { name: 'PromQL query', exact: true });
+  await expect(type).toBeDisabled();
+  await expect(type).toHaveAttribute('aria-invalid', 'true');
+  // The stored query is not typed here, so its error shows on load.
+  await expect(query).toHaveAccessibleDescription('Enter a valid PromQL expression.');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(query).toBeFocused();
+  expect(api.writes).toHaveLength(0);
+});
 test('dirty form blocks sidebar navigation and browser Back until confirmed', async ({ page }) => {
   await demo(page);
   await createPromql(page);
@@ -857,6 +901,45 @@ test('header inputs focus additions, surviving neighbours and Add after the last
   await expect(add).toBeFocused();
 });
 
+test('a header error marks and focuses only the invalid header field', async ({ page }) => {
+  await demo(page, '/alerts/targets');
+  await page.getByRole('button', { name: 'New target', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+  await sheet.getByLabel('Target name').fill('Hook');
+  await sheet.getByLabel('Endpoint URL').fill('https://example.com/hook');
+  const add = sheet.getByRole('button', { name: 'Add header', exact: true });
+  await add.click();
+  await sheet.getByLabel('Header 1 name', { exact: true }).fill('X-One');
+  await sheet.getByLabel('Header 1 value', { exact: true }).fill('one');
+  await add.click();
+  await sheet.getByLabel('Header 2 name', { exact: true }).fill('X-Two');
+  await sheet.getByRole('button', { name: 'Create target', exact: true }).click();
+  const message = 'Each header needs a valid name and a non-empty value without line breaks.';
+  await expect(sheet.getByRole('alert')).toHaveText(message);
+  const value = sheet.getByLabel('Header 2 value', { exact: true });
+  await expect(value).toBeFocused();
+  await expect(value).toHaveAttribute('aria-invalid', 'true');
+  await expect(value).toHaveAccessibleDescription(message);
+  for (const label of ['Header 1 name', 'Header 1 value', 'Header 2 name']) {
+    const input = sheet.getByLabel(label, { exact: true });
+    await expect(input).not.toHaveAttribute('aria-invalid', 'true');
+    await expect(input).not.toHaveAccessibleDescription(message);
+  }
+  // A duplicate name marks the repeated name, not its value or the first row.
+  await value.fill('two');
+  await sheet.getByLabel('Header 2 name', { exact: true }).fill('x-one');
+  await expect(sheet.getByRole('alert')).toHaveText('Header names must be unique.');
+  await expect(sheet.getByLabel('Header 2 name', { exact: true })).toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await expect(value).not.toHaveAttribute('aria-invalid', 'true');
+  await expect(sheet.getByLabel('Header 1 name', { exact: true })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+});
+
 test('trailing-slash alert routes reach the intended list, targets, form, detail and edit views', async ({
   page,
 }) => {
@@ -891,7 +974,7 @@ for (const type of ['sql', 'code'])
     expect(api.writes[0]).toMatchObject({ queryType: 'code', query, datasets: ['logs'] });
   });
 
-test('an untouched invalid handoff and blank new form stay quiet until blur or a submit attempt', async ({
+test('an invalid handoff shows its error on load while a blank new form stays quiet until blur or a submit attempt', async ({
   page,
 }) => {
   await mocked(page);
@@ -900,10 +983,13 @@ test('an untouched invalid handoff and blank new form stay quiet until blur or a
   await page.goto(
     `/alerts/new?${new URLSearchParams({ dataset: 'metrics', alertQuery: 'sum by (host.name) (up)', title: 'Invalid handoff' })}`,
   );
-  await expect(query).toHaveAttribute('aria-invalid', 'false');
-  await expect(page.getByText('Enter a valid PromQL expression.')).toHaveCount(0);
-  await create.click();
   await expect(query).toHaveAttribute('aria-invalid', 'true');
+  await expect(query).toHaveAccessibleDescription('Enter a valid PromQL expression.');
+  await expect(page.getByLabel('Title', { exact: true })).not.toHaveAttribute(
+    'aria-invalid',
+    'true',
+  );
+  await create.click();
   await expect(query).toBeFocused();
   await expect(query).toHaveAccessibleDescription('Enter a valid PromQL expression.');
   await expect(page.getByText('Enter a valid PromQL expression.', { exact: true })).toBeVisible();
@@ -934,7 +1020,7 @@ for (const duplicate of [
   test(`invalid or builder duplicate history is ignored safely: ${duplicate.id}`, async ({
     page,
   }) => {
-    await mocked(page);
+    const api = await mocked(page);
     await page.addInitScript((duplicate) => {
       history.replaceState({ ...history.state, usr: { duplicate } }, '');
     }, duplicate);
@@ -942,11 +1028,12 @@ for (const duplicate of [
     await expect(
       page.getByText('This alert cannot be duplicated. Create a new rule.', { exact: true }),
     ).toBeVisible();
-    await expect(page.getByLabel('Title', { exact: true })).toHaveValue('');
-    await expect(page.getByLabel('Title', { exact: true })).not.toHaveAttribute(
-      'aria-invalid',
-      'true',
-    );
+    const title = page.getByLabel('Title', { exact: true });
+    await expect(title).toHaveValue('');
+    await page.getByRole('button', { name: 'Create alert', exact: true }).click();
+    await expect(title).toHaveAccessibleDescription('Enter an alert title.');
+    await expect(page).toHaveURL(/\/alerts\/new$/);
+    expect(api.writes).toHaveLength(0);
   });
 
 test('editing an alert preserves server-accepted long duration aliases unchanged', async ({
@@ -1033,6 +1120,34 @@ test('delivery errors redact credential-bearing URLs', async ({ page }) => {
   await expect(deliveries).toContainText('[redacted endpoint]');
   await expect(deliveries).not.toContainText('secret-token');
   await expect(deliveries.locator('xpath=ancestor::*[@role="alert"]')).toHaveCount(0);
+});
+test('the threshold shows its exact configured value while measured values are rounded', async ({
+  page,
+}) => {
+  const runtime = alertFixture.promqlRuntime!;
+  await mocked(page, {
+    original: {
+      ...alertFixture,
+      thresholdConfig: { operator: '>', value: 1234.5 },
+      promqlRuntime: {
+        ...runtime,
+        instances: { a: { ...runtime.instances.a, value: 0.12345 } },
+      },
+    } as Alert,
+  });
+  await page.goto(detailPath);
+  const evaluation = page
+    .locator('.ui-card')
+    .filter({ has: page.getByRole('heading', { name: 'Threshold and evaluation', exact: true }) });
+  await expect(evaluation.locator('dt:text-is("Threshold") + dd')).toHaveText('> 1234.5');
+  await expect(
+    page.getByText('Threshold: > 1234.5. Times are UTC.', { exact: true }),
+  ).toBeVisible();
+  const value = page
+    .getByRole('table', { name: 'Alert instances' })
+    .locator('tbody td:nth-child(3)');
+  await expect(value).toHaveText('0.1235');
+  await expect(value).toHaveAttribute('title', '0.12345');
 });
 
 for (const health of ['ok', 'noData', 'error'] as const)
@@ -1174,7 +1289,9 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   // The chart's window ends at "now" when the expression loads and moves only when the dataset or
   // query changes. Pin the clock so the step below is deterministic.
   await page.clock.setFixedTime(new Date('2026-10-10T12:00:00Z'));
+  let ranges = 0;
   await page.route('**/prometheus/api/v1/query_range', (route) => {
+    ranges++;
     const end = Number(new URLSearchParams(route.request().postData()!).get('end'));
     return route.fulfill({
       json: {
@@ -1203,21 +1320,31 @@ test('detail, preview and target sheet have padded cards, readable labels, UTC t
   const plot = page.locator('.uplot');
   await expect(plot).toBeVisible();
   await plot.evaluate((element) => element.setAttribute('data-retained', 'true'));
+  // StrictMode mounts the chart twice in development, so count from here rather than from 1.
+  const loaded = ranges;
   // Mute reloads the alert a minute later; the window must not move and the plot must be kept.
   await page.clock.setFixedTime(new Date('2026-10-10T12:01:00Z'));
   await page.getByRole('button', { name: 'Mute', exact: true }).click();
+  const reloaded = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'GET' &&
+      new URL(response.url()).pathname === `/api/v1/alerts/${alertFixture.id}`,
+  );
   await page
     .getByRole('dialog', { name: 'Mute notifications' })
     .getByRole('button', { name: 'Indefinitely', exact: true })
     .click();
+  await (await reloaded).finished();
   await expect(page.getByRole('button', { name: 'Unmute', exact: true })).toBeVisible();
-  await expect(plot).toHaveAttribute('data-retained', 'true');
   await expect(
     page.getByRole('table', { name: 'Alert instances' }).locator('.alerts-label-chip'),
   ).toHaveText('host=node-a');
   await expect(
     page.getByRole('table', { name: 'Notification deliveries' }).locator('.alerts-label-chip'),
   ).toHaveText('host=node-a');
+  // The reload must not query the range again, which would rebuild the plot.
+  expect(ranges).toBe(loaded);
+  await expect(plot).toHaveAttribute('data-retained', 'true');
   await expect(page.locator('.alerts-page time').first()).toBeVisible();
   for (const time of await page.locator('.alerts-page time').all())
     await expect(time).toHaveText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$/);
@@ -1461,4 +1588,34 @@ test('list, detail, form, targets and an open sheet fit 390px without horizontal
   expect(
     await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
   ).toBeLessThanOrEqual(1);
+});
+
+test('a tabbed-to sort button scrolls clear of the sticky Actions column at 390px', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const [path, first, tabbed] of [
+    ['/alerts', 'Sort by title', ['Sort by severity', 'Sort by state']],
+    ['/alerts/targets', 'Sort by name', ['Sort by type', 'Sort by endpoint']],
+  ] as const) {
+    await demo(page, path);
+    await page.getByRole('button', { name: first, exact: true }).focus();
+    for (const name of tabbed) {
+      await page.keyboard.press('Tab');
+      const button = page.getByRole('button', { name, exact: true });
+      await expect(button).toBeFocused();
+      const { centreHit, right, stickyLeft } = await button.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const sticky = element.closest('table')!.querySelector('thead th:last-child')!;
+        const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        return {
+          centreHit: element.contains(hit),
+          right: rect.right,
+          stickyLeft: sticky.getBoundingClientRect().left,
+        };
+      });
+      expect(centreHit, name).toBe(true);
+      expect(right, name).toBeLessThan(stickyLeft);
+    }
+  }
 });

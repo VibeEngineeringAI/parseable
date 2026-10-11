@@ -131,6 +131,29 @@ test('legend toggle updates aria-pressed and the count, and Alt-click isolates',
   await expect(page.getByText('1 of 3 series', { exact: true })).toBeVisible();
 });
 
+test('the legend leaves room for the focus ring of its first row', async ({ page }) => {
+  await story(page, 'timeserieschart', 'three-series');
+  const alpha = page.getByRole('button', { name: '{host="alpha"}', exact: true });
+  await alpha.focus();
+  await expect(alpha).toBeFocused();
+  await expect(alpha).toHaveCSS('outline-style', 'solid');
+  // The legend scrolls, so any part of the ring outside its box is clipped.
+  const overflow = await alpha.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const ring = parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset);
+    const item = element.getBoundingClientRect();
+    const legend = element.closest('.charts-legend')!.getBoundingClientRect();
+    return {
+      top: legend.top - (item.top - ring),
+      left: legend.left - (item.left - ring),
+      bottom: item.bottom + ring - legend.bottom,
+    };
+  });
+  expect(overflow.top).toBeLessThanOrEqual(0);
+  expect(overflow.left).toBeLessThanOrEqual(0);
+  expect(overflow.bottom).toBeLessThanOrEqual(0);
+});
+
 test('requested range leaves space before and after samples without repeating a card title', async ({
   page,
 }) => {

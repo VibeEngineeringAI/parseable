@@ -17,14 +17,37 @@ export function visibleErrors<K extends string>(
 }
 
 /**
+ * The invalid fields that open with a non-empty value, such as a handoff or a saved alert. The user
+ * did not type these here, so their errors show straight away; blank fields still wait.
+ */
+export function prefilledInvalid<K extends string>(
+  errors: Partial<Record<K, string>>,
+  values: Partial<Record<K, unknown>>,
+): K[] {
+  return (Object.keys(errors) as K[]).filter((key) => {
+    const value = values[key];
+    return typeof value === 'string' ? value.trim() !== '' : Array.isArray(value) && !!value.length;
+  });
+}
+
+/** Move focus to the first invalid control that can take it; disabled controls are skipped. */
+export function focusFirstInvalid(root: ParentNode | null) {
+  root?.querySelector<HTMLElement>('[aria-invalid="true"]:not(:disabled)')?.focus();
+}
+
+/**
  * Defers validation messages until a field has been touched or a submit was attempted. `attempts`
  * counts submit attempts so a form can move focus to the first invalid field after each one.
+ * `initial` holds the values the form opened with and is read on the first render only.
  */
 export function useTouchedErrors<K extends string>(
   errors: Partial<Record<K, string>>,
   always: readonly K[] = [],
+  initial?: Partial<Record<K, unknown>>,
 ) {
-  const [touched, setTouched] = useState<ReadonlySet<K>>(() => new Set());
+  const [touched, setTouched] = useState<ReadonlySet<K>>(
+    () => new Set(initial ? prefilledInvalid(errors, initial) : []),
+  );
   const [attempts, setAttempts] = useState(0);
   return {
     errors: visibleErrors(errors, touched, attempts > 0, always),

@@ -16,7 +16,13 @@ import {
   validateAlert,
   type AlertDraft,
 } from './helpers';
-import { buildTargetPayload, targetDraft, targetType, validateTarget } from './targetHelpers';
+import {
+  buildTargetPayload,
+  invalidHeader,
+  targetDraft,
+  targetType,
+  validateTarget,
+} from './targetHelpers';
 import type { Alert, AlertSummary, ParseableClient } from '../../lib/types';
 import humantime from './__fixtures__/humantime.json';
 
@@ -442,5 +448,42 @@ describe('target forms', () => {
       ],
     ])
       expect(validateTarget({ ...form, headers })).toHaveProperty('headers');
+  });
+  it('reports the first invalid header row and the fields to fix', () => {
+    const valid = { id: 'a', key: 'X-One', value: 'one' };
+    const blank = { id: 'b', key: '', value: '' };
+    expect(invalidHeader([valid, blank])).toBeUndefined();
+    expect(invalidHeader([valid, { id: 'c', key: 'X-Two', value: '' }])).toMatchObject({
+      index: 1,
+      fields: ['value'],
+    });
+    expect(invalidHeader([valid, blank, { id: 'c', key: '', value: 'two' }])).toMatchObject({
+      index: 2,
+      fields: ['key'],
+    });
+    expect(invalidHeader([{ id: 'c', key: 'X Two', value: 'a\nb' }])).toMatchObject({
+      index: 0,
+      fields: ['key', 'value'],
+    });
+    expect(invalidHeader([valid, { id: 'c', key: 'Cookie', value: 'a' }])).toEqual({
+      index: 1,
+      fields: ['key'],
+      message: 'The Cookie header is blocked by outbound policy.',
+    });
+    expect(invalidHeader([valid, { id: 'c', key: ' x-one ', value: 'b' }])).toEqual({
+      index: 1,
+      fields: ['key'],
+      message: 'Header names must be unique.',
+    });
+    // The message belongs to the row that is reported, not to a later invalid row.
+    const headers = [
+      valid,
+      { id: 'c', key: 'X-Two', value: '' },
+      { id: 'd', key: 'Host', value: 'h' },
+    ];
+    expect(validateTarget({ ...targetDraft(), headers }).headers).toBe(
+      invalidHeader(headers)?.message,
+    );
+    expect(invalidHeader(headers)?.index).toBe(1);
   });
 });

@@ -4,9 +4,15 @@ import { Button, Input, Select, Sheet, InlineError } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { createId } from '../../lib/ids';
 import type { AlertTarget } from '../../lib/types';
-import { buildTargetPayload, targetDraft, validateTarget, type TargetDraft } from './targetHelpers';
+import {
+  buildTargetPayload,
+  invalidHeader,
+  targetDraft,
+  validateTarget,
+  type TargetDraft,
+} from './targetHelpers';
 import { useMutation } from '../../hooks/useMutation';
-import { useTouchedErrors } from '../../hooks/useTouchedErrors';
+import { focusFirstInvalid, useTouchedErrors } from '../../hooks/useTouchedErrors';
 
 export function TargetSheet({
   target,
@@ -32,9 +38,12 @@ export function TargetSheet({
   const invalid = validateTarget(draft);
   const shown = useTouchedErrors(invalid);
   const errors = shown.errors;
+  const badHeader = errors.headers ? invalidHeader(draft.headers) : undefined;
+  const headerInvalid = (index: number, field: 'key' | 'value') =>
+    badHeader?.index === index && badHeader.fields.includes(field);
   const form = useRef<HTMLFormElement>(null);
   useEffect(() => {
-    if (shown.attempts) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+    if (shown.attempts) focusFirstInvalid(form.current);
   }, [shown.attempts]);
   function update<K extends keyof TargetDraft>(key: K, value: TargetDraft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -140,8 +149,8 @@ export function TargetSheet({
                   autoComplete="off"
                   value={header.key}
                   disabled={mutation.pending}
-                  aria-invalid={Boolean(errors.headers)}
-                  aria-describedby={errors.headers ? headersError : undefined}
+                  aria-invalid={headerInvalid(index, 'key')}
+                  aria-describedby={headerInvalid(index, 'key') ? headersError : undefined}
                   onBlur={() => shown.touch('headers')}
                   onChange={(event) =>
                     update(
@@ -158,8 +167,8 @@ export function TargetSheet({
                   autoComplete="new-password"
                   value={header.value}
                   disabled={mutation.pending}
-                  aria-invalid={Boolean(errors.headers)}
-                  aria-describedby={errors.headers ? headersError : undefined}
+                  aria-invalid={headerInvalid(index, 'value')}
+                  aria-describedby={headerInvalid(index, 'value') ? headersError : undefined}
                   onBlur={() => shown.touch('headers')}
                   onChange={(event) =>
                     update(

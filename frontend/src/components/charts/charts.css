@@ -126,8 +126,9 @@
   gap: 0 4px;
   list-style: none;
   margin: 0;
-  /* The items carry 8px of padding, so 4px keeps their key flush with the text above. */
-  padding: 0 4px 8px;
+  /* The items carry 8px of padding, so 4px keeps their key flush with the text above. The top
+     4px fits the focus ring and its offset, which the overflow would otherwise clip. */
+  padding: 4px 4px 8px;
   max-height: 160px;
   overflow: auto;
 }
