@@ -16,7 +16,10 @@
  *
  */
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use actix_web::http::StatusCode;
 use actix_web::{
@@ -36,6 +39,7 @@ pub fn set_cookie_cross_site(enabled: bool) {
 use chrono::TimeDelta;
 use openid::Bearer;
 use serde::Deserialize;
+use tokio::sync::RwLock;
 use ulid::Ulid;
 use url::Url;
 
@@ -44,7 +48,7 @@ use crate::{
         COOKIE_AGE_DAYS, SESSION_COOKIE_NAME, USER_COOKIE_NAME, USER_ID_COOKIE_NAME,
         http::{cluster::sync_user_creation, modal::OIDC_CLIENT, rbac::UPDATE_LOCK},
     },
-    oauth::OAuthSession,
+    oauth::{OAuthProvider, OAuthSession},
     parseable::{DEFAULT_TENANT, PARSEABLE},
     rbac::{
         self, EXPIRY_DURATION, Users,
@@ -56,6 +60,11 @@ use crate::{
         actix::extract_session_key_from_req, get_tenant_id_from_key, get_tenant_id_from_request,
     },
 };
+
+/// Holds the token that ties an IdP round trip to the browser that started it.
+const LOGIN_STATE_COOKIE_NAME: &str = "oidc_state";
+/// How long a browser has to finish signing in at the IdP.
+const LOGIN_STATE_MINUTES: i64 = 10;
 
 /// Struct representing query params returned from oidc provider
 #[derive(Deserialize, Debug)]
@@ -76,9 +85,7 @@ pub async fn login(
     req: HttpRequest,
     query: web::Query<RedirectAfterLogin>,
 ) -> Result<HttpResponse, OIDCError> {
-    let conn = req.connection_info().clone();
-    let base_url = format!("{}://{}/", conn.scheme(), conn.host());
-    if !is_valid_redirect_url(&base_url, query.redirect.as_str()) {
+    if !is_valid_redirect_url(&request_base_url(&req), query.redirect.as_str()) {
         return Err(OIDCError::BadRequest(
             "Bad Request, Invalid Redirect URL!".to_string(),
         ));
@@ -89,23 +96,7 @@ pub async fn login(
     let session_key = extract_session_key_from_req(&req).ok();
     let (session_key, oidc_client) = match (session_key, oidc_client) {
         (None, None) => return Ok(redirect_no_oauth_setup(query.redirect.clone())),
-        (None, Some(client)) => {
-            let redirect = query.into_inner().redirect.to_string();
-
-            let scope = PARSEABLE.options.scope.to_string();
-            let mut auth_url: String = client.read().await.auth_url(&scope, Some(redirect)).into();
-
-            if let Some(query_params) = PARSEABLE.options.oidc_query_params.as_ref() {
-                if !query_params.starts_with('&') {
-                    auth_url = format!("{auth_url}&{query_params}");
-                } else {
-                    auth_url.push_str(query_params.as_str());
-                }
-            }
-            return Ok(HttpResponse::TemporaryRedirect()
-                .insert_header((actix_web::http::header::LOCATION, auth_url))
-                .finish());
-        }
+        (None, Some(client)) => return Ok(redirect_to_idp(client, &query.redirect).await),
         (Some(session_key), client) => (session_key, client),
     };
     // if control flow is here then it is most likely basic auth
@@ -151,23 +142,7 @@ pub async fn login(
             } else {
                 Users.remove_session(&key);
                 if let Some(oidc_client) = oidc_client {
-                    let redirect = query.into_inner().redirect.to_string();
-                    let scope = PARSEABLE.options.scope.to_string();
-                    let mut auth_url: String = oidc_client
-                        .read()
-                        .await
-                        .auth_url(&scope, Some(redirect))
-                        .into();
-                    if let Some(query_params) = PARSEABLE.options.oidc_query_params.as_ref() {
-                        if !query_params.starts_with('&') {
-                            auth_url = format!("{auth_url}&{query_params}");
-                        } else {
-                            auth_url.push_str(query_params.as_str());
-                        }
-                    }
-                    HttpResponse::TemporaryRedirect()
-                        .insert_header((actix_web::http::header::LOCATION, auth_url))
-                        .finish()
+                    redirect_to_idp(oidc_client, &query.redirect).await
                 } else {
                     redirect_to_client(query.redirect.as_str(), None)
                 }
@@ -182,10 +157,8 @@ pub async fn logout(
     query: web::Query<RedirectAfterLogin>,
 ) -> Result<HttpResponse, OIDCError> {
     let oidc_client = OIDC_CLIENT.get();
-    let conn = req.connection_info().clone();
-    let base_url = format!("{}://{}/", conn.scheme(), conn.host());
 
-    if !is_valid_redirect_url(&base_url, query.redirect.as_str()) {
+    if !is_valid_redirect_url(&request_base_url(&req), query.redirect.as_str()) {
         return Err(OIDCError::BadRequest(
             "Bad Request, Invalid Redirect URL!".to_string(),
         ));
@@ -229,6 +202,15 @@ pub async fn reply_login(
 ) -> Result<HttpResponse, OIDCError> {
     let oidc_client = OIDC_CLIENT.get().ok_or(OIDCError::Unauthorized)?;
     let tenant_id = get_tenant_id_from_request(&req);
+    // An XHR caller forwards the code itself and receives the session as JSON;
+    // a browser arrives from the IdP and is redirected on. Check either caller
+    // before the code is redeemed: a forged callback must not create a session.
+    let redirect = if is_xhr(&req) {
+        verify_xhr_origin(&req)?;
+        None
+    } else {
+        Some(login_redirect(&req, login_query.state.as_deref())?)
+    };
 
     let session = oidc_client
         .read()
@@ -272,12 +254,7 @@ pub async fn reply_login(
     ];
 
     Ok(build_login_response(
-        &req,
-        &login_query,
-        cookies,
-        id,
-        &username,
-        &user_id,
+        redirect, cookies, id, &username, &user_id,
     ))
 }
 
@@ -339,40 +316,142 @@ fn warn_if_refresh_unavailable(bearer: &Bearer) {
     }
 }
 
+fn is_xhr(req: &HttpRequest) -> bool {
+    req.headers().contains_key("x-p-tenant")
+        || req
+            .headers()
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("application/json"))
+}
+
+/// The page to return to after a browser login. Only the browser holding the
+/// state cookie set by `login` may finish the login, and only toward an
+/// allowed origin.
+fn login_redirect(req: &HttpRequest, state: Option<&str>) -> Result<String, OIDCError> {
+    let cookie = req.cookie(LOGIN_STATE_COOKIE_NAME);
+    let redirect = state
+        .zip(cookie.as_ref())
+        .and_then(|(state, cookie)| verify_login_state(state, cookie.value()))
+        .ok_or_else(|| {
+            OIDCError::BadRequest(
+                "Bad Request, login state does not match this browser. Sign in again.".to_string(),
+            )
+        })?;
+    // Redirect to the URL as parsed for validation, not the raw string.
+    Url::parse(redirect)
+        .ok()
+        .filter(|url| is_valid_redirect_url(&callback_base_url(req), url.as_str()))
+        .map(String::from)
+        .ok_or_else(|| OIDCError::BadRequest("Bad Request, Invalid Redirect URL!".to_string()))
+}
+
+/// Accept is CORS-safelisted, so a page on another site can make a browser
+/// send a JSON callback and keep the session cookies in the response. Callers
+/// must show they run on this or an allowed origin. Browsers send no Fetch
+/// Metadata over plain HTTP, and a same-origin GET carries no Origin, so a
+/// same-origin Referer is the remaining proof there.
+fn verify_xhr_origin(req: &HttpRequest) -> Result<(), OIDCError> {
+    let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok());
+    let allowed = |url: &str| is_valid_redirect_url(&callback_base_url(req), url);
+    let trusted = match header("origin") {
+        Some(origin) => allowed(origin),
+        None => match header("sec-fetch-site") {
+            Some(site) => site == "same-origin",
+            None => header("referer").is_some_and(allowed),
+        },
+    };
+    if trusted {
+        Ok(())
+    } else {
+        Err(OIDCError::BadRequest(
+            "Bad Request, login callback from a disallowed origin".to_string(),
+        ))
+    }
+}
+
+/// The IdP echoes this back as `state`. A ULID never contains the separator.
+fn login_state(token: &str, redirect: &Url) -> String {
+    format!("{token}.{redirect}")
+}
+
+/// Returns the redirect carried in `state` if its token matches the cookie.
+fn verify_login_state<'a>(state: &'a str, token: &str) -> Option<&'a str> {
+    let (state_token, redirect) = state.split_once('.')?;
+    (!token.is_empty() && state_token == token).then_some(redirect)
+}
+
 /// Build the HTTP response for the login callback (XHR JSON or redirect).
 fn build_login_response(
-    req: &HttpRequest,
-    login_query: &web::Query<Login>,
+    redirect: Option<String>,
     cookies: [Cookie<'static>; 3],
     session_id: Ulid,
     username: &str,
     user_id: &str,
 ) -> HttpResponse {
-    let is_xhr = req.headers().contains_key("x-p-tenant")
-        || req
-            .headers()
-            .get("accept")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("application/json"));
-
-    if is_xhr {
-        let mut response = HttpResponse::Ok();
-        for cookie in cookies {
-            response.cookie(cookie);
+    match redirect {
+        Some(redirect) => redirect_to_client(
+            &redirect,
+            cookies.into_iter().chain([login_state_removal()]),
+        ),
+        None => {
+            let mut response = HttpResponse::Ok();
+            for cookie in cookies {
+                response.cookie(cookie);
+            }
+            response.json(serde_json::json!({
+                "session": session_id.to_string(),
+                "username": username,
+                "user_id": user_id,
+            }))
         }
-        response.json(serde_json::json!({
-            "session": session_id.to_string(),
-            "username": username,
-            "user_id": user_id,
-        }))
-    } else {
-        let redirect_url = login_query
-            .state
-            .clone()
-            .unwrap_or_else(|| PARSEABLE.options.address.to_string());
-
-        redirect_to_client(&redirect_url, cookies)
     }
+}
+
+/// Send the browser to the IdP with a fresh state token that only this
+/// browser holds, so the callback can reject codes obtained elsewhere.
+async fn redirect_to_idp(
+    client: &Arc<RwLock<Box<dyn OAuthProvider>>>,
+    redirect: &Url,
+) -> HttpResponse {
+    let token = Ulid::new().to_string();
+    let scope = PARSEABLE.options.scope.to_string();
+    let mut auth_url: String = client
+        .read()
+        .await
+        .auth_url(&scope, Some(login_state(&token, redirect)))
+        .into();
+    if let Some(query_params) = PARSEABLE.options.oidc_query_params.as_ref() {
+        if !query_params.starts_with('&') {
+            auth_url = format!("{auth_url}&{query_params}");
+        } else {
+            auth_url.push_str(query_params.as_str());
+        }
+    }
+    HttpResponse::TemporaryRedirect()
+        .cookie(cookie_login_state(&token))
+        .insert_header((actix_web::http::header::LOCATION, auth_url))
+        .finish()
+}
+
+fn request_base_url(req: &HttpRequest) -> String {
+    let conn = req.connection_info();
+    format!("{}://{}/", conn.scheme(), conn.host())
+}
+
+/// The origin the IdP returns browsers to. A client can set forwarded headers,
+/// so trust `P_ORIGIN_URI`, or else the scheme Parseable serves and the Host.
+fn callback_base_url(req: &HttpRequest) -> String {
+    if let Some(url) = &PARSEABLE.options.domain_address {
+        return url.origin().ascii_serialization();
+    }
+    let host = req
+        .headers()
+        .get(actix_web::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
+        .unwrap_or_default();
+    format!("{}://{host}/", PARSEABLE.options.get_scheme())
 }
 
 fn exchange_basic_for_cookie(
@@ -451,6 +530,19 @@ fn build_cookie(name: &str, value: String) -> Cookie<'static> {
     }
 
     cookie.finish()
+}
+
+fn cookie_login_state(token: &str) -> Cookie<'static> {
+    let mut cookie = build_cookie(LOGIN_STATE_COOKIE_NAME, token.to_string());
+    cookie.set_max_age(time::Duration::minutes(LOGIN_STATE_MINUTES));
+    cookie.set_http_only(true);
+    cookie
+}
+
+fn login_state_removal() -> Cookie<'static> {
+    let mut cookie = cookie_login_state("");
+    cookie.make_removal();
+    cookie
 }
 
 pub fn cookie_session(id: Ulid) -> Cookie<'static> {
@@ -753,6 +845,140 @@ mod tests {
             location("http://host/next/logs?x=1"),
             "http://host/next/oidc-not-configured?x=1"
         );
+    }
+
+    fn callback(cookie: Option<&str>) -> HttpRequest {
+        let mut req = actix_web::test::TestRequest::get().uri("/api/v1/o/code");
+        if let Some(token) = cookie {
+            req = req.cookie(Cookie::new(LOGIN_STATE_COOKIE_NAME, token.to_owned()));
+        }
+        req.to_http_request()
+    }
+
+    fn rejected(result: Result<String, OIDCError>) -> bool {
+        matches!(result, Err(OIDCError::BadRequest(_)))
+    }
+
+    #[test]
+    fn login_state_round_trips_the_redirect_for_the_matching_token() {
+        let redirect = Url::parse("https://host.example/next/logs?q=a.b&x=1#frag").unwrap();
+        let state = login_state("01JTOKEN", &redirect);
+        assert_eq!(
+            verify_login_state(&state, "01JTOKEN"),
+            Some(redirect.as_str())
+        );
+    }
+
+    #[test]
+    fn login_state_rejects_other_tokens_and_unbound_states() {
+        let redirect = Url::parse("https://host.example/").unwrap();
+        let state = login_state("01JTOKEN", &redirect);
+        assert_eq!(verify_login_state(&state, "01JOTHER"), None);
+        assert_eq!(verify_login_state(&state, ""), None);
+        // States issued before the binding, or crafted without a token.
+        assert_eq!(verify_login_state("https://evil.example/", ""), None);
+        assert_eq!(verify_login_state(".https://evil.example/", ""), None);
+    }
+
+    #[test]
+    fn browser_callback_without_the_state_cookie_is_rejected() {
+        let state = login_state("01JTOKEN", &Url::parse("https://evil.example/").unwrap());
+        assert!(rejected(login_redirect(&callback(None), Some(&state))));
+        assert!(rejected(login_redirect(&callback(None), None)));
+        assert!(rejected(login_redirect(
+            &callback(Some("01JOTHER")),
+            Some(&state)
+        )));
+        assert!(rejected(login_redirect(&callback(Some("01JTOKEN")), None)));
+    }
+
+    #[test]
+    fn xhr_detection_matches_tenant_header_or_json_accept() {
+        let req = |headers: &[(&str, &str)]| {
+            let mut req = actix_web::test::TestRequest::get();
+            for &header in headers {
+                req = req.insert_header(header);
+            }
+            req.to_http_request()
+        };
+        assert!(is_xhr(&req(&[("x-p-tenant", "acme")])));
+        assert!(is_xhr(&req(&[("accept", "application/json")])));
+        assert!(!is_xhr(&req(&[(
+            "accept",
+            "text/html,application/xhtml+xml,*/*;q=0.8"
+        )])));
+        assert!(!is_xhr(&req(&[])));
+    }
+
+    #[test]
+    fn json_callback_without_proof_of_origin_is_rejected() {
+        let req = |headers: &[(&str, &str)]| {
+            let mut req =
+                actix_web::test::TestRequest::get().insert_header(("accept", "application/json"));
+            for &header in headers {
+                req = req.insert_header(header);
+            }
+            req.to_http_request()
+        };
+        // A `no-cors` fetch from another site sends no Origin, and over plain
+        // HTTP no Fetch Metadata either; it can also suppress the Referer.
+        for headers in [
+            &[("sec-fetch-site", "cross-site")][..],
+            &[("sec-fetch-site", "same-site")],
+            &[("sec-fetch-site", "none")],
+            // Fetch Metadata outranks a Referer, which a redirect chain carries along.
+            &[
+                ("sec-fetch-site", "cross-site"),
+                ("referer", "https://parseable.example/"),
+            ],
+            &[],
+        ] {
+            assert!(matches!(
+                verify_xhr_origin(&req(headers)),
+                Err(OIDCError::BadRequest(_))
+            ));
+        }
+        assert!(verify_xhr_origin(&req(&[("sec-fetch-site", "same-origin")])).is_ok());
+    }
+
+    #[test]
+    fn state_cookie_is_short_lived_and_hidden_from_scripts() {
+        let cookie = cookie_login_state("01JTOKEN");
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(cookie.path(), Some("/"));
+        assert_eq!(
+            cookie.max_age(),
+            Some(time::Duration::minutes(LOGIN_STATE_MINUTES))
+        );
+    }
+
+    #[test]
+    fn browser_login_response_clears_the_state_cookie() {
+        let cookies = [
+            cookie_session(Ulid::new()),
+            cookie_username("user"),
+            cookie_userid("id"),
+        ];
+        let response = build_login_response(
+            Some("https://host.example/next".to_owned()),
+            cookies,
+            Ulid::new(),
+            "user",
+            "id",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(actix_web::http::header::LOCATION)
+                .unwrap(),
+            "https://host.example/next"
+        );
+        let state = response
+            .cookies()
+            .find(|cookie| cookie.name() == LOGIN_STATE_COOKIE_NAME)
+            .expect("state cookie removal");
+        assert_eq!(state.value(), "");
+        assert_eq!(state.max_age(), Some(time::Duration::ZERO));
     }
 
     #[test]
