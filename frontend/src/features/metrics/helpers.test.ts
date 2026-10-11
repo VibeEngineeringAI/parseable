@@ -46,6 +46,16 @@ describe('Metrics URL state', () => {
       expect(parseExplorerSearch(search)).toEqual(input);
     },
   );
+  it.each(['10m', '30m', '5h', '3d'] as const)(
+    'restores the classic quick range %s that a classic link brings',
+    (range) => {
+      expect(parseExplorerSearch(`?range=${range}`).range).toBe(range);
+    },
+  );
+  it('ignores a range that is not a preset', () => {
+    for (const range of ['1d', '2h', 'constructor'])
+      expect(parseExplorerSearch(`?range=${range}`).range, range).toBe('1h');
+  });
   it('normalizes and restores absolute bounds', () => {
     const parsed = parseExplorerSearch(
       '?start=2026-10-09T10:00:00%2B00:00&end=2026-10-09T12:00:00Z',

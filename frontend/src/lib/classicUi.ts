@@ -1,5 +1,5 @@
 import { basePath } from './config';
-import { metricSelector } from './promql';
+import { metricSelector, validateRange } from './promql';
 import type { LogFilter, TimeRange } from './types';
 
 /** The classic (Prism) UI owns the root while this frontend is mounted under a prefix. */
@@ -19,14 +19,18 @@ export type ClassicRoute = {
   /** Path here, using the classic captures. Absent for `classic-only`. */
   native?: string;
   kind: ClassicRouteKind;
-  /** Query parameters added on the way here, from the decoded classic captures. */
+  /**
+   * Query parameters added on the way here, from the decoded classic captures.
+   * A value is appended, so a parameter already on the link is kept.
+   */
   params?: (captures: Record<string, string>) => Record<string, string>;
 };
 
 /**
  * Every route in Prism v3.2.5's router (`index-CaJv0zbb.js`, outside `*`), and
  * the only place the classic-to-native mapping is defined. Classic Logs query
- * parameters are translated by `classicLogsState`, since the path is unchanged.
+ * parameters are translated by `classicLogsState`, and classic Metrics ones by
+ * `classicMetricsSearch`, since the path is unchanged.
  */
 export const classicRoutes: readonly ClassicRoute[] = [
   { classic: '/', native: '/', kind: 'same' },
@@ -136,7 +140,7 @@ export function nativePath(path: string): string {
       }
     }
     for (const [name, value] of Object.entries(found.route.params(decoded)))
-      search.set(name, value);
+      search.append(name, value);
   }
   const query = search.toString();
   return `${fill(found.route.native, found.captures)}${query ? `?${query}` : ''}${hash}`;
@@ -246,27 +250,95 @@ export function classicLogsState(
   filters: Omit<LogFilter, 'id'>[];
   dropped: string[];
 } {
-  const dropped: string[] = [];
+  const { range, unread } = classicRange(params, now);
+  const { filters, skipped } = classicLogFilters(params.get('query') ?? '');
+  return { range, filters, dropped: droppedFromLink(params, unread, skipped) };
+}
+
+/** The range of classic `start`, `end` and `type`, and whether they were present but unusable. */
+function classicRange(params: URLSearchParams, now: number) {
   const start = params.get('start'),
     end = params.get('end'),
     type = params.get('type');
+  if (!start || !end || !type) return { unread: false };
   let range: TimeRange | undefined;
-  if (start && end && type) {
-    if (type === 'fixed')
-      range = Object.hasOwn(classicPresets, start) ? classicPresets[start] : undefined;
-    else {
-      const from = Date.parse(start),
-        to = end === 'now' ? now : Date.parse(end);
-      if (Number.isFinite(from) && Number.isFinite(to) && from < to)
-        range = { startTime: new Date(from).toISOString(), endTime: new Date(to).toISOString() };
-    }
-    if (!range) dropped.push('time range');
+  if (type === 'fixed')
+    range = Object.hasOwn(classicPresets, start) ? classicPresets[start] : undefined;
+  else {
+    const from = Date.parse(start),
+      to = end === 'now' ? now : Date.parse(end);
+    if (Number.isFinite(from) && Number.isFinite(to) && from < to)
+      range = { startTime: new Date(from).toISOString(), endTime: new Date(to).toISOString() };
   }
+  return { range, unread: !range };
+}
+
+/** What a classic link asked for that is not carried over, in the order the notice lists it. */
+function droppedFromLink(params: URLSearchParams, unreadRange: boolean, filters: number) {
+  const dropped: string[] = [];
+  if (unreadRange) dropped.push('time range');
   const tz = params.get('tz');
   if (tz && tz !== 'UTC') dropped.push(`time zone ${tz} (times are shown in UTC)`);
-  const { filters, skipped } = classicLogFilters(params.get('query') ?? '');
-  if (skipped) dropped.push(skipped === 1 ? '1 filter' : `${skipped} filters`);
+  if (filters) dropped.push(filters === 1 ? '1 filter' : `${filters} filters`);
   if (params.get('groupBy')) dropped.push('grouping');
   if (params.get('view')) dropped.push('saved view');
-  return { range, filters, dropped };
+  return dropped;
+}
+
+/**
+ * A classic Metrics filter, `WHERE ${type} ${column} …` or `WHERE (… OR …)`.
+ * Neither form parses as PromQL, so a query here is never mistaken for one.
+ */
+const classicMetricsFilter = new RegExp(`^WHERE\\s+(?:\\(|(?:${filterTypes})\\s)`, 'i');
+
+/** Classic Metrics parameters with no meaning here. */
+const classicMetricsOnly = ['tz', 'groupBy', 'view', 'viewType', 'viewMode', 'fromSavedFilter'];
+
+/**
+ * The Metrics search for a classic Metrics link, and what could not be carried
+ * over, or undefined if `search` is not from classic. Classic keeps its range
+ * in `type=fixed|custom` with `start` and `end`, which become `range`, or ISO
+ * `start` and `end`, here. Its `query` holds column filters on the dataset's
+ * records, not PromQL. Classic does not apply them to a metric's chart either,
+ * so they are reported rather than turned into label matchers.
+ */
+export function classicMetricsSearch(
+  search: string,
+  now = Date.now(),
+): { search: string; dropped: string[] } | undefined {
+  const params = new URLSearchParams(search);
+  const type = params.get('type');
+  const classicTime = type === 'fixed' || type === 'custom';
+  const filters = params.getAll('query').filter((query) => classicMetricsFilter.test(query));
+  if (!classicTime && !filters.length) return;
+  const next = new URLSearchParams();
+  for (const [name, value] of params) {
+    if (name === 'query' ? classicMetricsFilter.test(value) : classicMetricsOnly.includes(name))
+      continue;
+    if (!classicTime || !['type', 'start', 'end'].includes(name)) next.append(name, value);
+  }
+  let { range, unread } = classicTime ? classicRange(params, now) : { unread: false };
+  // Metrics queries at most 31 days.
+  if (typeof range === 'object') {
+    const start = Date.parse(range.startTime) / 1000,
+      end = Date.parse(range.endTime) / 1000;
+    if (validateRange({ start, end, step: Math.max(1, end - start) })) {
+      range = undefined;
+      unread = true;
+    }
+  }
+  if (typeof range === 'string') next.set('range', range);
+  else if (range) {
+    next.set('start', range.startTime);
+    next.set('end', range.endTime);
+  }
+  const conditions = filters.reduce((count, query) => {
+    const { filters, skipped } = classicLogFilters(query);
+    return count + filters.length + skipped;
+  }, 0);
+  const query = next.toString();
+  return {
+    search: query ? `?${query}` : '',
+    dropped: droppedFromLink(params, unread, conditions),
+  };
 }

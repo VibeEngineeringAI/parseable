@@ -65,6 +65,45 @@ test('classic paths that moved open their page here', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
 });
 
+test('a classic metric drilldown opens its metric and names the filter it drops', async ({
+  page,
+}) => {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  const metric = 'system.cpu.load_average.1m';
+  const filter = encodeURIComponent("WHERE text host = 'node-a'");
+  await page.goto(
+    `/metrics/explore/demo_metrics/metric/${metric}?start=30m&end=now&type=fixed&tz=UTC&query=${filter}#top`,
+  );
+  const query = encodeURIComponent(`{"${metric}"}`).replace(/%20/g, '+');
+  await expect(page).toHaveURL(`/metrics/explore/demo_metrics?query=${query}&range=30m#top`);
+  await expect(page.getByRole('textbox', { name: 'PromQL query A', exact: true })).toHaveText(
+    `{"${metric}"}`,
+  );
+  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('30m');
+  await expect(page.getByRole('img', { name: /PromQL range result/ })).toBeVisible();
+  const notice = page.getByRole('status').filter({ hasText: 'Not carried over' });
+  await expect(notice).toHaveText(/Not carried over from this link: 1 filter\./);
+  await notice.getByRole('button', { name: 'Dismiss' }).click();
+  await expect(page.getByText('Not carried over')).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('30m');
+  await expect(page.getByText('Not carried over')).toHaveCount(0);
+});
+
+test('a classic Metrics link keeps no classic filter as a PromQL query', async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  const filter = encodeURIComponent("WHERE text host = 'node-a' AND text env = 'prod'");
+  await page.goto(`/metrics/explore/demo_metrics?start=1d&end=now&type=fixed&query=${filter}`);
+  await expect(page).toHaveURL('/metrics/explore/demo_metrics?range=24h');
+  await expect(
+    page.getByRole('heading', { name: 'Build or write a PromQL query above to plot the chart.' }),
+  ).toBeVisible();
+  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('24h');
+  await expect(page.getByRole('status').filter({ hasText: 'Not carried over' })).toHaveText(
+    /Not carried over from this link: 2 filters\./,
+  );
+});
+
 test('a page whose code fails to load keeps reload and sign out', async ({ page }) => {
   await server(page);
   await page.route('**/src/features/logs/LogsPage.tsx*', (route) => route.abort());

@@ -3,12 +3,24 @@ import { describe, expect, it } from 'vitest';
 import {
   classicLogFilters,
   classicLogsState,
+  classicMetricsSearch,
   classicRoute,
   classicRoutes,
   classicUiPath,
   nativePath,
 } from './classicUi';
 import { appPath } from './config';
+
+/** Offsets of PromQL parse errors in `query`. */
+function promqlErrors(query: string) {
+  const errors: number[] = [];
+  parser.parse(query).iterate({
+    enter(node) {
+      if (node.type.isError) errors.push(node.from);
+    },
+  });
+  return errors;
+}
 
 describe('classic routes opened here', () => {
   it.each([
@@ -132,13 +144,15 @@ describe('classic routes opened here', () => {
     expect(target.pathname).toBe('/metrics/explore/otel');
     const query = target.searchParams.get('query')!;
     expect(query).toBe(selector);
-    const errors: number[] = [];
-    parser.parse(query).iterate({
-      enter(node) {
-        if (node.type.isError) errors.push(node.from);
-      },
-    });
-    expect(errors, query).toEqual([]);
+    expect(promqlErrors(query), query).toEqual([]);
+  });
+
+  it('keeps a query already on a metric drilldown link', () => {
+    expect(
+      nativePath(
+        '/metrics/explore/otel/metric/cpu?query=WHERE+text+host+%3D+%27node-a%27&type=fixed#x',
+      ),
+    ).toBe('/metrics/explore/otel?query=WHERE+text+host+%3D+%27node-a%27&type=fixed&query=cpu#x');
   });
 
   it.each(['/metrics/explore/otel/metric/100%', '/metrics/explore/otel/metric/%E0%A4%A'])(
@@ -267,6 +281,111 @@ describe('classic Logs links', () => {
       ],
       dropped: [],
     });
+  });
+});
+
+describe('classic Metrics links', () => {
+  const now = Date.parse('2026-10-10T12:00:00Z');
+  const translate = (search: string) => classicMetricsSearch(search, now);
+  const host = `query=${encodeURIComponent("WHERE text host = 'node-a'")}`;
+
+  it('treats only a query that is not PromQL as a classic filter', () => {
+    for (const query of [
+      "WHERE text host = 'node-a'",
+      "WHERE (text env = 'x' OR text env = 'y')",
+      'WHERE number n > 1',
+      'WHERE listString tags contains [a]',
+    ]) {
+      expect(promqlErrors(query), query).not.toEqual([]);
+      expect(translate(`?query=${encodeURIComponent(query)}`), query).toEqual({
+        search: '',
+        dropped: ['1 filter'],
+      });
+    }
+    for (const query of ['WHERE', 'WHERE > 5', 'WHERE and on() up', 'WHERE{host="a"}'])
+      expect(promqlErrors(query), query).toEqual([]);
+  });
+
+  it('leaves a link from this frontend alone', () => {
+    for (const search of [
+      '',
+      '?query=cpu&type=range&range=6h',
+      '?query=WHERE&type=both',
+      `?query=${encodeURIComponent('WHERE{host="a"}')}`,
+      `?query=${encodeURIComponent('WHERE > 5')}&type=instant`,
+      `?query=${encodeURIComponent('WHERE and on() up')}`,
+      '?start=2026-10-10T10:00:00.000Z&end=2026-10-10T11:00:00.000Z',
+    ])
+      expect(translate(search), search).toBeUndefined();
+  });
+
+  it('reports the filter of a drilldown and keeps the metric query', () => {
+    const link = nativePath(
+      `/metrics/explore/otel/metric/system.cpu.load_average.1m?start=10m&end=now&type=fixed&tz=UTC&${host}`,
+    );
+    const { pathname, search } = new URL(link, 'http://x');
+    expect(pathname).toBe('/metrics/explore/otel');
+    expect(translate(search)).toEqual({
+      search: `?query=${encodeURIComponent('{"system.cpu.load_average.1m"}')}&range=10m`,
+      dropped: ['1 filter'],
+    });
+  });
+
+  it('counts every condition it drops', () => {
+    const query = encodeURIComponent(
+      "WHERE text host = 'a' AND (text env = 'x' OR text env = 'y') AND number n > 1",
+    );
+    expect(translate(`?query=${query}&query=cpu`)).toEqual({
+      search: '?query=cpu',
+      dropped: ['3 filters'],
+    });
+  });
+
+  it.each([
+    ['start=1h&end=now&type=fixed', '?range=1h'],
+    ['start=1d&end=now&type=fixed', '?range=24h'],
+    ['start=3d&end=now&type=fixed', '?range=3d'],
+    [
+      'start=2026-10-10T11:00:00.000Z&end=now&type=custom',
+      '?start=2026-10-10T11%3A00%3A00.000Z&end=2026-10-10T12%3A00%3A00.000Z',
+    ],
+  ])('carries the classic range %s as %s', (params, search) => {
+    expect(translate(`?${params}`)).toEqual({ search, dropped: [] });
+  });
+
+  it('reports a range it cannot use', () => {
+    for (const params of [
+      'start=2h&end=now&type=fixed',
+      'start=constructor&end=now&type=fixed',
+      'start=later&end=now&type=custom',
+      // More than the 31 days a query can cover.
+      'start=2026-08-01T00:00:00.000Z&end=now&type=custom',
+    ])
+      expect(translate(`?${params}`), params).toEqual({ search: '', dropped: ['time range'] });
+  });
+
+  it('removes classic-only parameters and keeps the rest', () => {
+    expect(
+      translate(
+        `?${host}&tz=Asia%2FKolkata&groupBy=host&view=v1&viewType=list&viewMode=chart&fromSavedFilter=true&step=30s&promql=up`,
+      ),
+    ).toEqual({
+      search: '?step=30s&promql=up',
+      dropped: [
+        'time zone Asia/Kolkata (times are shown in UTC)',
+        '1 filter',
+        'grouping',
+        'saved view',
+      ],
+    });
+  });
+
+  it('produces a search it would not translate again', () => {
+    for (const search of [
+      `?${host}&start=1h&end=now&type=fixed`,
+      '?start=2026-10-10T11:00:00.000Z&end=now&type=custom',
+    ])
+      expect(translate(translate(search)!.search)).toBeUndefined();
   });
 });
 

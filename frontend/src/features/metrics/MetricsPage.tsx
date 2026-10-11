@@ -8,6 +8,8 @@ import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
+import { LinkNotice } from '../../components/explorer/LinkNotice';
+import { classicMetricsSearch } from '../../lib/classicUi';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
 import { autoStep, formatStep, loadHistory } from '../../lib/promql';
 import type { DatasetInfo } from '../../lib/types';
@@ -58,6 +60,16 @@ export function MetricsPage() {
   const warning = discovery.data?.unchecked.length ? (
     <DiscoveryWarning unchecked={discovery.data.unchecked} retry={rescan} />
   ) : null;
+  // A classic link's range and filters are rewritten before the explorer reads the address.
+  const classicLink = classicMetricsSearch(location.search);
+  if (classicLink)
+    return (
+      <Navigate
+        replace
+        to={{ pathname: location.pathname, search: classicLink.search, hash: location.hash }}
+        state={{ ...(location.state as object | null), classicDropped: classicLink.dropped }}
+      />
+    );
   if (enabled && datasets?.length && !dataset)
     return <Navigate replace to={`${datasetPath(datasets[0].name)}${location.search}`} />;
   if (enabled && datasets?.some((entry) => entry.name === dataset))
@@ -143,6 +155,11 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
   const location = useLocation();
   const navigate = useNavigate();
   const [state, setState] = useState(() => parseExplorerSearch(location.search));
+  // What the latest classic link could not carry over, kept until dismissed or another link.
+  const linkDropped = (location.state as { classicDropped?: string[] } | null)?.classicDropped;
+  const [notice, setNotice] = useState({ key: location.key, dropped: linkDropped ?? [] });
+  if (linkDropped && notice.key !== location.key)
+    setNotice({ key: location.key, dropped: linkDropped });
   const draft = useRef(state);
   const writtenSearch = useRef(location.search);
   const pendingSearches = useRef(new Set<string>());
@@ -298,6 +315,19 @@ function MetricsExplorer({ dataset, datasets }: { dataset: string; datasets: Dat
             </Button>
           </>
         }
+      />
+      <LinkNotice
+        dropped={notice.dropped}
+        onDismiss={() => {
+          setNotice({ key: notice.key, dropped: [] });
+          // Clear it from history too, so a reload does not bring it back.
+          if (!linkDropped) return;
+          const { classicDropped: _, ...rest } = location.state as Record<string, unknown>;
+          navigate(
+            { pathname: location.pathname, search: location.search, hash: location.hash },
+            { replace: true, state: rest },
+          );
+        }}
       />
       <div className={`metrics-layout ${showBrowser ? '' : 'metrics-browser-hidden'}`}>
         <QueryPanel
