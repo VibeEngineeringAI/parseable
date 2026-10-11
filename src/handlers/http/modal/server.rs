@@ -54,7 +54,7 @@ use actix_web::Scope;
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::http::StatusCode;
-use actix_web::http::header::{CACHE_CONTROL, HeaderValue};
+use actix_web::http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderMap, HeaderValue};
 use actix_web::middleware::{Next, from_fn};
 use actix_web::web;
 use actix_web::web::resource;
@@ -900,9 +900,32 @@ impl ResourceFilesCollection for UiBuild {
 
 /// Vite names every file it emits under `assets/` after a hash of its content,
 /// in both UIs. Only the prefix is checked: client routes such as Prism's
-/// `/apm/<service>` may end in a segment containing a dot.
+/// `/apm/<service>` may end in a segment containing a dot. `path` must be
+/// normalized, so that `assets/` with nothing after it is not a file.
 fn is_hashed_asset(path: &str) -> bool {
-    path.trim_start_matches('/').starts_with("assets/")
+    path.trim_start_matches('/')
+        .strip_prefix("assets/")
+        .is_some_and(|file| !file.is_empty())
+}
+
+/// The path `ResourceFiles` looks up once its exact lookup fails: empty segments
+/// dropped and `..` resolved. `None` where the crate rejects the path with a 400.
+/// This mirrors the crate's private `get_pathbuf`.
+fn normalize(path: &str) -> Option<String> {
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        if segment == ".." {
+            segments.pop();
+        } else if segment.starts_with(['.', '*'])
+            || segment.ends_with([':', '>', '<'])
+            || (cfg!(windows) && segment.contains('\\'))
+        {
+            return None;
+        } else if !segment.is_empty() {
+            segments.push(segment);
+        }
+    }
+    Some(segments.join("/"))
 }
 
 /// Hashed assets never change, so browsers may keep them for good. Everything
@@ -912,10 +935,13 @@ async fn ui_cache_control(
     req: ServiceRequest,
     next: Next<impl MessageBody>,
 ) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    let hashed = is_hashed_asset(req.match_info().unprocessed());
+    // Decide from the path `ResourceFiles` resolves, not the raw one: `/assets/`
+    // and `/assets/%2e%2e/index.html` resolve outside `assets/`.
+    let hashed = normalize(req.match_info().unprocessed()).is_some_and(|p| is_hashed_asset(&p));
     let mut response = next.call(req).await?;
     let status = response.status();
-    let value = if hashed && (status.is_success() || status == StatusCode::NOT_MODIFIED) {
+    let served = status.is_success() || status == StatusCode::NOT_MODIFIED;
+    let value = if hashed && served && !is_html(response.headers()) {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
@@ -926,11 +952,25 @@ async fn ui_cache_control(
     Ok(response)
 }
 
+/// Vite emits no HTML under `assets/`, so HTML there is the SPA fallback and is
+/// never kept for good. `ResourceFiles` sets `Content-Type` on a 304 as well.
+fn is_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+}
+
 #[cfg(test)]
 mod tests {
+    use actix_web::http::Method;
+    use actix_web::http::header::{ETAG, IF_NONE_MATCH};
     use actix_web::{App, body::to_bytes, dev::ServiceResponse, test};
 
     use super::*;
+
+    const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
     fn file(data: &'static [u8], mime_type: &'static str) -> static_files::Resource {
         static_files::Resource {
@@ -949,11 +989,37 @@ mod tests {
     }
 
     async fn get(path: &str, next: UiFiles) -> ServiceResponse {
+        call(test::TestRequest::get(), path, next).await
+    }
+
+    async fn call(request: test::TestRequest, path: &str, next: UiFiles) -> ServiceResponse {
         let app = test::init_service(
             App::new().configure(|config| Server::mount_ui(config, ui(b"classic"), next)),
         )
         .await;
-        test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await
+        test::call_service(&app, request.uri(path).to_request()).await
+    }
+
+    /// GETs `path`, then again with the first response's ETag in `If-None-Match`,
+    /// as a browser revalidating its copy does. Returns both responses.
+    async fn get_and_revalidate(path: &str, next: UiFiles) -> [ServiceResponse; 2] {
+        let app = test::init_service(
+            App::new().configure(|config| Server::mount_ui(config, ui(b"classic"), next)),
+        )
+        .await;
+        let first = test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+        let etag = first.headers().get(ETAG).expect("an ETag").clone();
+        let request = test::TestRequest::get()
+            .uri(path)
+            .insert_header((IF_NONE_MATCH, etag))
+            .to_request();
+        let second = test::call_service(&app, request).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::NOT_MODIFIED,
+            "revalidate {path}"
+        );
+        [first, second]
     }
 
     async fn body_at(path: &str, next: UiFiles) -> Bytes {
@@ -1014,20 +1080,69 @@ mod tests {
 
     #[actix_web::test]
     async fn hashed_assets_are_immutable_and_everything_else_revalidates() {
-        for path in ["/assets/index-abc123.js", "/next/assets/index-abc123.js"] {
-            let response = get(path, ui(b"next")).await;
+        for path in [
+            "/assets/index-abc123.js",
+            "/assets//index-abc123.js",
+            "/next/assets/index-abc123.js",
+        ] {
+            let [response, revalidated] = get_and_revalidate(path, ui(b"next")).await;
             assert_eq!(response.status(), StatusCode::OK, "GET {path}");
-            assert_eq!(
-                cache_control(&response),
-                "public, max-age=31536000, immutable",
-                "GET {path}"
-            );
+            assert_eq!(cache_control(&response), IMMUTABLE, "GET {path}");
+            assert_eq!(cache_control(&revalidated), IMMUTABLE, "revalidate {path}");
         }
         for path in ["/", "/logs", "/favicon.ico", "/next", "/next/team"] {
-            let response = get(path, ui(b"next")).await;
+            let [response, revalidated] = get_and_revalidate(path, ui(b"next")).await;
             assert_eq!(response.status(), StatusCode::OK, "GET {path}");
             assert_eq!(cache_control(&response), "no-cache", "GET {path}");
+            assert_eq!(cache_control(&revalidated), "no-cache", "revalidate {path}");
         }
+        let response = call(
+            test::TestRequest::default().method(Method::HEAD),
+            "/assets/index-abc123.js",
+            ui(b"next"),
+        )
+        .await;
+        assert_eq!(cache_control(&response), IMMUTABLE, "HEAD");
+    }
+
+    /// `ResourceFiles` drops a trailing slash and resolves `..`, so these name no
+    /// file under `assets/` and get the SPA's `index.html`. Kept for a year, that
+    /// `index.html` would point at chunks the next deploy removes.
+    #[actix_web::test]
+    async fn paths_resolving_outside_assets_are_not_immutable() {
+        for path in [
+            "/assets/",
+            "/assets//",
+            "/next/assets/",
+            "/next/assets//",
+            "/assets/%2e%2e/index.html",
+            "/next/assets/%2E%2E/index.html",
+            "/assets/x/%2e%2e/%2e%2e/logs",
+        ] {
+            let [response, revalidated] = get_and_revalidate(path, ui(b"next")).await;
+            assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+            assert_eq!(cache_control(&response), "no-cache", "GET {path}");
+            assert_eq!(cache_control(&revalidated), "no-cache", "revalidate {path}");
+        }
+        let response = call(
+            test::TestRequest::default().method(Method::HEAD),
+            "/assets/",
+            ui(b"next"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "HEAD");
+        assert_eq!(cache_control(&response), "no-cache", "HEAD");
+    }
+
+    #[actix_web::test]
+    async fn html_is_never_immutable() {
+        let mut next = ui(b"next");
+        next.insert("assets/page-abc123.html", file(b"page", "text/html"));
+        let [response, revalidated] =
+            get_and_revalidate("/next/assets/page-abc123.html", next).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cache_control(&response), "no-cache");
+        assert_eq!(cache_control(&revalidated), "no-cache");
     }
 
     #[actix_web::test]
