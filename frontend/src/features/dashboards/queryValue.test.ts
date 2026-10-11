@@ -237,12 +237,17 @@ describe('query value font fitting', () => {
     expect(measure(size + 4)).toBeGreaterThan(180 * 0.9);
     expect(fitFontSize({ measure: (px) => px, width: 100, height: 300 })).toBe(88);
     expect(fitFontSize({ measure: () => 90, width: 100, height: 300 })).toBe(100);
-    expect(fitFontSize({ measure: () => 90.001, width: 100, height: 300 })).toBe(20);
+    expect(fitFontSize({ measure: () => 90.001, width: 100, height: 300 })).toBe(10);
   });
 
-  it('stops at 20px even when the width or height cannot fit the minimum', () => {
-    expect(fitFontSize({ measure: (px) => px * 100, width: 100, height: 300 })).toBe(20);
+  it('stops at 20px for the height cap and never goes below 10px for the width', () => {
     expect(fitFontSize({ measure: () => 0, width: 0, height: 0 })).toBe(20);
+    expect(fitFontSize({ measure: (px) => px, width: 1000, height: 10 })).toBe(20);
+    expect(fitFontSize({ measure: (px) => px * 100, width: 100, height: 300 })).toBe(10);
+  });
+
+  it('shrinks past 20px in single pixels only when the text overflows at 20px', () => {
+    expect(fitFontSize({ measure: (px) => px * 10, width: 200, height: 300 })).toBe(18);
   });
 
   it('also stays within 70% of the height in four-pixel steps', () => {

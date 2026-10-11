@@ -38,7 +38,9 @@ export const sparklineEnabled = (tile: DashboardTile): boolean =>
 
 /** Classic starts at 100px and shrinks in 4px steps to fit 90% of the width.
  * Deliberately also cap at 70% of the height: classic's canvas always had room.
- * The 20px minimum takes precedence when the box is too small for either cap. */
+ * The 20px minimum takes precedence over the height cap. Deliberate deviation: when
+ * the text still overflows the width at 20px (a long formatted value in a narrow
+ * tile) it keeps shrinking by 1px down to 10px, because a clipped number is worse. */
 export function fitFontSize({
   measure,
   width,
@@ -50,6 +52,7 @@ export function fitFontSize({
 }): number {
   let size = 100;
   while (size > 20 && (size > height * 0.7 || measure(size) > width * 0.9)) size -= 4;
+  while (size > 10 && measure(size) > width * 0.9) size -= 1;
   return size;
 }
 
