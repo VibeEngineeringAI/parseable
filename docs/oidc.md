@@ -43,7 +43,7 @@ PARSEABLE_BIN=/absolute/path/to/parseable \
   python3 scripts/test-oidc.py
 ```
 
-The check performs an authorization-code login through Parseable's login redirect and callback. Its mock issuer serves discovery and JWKS, signs ID tokens with a temporary RS256 key, and uses single-use rotating refresh tokens. It creates a disposable stream and verifies that a group-mapped Reader can access it. After group removal, two concurrent requests share one refresh and both lose access. The check also rejects unknown and internal defaults, protects provider-only grants from manual removal, preserves overlapping manual grants, handles a missing groups claim, applies and clears the default role, fails closed when refresh omits its signed ID token, and verifies that logout or default-role removal during a blocked refresh cannot recreate the session.
+The check performs an authorization-code login through Parseable's login redirect and callback. Its mock issuer serves discovery and JWKS, signs ID tokens with a temporary RS256 key, and uses single-use rotating refresh tokens. It creates a disposable stream and verifies that a group-mapped Reader can access it. After group removal, two concurrent requests share one refresh and both lose access. The check also rejects unknown and internal defaults, protects provider-only grants from manual removal, preserves overlapping manual grants, handles a missing groups claim, applies and clears the default role, fails closed when refresh omits its signed ID token, and verifies that logout or default-role removal during a blocked refresh cannot recreate the session. It also completes a browser-style callback (HTML Accept, redirects not followed). The callback must redirect only when the `oidc_state` cookie matches the token in `state`, and must clear that cookie. Before redeeming the code, it must reject these with 400: a missing or foreign state cookie, a foreign redirect origin (including with forged forwarded headers), a legacy unbound `state`, and a JSON callback without an allowed `Origin`, same-origin Fetch Metadata, or `Referer`. A UI origin listed in `P_ALLOW_ORIGINS` must work both as the redirect target and as the JSON caller. A login reached under a host name other than `P_ORIGIN_URI`'s must redirect once to `P_ORIGIN_URI` before setting `oidc_state`, and not again when the proxy rewrites `Host`.
 
 Do not point this test at the production server or a real Pocket ID instance; `PARSEABLE_BIN` must name a local executable. The process is stopped and its temporary data is removed whether the check passes or fails.
 
@@ -91,6 +91,34 @@ The revalidation bound applies to active cookie-authenticated requests.
 Providers that cannot return a fresh signed ID token during refresh require a
 new sign-in. Dormant users and background jobs do not poll the identity
 provider; a stored role set is not a promise of continuous provider membership.
-The existing callback state/nonce design was not redesigned here and requires a
+A browser login is bound to the browser that started it: `/o/login` sets a
+short-lived HttpOnly `oidc_state` cookie and sends its token with the redirect
+target in `state`. The callback redeems the code only when the token matches the
+cookie and the target's origin is `P_ORIGIN_URI` or listed in
+`P_ALLOW_ORIGINS`. When `P_ORIGIN_URI` is unset, the `Host` header and the
+scheme Parseable serves stand in for it; forwarded headers are ignored. Unlike
+`/o/login`, which checks against the request's own origin, the callback relies
+on `P_ORIGIN_URI`, so set it to the exact scheme, host and port browsers use.
+For example, an `http://` value behind an HTTPS proxy rejects browser logins
+that return to the Parseable UI, unless its origin is in `P_ALLOW_ORIGINS`.
+The IdP always returns to the `P_ORIGIN_URI` host, so `/o/login` reached under
+another host name (`localhost` for `127.0.0.1`, an internal DNS name) first
+redirects once to `/o/login` on `P_ORIGIN_URI`, where it sets `oidc_state`. The
+redirect target is then checked against that origin, so a UI served under the
+other name must be listed in `P_ALLOW_ORIGINS`, and it only shares the session
+if it calls the API on `P_ORIGIN_URI`. A proxy should pass the browser's host in
+`Host`, `X-Forwarded-Host` or `Forwarded`. Otherwise `/o/login` rejects
+redirects back to the browser's origin unless that origin is in
+`P_ALLOW_ORIGINS`, and every login takes the extra redirect. A callback that finds no `oidc_state` cookie says so; if that
+repeats, `P_ORIGIN_URI` does not match the address browsers use.
+Each browser holds one pending login, so the most recently started tab wins and
+others must sign in again. JSON callers (`Accept: application/json` or
+`x-p-tenant`) forward the code themselves and are not redirected. If such a
+request has an `Origin`, that origin must be allowed. Otherwise
+`Sec-Fetch-Site` must be `same-origin`, and only a request without
+`Sec-Fetch-Site` may rely on a `Referer` from an allowed origin. Any other JSON
+callback is rejected before the code is redeemed.
+A host that can set cookies for a parent domain can still plant a login, as it
+already can with the `session` cookie. Nonce and per-login PKCE still need a
 separate OIDC protocol-hardening review. The built-in `reader` privilege includes
 dashboard/filter writes; it is not a strict read-only UI role.
