@@ -106,9 +106,10 @@ another host name (`localhost` for `127.0.0.1`, an internal DNS name) first
 redirects once to `/o/login` on `P_ORIGIN_URI`, where it sets `oidc_state`. The
 redirect target is then checked against that origin, so a UI served under the
 other name must be listed in `P_ALLOW_ORIGINS`, and it only shares the session
-if it calls the API on `P_ORIGIN_URI`. A proxy must pass the browser's host in
-`Host`, `X-Forwarded-Host` or `Forwarded`, or every login takes that extra
-redirect. A callback that finds no `oidc_state` cookie says so; if that
+if it calls the API on `P_ORIGIN_URI`. A proxy should pass the browser's host in
+`Host`, `X-Forwarded-Host` or `Forwarded`. Otherwise `/o/login` rejects
+redirects back to the browser's origin unless that origin is in
+`P_ALLOW_ORIGINS`, and every login takes the extra redirect. A callback that finds no `oidc_state` cookie says so; if that
 repeats, `P_ORIGIN_URI` does not match the address browsers use.
 Each browser holds one pending login, so the most recently started tab wins and
 others must sign in again. JSON callers (`Accept: application/json` or
