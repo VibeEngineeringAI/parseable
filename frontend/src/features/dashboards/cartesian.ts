@@ -52,7 +52,7 @@ export function cartesianChart(rows: LogRecord[], tile: DashboardTile): Cartesia
   const axes = record(record(tile.config).axes),
     xField = text(record(axes.x).field),
     yFields = fieldList(record(axes.y).field);
-  if (!xField || !yFields.length) return chart;
+  if (!xField || !yFields.length || yFields.some((field) => !field)) return chart;
   const groupFields = fieldList(record(axes.groupBy).field);
   let categories: string[], series: CartesianChart['series'];
   if (!groupFields.length) {

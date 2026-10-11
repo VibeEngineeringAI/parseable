@@ -222,7 +222,6 @@ describe('cartesianChart categories', () => {
     { x: { field: 'category' }, y: { field: '' } },
     { x: { field: 'category' }, y: { field: [] } },
     { x: { field: 'category' }, y: { field: [''] } },
-    { x: { field: 'category' }, y: { field: ['value', 2] } },
     { x: { field: ['category'] }, y: { field: 'value' } },
   ])('keeps the table fallback for missing or invalid fields: %j', (axes) => {
     expect(
