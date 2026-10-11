@@ -129,7 +129,7 @@ export function newTile(tiles: DashboardTile[]): DashboardTile {
   };
 }
 // Numbers count as Unix seconds or milliseconds; smaller numbers and numeric strings are not times.
-const timeValue = (value: unknown) => {
+export const timeValue = (value: unknown) => {
   if (typeof value === 'number')
     return value >= 1e9 && value < 1e11
       ? value
@@ -139,7 +139,7 @@ const timeValue = (value: unknown) => {
   if (typeof value === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(value)) return NaN;
   return parseEventTimestamp(value) / 1000;
 };
-const groupValue = (value: unknown) =>
+export const groupValue = (value: unknown) =>
   value == null || value === ''
     ? '(empty)'
     : typeof value === 'string'

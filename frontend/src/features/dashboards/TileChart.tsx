@@ -1,5 +1,6 @@
 import { useCallback, useMemo } from 'react';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
+import { BubbleChart } from '../../components/charts/BubbleChart';
 import { GaugeChart } from '../../components/charts/GaugeChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
@@ -11,6 +12,7 @@ import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
 import { record, sqlChart, text, tileTitle } from './tiles';
 import type { TileResults } from './queries';
+import { bubbleChart } from './bubble';
 export function TileChart({
   tile,
   result,
@@ -61,6 +63,13 @@ export function TileChart({
     () => result.rows ?? (result.promql ? promqlTableRows(result.promql) : []),
     [result],
   );
+  const bubble = useMemo(
+    () =>
+      tile.chartType === 'bubble' && !result.promql && tile.tileType !== 'promql'
+        ? bubbleChart(result.rows ?? [], tile)
+        : undefined,
+    [result, tile],
+  );
   const unit = text(layout.unit),
     precision = typeof layout.precision === 'number' ? layout.precision : undefined,
     humanize = layout.humanize === true;
@@ -72,8 +81,44 @@ export function TileChart({
   const xRange = useMemo(() => [start, end] as const, [start, end]);
   const fitted = useChartHeight(
     height,
-    JSON.stringify([tile.config, chart.categorical, chart.series.map((series) => series.id)]),
+    JSON.stringify([
+      tile.config,
+      chart.categorical,
+      chart.series.map((series) => series.id),
+      bubble?.groups.map((group) => group.id),
+      bubble?.truncated,
+    ]),
   );
+  if (tile.chartType === 'bubble') {
+    if (result.promql || tile.tileType === 'promql')
+      return (
+        <p className="muted dashboard-chart-note" role="status">
+          Bubble charts are not available for PromQL tiles.
+        </p>
+      );
+    const legend = text(layout.legendPosition);
+    const legendPosition =
+      legend === 'top' || legend === 'left' || legend === 'right' ? legend : 'bottom';
+    const { xField, yField, sizeField, groupField, ...data } = bubble!;
+    return (
+      <div ref={fitted.root} className="dashboard-chart" data-legend-position={legendPosition}>
+        <BubbleChart
+          {...data}
+          xTitle={text(record(axes.x).title) || xField}
+          yTitle={text(record(axes.y).title) || yField}
+          xLabel={xField}
+          yLabel={yField}
+          sizeLabel={sizeField}
+          groupLabel={groupField}
+          legendPosition={legendPosition}
+          formatValue={formatValue}
+          title={`${tileTitle(tile)} chart`}
+          height={fitted.pixels}
+          emptyMessage="No results for the selected time range"
+        />
+      </div>
+    );
+  }
   if (tile.chartType === 'gauge') {
     const value = gaugeValue(tile, result, rows);
     return value === undefined ? (
