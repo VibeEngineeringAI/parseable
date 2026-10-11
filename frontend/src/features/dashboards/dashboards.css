@@ -276,11 +276,21 @@
   grid-column: 2;
   grid-row: 1 / -1;
   flex-direction: column;
+  flex-wrap: nowrap;
   align-items: flex-start;
   min-height: 0;
   max-height: 100%;
   overflow: auto;
   margin: 0;
+}
+.dashboard-chart:is([data-legend-position='left'], [data-legend-position='right'])
+  .charts-legend-title {
+  align-self: flex-start;
+}
+.dashboard-chart:is([data-legend-position='left'], [data-legend-position='right'])
+  .charts-legend
+  > li {
+  flex-shrink: 0;
 }
 .dashboard-chart:is([data-legend-position='left'], [data-legend-position='right']) .charts-plot-box,
 .dashboard-chart:is([data-legend-position='left'], [data-legend-position='right'])

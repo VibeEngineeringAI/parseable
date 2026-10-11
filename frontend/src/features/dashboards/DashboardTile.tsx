@@ -9,6 +9,7 @@ import { timeBounds } from '../../lib/query';
 import type { QueryLimiter } from '../../lib/concurrency';
 import type { DashboardTile as Tile, DashboardVariable, QueryRequest } from '../../lib/types';
 import { TileChart } from './TileChart';
+import type { TimeSeriesChartProps } from '../../components/charts/TimeSeriesChart';
 import { loadTile, type TileResults } from './queries';
 import {
   instantCharts,
@@ -50,6 +51,7 @@ export function DashboardTile({
   first,
   last,
   onAction,
+  onZoomRange,
 }: {
   tile: Tile;
   layout: TileLayout;
@@ -68,6 +70,7 @@ export function DashboardTile({
   first: boolean;
   last: boolean;
   onAction: (action: 'edit' | 'duplicate' | 'earlier' | 'later' | 'delete', tile: Tile) => void;
+  onZoomRange?: TimeSeriesChartProps['onZoomRange'];
 }) {
   const { client, mode } = useApp(),
     navigate = useNavigate();
@@ -272,6 +275,7 @@ export function DashboardTile({
                 start={Date.parse(effectiveBounds.startTime) / 1000}
                 end={Date.parse(effectiveBounds.endTime) / 1000}
                 height="fit"
+                onZoomRange={onZoomRange}
               />
             )}
           </>

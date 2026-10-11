@@ -1,6 +1,9 @@
 import { useCallback, useMemo } from 'react';
 import { PieChart } from '../../components/charts/PieChart';
-import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
+import {
+  TimeSeriesChart,
+  type TimeSeriesChartProps,
+} from '../../components/charts/TimeSeriesChart';
 import { BubbleChart } from '../../components/charts/BubbleChart';
 import { GaugeChart } from '../../components/charts/GaugeChart';
 import { DataTable } from '../../components/explorer/DataTable';
@@ -28,12 +31,14 @@ export function TileChart({
   start,
   end,
   height,
+  onZoomRange,
 }: {
   tile: DashboardTile;
   result: TileResults;
   start: number;
   end: number;
   height: number | 'fit';
+  onZoomRange?: TimeSeriesChartProps['onZoomRange'];
 }) {
   const config = record(tile.config),
     layout = record(config.layout),
@@ -225,12 +230,18 @@ export function TileChart({
       data-stacked={style.stacked}
       data-orientation={horizontal ? 'horizontal' : 'vertical'}
     >
-      {text(record(axes.y).title) && (
+      {!horizontal && text(record(axes.y).title) && (
         <p className="muted dashboard-axis-title">{text(record(axes.y).title)}</p>
       )}
       <TimeSeriesChart
         timestamps={chart.timestamps}
         series={chart.series}
+        legendTitle={chart.legendTitle}
+        onZoomRange={
+          tile.chartType === 'timeseries' && chart.categories === undefined
+            ? onZoomRange
+            : undefined
+        }
         categories={chart.categories}
         kind={style.kind}
         fill={style.fill}
@@ -243,6 +254,7 @@ export function TileChart({
         title={`${tileTitle(tile)} chart`}
         showTitle={false}
         xAxisTitle={text(record(axes.x).title)}
+        valueAxisTitle={horizontal ? text(record(axes.y).title) : undefined}
         showSeriesCount={false}
         height={fitted.pixels}
         yAxisSize={

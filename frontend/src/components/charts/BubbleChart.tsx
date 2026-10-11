@@ -10,6 +10,7 @@ import {
 import type { BubbleGroup, BubblePoint } from '../../features/dashboards/bubble';
 import { linearAxis, timeAxis } from './bubbleAxes';
 import { formatChartValue } from './format';
+import { shortenLegendLabel } from './legend';
 import './charts.css';
 
 export interface BubbleChartProps {
@@ -572,13 +573,19 @@ export function BubbleChart({
           onFocusCapture={clearInspection}
         >
           {legendGroups.map((group) => (
-            <li key={group.id} className="charts-legend-item">
+            <li
+              key={group.id}
+              className="charts-legend-item"
+              aria-label={group.label}
+              title={group.label}
+            >
               <span
-                className="charts-bubble-swatch"
+                className="charts-bubble-swatch charts-legend-swatch"
+                data-legend-swatch="square"
                 style={{ background: group.colour }}
                 aria-hidden="true"
               />
-              <span>{group.label}</span>
+              <span>{shortenLegendLabel(group.label)}</span>
             </li>
           ))}
         </ul>

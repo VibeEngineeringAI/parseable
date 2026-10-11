@@ -268,6 +268,10 @@ function DashboardFields({ original }: { original: Dashboard }) {
           resolutions={resolutions}
           limit={limit}
           onAction={tileAction}
+          onZoomRange={(range) => {
+            url.setRange(range);
+            workspace.setRangeDirty(writable);
+          }}
         />
       </div>
       <DashboardDialogs

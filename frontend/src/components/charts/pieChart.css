@@ -111,17 +111,8 @@
   outline: 2px solid var(--color-focus);
   outline-offset: 2px;
 }
-.pie-chart-swatch {
-  flex: 0 0 12px;
-  width: 12px;
-  height: 12px;
-  border-radius: 4px;
-}
 .pie-chart-legend-item[aria-pressed='false'] .pie-chart-legend-label {
   text-decoration: line-through;
-}
-.pie-chart-legend-item[aria-pressed='false'] .pie-chart-swatch {
-  opacity: 0.3;
 }
 
 .pie-chart-tooltip {

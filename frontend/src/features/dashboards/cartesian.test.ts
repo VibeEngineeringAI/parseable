@@ -86,6 +86,19 @@ describe('cartesianStyle', () => {
 });
 
 describe('cartesianChart categories', () => {
+  it.each([
+    [['a'], 'a:'],
+    [['a', 'b'], 'a | b:'],
+    [[], undefined],
+  ])('derives a categorical legend title from group fields %j', (groups, title) => {
+    const chart = cartesianChart(
+      [{ category: 'one', value: 2, a: 'api', b: 'error' }],
+      categoryTile('value', groups),
+    );
+    expect(chart.categories).toEqual(['one']);
+    expect(chart.legendTitle).toBe(title);
+    if (!groups.length) expect(chart).not.toHaveProperty('legendTitle');
+  });
   it('keeps server order and duplicate categories, converts y values and drops null x', () => {
     const rows = [
       { category: 'beta', value: '2.5' },
@@ -159,6 +172,7 @@ describe('cartesianChart categories', () => {
       barGrouped,
     );
     expect(chart.categorical).toBe(false);
+    expect(chart.legendTitle).toBe('service:');
     expect(chart.categories).toEqual(['10', '2']);
     expect(chart.timestamps).toEqual([0, 1]);
     expect(chart.series.map(({ label, values }) => ({ label, values }))).toEqual([
@@ -239,16 +253,20 @@ describe('cartesianChart categories', () => {
   });
 
   it.each([
-    [[{ category: null, value: 3 }, { value: 4 }], categoryTile()],
-    [[{ category: 'a', group: ' ', value: 3 }], categoryTile('value', ['group'])],
-  ])('returns chartable empty arrays when no categorical rows survive', (rows, tile) => {
-    expect(cartesianChart(rows, tile)).toEqual({
-      categorical: false,
-      categories: [],
-      timestamps: [],
-      series: [],
-    });
-  });
+    [[{ category: null, value: 3 }, { value: 4 }], categoryTile(), undefined],
+    [[{ category: 'a', group: ' ', value: 3 }], categoryTile('value', ['group']), 'group:'],
+  ])(
+    'returns chartable empty arrays when no categorical rows survive',
+    (rows, tile, legendTitle) => {
+      expect(cartesianChart(rows, tile)).toEqual({
+        categorical: false,
+        categories: [],
+        timestamps: [],
+        series: [],
+        ...(legendTitle ? { legendTitle } : {}),
+      });
+    },
+  );
 
   it('keeps the existing shape for an empty SQL result', () => {
     expect(cartesianChart([], categoryTile())).toEqual({

@@ -11,7 +11,9 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import { cartesianPlot, drawThresholds, seriesWidth, type PositionedSeries } from './cartesianPlot';
 import { formatChartValue } from './format';
+import { shortenLegendLabel } from './legend';
 import { PALETTE_SIZE, assignSeriesSlots, rankSeries, selectTopSeries } from './seriesSelection';
+import { zoomRange, type ZoomRange } from './zoomRange';
 import './charts.css';
 
 export type ChartSeries = { id: string; label: string; values: (number | null)[] };
@@ -31,6 +33,12 @@ export interface TimeSeriesChartProps {
   showTitle?: boolean;
   /** Place a title immediately below the time axis, before counts and legend. */
   xAxisTitle?: string;
+  /** Numeric axis label for horizontal category bars. */
+  valueAxisTitle?: string;
+  /** Group field names shown before the series visibility controls. */
+  legendTitle?: string;
+  /** Opt time charts into selecting an absolute dashboard range. */
+  onZoomRange?: (range: ZoomRange) => void;
   /** Compact cards can omit counts while retaining the Show all control. */
   showSeriesCount?: boolean;
   /** Fixed x-axis bounds in Unix seconds, independent of the sample timestamps. */
@@ -160,6 +168,9 @@ export function TimeSeriesChart({
   title = 'Time series',
   showTitle = true,
   xAxisTitle,
+  valueAxisTitle,
+  legendTitle,
+  onZoomRange,
   showSeriesCount = true,
   xRange,
   maxSeries = 20,
@@ -181,11 +192,14 @@ export function TimeSeriesChart({
   const plot = useRef<uPlot | null>(null);
   const cursorIndex = useRef<number | null>(null);
   const highlighted = useRef<string | null>(null);
+  const keyboardSelection = useRef<{ anchor: number; index: number } | null>(null);
+  const onZoomRangeRef = useRef(onZoomRange);
   const hiddenRef = useRef(new Set<string>());
   const [hidden, setHidden] = useState(new Set<string>());
   const [showAll, setShowAll] = useState(false);
   const [cursor, setCursor] = useState<Cursor | null>(null);
   const [themeRevision, setThemeRevision] = useState(0);
+  const [zoomStatus, setZoomStatus] = useState('');
   const instructionsId = useId();
   const tooltipId = useId();
   const xMin = xRange?.[0];
@@ -202,6 +216,9 @@ export function TimeSeriesChart({
   const colorsKey = JSON.stringify(colors ?? []);
   const isHorizontal = kind === 'bar' && categoryLabels !== undefined && horizontal;
   const horizontalTitle = isHorizontal ? xAxisTitle : undefined;
+  const horizontalValueTitle = isHorizontal ? valueAxisTitle : undefined;
+  const zoomEnabled = onZoomRange !== undefined && categoryLabels === undefined;
+  onZoomRangeRef.current = onZoomRange;
   // Bar visibility changes require fresh stack totals and group positions.
   const barVisibility = kind === 'bar' ? hidden : undefined;
   const slotHistory = useRef(new Map<string, number>());
@@ -251,6 +268,24 @@ export function TimeSeriesChart({
   // A shorter result can arrive while a cursor still points into the previous data.
   const activeCursor = cursor && cursor.index < timestamps.length ? cursor : null;
 
+  function clearSelection(chart = plot.current) {
+    const selected = keyboardSelection.current !== null || (chart?.select.width ?? 0) > 0;
+    keyboardSelection.current = null;
+    chart?.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+    if (selected) setZoomStatus('Selection cleared.');
+  }
+
+  function applyZoom(chart: uPlot, from: number, to: number) {
+    const range = zoomRange(timestamps, from, to);
+    if (range) onZoomRangeRef.current?.(range);
+    clearSelection(chart);
+    setZoomStatus(
+      range
+        ? `Zoomed to ${formatTime(Date.parse(range.startTime) / 1000, timeZone)} to ${formatTime(Date.parse(range.endTime) / 1000, timeZone)}.`
+        : 'Selection cleared. Select at least two points to zoom.',
+    );
+  }
+
   useEffect(() => {
     const observer = new MutationObserver(() => setThemeRevision((revision) => revision + 1));
     observer.observe(document.documentElement, {
@@ -263,6 +298,7 @@ export function TimeSeriesChart({
   useEffect(() => {
     const host = container.current;
     cursorIndex.current = null;
+    keyboardSelection.current = null;
     setCursor(null);
     if (!host || !hasData) return;
     const styles = getComputedStyle(host);
@@ -296,6 +332,8 @@ export function TimeSeriesChart({
       xMin,
       xMax,
       xAxisTitle: horizontalTitle,
+      valueAxisTitle: horizontalValueTitle,
+      zoomable: zoomEnabled,
       references,
       yAxisSize,
       formatValue,
@@ -318,7 +356,7 @@ export function TimeSeriesChart({
           width,
           height,
           legend: { show: false },
-          select: { show: false, left: 0, top: 0, width: 0, height: 0 },
+          select: { show: zoomEnabled, left: 0, top: 0, width: 0, height: 0 },
           tzDate: (timestamp) =>
             timeZone === 'UTC'
               ? uPlot.tzDate(new Date(timestamp * 1000), 'UTC')
@@ -326,6 +364,20 @@ export function TimeSeriesChart({
           ...options,
           focus: { alpha: 1 },
           hooks: {
+            ...(zoomEnabled
+              ? {
+                  setSelect: [
+                    (self: uPlot) => {
+                      if (self.select.width <= 0) return;
+                      applyZoom(
+                        self,
+                        self.posToVal(self.select.left, 'x'),
+                        self.posToVal(self.select.left + self.select.width, 'x'),
+                      );
+                    },
+                  ],
+                }
+              : {}),
             draw: [(self) => drawThresholds(self, references, thresholdColor, isHorizontal)],
             setCursor: [
               (self) => {
@@ -395,6 +447,8 @@ export function TimeSeriesChart({
     stacked,
     isHorizontal,
     horizontalTitle,
+    horizontalValueTitle,
+    zoomEnabled,
     showXAxis,
     paddedBounds,
     barVisibility,
@@ -419,14 +473,29 @@ export function TimeSeriesChart({
     if (event.key === 'Escape') {
       event.preventDefault();
       hideCursor();
+      if (zoomEnabled) clearSelection();
       return;
     }
     const chart = plot.current;
+    const selection = keyboardSelection.current;
+    if (zoomEnabled && chart && event.key === 'Enter' && selection) {
+      event.preventDefault();
+      applyZoom(chart, timestamps[selection.anchor], timestamps[selection.index]);
+      return;
+    }
     const forward = event.key === 'ArrowRight' || (isHorizontal && event.key === 'ArrowDown');
     const backward = event.key === 'ArrowLeft' || (isHorizontal && event.key === 'ArrowUp');
     if (!chart || (!forward && !backward)) return;
     event.preventDefault();
     const current = cursorIndex.current;
+    const extending =
+      zoomEnabled &&
+      event.shiftKey &&
+      current !== null &&
+      chart.cursor.idx != null &&
+      chart.cursor.left! >= 0 &&
+      chart.cursor.top! >= 0;
+    if (zoomEnabled && !extending && selection) clearSelection(chart);
     const index =
       current == null
         ? 0
@@ -443,6 +512,29 @@ export function TimeSeriesChart({
         ? { left: valuePosition, top: categoryPosition }
         : { left: categoryPosition, top: valuePosition },
     );
+    if (extending) {
+      const anchor = selection?.anchor ?? current;
+      keyboardSelection.current = { anchor, index };
+      const from = timestamps[anchor],
+        to = timestamps[index],
+        left = chart.valToPos(from, 'x'),
+        right = chart.valToPos(to, 'x');
+      chart.setSelect(
+        {
+          left: Math.min(left, right),
+          top: 0,
+          width: Math.abs(right - left),
+          height: chart.bbox.height / uPlot.pxRatio,
+        },
+        false,
+      );
+      const start = Math.min(from, to),
+        end = Math.max(from, to),
+        count = timestamps.filter((time) => time >= start && time <= end).length;
+      setZoomStatus(
+        `Selected ${count} ${count === 1 ? 'point' : 'points'} from ${formatTime(start, timeZone)} to ${formatTime(end, timeZone)}. Press Enter to zoom.`,
+      );
+    }
   }
 
   function toggleSeries(id: string, isolate = false) {
@@ -475,11 +567,20 @@ export function TimeSeriesChart({
         {isHorizontal
           ? 'Use Up and Down or Left and Right arrow keys to inspect values. Escape hides the tooltip.'
           : 'Use Left and Right arrow keys to inspect values. Escape hides the tooltip.'}
+        {' Click to toggle; Alt-click or double-click to show only this series.'}
+        {zoomEnabled &&
+          ' Drag to select a time range, or use Shift+ArrowLeft and Shift+ArrowRight to select points, then Enter to zoom. Escape cancels the selection.'}
       </p>
+      {zoomEnabled && (
+        <p className="charts-sr-only" aria-live="polite" aria-atomic="true">
+          {zoomStatus}
+        </p>
+      )}
       <div className="charts-plot-box" style={{ height }}>
         <div
           ref={container}
           className="charts-plot"
+          data-zoom-enabled={zoomEnabled ? 'true' : undefined}
           style={{ height }}
           role="img"
           tabIndex={0}
@@ -488,6 +589,7 @@ export function TimeSeriesChart({
           onKeyDown={moveCursor}
           onBlur={hideCursor}
           onMouseLeave={hideCursor}
+          onMouseDown={zoomEnabled ? () => clearSelection() : undefined}
         >
           {!hasData && <div className="charts-empty">{emptyMessage}</div>}
         </div>
@@ -536,14 +638,24 @@ export function TimeSeriesChart({
         </div>
       )}
       {series.length > 0 && (series.length > 1 || !showTitle) && (
-        <ul className="charts-legend" aria-label="Series visibility">
+        <ul
+          className="charts-legend"
+          aria-label={legendTitle ? `${legendTitle} series visibility` : 'Series visibility'}
+        >
+          {legendTitle && (
+            <li className="charts-legend-title" aria-hidden="true">
+              {legendTitle}
+            </li>
+          )}
           {entries.map(({ series: entry, slot, color }) => (
             <li key={entry.id}>
               <button
                 type="button"
                 className="charts-legend-item"
                 aria-pressed={!hidden.has(entry.id)}
-                title="Click to toggle; Alt-click or double-click to show only this series"
+                aria-label={entry.label}
+                title={entry.label}
+                aria-describedby={instructionsId}
                 onClick={(event) => toggleSeries(entry.id, event.altKey)}
                 onDoubleClick={() => toggleSeries(entry.id, true)}
                 onMouseEnter={() => emphasize(entry.id)}
@@ -553,10 +665,15 @@ export function TimeSeriesChart({
               >
                 <span
                   aria-hidden="true"
-                  className="charts-line-key"
-                  style={{ borderColor: seriesColor(slot, color) }}
+                  className={kind === 'bar' || fill ? 'charts-legend-swatch' : 'charts-line-key'}
+                  data-legend-swatch={kind === 'bar' || fill ? 'square' : 'line'}
+                  style={
+                    kind === 'bar' || fill
+                      ? { background: seriesColor(slot, color) }
+                      : { borderColor: seriesColor(slot, color) }
+                  }
                 />
-                <span>{entry.label}</span>
+                <span>{shortenLegendLabel(entry.label)}</span>
               </button>
             </li>
           ))}

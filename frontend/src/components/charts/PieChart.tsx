@@ -2,6 +2,7 @@ import { useId, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } fr
 import { colourSchemes, paletteColour } from '../../features/dashboards/palettes';
 import type { Slice } from '../../features/dashboards/slices';
 import { formatChartValue } from './format';
+import { shortenLegendLabel } from './legend';
 import {
   filterOverlappingLabels,
   labelAnchor,
@@ -26,8 +27,6 @@ export interface PieChartProps {
 
 type Cursor = { index: number; label: string; left: number; top: number };
 const displayLabel = (label: string) => (label === '' ? '(empty)' : label);
-const shortened = (label: string, limit: number) =>
-  label.length > limit ? `${label.slice(0, limit)}…` : label;
 
 function PieTooltip({ cursor, text, id }: { cursor: Cursor; text: string; id: string }) {
   const element = useRef<HTMLDivElement>(null);
@@ -122,7 +121,7 @@ export function PieChart({
           // Smaller plots shorten labels further so the text stays inside the measured box.
           const limit = Math.min(18, Math.floor(available / 7) - 1);
           if (limit < 3 || anchor.y < 8 || anchor.y > size.height - 8) return [];
-          const text = shortened(displayLabel(label), limit);
+          const text = shortenLegendLabel(displayLabel(label), limit);
           return [{ ...anchor, label, index: arc.index, text, width: text.length * 7, height: 14 }];
         }),
       )
@@ -287,11 +286,12 @@ export function PieChart({
                 >
                   <span
                     aria-hidden="true"
-                    className="pie-chart-swatch"
+                    className="pie-chart-swatch charts-legend-swatch"
+                    data-legend-swatch="square"
                     style={{ background: paletteColour(colours, index) }}
                   />
                   <span className="pie-chart-legend-label">
-                    {shortened(displayLabel(slice.label), 40)}
+                    {shortenLegendLabel(displayLabel(slice.label))}
                   </span>
                 </button>
               </li>
