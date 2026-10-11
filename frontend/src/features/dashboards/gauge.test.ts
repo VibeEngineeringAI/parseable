@@ -13,12 +13,14 @@ import editor from './__fixtures__/gauge/editor-gauge.json';
 import {
   GAUGE_CENTRE,
   GAUGE_TEXT,
+  estimateEmWidth,
   fitGaugeText,
   gaugeColours,
   gaugeFraction,
   gaugeLevel,
   gaugeModel,
   gaugeRange,
+  gaugeTextBaseline,
   gaugeValue,
 } from './gauge';
 import { paletteColour, tilePalette } from './palettes';
@@ -327,24 +329,46 @@ describe('gauge value text fitting', () => {
   it('keeps short text large and shrinks longer formatted text', () => {
     expect(fitGaugeText('5')).toBe(GAUGE_TEXT.maxSize);
     expect(fitGaugeText('5')).toBeGreaterThan(fitGaugeText('12,345.678 GB'));
-    expect(fitGaugeText('300.0 GB')).toBe(19.5);
   });
 
-  it('keeps both top corners inside the hole for a formatted GB value', () => {
-    const size = fitGaugeText('300.0 GB');
-    // Four digits, a decimal point, a space and two letters: 4.24em wide.
-    const distance = (fontSize: number) =>
-      Math.hypot(
-        (4.24 * fontSize) / 2,
-        GAUGE_CENTRE.y - GAUGE_TEXT.baseline + GAUGE_TEXT.capHeight * fontSize,
+  it.each(['5', '320.4 GB', '72.5 %', '1,234,567 ms', '54.6%', '-12.5 °C'])(
+    'keeps all four cap-box corners inside the margin for %s',
+    (text) => {
+      const emWidth = estimateEmWidth(text);
+      const size = fitGaugeText(text);
+      const corners = (fontSize: number) => {
+        const baseline = gaugeTextBaseline(fontSize);
+        return [-0.5, 0.5].flatMap((side) =>
+          [baseline - GAUGE_TEXT.capHeight * fontSize, baseline].map((height) =>
+            Math.hypot(emWidth * fontSize * side, height - GAUGE_CENTRE.y),
+          ),
+        );
+      };
+      for (const distance of corners(size))
+        expect(distance).toBeLessThanOrEqual(GAUGE_TEXT.fitRadius);
+      if (size < GAUGE_TEXT.maxSize)
+        expect(Math.max(...corners(size + GAUGE_TEXT.sizeStep))).toBeGreaterThan(
+          GAUGE_TEXT.fitRadius,
+        );
+      expect(gaugeTextBaseline(size) - (GAUGE_TEXT.capHeight * size) / 2).toBeCloseTo(
+        GAUGE_CENTRE.y - GAUGE_TEXT.centreOffset,
       );
-    expect(distance(size)).toBeLessThanOrEqual(GAUGE_TEXT.fitRadius);
-    expect(distance(size + GAUGE_TEXT.sizeStep)).toBeGreaterThan(GAUGE_TEXT.fitRadius);
+      expect(gaugeTextBaseline(size)).toBeLessThanOrEqual(GAUGE_CENTRE.y - 8);
+      expect(fitGaugeText(text)).toBe(size);
+    },
+  );
+
+  it('honours a supplied measured advance independently of the text', () => {
+    const width = estimateEmWidth('320.4 GB');
+    expect(fitGaugeText('5', width)).toBe(fitGaugeText('320.4 GB'));
+    expect(fitGaugeText('5', width)).toBeLessThan(fitGaugeText('5'));
+    expect(fitGaugeText('320.4 GB', width * 2)).toBeLessThan(fitGaugeText('320.4 GB', width));
+    expect(fitGaugeText('320.4 GB', 0)).toBe(GAUGE_TEXT.maxSize);
   });
 
   it('is deterministic and stops at the minimum for extremely long strings', () => {
     const text = '1234567890'.repeat(100);
-    expect(fitGaugeText(text)).toBe(GAUGE_TEXT.minSize);
+    expect(fitGaugeText(text)).toBe(4);
     expect(fitGaugeText(text)).toBe(fitGaugeText(text));
     expect(fitGaugeText('')).toBe(GAUGE_TEXT.maxSize);
   });
@@ -362,5 +386,19 @@ describe('gauge value text fitting', () => {
   it('accounts for narrower punctuation and wider letters', () => {
     expect(fitGaugeText('., :'.repeat(4))).toBeGreaterThan(fitGaugeText('1234'.repeat(4)));
     expect(fitGaugeText('1234'.repeat(4))).toBeGreaterThanOrEqual(fitGaugeText('ABCD'.repeat(4)));
+  });
+
+  it.each([
+    ['0123456789', 6],
+    ['.,:', 0.9],
+    [' ', 0.28],
+    ['%', 0.92],
+    ['GB', 1.44],
+    ['ab', 1.24],
+    ['mw', 1.9],
+    ['ilj', 0.9],
+    ['-°', 1.4],
+  ])('uses conservative advances for %s', (text, width) => {
+    expect(estimateEmWidth(text)).toBeCloseTo(width);
   });
 });

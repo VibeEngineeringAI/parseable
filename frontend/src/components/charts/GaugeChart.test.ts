@@ -2,7 +2,14 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import gauge from '../../features/dashboards/__fixtures__/gauge/gauge.json';
-import { gaugeModel } from '../../features/dashboards/gauge';
+import {
+  GAUGE_CENTRE,
+  GAUGE_TEXT,
+  estimateEmWidth,
+  fitGaugeText,
+  gaugeModel,
+  gaugeTextBaseline,
+} from '../../features/dashboards/gauge';
 import { GaugeChart } from './GaugeChart';
 
 describe('GaugeChart markup', () => {
@@ -52,4 +59,24 @@ describe('GaugeChart markup', () => {
     expect(markup).toContain('stroke="#dc2626"');
     expect(markup).toContain('fill="#dc2626"');
   });
+
+  it.each(['320.4 GB', '72.5 %', '1,234,567 ms', '54.6%', '-12.5 °C'])(
+    'fits and positions %s using the deterministic fallback without a browser',
+    (text) => {
+      const markup = renderToStaticMarkup(
+        createElement(GaugeChart, { label: 'Units', model: gaugeModel(50, gauge), text }),
+      );
+      const tag = markup.match(/<text\b[^>]*>/)![0];
+      const size = Number(tag.match(/font-size="([^"]+)"/)![1]);
+      const baseline = Number(tag.match(/\by="([^"]+)"/)![1]);
+      expect(size).toBe(fitGaugeText(text));
+      expect(baseline).toBe(gaugeTextBaseline(size));
+      expect(baseline).toBeLessThanOrEqual(GAUGE_CENTRE.y - 8);
+      for (const side of [-0.5, 0.5])
+        for (const height of [baseline - GAUGE_TEXT.capHeight * size, baseline])
+          expect(
+            Math.hypot(estimateEmWidth(text) * size * side, height - GAUGE_CENTRE.y),
+          ).toBeLessThanOrEqual(GAUGE_TEXT.fitRadius);
+    },
+  );
 });

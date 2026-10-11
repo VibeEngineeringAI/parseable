@@ -47,6 +47,15 @@ const dashboard: Dashboard = {
         layout: { ...gauge.config.layout, rangeFrom: 50, rangeTo: 50 },
       },
     },
+    {
+      ...gauge,
+      title: 'Milliseconds gauge',
+      chartQuery: 'SELECT 1234567 AS utilization FROM "app-logs"',
+      config: {
+        ...gauge.config,
+        layout: { ...gauge.config.layout, unit: 'ms', precision: 0, humanize: false },
+      },
+    },
   ].map((tile, index) => ({
     ...tile,
     tile_id: `${gauge.tile_id.slice(0, -2)}${String(index + 1).padStart(2, '0')}`,
@@ -79,6 +88,15 @@ const states = [
   },
   { title: 'Native gauge', min: 0, max: 100, now: 42, text: '42', level: 'yellow', fraction: 0.42 },
   { title: 'Degenerate gauge', min: 50, max: 50, now: 50, text: '60', level: 'red', fraction: 1 },
+  {
+    title: 'Milliseconds gauge',
+    min: 0,
+    max: 100,
+    now: 100,
+    text: '1,234,567 ms',
+    level: 'red',
+    fraction: 1,
+  },
 ] as const;
 const colours = {
   green: 'rgb(16, 185, 129)',
@@ -94,6 +112,7 @@ const sqlRows: Record<string, LogRecord[]> = {
   "SELECT 'x' AS a, 42 AS b": [{ a: 'x', b: 42 }],
   'SELECT utilization FROM "app-logs" WHERE 1 = 0': [],
   'SELECT 60 AS utilization': [{ utilization: 60 }],
+  'SELECT 1234567 AS utilization': [{ utilization: 1234567 }],
 };
 const tile = (page: Page, name: string) =>
   page.locator('[data-tile-id]').filter({ has: page.getByRole('heading', { name, exact: true }) });
@@ -211,9 +230,7 @@ test.beforeEach(async ({ page, baseURL }) => {
   await page.goto(`/dashboards/${dashboard.dashboardId}`);
   await expect(page.getByRole('heading', { name: dashboard.title, exact: true })).toBeVisible();
   await expect(page.getByRole('meter')).toHaveCount(states.length);
-  await expect(tile(page, 'Empty gauge').locator('.dashboard-stat')).toHaveText(
-    'No values returned',
-  );
+  await expect(tile(page, 'Empty gauge').locator('.charts-empty')).toHaveText('No values returned');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
 });
 
@@ -256,6 +273,113 @@ test('gauges fit inside their tile bodies and cards before and after a viewport 
   await expectGeometry(page);
   await page.setViewportSize({ width: 800, height: 600 });
   await expectGeometry(page);
+});
+
+test('formatted gauge text stays inside the hole with margin at desktop and narrow viewports', async ({
+  page,
+}) => {
+  await page.evaluate(async () => {
+    await document.fonts?.ready;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+  });
+  const formatted = states.filter((state) =>
+    ['Absolute GB gauge', 'PromQL gauge', 'Milliseconds gauge'].includes(state.title),
+  );
+  const measurements: {
+    viewport: { width: number; height: number };
+    text: string;
+    width: number;
+    size: number;
+    baseline: number;
+    corners: number[];
+    radialMargin: number;
+    baselineMargin: number;
+  }[] = [];
+  for (const viewport of [
+    page.viewportSize()!,
+    { width: 800, height: 600 },
+    { width: 420, height: 800 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expectGeometry(page);
+    for (const state of formatted) {
+      const text = meter(page, state.title).locator('svg text');
+      await expect(text).toHaveText(state.text);
+      const geometry = await text.evaluate((node) => {
+        const width = (node as SVGTextElement).getComputedTextLength();
+        const size = Number(node.getAttribute('font-size'));
+        const baseline = Number(node.getAttribute('y'));
+        const corners = [100 - width / 2, 100 + width / 2].flatMap((x) =>
+          [baseline - 0.72 * size, baseline].map((y) => Math.hypot(x - 100, y - 100)),
+        );
+        return { width, size, baseline, corners };
+      });
+      expect(geometry.width).toBeGreaterThan(0);
+      expect(geometry.size).toBeGreaterThanOrEqual(4);
+      expect(geometry.baseline).toBeLessThanOrEqual(92);
+      expect(geometry.baseline - 0.36 * geometry.size).toBeCloseTo(76);
+      for (const distance of geometry.corners) expect(distance).toBeLessThanOrEqual(46);
+      measurements.push({
+        viewport,
+        text: state.text,
+        ...geometry,
+        radialMargin: 50 - Math.max(...geometry.corners),
+        baselineMargin: 100 - geometry.baseline,
+      });
+    }
+  }
+  await test.info().attach('gauge-text-geometry', {
+    body: JSON.stringify(measurements, null, 2),
+    contentType: 'application/json',
+  });
+  console.log(
+    'Gauge text margins (SVG units):',
+    formatted.map((state) => {
+      const samples = measurements.filter((measurement) => measurement.text === state.text);
+      return {
+        text: state.text,
+        radialMargin: Math.min(...samples.map((sample) => sample.radialMargin)),
+        baselineMargin: Math.min(...samples.map((sample) => sample.baselineMargin)),
+      };
+    }),
+  );
+});
+
+test('an empty gauge uses a normal-size muted message centred in the tile body', async ({
+  page,
+}) => {
+  const empty = tile(page, 'Empty gauge').getByRole('group', {
+    name: 'Empty gauge value',
+    exact: true,
+  });
+  await expect(empty).toHaveClass('charts-empty charts-gauge-empty');
+  for (const theme of ['light', 'dark'] as const) {
+    await setTheme(page, theme);
+    const style = await empty.evaluate((node) => {
+      const style = getComputedStyle(node);
+      const probe = document.createElement('span');
+      probe.hidden = true;
+      node.append(probe);
+      probe.style.color = 'var(--color-muted)';
+      const muted = getComputedStyle(probe).color;
+      probe.style.color = 'var(--color-text)';
+      const text = getComputedStyle(probe).color;
+      probe.remove();
+      return { fontSize: parseFloat(style.fontSize), colour: style.color, muted, text };
+    });
+    expect(style.fontSize).toBeLessThanOrEqual(16);
+    expect(style.colour).toBe(style.muted);
+    expect(style.colour).not.toBe(style.text);
+    await expect(empty).toHaveCSS('display', 'grid');
+    await expect(empty).toHaveCSS('align-items', 'center');
+    await expect(empty).toHaveCSS('justify-items', 'center');
+    const bounds = (await empty.boundingBox())!;
+    const body = (await tile(page, 'Empty gauge').locator('.dashboard-tile-body').boundingBox())!;
+    expect(Math.abs(bounds.height - body.height)).toBeLessThanOrEqual(1);
+    expect(Math.abs(bounds.y - body.y)).toBeLessThanOrEqual(1);
+  }
 });
 
 test('prefers-reduced-motion disables the gauge arc transition', async ({ page }) => {

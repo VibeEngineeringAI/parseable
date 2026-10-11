@@ -35,6 +35,13 @@
   justify-content: center;
 }
 
+.charts-gauge-empty {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  font-size: 14px;
+}
+
 .charts-gauge-meter {
   display: flex;
   width: 100%;
