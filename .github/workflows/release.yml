@@ -71,7 +71,7 @@ jobs:
 
   build-linux:
     name: Build for ${{matrix.target}}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
       id-token: write
       contents: write
@@ -81,9 +81,13 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
             use-cross: false
+          # A hosted runner lost contact during the cross-compiled LTO build,
+          # so aarch64 builds natively on an Arm runner.
           - target: aarch64-unknown-linux-gnu
-            use-cross: true
+            os: ubuntu-24.04-arm
+            use-cross: false
     steps:
       - uses: actions/checkout@v4
         with:
