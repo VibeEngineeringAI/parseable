@@ -25,9 +25,9 @@ The proxy preserves the browser Host so the backend can validate the same-origin
 
 ## Build and embed in Parseable
 
-While this frontend reaches parity, Parseable serves it **beside** the classic Prism UI: Prism stays at `/` and this frontend is mounted at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both. Each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab. Alerts now has native navigation under Observe.
+Parseable serves this frontend at `/`, and links to its old `/next/` mount redirect (307) to the same path there. Its old asset URLs return 404, so a tab left open across the switch fails to load a chunk, as after any deploy, instead of starting a second copy of the app. `P_UI_ROOT=classic` puts the classic Prism UI back at `/` for one release and mounts this frontend **beside** it at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both, and each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab. Alerts now has native navigation under Observe.
 
-Release builds use **Node 24**. `npm run build` targets the `/next/` base path. From this directory:
+Release builds use **Node 24**. `npm run build` loads assets relative to the `<base href="/">` in `index.html`, and the server points that base at the mount, so the same build serves `/` and `/next/`. The Rust build refuses an `index.html` without it. From this directory:
 
 ```sh
 npm ci && npm run build
@@ -37,11 +37,11 @@ NEXT_ASSETS_PATH="$PWD/frontend/dist" cargo build --release
 
 On PowerShell, set `$env:NEXT_ASSETS_PATH = (Resolve-Path frontend/dist).Path` from the repository root before running `cargo build --release`.
 
-All Parseable Dockerfiles build the frontend in a Node 24 stage and set `NEXT_ASSETS_PATH`. The build/release workflows also build it before Rust, including Windows, macOS, and Kafka variants. Cross receives `NEXT_ASSETS_PATH` through `Cross.toml`; its absolute path stays inside the mounted workspace. Without `NEXT_ASSETS_PATH`, nothing is mounted at `/next`. The build script tracks changes to the assets and environment variable. Point it at `frontend/dist`, not the source directory or Storybook output.
+All Parseable Dockerfiles build the frontend in a Node 24 stage and set `NEXT_ASSETS_PATH`. The build/release workflows also build it before Rust, including Windows, macOS, and Kafka variants. Cross receives `NEXT_ASSETS_PATH` through `Cross.toml`; its absolute path stays inside the mounted workspace. Without `NEXT_ASSETS_PATH`, the classic UI serves `/` whatever `P_UI_ROOT` says, and nothing is mounted at `/next`. The build script tracks changes to the assets and environment variable. Point it at `frontend/dist`, not the source directory or Storybook output.
 
-The classic UI at `/` is unchanged: plain Cargo builds download the Prism ZIP pinned in `Cargo.toml` and apply the community overlay, and `/api/v1/about` reports its version. `LOCAL_ASSETS_PATH` still replaces the root UI as before.
+The classic UI is still embedded for `P_UI_ROOT=classic`: plain Cargo builds download the Prism ZIP pinned in `Cargo.toml` and apply the community overlay, and `/api/v1/about` reports its version. `LOCAL_ASSETS_PATH` still replaces it as before.
 
-When this frontend replaces Prism, remove `--base=/next/` from the build script, serve it at `/` via `LOCAL_ASSETS_PATH` (or a hosted ZIP pinned in `Cargo.toml`), and remove the `/next` mount, the community overlay, and the classic UI links.
+Once the rollback release has passed, retiring Prism removes the classic embed, the community overlay, `P_UI_ROOT`, the `/next` redirect and the classic UI links (phase D of the switch-over plan).
 
 To package the already-built `dist/` (from this directory):
 
@@ -49,9 +49,9 @@ To package the already-built `dist/` (from this directory):
 npm run package
 ```
 
-This creates `build.zip` with a top-level `dist/` directory, including `dist/index.html`, and `build.zip.sha1`. The script prints the ZIP's SHA-1 and writes the same checksum in `sha1sum -c` format. It uses sorted entries, fixed timestamps and permissions, and no extra package dependencies; identical assets produce identical ZIP bytes with the same Node/zlib version. The frontend CI uploads both files as the `parseable-frontend` artifact, and the release workflow attaches both to the GitHub release. The ZIP contains the `/next/`-based build until the switch above.
+This creates `build.zip` with a top-level `dist/` directory, including `dist/index.html`, and `build.zip.sha1`. The script prints the ZIP's SHA-1 and writes the same checksum in `sha1sum -c` format. It uses sorted entries, fixed timestamps and permissions, and no extra package dependencies; identical assets produce identical ZIP bytes with the same Node/zlib version. The frontend CI uploads both files as the `parseable-frontend` artifact, and the release workflow attaches both to the GitHub release. The ZIP contains the same base-relative build.
 
-`npm run preview` previews the production assets at `http://127.0.0.1:4173/next/`. It has no API proxy; use demo mode, or use `npm run dev`/the embedded server for API calls.
+`npm run preview` previews the production assets at `http://127.0.0.1:4173/`. It has no API proxy; use demo mode, or use `npm run dev`/the embedded server for API calls.
 
 ## Working features
 
@@ -101,6 +101,7 @@ Or run checks separately:
 npm run build          # TypeScript + production bundle
 npm test               # Client, escaping, demo query and error contracts
 npm run test:ui         # Browser workflows + axe accessibility smoke checks
+npm run test:prod       # Demo production build served at / and /next/ as the server mounts it
 npm run test:stories    # Build Storybook and test isolated component interactions
 npm run format:check
 ```
@@ -113,11 +114,11 @@ PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
 npm run test:live
 ```
 
-Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DATASET` for a disposable server; defaults are `frontend-smoke`, `local-smoke-password` and `frontend_smoke`. Page paths use the `/next` mount of a server built with `NEXT_ASSETS_PATH`; set `PARSEABLE_LIVE_BASE=` (empty) when `PARSEABLE_LIVE_URL` points at `npm run dev` or another server at the root. API calls always go to the origin root. Omitting `PARSEABLE_LIVE_URL` skips the live tests. Add `PARSEABLE_LIVE_OIDC=true` only with the local fixture provider configured, or `PARSEABLE_LIVE_NO_OIDC=true` with a provider-free server to exercise the real missing-provider route. `npm run check` excludes this suite. The completed default check passed **946 unit tests in 41 files, 224 app browser tests and 46 Storybook browser tests** (2026-10-10), including **51 dashboard browser cases**. The earlier Alerts validation (2026-10-09) also recorded a **60/60** repeated dark axe run and three passing live tests. The Team live tests create uniquely named users, roles and API keys, remove them afterwards and restore the server's previous default OIDC role. Metrics, Alerts and Dashboards live tests ingest unique OTLP datasets and delete them afterwards. See [the live runbook and recorded results](docs/validation-review.md) for setup, exact commands, scope and limitations.
+Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DATASET` for a disposable server; defaults are `frontend-smoke`, `local-smoke-password` and `frontend_smoke`. Page paths are at the root, as on a server built with `NEXT_ASSETS_PATH`; set `PARSEABLE_LIVE_BASE=/next` for a server started with `P_UI_ROOT=classic`. API calls always go to the origin root. Omitting `PARSEABLE_LIVE_URL` skips the live tests. Add `PARSEABLE_LIVE_OIDC=true` only with the local fixture provider configured, or `PARSEABLE_LIVE_NO_OIDC=true` with a provider-free server to exercise the real missing-provider route. `npm run check` excludes this suite. The completed default check passed **946 unit tests in 41 files, 224 app browser tests and 46 Storybook browser tests** (2026-10-10), including **51 dashboard browser cases**. The earlier Alerts validation (2026-10-09) also recorded a **60/60** repeated dark axe run and three passing live tests. The Team live tests create uniquely named users, roles and API keys, remove them afterwards and restore the server's previous default OIDC role. Metrics, Alerts and Dashboards live tests ingest unique OTLP datasets and delete them afterwards. See [the live runbook and recorded results](docs/validation-review.md) for setup, exact commands, scope and limitations.
 
 The Alerts live spec (`e2e-live/alerts.spec.ts`) creates a unique OTLP dataset, webhook target and PromQL rule, checks preview values and mutations against the API, and cleans up all three in `afterAll`, including after failures. Run it only against a disposable server. Set `TMPDIR` to a disk-backed directory when `/tmp` is small. The current Alerts checks and counts are recorded in [validation-review.md](docs/validation-review.md).
 
-The Dashboards live spec (`e2e-live/dashboards.spec.ts`) ingests unique logs and OTLP metrics, creates SQL and PromQL tiles with variables through this frontend, verifies their stored classic shapes, and hard-loads the same dashboard on the classic origin. It also renders a literal classic-shaped Report fixture in this frontend, checks unknown-field preservation, and verifies admin ownership rules and `limit=0`. Cleanup removes all test dashboards, datasets, users and roles. Both origins must point at the same disposable server and use the same hostname to share login cookies across ports (use `127.0.0.1` for both; mixing it with `localhost` fails). The spec checks this before ingesting:
+The Dashboards live spec (`e2e-live/dashboards.spec.ts`) ingests unique logs and OTLP metrics, creates SQL and PromQL tiles with variables through this frontend, verifies their stored classic shapes, and hard-loads the same dashboard on the classic origin. It also renders a literal classic-shaped Report fixture in this frontend, checks unknown-field preservation, and verifies admin ownership rules and `limit=0`. Cleanup removes all test dashboards, datasets, users and roles. The classic origin must be a server started with `P_UI_ROOT=classic`, or the native frontend answers there too. Both origins must point at the same disposable server and use the same hostname to share login cookies across ports (use `127.0.0.1` for both; mixing it with `localhost` fails). The spec checks this before ingesting:
 
 ```sh
 PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030 npx vite --host 127.0.0.1 --port 8271
@@ -134,4 +135,4 @@ flock /home/ajs/.cache/parseable-playwright.lock bash -c '
 '
 ```
 
-On shared machines, run every Playwright invocation (including `npm run check`, `test:ui` and `test:stories`) under this lock, checking ports 5173 and 6006 inside the lock before running. Do not reuse another worktree's server.
+On shared machines, run every Playwright invocation (including `npm run check`, `test:ui`, `test:prod` and `test:stories`) under this lock, checking ports 5173, 4180 and 6006 inside the lock before running. Do not reuse another worktree's server.

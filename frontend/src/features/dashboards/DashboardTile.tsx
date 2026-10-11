@@ -212,14 +212,15 @@ export function DashboardTile({
         {!knownTile(tile) ? (
           <div className="dashboard-placeholder">
             <p>
-              {typeLabel(tile.tileType)} tiles cannot be shown in /next. The tile is kept unchanged.
+              {typeLabel(tile.tileType)} tiles cannot be shown in this UI. The tile is kept
+              unchanged.
             </p>
             {classicLink}
           </div>
         ) : !supported ? (
           <div className="dashboard-placeholder">
             <p>
-              {typeLabel(tile.chartType)} charts are not available in /next yet. The tile is kept
+              {typeLabel(tile.chartType)} charts are not available in this UI yet. The tile is kept
               unchanged.
             </p>
             <pre>{handoff.queries.join('\n\n') || JSON.stringify(tile.chartQuery, null, 2)}</pre>
