@@ -31,6 +31,8 @@ from pathlib import Path
 
 CLIENT_ID = "parseable-oidc-smoke-client"
 CLIENT_SECRET = "parseable-oidc-smoke-secret"
+# A UI on another origin, listed in P_ALLOW_ORIGINS; never contacted.
+ALLOWED_UI = "http://allowed-ui.invalid:5173"
 SUBJECT = "oidc-smoke-user"
 GROUP_SOURCE_ONLY = "parseable-oidc-smoke-readers"
 GROUP_SHARED = "parseable-oidc-smoke-shared"
@@ -386,6 +388,70 @@ def wait_for_parseable(smoke: Smoke, process: subprocess.Popen[bytes]) -> None:
     fail("disposable Parseable process did not become ready in time")
 
 
+def browser_get(
+    url: str, cookies: dict[str, str] | None = None, extra_headers: dict[str, str] | None = None
+) -> tuple[int, list[str], str | None]:
+    """A top-level browser navigation: HTML Accept, no tenant header, and
+    redirects are returned rather than followed."""
+    headers = {"Accept": "text/html,application/xhtml+xml,*/*;q=0.8", **(extra_headers or {})}
+    if cookies:
+        headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items())
+    opener = urllib.request.build_opener(NoRedirect())
+    try:
+        with opener.open(urllib.request.Request(url, headers=headers), timeout=15) as response:
+            return response.status, response.headers.get_all("Set-Cookie", []), response.headers.get("Location")
+    except urllib.error.HTTPError as exc:
+        exc.read()
+        return exc.code, exc.headers.get_all("Set-Cookie", []), exc.headers.get("Location")
+
+
+def cookie_value(set_cookie: list[str], name: str) -> str | None:
+    for header in set_cookie:
+        pair = header.split(";", 1)[0]
+        if pair.startswith(f"{name}="):
+            return pair[len(name) + 1 :]
+    return None
+
+
+def start_browser_login(smoke: Smoke, redirect: str) -> tuple[str, str]:
+    """Begins a browser login and returns the state cookie and the callback
+    URL the mock provider sends the browser back to."""
+    status, set_cookie, location = browser_get(
+        f"{smoke.base_url}/api/v1/o/login?{urllib.parse.urlencode({'redirect': redirect})}"
+    )
+    if status not in (302, 307, 303):
+        fail(f"OIDC login did not redirect to the provider (HTTP {status})")
+    if not location:
+        fail("OIDC login redirect omitted its Location")
+    state_cookie = cookie_value(set_cookie, "oidc_state")
+    state_header = next((x for x in set_cookie if x.startswith("oidc_state=")), "")
+    if not state_cookie:
+        fail("OIDC login did not set the oidc_state cookie")
+    attributes = {part.strip().lower() for part in state_header.split(";")[1:]}
+    if "httponly" not in attributes or "max-age=600" not in attributes or "path=/" not in attributes:
+        fail("oidc_state cookie is not HttpOnly, path-wide, and limited to ten minutes")
+    status, _set_cookie, callback_url = browser_get(location)
+    if status not in (302, 303, 307):
+        fail(f"mock OIDC authorization endpoint returned HTTP {status}")
+    if not callback_url:
+        fail("mock OIDC callback redirect omitted its Location")
+    state = urllib.parse.parse_qs(urllib.parse.urlsplit(callback_url).query).get("state", [""])[0]
+    if state != f"{state_cookie}.{redirect}":
+        fail("OIDC login state does not bind the redirect to the state cookie")
+    return state_cookie, callback_url
+
+
+def with_state(callback_url: str, state: str) -> str:
+    parts = urllib.parse.urlsplit(callback_url)
+    query = urllib.parse.parse_qs(parts.query)
+    query["state"] = [state]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query, doseq=True)))
+
+
+def callback_code(callback_url: str) -> str:
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(callback_url).query).get("code", [""])[0]
+
+
 def do_login(smoke: Smoke, issuer: MockIssuer) -> tuple[str, str]:
     redirect = f"{smoke.base_url}/oidc-smoke-finished"
     status, _body, headers = smoke.request(
@@ -415,7 +481,8 @@ def do_login(smoke: Smoke, issuer: MockIssuer) -> tuple[str, str]:
     callback_query = urllib.parse.parse_qs(callback.query)
     if not callback_query.get("state") or not callback_query.get("code"):
         fail("OIDC callback did not include code and state")
-    callback_headers = {"Accept": "application/json"}
+    # A same-origin XHR over plain HTTP: no Origin or Fetch Metadata, only a Referer.
+    callback_headers = {"Accept": "application/json", "Referer": f"{smoke.base_url}/login"}
     req = urllib.request.Request(callback_url, headers=callback_headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
@@ -755,7 +822,126 @@ def test_flow(smoke: Smoke, issuer: MockIssuer) -> None:
     if smoke.user_roles(default_race_user):
         fail("removed default role returned after refresh")
 
-    print("OIDC smoke passed: discovery, RS256/JWKS code exchange, group mapping, permission revocation, manual grant protection, serialized refresh, fail-closed refresh, transient refresh failure, default validation/clear, and logout/default invalidation races.")
+    test_browser_callback(smoke, issuer, info_path)
+
+    print("OIDC smoke passed: discovery, RS256/JWKS code exchange, group mapping, permission revocation, manual grant protection, serialized refresh, fail-closed refresh, transient refresh failure, default validation/clear, logout/default invalidation races, and browser callback state binding (login CSRF, open redirect, legacy state, JSON callback origin).")
+
+
+def test_browser_callback(smoke: Smoke, issuer: MockIssuer, info_path: str) -> None:
+    issuer.subject = "oidc-smoke-browser-user"
+    issuer.groups = {GROUP_SOURCE_ONLY}
+    issuer.omit_groups_claim = False
+    issuer.omit_refresh_id_token = False
+    issuer.token_expiry = 60
+
+    def expect_rejected(
+        callback_url: str, cookies: dict[str, str] | None, what: str, headers: dict[str, str] | None = None
+    ) -> None:
+        token_requests = issuer.token_request_count
+        code = callback_code(callback_url)
+        status, set_cookie, location = browser_get(callback_url, cookies, headers)
+        if status != 400:
+            fail(f"browser callback with {what} was not rejected (HTTP {status})")
+        if location:
+            fail(f"rejected browser callback with {what} still redirected")
+        if cookie_value(set_cookie, "session"):
+            fail(f"rejected browser callback with {what} set a session cookie")
+        if issuer.token_request_count != token_requests or code not in issuer.codes:
+            fail(f"browser callback with {what} redeemed the code before rejecting it")
+
+    # A browser that started the login is sent on to its redirect with a
+    # working session, and the single-use state cookie is cleared.
+    redirect = f"{smoke.base_url}/oidc-smoke-browser?view=logs"
+    state_cookie, callback_url = start_browser_login(smoke, redirect)
+    status, set_cookie, location = browser_get(callback_url, {"oidc_state": state_cookie})
+    if status != 301:
+        fail(f"browser callback with a matching state cookie did not redirect (HTTP {status})")
+    if location != redirect:
+        fail("browser callback did not redirect to the requested page")
+    session = cookie_value(set_cookie, "session")
+    if not session:
+        fail("browser callback omitted the Parseable session cookie")
+    cleared = next((x for x in set_cookie if x.startswith("oidc_state=")), "")
+    if cookie_value(set_cookie, "oidc_state") != "" or "max-age=0" not in cleared.lower():
+        fail("browser callback did not clear the oidc_state cookie")
+    status, _body, _headers = smoke.request(
+        info_path,
+        headers={"Cookie": f"session={session}"},
+        follow=False,
+        admin_auth=False,
+    )
+    if status != 200:
+        fail(f"browser callback session could not access the fixture stream (HTTP {status})")
+
+    # Login CSRF: a valid code and state minted for another browser must not
+    # sign this browser in, whether it holds no state cookie or its own.
+    state_cookie, callback_url = start_browser_login(smoke, redirect)
+    other_cookie, other_callback = start_browser_login(smoke, redirect)
+    expect_rejected(callback_url, None, "no state cookie")
+    expect_rejected(callback_url, {"oidc_state": other_cookie}, "another login's state cookie")
+    expect_rejected(callback_url, {"oidc_state": uuid.uuid4().hex}, "an unknown state cookie")
+    # The rejected code was never redeemed, so its own browser can still use it.
+    status, set_cookie, location = browser_get(callback_url, {"oidc_state": state_cookie})
+    if status != 301 or location != redirect or not cookie_value(set_cookie, "session"):
+        fail(f"rejected forged callbacks consumed the legitimate login (HTTP {status})")
+
+    # Open redirect: the matching token cannot carry a foreign redirect.
+    evil = "https://evil.example/"
+    expect_rejected(
+        with_state(other_callback, f"{other_cookie}.{evil}"),
+        {"oidc_state": other_cookie},
+        "a foreign redirect in its state",
+    )
+    status, _set_cookie, location = browser_get(
+        f"{smoke.base_url}/api/v1/o/login?{urllib.parse.urlencode({'redirect': evil})}"
+    )
+    if status != 400 or location:
+        fail(f"OIDC login accepted a foreign redirect (HTTP {status})")
+
+    # States issued before the binding carried only the redirect URL.
+    legacy = f"{smoke.base_url}/oidc-smoke-legacy"
+    expect_rejected(with_state(other_callback, legacy), None, "a legacy unbound state")
+    expect_rejected(with_state(other_callback, legacy), {"oidc_state": other_cookie}, "a legacy state and a valid cookie")
+    expect_rejected(with_state(other_callback, f".{legacy}"), {"oidc_state": ""}, "an empty state token")
+
+    # A forged forwarded host does not widen the allowed redirect origins.
+    expect_rejected(
+        with_state(other_callback, f"{other_cookie}.{evil}"),
+        {"oidc_state": other_cookie},
+        "a foreign redirect and forwarded host",
+        {"X-Forwarded-Host": "evil.example", "X-Forwarded-Proto": "https"},
+    )
+
+    # JSON callbacks are not bound to the state cookie, so they must show they
+    # come from this origin. A page elsewhere can send Accept but cannot forge
+    # Origin or Referer, and plain HTTP carries no Fetch Metadata.
+    for what, headers in [
+        ("no proof of origin", {}),
+        ("a cross-site fetch", {"Sec-Fetch-Site": "cross-site"}),
+        ("a foreign Origin", {"Origin": "https://evil.example"}),
+        ("an opaque Origin", {"Origin": "null", "Referer": f"{smoke.base_url}/login"}),
+        ("a foreign Referer", {"Referer": "https://evil.example/login"}),
+        ("a forwarded foreign host", {"Origin": "https://evil.example", "X-Forwarded-Host": "evil.example", "X-Forwarded-Proto": "https"}),
+    ]:
+        expect_rejected(other_callback, None, f"JSON and {what}", {"Accept": "application/json", **headers})
+    status, _set_cookie, _location = browser_get(
+        other_callback, None, {"Accept": "application/json", "Origin": smoke.base_url}
+    )
+    if status != 200:
+        fail(f"JSON callback from this origin was rejected (HTTP {status})")
+
+    # A UI listed in P_ALLOW_ORIGINS can be the redirect target and the JSON caller.
+    allowed_redirect = f"{ALLOWED_UI}/app/logs"
+    state_cookie, callback_url = start_browser_login(smoke, allowed_redirect)
+    status, set_cookie, location = browser_get(callback_url, {"oidc_state": state_cookie})
+    if status != 301 or location != allowed_redirect or not cookie_value(set_cookie, "session"):
+        fail(f"browser callback to an allowed UI origin was rejected (HTTP {status})")
+    _state_cookie, callback_url = start_browser_login(smoke, allowed_redirect)
+    status, _set_cookie, _location = browser_get(
+        callback_url, None, {"Accept": "application/json", "Origin": ALLOWED_UI}
+    )
+    if status != 200:
+        fail(f"JSON callback from an allowed UI origin was rejected (HTTP {status})")
 
 
 def main() -> int:
@@ -787,6 +973,7 @@ def main() -> int:
             "P_OIDC_CLIENT_SECRET": CLIENT_SECRET,
             "P_OIDC_ISSUER": issuer_url,
             "P_OIDC_SCOPE": "openid profile email groups",
+            "P_ALLOW_ORIGINS": f"{ALLOWED_UI}/app",
             "P_CHECK_UPDATE": "false",
             "P_SEND_ANONYMOUS_USAGE_DATA": "false",
             "P_ACTIX_NUM_WORKERS": "1",
