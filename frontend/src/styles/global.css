@@ -261,6 +261,12 @@ code,
   max-width: 1800px;
   margin: 0 auto;
 }
+/* Rendered without the app shell, so it centres itself in the viewport. */
+.route-error {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+}
 .page-heading {
   display: flex;
   align-items: center;

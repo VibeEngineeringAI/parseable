@@ -1,14 +1,145 @@
 import { describe, expect, it } from 'vitest';
-import { classicUiPath, nextUiPath } from './classicUi';
+import {
+  classicLogFilters,
+  classicLogsState,
+  classicRoute,
+  classicRoutes,
+  classicUiPath,
+  nativePath,
+} from './classicUi';
 import { appPath } from './config';
 
-describe('side-by-side classic UI', () => {
+describe('classic routes opened here', () => {
+  it.each([
+    ['/', 'same', '/'],
+    ['/login', 'same', '/login'],
+    ['/logs/explore/team%20logs', 'same', '/logs/explore/team%20logs'],
+    ['/logs/search/app', 'redirect', '/logs/explore/app'],
+    ['/metrics/explore/otel', 'same', '/metrics/explore/otel'],
+    [
+      '/metrics/explore/otel/metric/http_requests_total',
+      'redirect',
+      '/metrics/explore/otel?query=http_requests_total',
+    ],
+    ['/metrics/search/otel', 'redirect', '/metrics/explore/otel'],
+    ['/sql-editor', 'same', '/sql-editor'],
+    ['/datasets', 'same', '/datasets'],
+    ['/dashboards', 'same', '/dashboards'],
+    ['/dashboards/01ABC', 'same', '/dashboards/01ABC'],
+    ['/alerts', 'same', '/alerts'],
+    ['/alerts/create', 'redirect', '/alerts/new'],
+    ['/alerts/01ALERT', 'same', '/alerts/01ALERT'],
+    ['/alerts/01ALERT/edit', 'same', '/alerts/01ALERT/edit'],
+    ['/team', 'same', '/team'],
+    ['/settings/alert-targets', 'redirect', '/alerts/targets'],
+    ['/settings', 'redirect', '/alerts/targets'],
+    ['/traces/explore/spans', 'classic-only', '/traces/explore/spans'],
+    ['/apm/otel', 'classic-only', '/apm/otel'],
+    ['/apm/otel/checkout.api', 'classic-only', '/apm/otel/checkout.api'],
+    ['/agents', 'classic-only', '/agents'],
+    ['/agents/app', 'classic-only', '/agents/app'],
+    ['/keystone', 'classic-only', '/keystone'],
+    ['/keystone/k1', 'classic-only', '/keystone/k1'],
+    ['/settings/llm-key', 'classic-only', '/settings/llm-key'],
+    ['/settings/billing', 'classic-only', '/settings/billing'],
+    ['/settings/network-access', 'classic-only', '/settings/network-access'],
+    ['/add-data', 'classic-only', '/add-data'],
+    ['/cluster', 'classic-only', '/cluster'],
+    ['/onboarding', 'classic-only', '/onboarding'],
+    ['/new', 'classic-only', '/new'],
+    ['/errors', 'classic-only', '/errors'],
+    ['/errors/app', 'classic-only', '/errors/app'],
+    ['/no-access', 'classic-only', '/no-access'],
+    ['/post-auth', 'classic-only', '/post-auth'],
+    ['/sso-callback', 'classic-only', '/sso-callback'],
+  ])('%s is %s here at %s', (classic, kind, native) => {
+    expect(classicRoute(classic)?.kind).toBe(kind);
+    expect(nativePath(classic)).toBe(native);
+  });
+
+  it('covers every row of the table', () => {
+    const tested = new Set(
+      [
+        '/',
+        '/login',
+        '/logs/explore/x',
+        '/logs/search/x',
+        '/metrics/explore/x',
+        '/metrics/explore/x/metric/m',
+        '/metrics/search/x',
+        '/sql-editor',
+        '/datasets',
+        '/dashboards',
+        '/dashboards/x',
+        '/alerts',
+        '/alerts/create',
+        '/alerts/x',
+        '/alerts/x/edit',
+        '/team',
+        '/settings/alert-targets',
+        '/settings',
+        '/traces/explore/x',
+        '/apm/x',
+        '/apm/x/y',
+        '/agents',
+        '/agents/x',
+        '/keystone',
+        '/keystone/x',
+        '/settings/llm-key',
+        '/settings/billing',
+        '/settings/network-access',
+        '/add-data',
+        '/cluster',
+        '/onboarding',
+        '/new',
+        '/errors',
+        '/errors/x',
+        '/no-access',
+        '/post-auth',
+        '/sso-callback',
+      ].map(classicRoute),
+    );
+    expect(classicRoutes.filter((route) => !tested.has(route))).toEqual([]);
+  });
+
+  it('is not a classic page when the classic router has no such route', () => {
+    for (const path of ['/logs', '/metrics', '/components', '/oidc-not-configured', '/device'])
+      expect(classicRoute(path)).toBeUndefined();
+  });
+
+  it('keeps the query and hash of a redirected link', () => {
+    expect(
+      nativePath(
+        '/alerts/create?dataset=x&queryBuilderType=sql&alertQuery=SELECT+1&title=Panel#draft',
+      ),
+    ).toBe('/alerts/new?dataset=x&queryBuilderType=sql&alertQuery=SELECT+1&title=Panel#draft');
+    expect(nativePath('/alerts/create/?dataset=x')).toBe('/alerts/new?dataset=x');
+    expect(nativePath('/logs/search/app?start=1h&end=now&type=fixed')).toBe(
+      '/logs/explore/app?start=1h&end=now&type=fixed',
+    );
+    expect(nativePath('/dashboards/01ABC?range=30m')).toBe('/dashboards/01ABC?range=30m');
+  });
+
+  it('decodes a captured metric name before adding it as the query', () => {
+    expect(nativePath('/metrics/explore/otel/metric/a%20b')).toBe(
+      '/metrics/explore/otel?query=a+b',
+    );
+  });
+
+  it('never redirects a path it produced', () => {
+    for (const route of classicRoutes) {
+      const target = nativePath(route.classic.replaceAll(/:\w+/g, 'x'));
+      expect(nativePath(target)).toBe(target);
+    }
+  });
+});
+
+describe('comparing in the classic UI', () => {
   it.each([
     ['/', '/'],
     ['/logs', '/'],
     ['/logs/explore/team%20logs', '/logs/explore/team%20logs'],
-    ['/metrics', '/metrics'],
-    ['/metrics/explore/x', '/metrics/explore/x'],
+    ['/metrics', '/'],
     ['/metrics/explore/team%20metrics', '/metrics/explore/team%20metrics'],
     ['/sql-editor', '/sql-editor'],
     ['/datasets', '/datasets'],
@@ -16,26 +147,111 @@ describe('side-by-side classic UI', () => {
     ['/dashboards/01ABC/', '/dashboards/01ABC'],
     ['/team', '/team'],
     ['/alerts', '/alerts'],
-    ['/alerts/new', '/alerts'],
-    ['/alerts/targets', '/alerts'],
-    ['/alerts/abc', '/alerts'],
-    ['/alerts/abc/edit', '/alerts'],
+    ['/alerts/new', '/alerts/create'],
+    ['/alerts/targets', '/settings/alert-targets'],
+    ['/alerts/abc', '/alerts/abc'],
+    ['/alerts/abc/edit', '/alerts/abc/edit'],
     ['/components', '/'],
   ])('maps %s to the classic page %s', (route, classic) => {
     expect(classicUiPath(route)).toBe(classic);
   });
+
   it('prefixes document navigations with the mount path', () => {
     expect(appPath('/login', '/next')).toBe('/next/login');
     expect(appPath('/login', '')).toBe('/login');
   });
 });
 
-it('maps classic alert create links with every query parameter and hash intact', () => {
-  expect(
-    nextUiPath(
-      '/alerts/create?dataset=x&queryBuilderType=sql&alertQuery=SELECT+1&title=Panel#draft',
-    ),
-  ).toBe('/alerts/new?dataset=x&queryBuilderType=sql&alertQuery=SELECT+1&title=Panel#draft');
-  expect(nextUiPath('/alerts/create/?dataset=x')).toBe('/alerts/new?dataset=x');
-  expect(nextUiPath('/dashboards/01ABC?range=30m')).toBe('/dashboards/01ABC?range=30m');
+describe('classic Logs links', () => {
+  const state = (search: string) =>
+    classicLogsState(new URLSearchParams(search), Date.parse('2026-10-10T12:00:00Z'));
+
+  it.each([
+    ['10m', '10m'],
+    ['30m', '30m'],
+    ['1h', '1h'],
+    ['5h', '5h'],
+    ['1d', '24h'],
+    ['3d', '3d'],
+  ])('reads the classic preset %s as %s', (start, range) => {
+    expect(state(`start=${start}&end=now&type=fixed&tz=UTC`)).toEqual({
+      range,
+      filters: [],
+      dropped: [],
+    });
+  });
+
+  it('reads a custom range in UTC', () => {
+    expect(
+      state('start=2026-10-09T08:00:00.000Z&end=2026-10-09T09:30:00.000Z&type=custom').range,
+    ).toEqual({ startTime: '2026-10-09T08:00:00.000Z', endTime: '2026-10-09T09:30:00.000Z' });
+  });
+
+  it('ends a custom range that ran to now at the time the link was opened', () => {
+    expect(state('start=2026-10-10T11:00:00.000Z&end=now&type=custom').range).toEqual({
+      startTime: '2026-10-10T11:00:00.000Z',
+      endTime: '2026-10-10T12:00:00.000Z',
+    });
+  });
+
+  it('reports a range it cannot read and leaves the default in place', () => {
+    expect(state('start=2h&end=now&type=fixed')).toEqual({
+      range: undefined,
+      filters: [],
+      dropped: ['time range'],
+    });
+    expect(state('start=later&end=now&type=custom').dropped).toEqual(['time range']);
+    expect(state('start=1h&end=now').range).toBeUndefined();
+  });
+
+  it('reports what this frontend does not support', () => {
+    expect(
+      state(
+        "start=1h&end=now&type=fixed&tz=Asia%2FKolkata&groupBy=host&view=f1&query=WHERE+text+msg+ILIKE+'%25x%25'",
+      ).dropped,
+    ).toEqual([
+      'time zone Asia/Kolkata (times are shown in UTC)',
+      '1 filter',
+      'grouping',
+      'saved view',
+    ]);
+  });
+
+  it('reads equality filters from the classic query', () => {
+    expect(
+      state(
+        `query=${encodeURIComponent("WHERE text level = 'error' AND number status != 500 AND text \"host name\" = 'it''s'")}`,
+      ),
+    ).toEqual({
+      range: undefined,
+      filters: [
+        { field: 'level', operator: '=', value: 'error' },
+        { field: 'status', operator: '!=', value: '500' },
+        { field: 'host name', operator: '=', value: "it's" },
+      ],
+      dropped: [],
+    });
+  });
+});
+
+describe('classic Logs filters', () => {
+  it('skips conditions it cannot express', () => {
+    expect(
+      classicLogFilters(
+        "WHERE (text level = 'a' OR text level = 'b') AND text host IS NOT NULL AND number n > 3 AND text app = 'x AND y'",
+      ),
+    ).toEqual({ filters: [{ field: 'app', operator: '=', value: 'x AND y' }], skipped: 3 });
+  });
+
+  it('reads untyped and boolean comparisons', () => {
+    expect(classicLogFilters('WHERE ok = true AND `k` = 1.5').filters).toEqual([
+      { field: 'ok', operator: '=', value: 'true' },
+      { field: 'k', operator: '=', value: '1.5' },
+    ]);
+  });
+
+  it('has nothing to read without a condition', () => {
+    expect(classicLogFilters('')).toEqual({ filters: [], skipped: 0 });
+    expect(classicLogFilters('WHERE ')).toEqual({ filters: [], skipped: 0 });
+  });
 });

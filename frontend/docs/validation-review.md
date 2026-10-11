@@ -2,6 +2,18 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Switch-over Phase A (2026-10-10)
+
+Phase A of the `/next` to `/` plan (wiki page `frontend/prism-retirement/switch-over`):
+
+- **A1, route inventory:** the router in the pinned v3.2.5 ZIP (`index-CaJv0zbb.js`, ZIP SHA-1 `cbaf98f0…`) matches the plan's table. Corrections: `/settings` redirects to `/settings/alert-targets`; `/device` is a link target but not a route; `/oidc-not-configured` exists only here, so classic shows its not-found page there.
+- **A2, route map:** `src/lib/classicUi.ts` holds one row per classic route. `App` applies every redirect row before routing, replacing the single `/alerts/create` route, and the not-found page names Prism-only pages. Unit tests cover each row in both directions and check that no redirect target redirects again.
+- **A5, Logs links:** classic `start`/`end`/`type` (presets `10m`, `30m`, `1h`, `5h`, `1d`, `3d`, or ISO bounds with `end=now`) and the `=`/`!=` conditions of `query` are applied, then removed from the address. A notice names a non-UTC `tz`, other conditions, `groupBy` and `view`. Classic sends both bounds in UTC, so `tz` only changed the display.
+- **A6, sign-out:** the not-found page, `QueryState` errors and 403s render inside the shell, whose top bar has Sign out. A page that failed to render, including one whose chunk is gone after a deploy, used to show React Router's developer screen; `RouteError` now offers Reload, Back to overview and Sign out.
+- **A7, root build:** `vite build --base=/` into a temporary directory has no `/next/` references. Served by `vite preview` on port 8271 and proxied to a disposable v3.2.5 server on 8030 (classic at `/`, `PARSEABLE_LIVE_SERVER_URL`), the live suite passed **22**, with **2 skipped** (`PARSEABLE_LIVE_OIDC` provider tests). The first run failed only on `metrics.spec.ts` asserting `7.50`. That assertion predates the trailing-zero formatter change in `1bdcbc85` and now expects `7.5`.
+
+Default check on this branch: **1043 unit tests in 42 files, 235 app browser tests and 47 Storybook tests**, and `format:check` passes.
+
 ## Dashboards validation (2026-10-10)
 
 The required full `npm run check` passed: **946 unit tests in 41 files, 224 app browser tests and 46 Storybook browser tests**, without retries. The app total includes **51 dashboard browser cases**. Formatting, TypeScript, the production build and the Storybook build also passed.

@@ -3,12 +3,16 @@ import ReactDOM from 'react-dom/client';
 import { createBrowserRouter, RouterProvider } from 'react-router-dom';
 import { AppProvider } from './app/AppProvider';
 import { App } from './app/App';
+import { RouteError } from './app/RouteError';
 import './styles/tokens.css';
 import './styles/global.css';
 import { basePath } from './lib/config';
-const router = createBrowserRouter([{ path: '*', element: <App /> }], {
-  basename: basePath || undefined,
-});
+const router = createBrowserRouter(
+  [{ path: '*', element: <App />, errorElement: <RouteError /> }],
+  {
+    basename: basePath || undefined,
+  },
+);
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <AppProvider>

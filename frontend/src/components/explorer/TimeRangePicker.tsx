@@ -20,6 +20,11 @@ export function TimeRangePicker({
   disabled?: boolean;
   presets?: ReadonlyArray<{ value: Extract<TimeRange, string>; label: string }>;
 }) {
+  // A preset outside the list, such as one from a classic link, is still shown.
+  const options =
+    typeof value === 'string' && !presets.some((preset) => preset.value === value)
+      ? [...presets, { value, label: presetLabel(value) }]
+      : presets;
   const [open, setOpen] = useState(false);
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
@@ -42,7 +47,7 @@ export function TimeRangePicker({
           e.target.value === 'custom' ? begin() : onChange(e.target.value as TimeRange)
         }
       >
-        {presets.map(({ value, label }) => (
+        {options.map(({ value, label }) => (
           <option key={value} value={value}>
             {label}
           </option>
@@ -125,4 +130,12 @@ export function TimeRangePicker({
       </Dialog>
     </div>
   );
+}
+
+const units = { m: 'minute', h: 'hour', d: 'day' } as const;
+
+function presetLabel(range: string): string {
+  const count = Number(range.slice(0, -1));
+  const unit = units[range.slice(-1) as keyof typeof units];
+  return `Last ${count} ${unit}${count === 1 ? '' : 's'}`;
 }

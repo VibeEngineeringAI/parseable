@@ -1,7 +1,7 @@
 import { createPortal } from 'react-dom';
 import { createId } from '../../lib/ids';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { PanelLeft, RefreshCw, Terminal, WrapText, Download } from 'lucide-react';
 import { Button, EmptyState, Select } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
@@ -16,6 +16,7 @@ import { useApp } from '../../app/AppProvider';
 import { ApiError } from '../../lib/client';
 import { useAsync } from '../../hooks/useAsync';
 import { buildLogQuery, timeBounds } from '../../lib/query';
+import { classicLogsParams, classicLogsState } from '../../lib/classicUi';
 import type { LogRecord, TimeRange } from '../../lib/types';
 export function LogsPage() {
   const { client } = useApp();
@@ -23,11 +24,24 @@ export function LogsPage() {
   const navigate = useNavigate();
   const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
   const dataset = currentDataset || datasets.data?.[0]?.name || '';
-  const [range, setRange] = useState<TimeRange>('1h');
+  const [params, setParams] = useSearchParams();
+  // A classic Logs link carries its range and filters in the query string.
+  const [linked] = useState(() => classicLogsState(params));
+  const [dropped, setDropped] = useState(linked.dropped);
+  const [range, setRange] = useState<TimeRange>(linked.range ?? '1h');
   const [search, setSearch] = useState('');
   // Tagged with its dataset so a timer left over from the previous dataset is ignored.
   const [debounced, setDebounced] = useState({ dataset, search: '' });
-  const [filters, setFilters] = useState<LogFilter[]>([]);
+  const [filters, setFilters] = useState<LogFilter[]>(() =>
+    linked.filters.map((filter) => ({ ...filter, id: createId() })),
+  );
+  // Once read, they come out of the address so they cannot disagree with the page.
+  useEffect(() => {
+    if (!classicLogsParams.some((name) => params.has(name))) return;
+    const rest = new URLSearchParams(params);
+    for (const name of classicLogsParams) rest.delete(name);
+    setParams(rest, { replace: true });
+  }, [params, setParams]);
   const [columns, setColumns] = useState<string[]>();
   const [showFields, setShowFields] = useState(true);
   const [wrap, setWrap] = useState(false);
@@ -184,6 +198,14 @@ export function LogsPage() {
                 <Terminal size={15} />
               </Link>
             </div>
+            {dropped.length > 0 && (
+              <p role="status" className="notice">
+                Not carried over from this link: {dropped.join(', ')}.{' '}
+                <Button size="sm" variant="ghost" onClick={() => setDropped([])}>
+                  Dismiss
+                </Button>
+              </p>
+            )}
             <>
               {schema.error && (
                 <p role="status" className="notice">

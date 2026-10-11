@@ -7,7 +7,7 @@ import { ConnectionDialog } from './ConnectionDialog';
 import { useApp } from './AppProvider';
 import { LoginPage } from './LoginPage';
 import { safeReturnPath } from '../lib/auth';
-import { classicUiAvailable, classicUiPath, nextUiPath } from '../lib/classicUi';
+import { classicRoute, classicUiAvailable, classicUiPath, nativePath } from '../lib/classicUi';
 import '../styles/auth-shell.css';
 const LogsPage = lazy(() =>
   import('../features/logs/LogsPage').then((m) => ({ default: m.LogsPage })),
@@ -58,11 +58,14 @@ export function App() {
         components: 'Component library',
       } as Record<string, string>
     )[location.pathname.split('/')[1]] || 'Overview';
+  const path = `${location.pathname}${location.search}${location.hash}`;
+  // Classic links to pages that live at another path here.
+  if (nativePath(path) !== path) return <Navigate replace to={nativePath(path)} />;
   if (location.pathname === '/login' || location.pathname === '/oidc-not-configured') {
     return <LoginPage oidcUnavailable={location.pathname === '/oidc-not-configured'} />;
   }
   if (mode === 'live' && needsLogin && location.pathname !== '/components') {
-    const next = safeReturnPath(`${location.pathname}${location.search}${location.hash}`);
+    const next = safeReturnPath(path);
     return <Navigate replace to={`/login?${new URLSearchParams({ next })}`} />;
   }
   return (
@@ -167,15 +170,6 @@ export function App() {
               <Route path="/dashboards/:id" element={<DashboardView />} />
               <Route path="/team" element={<TeamPage />} />
               <Route path="/alerts" element={<AlertsPage />} />
-              <Route
-                path="/alerts/create"
-                element={
-                  <Navigate
-                    replace
-                    to={nextUiPath(`${location.pathname}${location.search}${location.hash}`)}
-                  />
-                }
-              />
               <Route path="/alerts/new" element={<AlertsPage />} />
               <Route path="/alerts/targets" element={<AlertsPage />} />
               <Route path="/alerts/:id/edit" element={<AlertsPage />} />
@@ -187,7 +181,11 @@ export function App() {
                   <div className="page">
                     <EmptyState
                       title="Page not found"
-                      description="This route is not part of this frontend iteration."
+                      description={
+                        classicRoute(location.pathname)?.kind === 'classic-only'
+                          ? 'This page is only available in the classic UI.'
+                          : 'This route is not part of this frontend iteration.'
+                      }
                       action={<Link to="/">Back to overview</Link>}
                     />
                   </div>
