@@ -25,7 +25,7 @@ The proxy preserves the browser Host so the backend can validate the same-origin
 
 ## Build and embed in Parseable
 
-Parseable serves this frontend at `/`, and links to its old `/next/` mount redirect (307) to the same path there. `P_UI_ROOT=classic` puts the classic Prism UI back at `/` for one release and mounts this frontend **beside** it at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both, and each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab. Alerts now has native navigation under Observe.
+Parseable serves this frontend at `/`, and links to its old `/next/` mount redirect (307) to the same path there. Its old asset URLs return 404, so a tab left open across the switch fails to load a chunk, as after any deploy, instead of starting a second copy of the app. `P_UI_ROOT=classic` puts the classic Prism UI back at `/` for one release and mounts this frontend **beside** it at `/next/`. Both share one origin, so one sign-in (native or OIDC) works in both, and each page has a **Compare in classic UI** link that opens the equivalent Prism page in a new tab. Alerts now has native navigation under Observe.
 
 Release builds use **Node 24**. `npm run build` loads assets relative to the `<base href="/">` in `index.html`, and the server points that base at the mount, so the same build serves `/` and `/next/`. The Rust build refuses an `index.html` without it. From this directory:
 
@@ -101,6 +101,7 @@ Or run checks separately:
 npm run build          # TypeScript + production bundle
 npm test               # Client, escaping, demo query and error contracts
 npm run test:ui         # Browser workflows + axe accessibility smoke checks
+npm run test:prod       # Demo production build served at / and /next/ as the server mounts it
 npm run test:stories    # Build Storybook and test isolated component interactions
 npm run format:check
 ```
@@ -134,4 +135,4 @@ flock /home/ajs/.cache/parseable-playwright.lock bash -c '
 '
 ```
 
-On shared machines, run every Playwright invocation (including `npm run check`, `test:ui` and `test:stories`) under this lock, checking ports 5173 and 6006 inside the lock before running. Do not reuse another worktree's server.
+On shared machines, run every Playwright invocation (including `npm run check`, `test:ui`, `test:prod` and `test:stories`) under this lock, checking ports 5173, 4180 and 6006 inside the lock before running. Do not reuse another worktree's server.

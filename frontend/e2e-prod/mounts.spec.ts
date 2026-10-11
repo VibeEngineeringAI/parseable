@@ -1,0 +1,54 @@
+import { test, expect, type Page } from '@playwright/test';
+
+/** Requests that failed, error statuses and uncaught errors on `page`. */
+function problems(page: Page): string[] {
+  const seen: string[] = [];
+  page.on('requestfailed', (r) => seen.push(`${r.url()} ${r.failure()?.errorText}`));
+  page.on('response', (r) => {
+    if (r.status() >= 400) seen.push(`${r.status()} ${r.url()}`);
+  });
+  page.on('pageerror', (error) => seen.push(error.message));
+  return seen;
+}
+
+for (const mount of ['', '/next']) {
+  test.describe(`the production build mounted at ${mount || '/'}`, () => {
+    test('loads lazy pages on deep routes from its own mount', async ({ page }) => {
+      const failed = problems(page);
+      const paths: string[] = [];
+      page.on('request', (r) => paths.push(new URL(r.url()).pathname));
+      await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+
+      // A hard load two segments deep: relative asset URLs resolve against
+      // `<base>`, not the document.
+      await page.goto(`${mount}/dashboards/01M4J000000000000000000002`);
+      await expect(page.locator('[data-tile-id]').first()).toBeVisible();
+      await page.getByRole('link', { name: 'Logs', exact: true }).click();
+      await expect(page).toHaveURL(`${mount}/logs`);
+      await expect(page.getByRole('table')).toBeVisible();
+      await page.getByRole('link', { name: 'Metrics', exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`^[^?]*${mount}/metrics(\\?|$)`));
+      await expect(page.getByRole('heading').first()).toBeVisible();
+
+      expect(failed).toEqual([]);
+      expect(paths.filter((path) => !path.startsWith(`${mount}/`))).toEqual([]);
+      // Lazy chunks import the entry module that is already running.
+      const entries = new Set(paths.filter((path) => /\/assets\/index-[^/]+\.js$/.test(path)));
+      expect(entries.size).toBe(1);
+    });
+
+    test('links a favicon that resolves under its mount', async ({ page, request }) => {
+      await page.goto(`${mount}/logs/explore/application_logs`);
+      const icons = await page
+        .locator('link[rel="icon"]')
+        .evaluateAll((links) => links.map((link) => (link as HTMLLinkElement).href));
+      expect(icons.length).toBeGreaterThan(0);
+      for (const href of [...icons, new URL(`${mount}/favicon.ico`, page.url()).href]) {
+        expect(new URL(href).pathname).toMatch(new RegExp(`^${mount}/favicon\\.(ico|svg)$`));
+        const response = await request.get(href);
+        expect(response.status(), href).toBe(200);
+        expect(response.headers()['content-type'], href).toMatch(/^image\//);
+      }
+    });
+  });
+}
