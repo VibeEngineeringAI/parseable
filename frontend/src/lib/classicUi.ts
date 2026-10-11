@@ -34,7 +34,12 @@ export type ClassicRoute = {
  * parameters are translated by `classicLogsState`, and classic Metrics ones by
  * `classicMetricsSearch`, since the path is unchanged.
  */
-/** The histogram series a classic drilldown can chart, by its `suffix`. */
+/**
+ * The histogram series a classic drilldown charts, by its `suffix`, which
+ * classic sets only for a histogram. PromQL here charts gauges and cumulative
+ * sums only, so the drilldown opens the plain metric, whose query reports
+ * that, and the series is named in the notice.
+ */
 const histogramSuffixes = ['bucket', 'sum', 'count'];
 
 export const classicRoutes: readonly ClassicRoute[] = [
@@ -48,12 +53,9 @@ export const classicRoutes: readonly ClassicRoute[] = [
     native: '/metrics/explore/:dataset',
     kind: 'redirect',
     params: ({ metric }, search) => {
-      // Classic adds `suffix` only for a histogram, whose chart is that series.
-      const suffix = search.get('suffix');
       // Classic shows the drilldown whatever its view, so these say nothing here.
-      for (const name of ['suffix', 'viewType', 'viewMode', 'promql', 'state']) search.delete(name);
-      const series = suffix && histogramSuffixes.includes(suffix) ? `${metric}_${suffix}` : metric;
-      return { query: metricSelector(series) };
+      for (const name of ['viewType', 'viewMode', 'promql', 'state']) search.delete(name);
+      return { query: metricSelector(metric) };
     },
   },
   { classic: '/metrics/search/:dataset', native: '/metrics/explore/:dataset', kind: 'redirect' },
@@ -320,9 +322,10 @@ function isClassicMetricsFilter(query: string): boolean {
  * Every parameter Prism v3.2.5's Metrics pages read (`Metrics-DYr03wWH.js`,
  * `MetricsExploreView-DmrgxGoz.js`) is either here, translated below, or
  * `start`, `end`, `type` and `query`: `tz`, `groupBy` and `view` are reported;
- * `viewType`, `viewMode` and `fromSavedFilter` only choose classic's layout;
- * `suffix` matters only on a drilldown, which the redirect handles; `promql` and
- * `state` hold the explorer's queries.
+ * `viewType` picks classic's view, of which a list or table is reported and the
+ * explorer translated; `viewMode` only lays out the list; `fromSavedFilter` only
+ * marks a saved filter as loaded; a drilldown's histogram `suffix` is reported;
+ * `promql` and `state` hold the explorer's queries.
  */
 const classicMetricsOnly = [
   'tz',
@@ -401,6 +404,13 @@ function builderSelector(metric: unknown, matchers: unknown, operations: unknown
   if (!isMissing(metric) && typeof metric !== 'string') return malformed;
   if (!isMissing(matchers) && !Array.isArray(matchers)) return malformed;
   if (!isMissing(operations) && !Array.isArray(operations)) return malformed;
+  // Classic's `fi`/`di` read each operation's `type`, `params` and `byLabels`.
+  for (const operation of (operations ?? []) as unknown[]) {
+    if (!operation || typeof operation !== 'object') return malformed;
+    const { type, params, byLabels } = operation as Record<string, unknown>;
+    if (typeof type !== 'string' || !Array.isArray(params)) return malformed;
+    if (!isMissing(byLabels) && !Array.isArray(byLabels)) return malformed;
+  }
   const parts: string[] = [];
   let unsupported = false;
   for (const entry of (matchers ?? []) as unknown[]) {
@@ -465,14 +475,18 @@ export function classicMetricsSearch(
     return count + filters.length + skipped;
   }, 0);
   const dropped = droppedFromLink(params, unread, conditions);
-  // Classic shows its explorer for `viewType=explorer`, or any `promql`; its
-  // default "All metrics" list is the label browser here. The explorer reads
+  // Classic shows its explorer for `viewType=explorer`, or any `promql`, and
+  // otherwise its "All metrics" list (the default) or a table of records,
+  // neither of which this page has. The explorer reads
   // `state` and, without a readable one, `promql`. A `state` left from an
   // earlier visit to the explorer is ignored by the other views, so it is here.
   const promql = params.get('promql');
   const viewType = params.get('viewType');
   const explorer = !!promql || viewType === 'explorer';
+  if (viewType === 'list') dropped.push('All metrics view');
   if (viewType === 'table') dropped.push('table view');
+  const suffix = params.get('suffix');
+  if (suffix && histogramSuffixes.includes(suffix)) dropped.push(`histogram _${suffix} series`);
   const saved =
     explorer && params.has('state') ? classicExplorerState(params.get('state')!) : undefined;
   if (explorer && params.has('state') && !saved) dropped.push('saved queries');

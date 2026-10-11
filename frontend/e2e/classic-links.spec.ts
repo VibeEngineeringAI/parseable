@@ -264,7 +264,12 @@ test('classic explorer bookmarks open their PromQL queries', async ({ page }) =>
     tiles: [
       { id: 'A', editorMode: 'promql', promqlQuery: `{"${metric}"}` },
       { id: 'B', editorMode: 'builder', promqlMetric: metric, promqlMatchers: [], operations: [] },
-      { id: 'C', editorMode: 'builder', promqlMetric: metric, operations: [{ id: 'rate' }] },
+      {
+        id: 'C',
+        editorMode: 'builder',
+        promqlMetric: metric,
+        operations: [{ type: 'rate', params: ['5m'] }],
+      },
     ],
   });
   await page.goto(

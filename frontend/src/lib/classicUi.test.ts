@@ -406,16 +406,22 @@ describe('classic Metrics links', () => {
         '1 filter',
         'grouping',
         'saved view',
+        'All metrics view',
+        'histogram _sum series',
       ],
     });
   });
 
-  it.each(['?viewType=list', '?viewMode=chart', '?fromSavedFilter=true', '?suffix=bucket'])(
-    'recognises %s alone as a classic link',
-    (search) => {
-      expect(translate(search)).toEqual({ search: '', dropped: [] });
-    },
-  );
+  it.each([
+    ['?viewType=list', ['All metrics view']],
+    ['?viewType=table', ['table view']],
+    ['?viewMode=chart', []],
+    ['?fromSavedFilter=true', []],
+    ['?suffix=bucket', ['histogram _bucket series']],
+    ['?suffix=other', []],
+  ])('recognises %s alone as a classic link', (search, dropped) => {
+    expect(translate(search)).toEqual({ search: '', dropped });
+  });
 
   it('opens the query of a classic PromQL link', () => {
     // As Prism's own link builder writes it: /metrics/explore/<dataset>?promql=<query>.
@@ -454,7 +460,12 @@ describe('classic Metrics links', () => {
           promqlMatchers: [{ label: 'job', operator: '=', value: 'api' }],
           operations: [],
         },
-        { id: 'D', editorMode: 'builder', promqlMetric: 'up', operations: [{ id: 'rate' }] },
+        {
+          id: 'D',
+          editorMode: 'builder',
+          promqlMetric: 'up',
+          operations: [{ type: 'rate', params: ['5m'] }],
+        },
       ],
     });
     const result = translate(`?${link}&start=1h&end=now&type=fixed&viewType=explorer`)!;
@@ -508,7 +519,10 @@ describe('classic Metrics links', () => {
   it('reads state only where classic shows its explorer', () => {
     const saved = state({ tiles: [{ id: 'A', editorMode: 'promql', promqlQuery: 'up' }] });
     // Switching to another view keeps `state` in the address; those views ignore it.
-    expect(translate(`?${saved}&viewType=list`)).toEqual({ search: '', dropped: [] });
+    expect(translate(`?${saved}&viewType=list`)).toEqual({
+      search: '',
+      dropped: ['All metrics view'],
+    });
     expect(translate(`?${saved}`)).toEqual({ search: '', dropped: [] });
     expect(translate(`?${saved}&viewType=table`)).toEqual({ search: '', dropped: ['table view'] });
     expect(translate(`?${saved}&viewType=explorer`)).toEqual({ search: '?query=up', dropped: [] });
@@ -569,16 +583,29 @@ describe('classic Metrics links', () => {
     ).toBe('/metrics/explore/otel?query=cpu');
   });
 
-  it('opens the histogram series a classic drilldown chose', () => {
-    expect(nativePath('/metrics/explore/otel/metric/http.server.duration?suffix=count')).toBe(
-      `/metrics/explore/otel?query=${encodeURIComponent('{"http.server.duration_count"}')}`,
+  it('opens a histogram drilldown on its metric and names the series', () => {
+    // PromQL here charts gauges and sums only; the plain metric's query says so.
+    const link = nativePath('/metrics/explore/otel/metric/http.server.duration?suffix=count&x=1');
+    expect(link).toBe(
+      `/metrics/explore/otel?suffix=count&x=1&query=${encodeURIComponent('{"http.server.duration"}')}`,
     );
-    expect(nativePath('/metrics/explore/otel/metric/latency?suffix=bucket&x=1')).toBe(
-      '/metrics/explore/otel?x=1&query=latency_bucket',
-    );
-    expect(nativePath('/metrics/explore/otel/metric/latency?suffix=max')).toBe(
-      '/metrics/explore/otel?query=latency',
-    );
+    expect(translate(new URL(link, 'http://x').search)).toEqual({
+      search: `?x=1&query=${encodeURIComponent('{"http.server.duration"}')}`,
+      dropped: ['histogram _count series'],
+    });
+  });
+
+  it.each([
+    ['a null operation', [null]],
+    ['an operation without a type', [{ params: [] }]],
+    ['an operation without params', [{ type: 'rate' }]],
+    ['labels that are not a list', [{ type: 'sum', params: [], byMode: 'by', byLabels: 'job' }]],
+  ])('rejects builder state with %s, as classic does', (_, operations) => {
+    const link = state({ tiles: [{ editorMode: 'builder', promqlMetric: 'up', operations }] });
+    expect(translate(`?viewType=explorer&${link}&promql=down`)).toEqual({
+      search: '?query=down',
+      dropped: ['saved queries'],
+    });
   });
 
   it('produces a search it would not translate again', () => {
