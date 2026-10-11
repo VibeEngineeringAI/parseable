@@ -119,6 +119,16 @@ jobs:
         if: matrix.use-cross
         run: cross build --profile release-lto --target ${{ matrix.target }}
 
+      # The aarch64 runner lost contact during the fat-LTO build twice, which
+      # GitHub attributes to CPU or memory starvation. Free disk, add swap and
+      # record the resources as annotations, which survive a lost runner.
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 16G /swap.release && sudo chmod 600 /swap.release
+          sudo mkswap /swap.release && sudo swapon /swap.release
+          echo "::notice title=Runner resources::$(nproc) CPUs; $(free -h | awk '/Mem/{print $2" RAM"} /Swap/{print $2" swap"}' | paste -sd ' '); $(df -h --output=avail / | tail -1 | tr -d ' ') free on /"
+
       - name: Build native
         if: ${{ !matrix.use-cross }}
         run: cargo build --profile release-lto --target ${{ matrix.target }}
