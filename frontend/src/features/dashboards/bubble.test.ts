@@ -431,13 +431,13 @@ describe('bubble chart', () => {
       expect(chart.points[0].y).toBe(2);
     }
   });
-  it('accepts only string bindings for x and size', () => {
+  it('reads the first entry of array bindings for x and size, like the editor', () => {
     const chart = bubbleChart(
       [{ first: 1, x: 2, y: 3, weight: 4, size: 5 }],
       tile({ x: { field: ['x'] }, size: { field: ['size'] } }),
     );
-    expect(chart).toMatchObject({ xField: 'first', yField: 'y', sizeField: 'weight' });
-    expect(chart.points[0]).toMatchObject({ x: 1, y: 3, size: 4 });
+    expect(chart).toMatchObject({ xField: 'x', yField: 'y', sizeField: 'size' });
+    expect(chart.points[0]).toMatchObject({ x: 2, y: 3, size: 5 });
   });
   it('caps after filtering, counts all valid rows and normalises only rendered sizes and groups', () => {
     const rows = [

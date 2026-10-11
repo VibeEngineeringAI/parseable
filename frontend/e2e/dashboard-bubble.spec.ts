@@ -208,6 +208,10 @@ async function xPointMargins(chart: Locator) {
   });
 }
 
+// Tick labels use the tile formatter, which compacts thousands (4K, 1.5K).
+const tickValue = (label: string) =>
+  Number(label.replaceAll(',', '').replace(/K$/, 'e3').replace(/M$/, 'e6'));
+
 test.use({ timezoneId: 'America/Chicago' });
 
 test('SQL bubbles retain row order, scale radius by sqrt(size), and use 11px for equal sizes', async ({
@@ -269,11 +273,11 @@ test('numeric axes use round real-unit ticks and keep only pixel padding around 
   const chart = figure(page, 'Round axes');
   await expect(chart.locator('.charts-bubble-point')).toHaveCount(3);
   const xTicks = (await chart.locator('.charts-bubble-x-tick').allTextContents()).map((label) =>
-    Number(label.replaceAll(',', '')),
+    tickValue(label),
   );
   const yTicks = (
     await chart.locator('.charts-bubble-tick:not(.charts-bubble-x-tick)').allTextContents()
-  ).map((label) => Number(label.replaceAll(',', '')));
+  ).map((label) => tickValue(label));
   expect(xTicks.length).toBeGreaterThan(1);
   expect(yTicks.length).toBeGreaterThan(1);
   expect(xTicks.every((value) => Number.isInteger(value) && value % 25 === 0)).toBe(true);
@@ -314,9 +318,7 @@ for (const sign of ['negative', 'zero', 'mixed'])
     const chart = figure(page, 'Zero boundary');
     await expect(chart.locator('.charts-bubble-point')).toHaveCount(3);
     const ticks = chart.locator('.charts-bubble-tick:not(.charts-bubble-x-tick)');
-    const labels = (await ticks.allTextContents()).map((label) =>
-      Number(label.replaceAll(',', '')),
-    );
+    const labels = (await ticks.allTextContents()).map((label) => tickValue(label));
     expect(labels).toContain(0);
     if (sign === 'mixed') {
       expect(labels.some((value) => value < 0)).toBe(true);
@@ -411,8 +413,8 @@ test('hover and keyboard inspect labelled values, sorted x navigation and Escape
   await expect(points.first()).toHaveAttribute('fill-opacity', '0.2');
   await tooltipValues(tooltip, {
     duration_ms: '3,000',
-    payload_bytes: '512.00',
-    total: '100.00',
+    payload_bytes: '512',
+    total: '100',
     service: 'payments',
   });
   await page.mouse.move(0, 0);
@@ -424,16 +426,16 @@ test('hover and keyboard inspect labelled values, sorted x navigation and Escape
   await expect(points.nth(1)).toHaveAccessibleName(/1,000/);
   await tooltipValues(tooltip, {
     duration_ms: '1,000',
-    payload_bytes: '128.00',
-    total: '25.00',
+    payload_bytes: '128',
+    total: '25',
     service: 'checkout',
   });
   await page.keyboard.press('ArrowRight');
   await expect(points.nth(2)).toBeFocused();
   await tooltipValues(tooltip, {
     duration_ms: '2,000',
-    payload_bytes: '256.00',
-    total: '50.00',
+    payload_bytes: '256',
+    total: '50',
     service: 'payments',
   });
   await page.keyboard.press('ArrowLeft');
@@ -442,16 +444,16 @@ test('hover and keyboard inspect labelled values, sorted x navigation and Escape
   await expect(points.nth(0)).toBeFocused();
   await tooltipValues(tooltip, {
     duration_ms: '3,000',
-    payload_bytes: '512.00',
-    total: '100.00',
+    payload_bytes: '512',
+    total: '100',
     service: 'payments',
   });
   await page.keyboard.press('Home');
   await expect(points.nth(1)).toBeFocused();
   await tooltipValues(tooltip, {
     duration_ms: '1,000',
-    payload_bytes: '128.00',
-    total: '25.00',
+    payload_bytes: '128',
+    total: '25',
     service: 'checkout',
   });
   await page.keyboard.press('Escape');
