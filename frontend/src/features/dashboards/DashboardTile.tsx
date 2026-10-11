@@ -11,6 +11,7 @@ import type { DashboardTile as Tile, DashboardVariable, QueryRequest } from '../
 import { TileChart } from './TileChart';
 import { loadTile, type TileResults } from './queries';
 import {
+  instantCharts,
   knownTile,
   supportedCharts,
   text,
@@ -93,7 +94,7 @@ export function DashboardTile({
       .map((variable) => variable.name),
     ...(tile.tileType === 'promql'
       ? {
-          stat: tile.chartType === 'query-value',
+          stat: instantCharts.includes(text(tile.chartType)),
           step: storedStep(tile),
           maxDataPoints:
             record(tile.config).maxDataPoints ?? record(record(tile.config).layout).maxDataPoints,

@@ -7,7 +7,15 @@ import type {
   LogRecord,
 } from '../../lib/types';
 import type { QueryResult } from '../../lib/promqlResults';
-import { promqlQueries, sqlQuery, tileDatasets, tileStep, tileVariableNames } from './tiles';
+import {
+  instantCharts,
+  promqlQueries,
+  sqlQuery,
+  text,
+  tileDatasets,
+  tileStep,
+  tileVariableNames,
+} from './tiles';
 import {
   interpolatePromql,
   interpolateSql,
@@ -45,7 +53,7 @@ export async function loadTile(
   const promql = await Promise.all(
     queries.map(async ({ query: template, type }, index): Promise<QueryResult> => {
       const query = interpolatePromql(template, values);
-      const stat = tile.chartType === 'query-value';
+      const stat = instantCharts.includes(text(tile.chartType));
       const [range, instant] = await Promise.all([
         !stat && type !== 'instant'
           ? limit(

@@ -12,7 +12,20 @@ export const record = (value: unknown): Record<string, unknown> => (object(value
 export const text = (value: unknown, fallback = '') =>
   typeof value === 'string' ? value : fallback;
 export const tileTitle = (tile: DashboardTile) => text(tile.title, 'Untitled tile');
-export const supportedCharts = ['timeseries', 'line', 'area', 'bar', 'table', 'query-value'];
+export const supportedCharts = [
+  'timeseries',
+  'line',
+  'area',
+  'bar',
+  'table',
+  'query-value',
+  'pie',
+  'donut',
+  'gauge',
+  'bubble',
+];
+/** Chart types that show one value per series, so PromQL tiles ask for instant results. */
+export const instantCharts = ['query-value', 'gauge', 'pie', 'donut'];
 export const tileType = (tile: DashboardTile) => text(tile.tileType) || 'builder';
 export const knownTile = (tile: DashboardTile) =>
   ['code', 'builder', 'promql'].includes(tileType(tile));
