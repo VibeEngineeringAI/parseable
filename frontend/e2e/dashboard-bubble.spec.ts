@@ -195,6 +195,19 @@ async function tooltipValues(tooltip: Locator, values: Record<string, string>) {
   }
 }
 
+async function xPointMargins(chart: Locator) {
+  return chart.evaluate((element) => {
+    const grid = Array.from(element.querySelectorAll<SVGLineElement>('.charts-bubble-grid')).find(
+      (line) => line.y1.baseVal.value === line.y2.baseVal.value,
+    )!;
+    const points = element.querySelectorAll<SVGCircleElement>('.charts-bubble-point');
+    return [
+      points[0].cx.baseVal.value - grid.x1.baseVal.value,
+      grid.x2.baseVal.value - points[points.length - 1].cx.baseVal.value,
+    ];
+  });
+}
+
 test.use({ timezoneId: 'America/Chicago' });
 
 test('SQL bubbles retain row order, scale radius by sqrt(size), and use 11px for equal sizes', async ({
@@ -238,6 +251,114 @@ test('SQL bubbles retain row order, scale radius by sqrt(size), and use 11px for
   expect(
     await equal.evaluateAll((points) => points.map((point) => Number(point.getAttribute('r')))),
   ).toEqual([11, 11, 11]);
+});
+
+test('numeric axes use round real-unit ticks and keep only pixel padding around the data', async ({
+  page,
+  baseURL,
+}) => {
+  await mockServer(page, baseURL, {
+    document: dashboard([bubbleTile('Round axes')]),
+    queryRows: [
+      { duration_ms: 0, payload_bytes: 0, total: 0 },
+      { duration_ms: 151.5, payload_bytes: 2409, total: 25 },
+      { duration_ms: 303, payload_bytes: 4818, total: 100 },
+    ],
+  });
+  await page.goto(detail);
+  const chart = figure(page, 'Round axes');
+  await expect(chart.locator('.charts-bubble-point')).toHaveCount(3);
+  const xTicks = (await chart.locator('.charts-bubble-x-tick').allTextContents()).map((label) =>
+    Number(label.replaceAll(',', '')),
+  );
+  const yTicks = (
+    await chart.locator('.charts-bubble-tick:not(.charts-bubble-x-tick)').allTextContents()
+  ).map((label) => Number(label.replaceAll(',', '')));
+  expect(xTicks.length).toBeGreaterThan(1);
+  expect(yTicks.length).toBeGreaterThan(1);
+  expect(xTicks.every((value) => Number.isInteger(value) && value % 25 === 0)).toBe(true);
+  expect(yTicks.every((value) => value >= 0 && value % 500 === 0)).toBe(true);
+  expect(yTicks).toContain(0);
+  for (const margin of await xPointMargins(chart)) expect(margin).toBeCloseTo(22, 3);
+  const zeroBand = await chart.evaluate((element) => {
+    const grid = Array.from(element.querySelectorAll<SVGLineElement>('.charts-bubble-grid'));
+    const vertical = grid.find((line) => line.x1.baseVal.value === line.x2.baseVal.value)!;
+    const zero = element.querySelector<SVGCircleElement>('.charts-bubble-point')!.cy.baseVal.value;
+    return {
+      padding: vertical.y2.baseVal.value - zero,
+      belowZero: grid.some(
+        (line) => line.y1.baseVal.value === line.y2.baseVal.value && line.y1.baseVal.value > zero,
+      ),
+    };
+  });
+  expect(zeroBand.padding).toBeCloseTo(22, 3);
+  expect(zeroBand.belowZero).toBe(false);
+});
+
+for (const sign of ['negative', 'zero', 'mixed'])
+  test(`y ticks and gridlines respect the zero boundary for ${sign} values`, async ({
+    page,
+    baseURL,
+  }) => {
+    const values =
+      sign === 'negative' ? [-4818, -2409, -100] : sign === 'zero' ? [0, 0, 0] : [-4818, 0, 4818];
+    await mockServer(page, baseURL, {
+      document: dashboard([bubbleTile('Zero boundary')]),
+      queryRows: values.map((payload_bytes, index) => ({
+        duration_ms: index * 100,
+        payload_bytes,
+        total: index * 25,
+      })),
+    });
+    await page.goto(detail);
+    const chart = figure(page, 'Zero boundary');
+    await expect(chart.locator('.charts-bubble-point')).toHaveCount(3);
+    const ticks = chart.locator('.charts-bubble-tick:not(.charts-bubble-x-tick)');
+    const labels = (await ticks.allTextContents()).map((label) =>
+      Number(label.replaceAll(',', '')),
+    );
+    expect(labels).toContain(0);
+    if (sign === 'mixed') {
+      expect(labels.some((value) => value < 0)).toBe(true);
+      expect(labels.some((value) => value > 0)).toBe(true);
+    } else {
+      if (sign === 'zero') expect(labels).toEqual([0]);
+      else expect(labels.every((value) => value <= 0)).toBe(true);
+      const zeroLine = Number(await ticks.filter({ hasText: /^0$/ }).getAttribute('y'));
+      const grid = await chart
+        .locator('.charts-bubble-grid')
+        .evaluateAll((lines) =>
+          lines
+            .map((line) =>
+              ['x1', 'x2', 'y1', 'y2'].map((attribute) => Number(line.getAttribute(attribute))),
+            )
+            .filter(([x1, x2]) => x1 !== x2),
+        );
+      if (sign === 'zero') expect(grid).toHaveLength(1);
+      expect(grid.every(([, , y]) => y >= zeroLine)).toBe(true);
+    }
+  });
+
+test('a short timestamp extent stays tightly padded instead of expanding to time tick boundaries', async ({
+  page,
+  baseURL,
+}) => {
+  await mockServer(page, baseURL, {
+    document: dashboard([bubbleTile('Tight time axis', { xField: 'timestamp' })]),
+    queryRows: [
+      { timestamp: '2026-10-10T00:00:00Z', payload_bytes: 100, total: 0 },
+      { timestamp: '2026-10-10T01:30:00Z', payload_bytes: 200, total: 25 },
+      { timestamp: '2026-10-10T03:15:00Z', payload_bytes: 300, total: 100 },
+    ],
+  });
+  await page.goto(detail);
+  const chart = figure(page, 'Tight time axis');
+  await expect(chart.locator('.charts-bubble-point')).toHaveCount(3);
+  const labels = await chart.locator('.charts-bubble-x-tick').allTextContents();
+  expect(labels.length).toBeGreaterThan(1);
+  expect(labels).toContain('00:00');
+  expect(labels.every((label) => /^0[0-3]:[0-5]\d$/.test(label))).toBe(true);
+  for (const margin of await xPointMargins(chart)) expect(margin).toBeCloseTo(22, 3);
 });
 
 test('missing size and two-column results use a constant 11px radius', async ({

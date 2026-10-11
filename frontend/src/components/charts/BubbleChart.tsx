@@ -8,6 +8,7 @@ import {
   type KeyboardEvent,
 } from 'react';
 import type { BubbleGroup, BubblePoint } from '../../features/dashboards/bubble';
+import { linearAxis, timeAxis } from './bubbleAxes';
 import { formatChartValue } from './format';
 import './charts.css';
 
@@ -30,16 +31,8 @@ export interface BubbleChartProps {
   totalRows?: number;
 }
 
-type Tick = { value: number; ratio: number };
-type Axis = { ticks: Tick[]; ratio: (value: number) => number; step: number };
 type TooltipRow = { label: string; value: string; timestamp?: number };
 const pointLimit = 2000;
-// The largest radius is 18, with three pixels to the ring and one for its stroke.
-const pointPadding = 22;
-const timeSteps = [
-  1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800,
-  604800, 1209600, 2592000, 7776000, 31536000,
-];
 const timeFormat = new Intl.DateTimeFormat('en-GB', {
   year: 'numeric',
   month: 'short',
@@ -81,72 +74,6 @@ function timeTick(timestamp: number, step: number, span: number) {
             timeZone: 'UTC',
           }).format(date)
         : '',
-  };
-}
-
-function niceStep(value: number): number {
-  const power = 10 ** Math.floor(Math.log10(value));
-  const fraction = value / power;
-  const multiple =
-    fraction < Math.sqrt(2)
-      ? 1
-      : fraction < Math.sqrt(5)
-        ? 2
-        : fraction < Math.sqrt(12.5)
-          ? 2.5
-          : fraction < Math.sqrt(50)
-            ? 5
-            : 10;
-  return multiple * power;
-}
-
-function linearAxis(min: number, max: number, pixels: number, tickCount: number): Axis {
-  // Normalizing also keeps the range finite for very large or very small values.
-  const magnitude = Math.max(Math.abs(min), Math.abs(max)) || 1;
-  let low = min / magnitude;
-  let high = max / magnitude;
-  if (low === high) {
-    const spread = Math.abs(low) * 0.05 || 1;
-    low -= spread;
-    high += spread;
-  }
-  const padding = ((high - low) * pointPadding) / Math.max(1, pixels - pointPadding * 2);
-  const step = niceStep((high - low + padding * 2) / Math.max(1, tickCount - 1));
-  low = Math.floor((low - padding) / step) * step;
-  high = Math.ceil((high + padding) / step) * step;
-  const count = Math.min(30, Math.round((high - low) / step));
-  const ticks = Array.from({ length: count + 1 }, (_, index) => {
-    const unit = low + index * step;
-    return {
-      value: Number((unit * magnitude).toPrecision(12)),
-      ratio: (unit - low) / (high - low),
-    };
-  }).filter((tick) => Number.isFinite(tick.value));
-  return {
-    ticks,
-    step: step * magnitude,
-    ratio: (value) => (value / magnitude - low) / (high - low),
-  };
-}
-
-function timeAxis(min: number, max: number, pixels: number, tickCount: number): Axis {
-  if (min === max) {
-    min -= 60;
-    max += 60;
-  }
-  const padding = ((max - min) * pointPadding) / Math.max(1, pixels - pointPadding * 2);
-  const target = (max - min + padding * 2) / Math.max(1, tickCount - 1);
-  const step = timeSteps.find((value) => value >= target) ?? niceStep(target);
-  const low = Math.floor((min - padding) / step) * step;
-  const high = Math.ceil((max + padding) / step) * step;
-  const count = Math.min(30, Math.round((high - low) / step));
-  return {
-    ticks: Array.from({ length: count + 1 }, (_, index) => {
-      const value = low + index * step;
-      return { value, ratio: (value - low) / (high - low) };
-    }),
-    step,
-    ratio: (value) => (value - low) / (high - low),
   };
 }
 
@@ -315,7 +242,9 @@ export function BubbleChart({
     plotPixelsY,
     Math.max(2, Math.floor(plotPixelsY / 45)),
   );
-  const yTicks = yAxis.ticks.map((tick) => ({ ...tick, label: formatValue(tick.value) }));
+  const yTicks = yAxis.ticks
+    .filter((tick) => (extent.yMin < 0 || tick.value >= 0) && (extent.yMax > 0 || tick.value <= 0))
+    .map((tick) => ({ ...tick, label: formatValue(tick.value) }));
   const longestY = Math.max(1, ...yTicks.map((tick) => tick.label.length));
   const left = Math.min(
     width * 0.45,
