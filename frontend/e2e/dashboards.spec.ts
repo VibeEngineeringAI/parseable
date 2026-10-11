@@ -467,8 +467,15 @@ test('variables re-query SQL and PromQL with concrete request bodies; selections
 test('non-owners see read-only tiles, including unknown and unavailable chart placeholders', async ({
   page,
 }) => {
+  // Pie renders now, so the unavailable-chart placeholder is covered with a type no renderer exists for.
   await mockServer(page, {
-    document: { ...classic, author: 'another-owner' },
+    document: {
+      ...classic,
+      author: 'another-owner',
+      tiles: classic.tiles.map((item) =>
+        item.title === 'Distribution' ? { ...item, chartType: 'heatmap' } : item,
+      ),
+    } as Dashboard,
     privilege: 'reader',
   });
   await page.goto(`${detail}/`);
@@ -482,7 +489,7 @@ test('non-owners see read-only tiles, including unknown and unavailable chart pl
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
   await expect(tile(page, 'AI summary')).toContainText('AI tiles cannot be shown');
   await expect(tile(page, 'Distribution')).toContainText(
-    'Pie charts are not available in this UI yet.',
+    'Heatmap charts are not available in this UI yet.',
   );
   await expect(tile(page, 'Distribution').getByRole('link', { name: /classic UI/ })).toHaveCount(0);
   await page.getByRole('button', { name: 'Actions for tile Host load', exact: true }).click();

@@ -1,0 +1,326 @@
+{
+  "pie": {
+    "tile_id": "01K7A000000000000000000004",
+    "authorMode": "manual",
+    "title": "Events by level",
+    "tileType": "code",
+    "chartType": "pie",
+    "chartQuery": "SELECT \"level\", COUNT(*) AS events FROM \"app-logs\" GROUP BY \"level\"",
+    "dbName": ["app-logs"],
+    "config": {
+      "type": "pie",
+      "colourScheme": "classic",
+      "layout": {
+        "legendPosition": "bottom",
+        "segments": {
+          "value": [10, 90],
+          "isPercent": true
+        },
+        "label": false,
+        "stacked": false
+      },
+      "axes": {
+        "x": {
+          "field": "level",
+          "title": "level",
+          "display": true
+        },
+        "y": {
+          "field": "level",
+          "title": "level",
+          "display": true,
+          "beginAtZero": true
+        },
+        "groupBy": {
+          "field": []
+        }
+      },
+      "advanced": {
+        "dataLabels": {
+          "enabled": false
+        },
+        "tooltip": {
+          "enabled": true,
+          "mode": "index",
+          "intersect": false
+        }
+      }
+    },
+    "layout": {
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    }
+  },
+  "donut": {
+    "tile_id": "01K7A000000000000000000005",
+    "authorMode": "manual",
+    "title": "Events by level",
+    "tileType": "code",
+    "chartType": "donut",
+    "chartQuery": "SELECT \"level\", COUNT(*) AS events FROM \"app-logs\" GROUP BY \"level\"",
+    "dbName": ["app-logs"],
+    "config": {
+      "type": "donut",
+      "colourScheme": "classic",
+      "layout": {
+        "legendPosition": "bottom",
+        "segments": {
+          "value": [10, 90],
+          "isPercent": true
+        },
+        "label": false,
+        "stacked": false
+      },
+      "axes": {
+        "x": {
+          "field": "level",
+          "title": "level",
+          "display": true
+        },
+        "y": {
+          "field": "level",
+          "title": "level",
+          "display": true,
+          "beginAtZero": true
+        },
+        "groupBy": {
+          "field": []
+        }
+      },
+      "advanced": {
+        "dataLabels": {
+          "enabled": false
+        },
+        "tooltip": {
+          "enabled": true,
+          "mode": "index",
+          "intersect": false
+        }
+      }
+    },
+    "layout": {
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    }
+  },
+  "donut-config-type-pie": {
+    "tile_id": "01K7A000000000000000000021",
+    "authorMode": "manual",
+    "title": "Events by level (config.type pie quirk)",
+    "tileType": "code",
+    "chartType": "donut",
+    "chartQuery": "SELECT \"level\", COUNT(*) AS events FROM \"app-logs\" GROUP BY \"level\"",
+    "dbName": ["app-logs"],
+    "config": {
+      "type": "pie",
+      "colourScheme": "classic",
+      "layout": {
+        "legendPosition": "bottom",
+        "segments": {
+          "value": [10, 90],
+          "isPercent": true
+        },
+        "label": false,
+        "stacked": false
+      },
+      "axes": {
+        "x": {
+          "field": "level",
+          "title": "level",
+          "display": true
+        },
+        "y": {
+          "field": "level",
+          "title": "level",
+          "display": true,
+          "beginAtZero": true
+        },
+        "groupBy": {
+          "field": []
+        }
+      },
+      "advanced": {
+        "dataLabels": {
+          "enabled": false
+        },
+        "tooltip": {
+          "enabled": true,
+          "mode": "index",
+          "intersect": false
+        }
+      }
+    },
+    "layout": {
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    }
+  },
+  "pie-labels-legend-right": {
+    "tile_id": "01K7A000000000000000000023",
+    "authorMode": "manual",
+    "title": "Events by level (labels, legend right)",
+    "tileType": "code",
+    "chartType": "pie",
+    "chartQuery": "SELECT \"level\", COUNT(*) AS events FROM \"app-logs\" GROUP BY \"level\"",
+    "dbName": ["app-logs"],
+    "config": {
+      "type": "pie",
+      "colourScheme": "classic",
+      "layout": {
+        "legendPosition": "right",
+        "segments": {
+          "value": [10, 90],
+          "isPercent": true
+        },
+        "label": true,
+        "stacked": false
+      },
+      "axes": {
+        "x": {
+          "field": "level",
+          "title": "level",
+          "display": true
+        },
+        "y": {
+          "field": "level",
+          "title": "level",
+          "display": true,
+          "beginAtZero": true
+        },
+        "groupBy": {
+          "field": []
+        }
+      },
+      "advanced": {
+        "dataLabels": {
+          "enabled": false
+        },
+        "tooltip": {
+          "enabled": true,
+          "mode": "index",
+          "intersect": false
+        }
+      }
+    },
+    "layout": {
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    }
+  },
+  "promql-pie": {
+    "authorMode": "manual",
+    "tileType": "promql",
+    "dbName": "$metrics_dataset",
+    "config": {
+      "colourScheme": "classic",
+      "axes": {
+        "x": {
+          "field": "",
+          "title": "",
+          "display": true
+        },
+        "y": {
+          "field": "",
+          "title": "",
+          "display": true,
+          "beginAtZero": false
+        }
+      },
+      "layout": {
+        "legendPosition": "bottom",
+        "segments": {
+          "value": [10, 90],
+          "isPercent": true
+        },
+        "label": true,
+        "unit": "req/s",
+        "precision": 2,
+        "humanize": true
+      },
+      "advanced": {
+        "dataLabels": {
+          "enabled": false
+        },
+        "tooltip": {
+          "enabled": true,
+          "mode": "index",
+          "intersect": false
+        }
+      },
+      "type": "pie"
+    },
+    "layout": {
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    },
+    "tile_id": "01K7ABCDEF0000000000000003",
+    "title": "Current request rate by status",
+    "chartType": "pie",
+    "chartQuery": ["sum by (status) (rate(http_requests_total{service=~\"$service\"}[5m]))"],
+    "promqlQueryType": ["instant"]
+  },
+  "promql-donut": {
+    "authorMode": "manual",
+    "tileType": "promql",
+    "dbName": "$metrics_dataset",
+    "config": {
+      "colourScheme": "classic",
+      "axes": {
+        "x": {
+          "field": "",
+          "title": "",
+          "display": true
+        },
+        "y": {
+          "field": "",
+          "title": "",
+          "display": true,
+          "beginAtZero": false
+        }
+      },
+      "layout": {
+        "legendPosition": "bottom",
+        "segments": {
+          "value": [10, 90],
+          "isPercent": true
+        },
+        "label": true,
+        "unit": "req/s",
+        "precision": 2,
+        "humanize": true
+      },
+      "advanced": {
+        "dataLabels": {
+          "enabled": false
+        },
+        "tooltip": {
+          "enabled": true,
+          "mode": "index",
+          "intersect": false
+        }
+      },
+      "type": "donut"
+    },
+    "layout": {
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    },
+    "tile_id": "01K7ABCDEF0000000000000004",
+    "title": "Current request rate by service",
+    "chartType": "donut",
+    "chartQuery": ["sum by (service) (rate(http_requests_total{service=~\"$service\"}[5m]))"],
+    "promqlQueryType": ["instant"]
+  }
+}

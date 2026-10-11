@@ -1,4 +1,5 @@
 import { useCallback, useMemo } from 'react';
+import { PieChart } from '../../components/charts/PieChart';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
@@ -8,6 +9,8 @@ import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
 import { record, sqlChart, text, tileTitle } from './tiles';
 import type { TileResults } from './queries';
+import { tilePalette } from './palettes';
+import { tileSlices } from './slices';
 export function TileChart({
   tile,
   result,
@@ -58,6 +61,10 @@ export function TileChart({
     () => result.rows ?? (result.promql ? promqlTableRows(result.promql) : []),
     [result],
   );
+  const slices = useMemo(
+    () => (['pie', 'donut'].includes(text(tile.chartType)) ? tileSlices(result, tile) : []),
+    [result, tile],
+  );
   const precision =
     typeof layout.precision === 'number' && Number.isFinite(layout.precision)
       ? Math.max(0, Math.min(20, Math.floor(layout.precision)))
@@ -73,6 +80,26 @@ export function TileChart({
     height,
     JSON.stringify([tile.config, chart.categorical, chart.series.map((series) => series.id)]),
   );
+  const chartType = text(tile.chartType);
+  if (chartType === 'pie' || chartType === 'donut') {
+    const legendPosition = text(layout.legendPosition);
+    return (
+      <PieChart
+        slices={slices}
+        variant={chartType}
+        palette={tilePalette(tile)}
+        showLabels={layout.label === true}
+        legendPosition={
+          legendPosition === 'top' || legendPosition === 'left' || legendPosition === 'right'
+            ? legendPosition
+            : 'bottom'
+        }
+        formatValue={formatValue}
+        title={`${tileTitle(tile)} chart`}
+        height={height === 'fit' ? undefined : height}
+      />
+    );
+  }
   if (tile.chartType === 'table' || (chart.categorical && tile.chartType !== 'query-value'))
     return (
       <div
