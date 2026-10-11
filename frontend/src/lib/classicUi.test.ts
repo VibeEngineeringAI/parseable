@@ -500,9 +500,73 @@ describe('classic Metrics links', () => {
       editorMode: 'promql',
       promqlQuery: `q${index}`,
     }));
-    const result = translate(`?${state({ step: 'soon', tiles })}`)!;
+    const result = translate(`?${state({ step: 'soon', tiles })}&viewType=explorer`)!;
     expect(new URLSearchParams(result.search).getAll('query')).toHaveLength(7);
     expect(result.dropped).toEqual(['step', '2 queries beyond the first five']);
+  });
+
+  it('reads state only where classic shows its explorer', () => {
+    const saved = state({ tiles: [{ id: 'A', editorMode: 'promql', promqlQuery: 'up' }] });
+    // Switching to another view keeps `state` in the address; those views ignore it.
+    expect(translate(`?${saved}&viewType=list`)).toEqual({ search: '', dropped: [] });
+    expect(translate(`?${saved}`)).toEqual({ search: '', dropped: [] });
+    expect(translate(`?${saved}&viewType=table`)).toEqual({ search: '', dropped: ['table view'] });
+    expect(translate(`?${saved}&viewType=explorer`)).toEqual({ search: '?query=up', dropped: [] });
+  });
+
+  it('quotes a builder label that is not a plain identifier', () => {
+    const result = translate(
+      `?viewType=explorer&${state({
+        tiles: [
+          {
+            editorMode: 'builder',
+            promqlMetric: 'up',
+            promqlMatchers: [{ label: 'region:zone', operator: '=~', value: 'api|web' }],
+            operations: [],
+          },
+        ],
+      })}`,
+    )!;
+    const [query] = new URLSearchParams(result.search).getAll('query');
+    expect(query).toBe('up{"region:zone"=~"api|web"}');
+    expect(promqlErrors(query)).toEqual([]);
+  });
+
+  it('reports a builder matcher with an operator PromQL lacks', () => {
+    const tiles = [
+      {
+        editorMode: 'builder',
+        promqlMetric: 'up',
+        promqlMatchers: [{ label: 'job', operator: '>', value: '1' }],
+      },
+    ];
+    expect(translate(`?viewType=explorer&${state({ tiles })}`)).toEqual({
+      search: '',
+      dropped: ['1 query built with operations'],
+    });
+  });
+
+  it.each([
+    ['a null matcher', { promqlMetric: 'up', promqlMatchers: [null] }],
+    ['matchers that are not a list', { promqlMetric: 'up', promqlMatchers: 'job=api' }],
+    ['operations that are not a list', { promqlMetric: 'up', operations: { id: 'rate' } }],
+    ['a metric that is not text', { promqlMetric: 5 }],
+    ['a value that is not text', { promqlMatchers: [{ label: 'job', operator: '=', value: 1 }] }],
+  ])('rejects builder state with %s, as classic does', (_, tile) => {
+    const link = state({ tiles: [{ editorMode: 'builder', ...tile }] });
+    expect(translate(`?${link}&promql=down`)).toEqual({
+      search: '?query=down',
+      dropped: ['saved queries'],
+    });
+  });
+
+  it('drops what classic ignores on a drilldown', () => {
+    const saved = state({ tiles: [{ editorMode: 'promql', promqlQuery: 'up' }] });
+    expect(
+      nativePath(
+        `/metrics/explore/otel/metric/cpu?viewType=table&viewMode=chart&promql=x&${saved}`,
+      ),
+    ).toBe('/metrics/explore/otel?query=cpu');
   });
 
   it('opens the histogram series a classic drilldown chose', () => {
@@ -522,7 +586,7 @@ describe('classic Metrics links', () => {
       `?${host}&start=1h&end=now&type=fixed`,
       '?start=2026-10-10T11:00:00.000Z&end=now&type=custom',
       '?promql=up&viewType=explorer',
-      `?${state({ queryType: 'instant', step: '1m', tiles: [{ editorMode: 'promql', promqlQuery: 'up' }] })}`,
+      `?${state({ queryType: 'instant', step: '1m', tiles: [{ editorMode: 'promql', promqlQuery: 'up' }] })}&viewType=explorer`,
     ])
       expect(translate(translate(search)!.search)).toBeUndefined();
   });

@@ -50,7 +50,8 @@ export const classicRoutes: readonly ClassicRoute[] = [
     params: ({ metric }, search) => {
       // Classic adds `suffix` only for a histogram, whose chart is that series.
       const suffix = search.get('suffix');
-      search.delete('suffix');
+      // Classic shows the drilldown whatever its view, so these say nothing here.
+      for (const name of ['suffix', 'viewType', 'viewMode', 'promql', 'state']) search.delete(name);
       const series = suffix && histogramSuffixes.includes(suffix) ? `${metric}_${suffix}` : metric;
       return { query: metricSelector(series) };
     },
@@ -343,8 +344,9 @@ const plural = (count: number, one: string, many: string) =>
 
 /**
  * The queries, step and query type in classic's serialized explorer `state`,
- * as Prism v3.2.5 reads it, and what does not translate. Undefined when
- * classic would not read it either.
+ * as Prism v3.2.5 reads it (`ya` in `MetricsExploreView-DmrgxGoz.js`), and how
+ * many builder queries do not translate. Undefined when classic would reject
+ * it too and fall back to `promql`.
  */
 function classicExplorerState(value: string) {
   let state: unknown;
@@ -374,6 +376,7 @@ function classicExplorerState(value: string) {
       continue;
     }
     const selector = builderSelector(tile.promqlMetric, tile.promqlMatchers, tile.operations);
+    if (selector === malformed) return;
     if (selector === undefined) untranslated++;
     else queries.push(selector);
   }
@@ -385,27 +388,31 @@ function classicExplorerState(value: string) {
   };
 }
 
+/** A builder query whose shape makes classic reject the whole state. */
+const malformed = Symbol('malformed');
+
 /**
  * The selector a classic builder query without operations stands for, as
- * classic writes it, or undefined if it has operations or cannot be read.
+ * classic's `Ca` writes it; undefined if it has operations or an operator
+ * PromQL lacks; `malformed` where classic's own code would throw.
  */
 function builderSelector(metric: unknown, matchers: unknown, operations: unknown) {
-  if (Array.isArray(operations) && operations.length) return;
-  if (metric !== undefined && typeof metric !== 'string') return;
-  if (matchers !== undefined && !Array.isArray(matchers)) return;
+  const isMissing = (value: unknown) => value === undefined || value === null;
+  if (!isMissing(metric) && typeof metric !== 'string') return malformed;
+  if (!isMissing(matchers) && !Array.isArray(matchers)) return malformed;
+  if (!isMissing(operations) && !Array.isArray(operations)) return malformed;
   const parts: string[] = [];
-  for (const entry of (matchers ?? []) as Record<string, unknown>[]) {
-    const { label, operator, value } = entry ?? {};
+  let unsupported = false;
+  for (const entry of (matchers ?? []) as unknown[]) {
+    if (!entry || typeof entry !== 'object') return malformed;
+    const { label, operator, value } = entry as Record<string, unknown>;
     // Classic skips a matcher without a label or value.
     if (!label || value === undefined || value === '') continue;
-    if (
-      typeof label !== 'string' ||
-      typeof value !== 'string' ||
-      !['=', '!=', '=~', '!~'].includes(operator as string)
-    )
-      return;
-    parts.push(matcher(label, value, operator as '=' | '!=' | '=~' | '!~'));
+    if (typeof label !== 'string' || typeof value !== 'string') return malformed;
+    if (!['=', '!=', '=~', '!~'].includes(operator as string)) unsupported = true;
+    else parts.push(matcher(label, value, operator as '=' | '!=' | '=~' | '!~'));
   }
+  if (unsupported || (operations as unknown[] | null)?.length) return;
   if (!metric) return parts.length ? `{${parts.join(', ')}}` : '';
   const name = metricSelector(metric);
   if (!parts.length) return name;
@@ -458,10 +465,17 @@ export function classicMetricsSearch(
     return count + filters.length + skipped;
   }, 0);
   const dropped = droppedFromLink(params, unread, conditions);
-  // Classic's explorer reads `state` and, without a readable one, `promql`.
-  const saved = params.has('state') ? classicExplorerState(params.get('state')!) : undefined;
-  if (params.has('state') && !saved) dropped.push('saved queries');
+  // Classic shows its explorer for `viewType=explorer`, or any `promql`; its
+  // default "All metrics" list is the label browser here. The explorer reads
+  // `state` and, without a readable one, `promql`. A `state` left from an
+  // earlier visit to the explorer is ignored by the other views, so it is here.
   const promql = params.get('promql');
+  const viewType = params.get('viewType');
+  const explorer = !!promql || viewType === 'explorer';
+  if (viewType === 'table') dropped.push('table view');
+  const saved =
+    explorer && params.has('state') ? classicExplorerState(params.get('state')!) : undefined;
+  if (explorer && params.has('state') && !saved) dropped.push('saved queries');
   const queries = saved?.queries ?? (promql ? [promql] : []);
   for (const query of queries) next.append('query', query);
   if (saved?.untranslated)
