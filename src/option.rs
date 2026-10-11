@@ -30,6 +30,16 @@ pub enum Mode {
     All,
 }
 
+/// Which embedded UI serves `/`.
+#[derive(Debug, Default, Eq, PartialEq, Clone, Copy)]
+pub enum UiRoot {
+    /// The native frontend. `/next`, where it used to live, redirects to `/`.
+    #[default]
+    Native,
+    /// The classic Prism UI, with the native frontend beside it under `/next`.
+    Classic,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(
     "Starting Standalone Mode is not permitted when Distributed Mode is enabled. Please restart the server with Distributed Mode enabled."
@@ -87,7 +97,7 @@ impl From<Compression> for parquet::basic::Compression {
 }
 
 pub mod validation {
-    use super::{Compression, Mode};
+    use super::{Compression, Mode, UiRoot};
     use path_clean::PathClean;
     use std::{
         env, io,
@@ -145,6 +155,14 @@ pub mod validation {
             "all" => Ok(Mode::All),
             "index" => Ok(Mode::Index),
             _ => Err("Invalid MODE provided".to_string()),
+        }
+    }
+
+    pub fn ui_root(s: &str) -> Result<UiRoot, String> {
+        match s {
+            "native" => Ok(UiRoot::Native),
+            "classic" => Ok(UiRoot::Classic),
+            _ => Err("Invalid P_UI_ROOT provided, expected native or classic".to_string()),
         }
     }
 

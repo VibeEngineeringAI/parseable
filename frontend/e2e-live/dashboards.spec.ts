@@ -8,7 +8,7 @@ const live = process.env.PARSEABLE_LIVE_URL;
 const server = process.env.PARSEABLE_LIVE_SERVER_URL;
 const username = process.env.PARSEABLE_LIVE_USERNAME || 'frontend-smoke',
   password = process.env.PARSEABLE_LIVE_PASSWORD || 'local-smoke-password';
-const base = (process.env.PARSEABLE_LIVE_BASE ?? '/next').replace(/\/+$/, '');
+const base = (process.env.PARSEABLE_LIVE_BASE ?? '').replace(/\/+$/, '');
 const app = (path: string) => `${base}${path}`,
   appUrl = (path: string) => new URL(app(path), live).href;
 const headers = {

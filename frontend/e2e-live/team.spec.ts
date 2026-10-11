@@ -8,7 +8,7 @@ const password = process.env.PARSEABLE_LIVE_PASSWORD || 'local-smoke-password';
 const dataset = process.env.PARSEABLE_LIVE_DATASET || 'frontend_smoke';
 const datasetPath = `/logs/explore/${encodeURIComponent(dataset)}`;
 // The embedded build is mounted at `/next`; set it empty for a server (or Vite dev) at the root.
-const base = (process.env.PARSEABLE_LIVE_BASE ?? '/next').replace(/\/+$/, '');
+const base = (process.env.PARSEABLE_LIVE_BASE ?? '').replace(/\/+$/, '');
 
 /** Document path for an application route, mirroring `appPath` in src/lib/config.ts. */
 const app = (route: string) => `${base}${route}`;

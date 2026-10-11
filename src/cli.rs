@@ -26,7 +26,7 @@ use crate::connectors::kafka::config::KafkaConfig;
 
 use crate::{
     oidc::{self, OpenidConfig},
-    option::{Compression, Mode, validation},
+    option::{Compression, Mode, UiRoot, validation},
     storage::{AzureBlobConfig, FSConfig, GcsConfig, S3Config},
 };
 
@@ -161,6 +161,15 @@ pub struct Options {
         help = "Comma separated URLs to allow as origins"
     )]
     pub allow_origins: Vec<Url>,
+
+    #[arg(
+        long,
+        env = "P_UI_ROOT",
+        default_value = "native",
+        value_parser = validation::ui_root,
+        help = "UI served at /: native, or classic to restore the Prism UI with the native frontend under /next"
+    )]
+    pub ui_root: UiRoot,
 
     // Actix request timeout in seconds
     #[arg(
