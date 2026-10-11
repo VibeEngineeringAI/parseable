@@ -101,6 +101,7 @@ Or run checks separately:
 npm run build          # TypeScript + production bundle
 npm test               # Client, escaping, demo query and error contracts
 npm run test:ui         # Browser workflows + axe accessibility smoke checks
+npm run test:preview    # Production build under /next/: missing page assets after a deploy
 npm run test:stories    # Build Storybook and test isolated component interactions
 npm run format:check
 ```
@@ -134,4 +135,4 @@ flock /home/ajs/.cache/parseable-playwright.lock bash -c '
 '
 ```
 
-On shared machines, run every Playwright invocation (including `npm run check`, `test:ui` and `test:stories`) under this lock, checking ports 5173 and 6006 inside the lock before running. Do not reuse another worktree's server.
+On shared machines, run every Playwright invocation (including `npm run check`, `test:ui`, `test:preview` and `test:stories`) under this lock, checking ports 5173, 4317 and 6006 inside the lock before running. Do not reuse another worktree's server.

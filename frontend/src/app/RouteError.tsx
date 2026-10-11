@@ -2,6 +2,7 @@ import { Link, useRouteError } from 'react-router-dom';
 import { LogOut, RefreshCw, TriangleAlert } from 'lucide-react';
 import { Button, EmptyState } from '../components/ui';
 import { useApp } from './AppProvider';
+import { isStaleChunkError } from '../lib/errors';
 
 /**
  * Replaces the router's developer screen when a page fails to render. The
@@ -11,9 +12,7 @@ import { useApp } from './AppProvider';
 export function RouteError() {
   const error = useRouteError();
   const { mode, client } = useApp();
-  const stale =
-    error instanceof TypeError &&
-    /dynamically imported module|module script|Failed to fetch/i.test(error.message);
+  const stale = isStaleChunkError(error);
   return (
     <main className="page route-error" role="alert">
       <EmptyState
