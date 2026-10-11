@@ -2157,6 +2157,11 @@ test('height can be cleared and typed as 8; resize compacts neighbours and keeps
     tileType: 'code',
     tile_id: createUlid(),
     title,
+    // Non-pie charts offer only top and bottom legends; a stored side position is preserved.
+    config: {
+      ...classic.tiles[1].config,
+      layout: { ...classic.tiles[1].config?.layout, legendPosition: 'right' },
+    },
     layout: {
       x: index === 1 ? 6 : 0,
       y: index === 2 ? 4 : 0,
@@ -2180,7 +2185,7 @@ test('height can be cleared and typed as 8; resize compacts neighbours and keeps
   await editor.getByLabel('Width (columns)').selectOption('8');
   await editor.getByLabel('X-axis title').fill('Observed time');
   await editor.getByLabel('Y-axis title').fill('Total events');
-  await editor.getByLabel('Legend position').selectOption('right');
+  await expect(editor.getByLabel('Legend position')).toHaveValue('right');
   await editor.getByRole('button', { name: 'Apply tile', exact: true }).click();
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();

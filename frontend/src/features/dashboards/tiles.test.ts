@@ -3,7 +3,9 @@ import classic from './__fixtures__/classic.json';
 import ingestDemoTile from './__fixtures__/ingest-demo-tile.json';
 import {
   appendLayout,
+  chartConfig,
   moveTile,
+  newTile,
   promqlQueries,
   resolvedLayouts,
   sqlChart,
@@ -23,6 +25,15 @@ const make = (id: string, layout: unknown): DashboardTile => ({
   unknown: 'keep',
 });
 describe('classic tile helpers', () => {
+  it('starts new tiles with the classic groupBy axis without selecting a series split', () => {
+    const config = chartConfig('timeseries');
+    expect(config.axes).toEqual({
+      x: { field: '', title: '', display: true },
+      y: { field: '', title: '', display: true, beginAtZero: false },
+      groupBy: { field: [] },
+    });
+    expect(newTile([]).config).toEqual(config);
+  });
   it('tracks only variables used in the tile query and dataset', () => {
     expect([
       ...tileVariableNames(
