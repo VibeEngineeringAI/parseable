@@ -1,0 +1,59 @@
+{
+  "tile_id": "01K7A000000000000000000022",
+  "authorMode": "manual",
+  "title": "Disk used (GB, absolute thresholds)",
+  "tileType": "code",
+  "chartType": "gauge",
+  "chartQuery": "SELECT AVG(\"disk_used_gb\") AS disk_used_gb FROM \"app-logs\"",
+  "dbName": ["app-logs"],
+  "config": {
+    "type": "gauge",
+    "colourScheme": "classic",
+    "layout": {
+      "legendPosition": "bottom",
+      "segments": {
+        "value": [300, 450],
+        "isPercent": false
+      },
+      "label": false,
+      "stacked": false,
+      "rangeTo": 500,
+      "unit": "GB",
+      "precision": 1,
+      "humanize": false,
+      "rangeFrom": 0
+    },
+    "axes": {
+      "x": {
+        "field": "disk_used_gb",
+        "title": "disk_used_gb",
+        "display": true
+      },
+      "y": {
+        "field": "disk_used_gb",
+        "title": "disk_used_gb",
+        "display": true,
+        "beginAtZero": true
+      },
+      "groupBy": {
+        "field": []
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 6
+  }
+}

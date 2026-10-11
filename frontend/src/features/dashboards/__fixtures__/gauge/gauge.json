@@ -1,0 +1,55 @@
+{
+  "tile_id": "01K7A000000000000000000006",
+  "authorMode": "manual",
+  "title": "Mean CPU utilization",
+  "tileType": "code",
+  "chartType": "gauge",
+  "chartQuery": "SELECT AVG(\"cpu_utilization\") AS utilization FROM \"app-logs\"",
+  "dbName": ["app-logs"],
+  "config": {
+    "type": "gauge",
+    "colourScheme": "classic",
+    "layout": {
+      "legendPosition": "bottom",
+      "segments": {
+        "value": [10, 90],
+        "isPercent": true
+      },
+      "label": false,
+      "stacked": false,
+      "rangeTo": 100
+    },
+    "axes": {
+      "x": {
+        "field": "utilization",
+        "title": "utilization",
+        "display": true
+      },
+      "y": {
+        "field": "utilization",
+        "title": "utilization",
+        "display": true,
+        "beginAtZero": true
+      },
+      "groupBy": {
+        "field": []
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 6
+  }
+}

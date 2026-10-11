@@ -19,10 +19,11 @@ import {
   supportedCharts,
   text,
   tileDatasets,
-  type QueryMode,
 } from './tiles';
 import { TileQueryFields } from './TileQueryFields';
 import { TileAppearanceFields } from './TileAppearanceFields';
+import { TileBindingFields } from './TileBindingFields';
+import { chartIssues } from './chartPicker';
 import { setQueryLanguage } from './tileEditing';
 import { resolveDataset, type VariableValues } from './variables';
 
@@ -56,7 +57,16 @@ export function TileEditor({
   const { client } = useApp();
   const [initial] = useState(() => original ?? newTile(tiles));
   const [draft, setDraft] = useState(() => structuredClone(initial));
-  const [layoutValid, setLayoutValid] = useState(true);
+  const [invalidFields, setInvalidFields] = useState<Set<string>>(() => new Set());
+  const onValidity = useCallback((key: string, valid: boolean) => {
+    setInvalidFields((current) => {
+      if (current.has(key) === !valid) return current;
+      const next = new Set(current);
+      if (valid) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
   const [preview, setPreview] = useState<{ tile: DashboardTile; revision: number }>();
   const previewBounds = useMemo(
     () =>
@@ -74,6 +84,12 @@ export function TileEditor({
           : Promise.resolve(undefined),
       [client, preview, variables, JSON.stringify(values), previewBounds, limit],
     ),
+  );
+  const columns = useMemo(
+    () => [
+      ...new Set((previewResults.data?.rows ?? []).slice(0, 50).flatMap((row) => Object.keys(row))),
+    ],
+    [previewResults.data],
   );
   const runPreview = () =>
     setPreview((current) => ({
@@ -112,23 +128,30 @@ export function TileEditor({
     setDraft((current) => ({ ...current, ...edits }));
     onDirty(true);
   }
-  const validation = !layoutValid
-    ? 'Enter a height between 1 and 24.'
-    : !text(draft.title).trim()
-      ? 'Enter a tile title.'
-      : !dataset.trim()
-        ? 'Choose a dataset.'
-        : isPromql && !promqlEnabled
-          ? promqlEnabled === undefined
-            ? 'Loading server capabilities…'
-            : 'PromQL dashboard tiles are unavailable on this server.'
-          : isPromql
-            ? !queries.length || queries.some((row) => !row.query.trim())
-              ? 'Enter a PromQL query for every row.'
-              : ''
-            : !sql.trim()
-              ? 'Enter a SQL query.'
-              : '';
+  const issue = chartIssues(draft)[0];
+  const validation = invalidFields.size
+    ? invalidFields.has('height')
+      ? 'Enter a height between 1 and 24.'
+      : invalidFields.has('range')
+        ? 'Enter numbers for the gauge range.'
+        : 'Enter numbers for the gauge thresholds.'
+    : issue
+      ? issue
+      : !text(draft.title).trim()
+        ? 'Enter a tile title.'
+        : !dataset.trim()
+          ? 'Choose a dataset.'
+          : isPromql && !promqlEnabled
+            ? promqlEnabled === undefined
+              ? 'Loading server capabilities…'
+              : 'PromQL dashboard tiles are unavailable on this server.'
+            : isPromql
+              ? !queries.length || queries.some((row) => !row.query.trim())
+                ? 'Enter a PromQL query for every row.'
+                : ''
+              : !sql.trim()
+                ? 'Enter a SQL query.'
+                : '';
   return (
     <Dialog
       open
@@ -243,7 +266,8 @@ export function TileEditor({
             )}
           </div>
         )}
-        <TileAppearanceFields draft={draft} change={change} onValidity={setLayoutValid} />
+        <TileBindingFields draft={draft} change={change} columns={columns} />
+        <TileAppearanceFields draft={draft} change={change} onValidity={onValidity} />
         {draft.chartType === 'query-value' && (
           <p className="muted">
             Query value uses the first numeric column of the last row, unless the stored Y-axis

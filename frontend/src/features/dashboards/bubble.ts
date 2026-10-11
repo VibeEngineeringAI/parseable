@@ -3,8 +3,9 @@
  * size is the first numeric column after y, excluding x and y, otherwise radius is 11.
  * Only the first y/groupBy array entry is read; an absent group field leaves one group. */
 import type { DashboardTile, LogRecord } from '../../lib/types';
+import { fieldList } from './chartPicker';
 import { paletteColour, tilePalette } from './palettes';
-import { groupValue, record, text, timeValue } from './tiles';
+import { groupValue, record, timeValue } from './tiles';
 
 export type BubblePoint = {
   x: number;
@@ -40,9 +41,8 @@ export function bubbleRadius(size: number, max: number): number {
 export function bubbleChart(rows: LogRecord[], tile: DashboardTile): BubbleChartData {
   const axes = record(record(tile.config).axes);
   const fields = [...new Set(rows.flatMap(Object.keys))];
-  const configured = (axis: string, first = false) => {
-    const binding = record(axes[axis]).field;
-    const field = text(first && Array.isArray(binding) ? binding[0] : binding);
+  const configured = (axis: string) => {
+    const field = fieldList(record(axes[axis]).field)[0];
     return field && fields.includes(field) ? field : undefined;
   };
   const numeric = (field: string) => rows.some((row) => Number.isFinite(numericValue(row[field])));
@@ -61,11 +61,11 @@ export function bubbleChart(rows: LogRecord[], tile: DashboardTile): BubbleChart
   };
   const xField = configured('x') ?? fields.find((field) => isTime(field) || numeric(field)) ?? '';
   const yField =
-    configured('y', true) ?? fields.find((field) => field !== xField && numeric(field)) ?? '';
+    configured('y') ?? fields.find((field) => field !== xField && numeric(field)) ?? '';
   const sizeField =
     configured('size') ??
     fields.slice(fields.indexOf(yField) + 1).find((field) => field !== xField && numeric(field));
-  const groupField = configured('groupBy', true);
+  const groupField = configured('groupBy');
   const xIsTime = isTime(xField);
   const palette = tilePalette(tile);
   const points: BubblePoint[] = [];

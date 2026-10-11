@@ -1,9 +1,12 @@
 import { useCallback, useMemo } from 'react';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { BubbleChart } from '../../components/charts/BubbleChart';
+import { GaugeChart } from '../../components/charts/GaugeChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
+import { gaugeModel, gaugeValue } from './gauge';
 import { chartValue, diagonalFill, fillStyle, percentFill } from './chartValue';
+import { formatValue as formatTileValue, valueFormat } from './formatValue';
 import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
@@ -67,16 +70,14 @@ export function TileChart({
         : undefined,
     [result, tile],
   );
-  const precision =
-    typeof layout.precision === 'number' && Number.isFinite(layout.precision)
-      ? Math.max(0, Math.min(20, Math.floor(layout.precision)))
-      : undefined;
-  const unit = text(layout.unit);
-  const formatValue = useCallback(
-    (value: number) =>
-      `${precision === undefined ? value.toLocaleString() : value.toFixed(precision)}${unit ? ` ${unit}` : ''}`,
-    [precision, unit],
+  const unit = text(layout.unit),
+    precision = typeof layout.precision === 'number' ? layout.precision : undefined,
+    humanize = layout.humanize === true;
+  const format = useMemo(
+    () => valueFormat({ unit, precision, humanize }),
+    [unit, precision, humanize],
   );
+  const formatValue = useCallback((value: number) => formatTileValue(value, format), [format]);
   const xRange = useMemo(() => [start, end] as const, [start, end]);
   const fitted = useChartHeight(
     height,
@@ -116,6 +117,20 @@ export function TileChart({
           emptyMessage="No results for the selected time range"
         />
       </div>
+    );
+  }
+  if (tile.chartType === 'gauge') {
+    const value = gaugeValue(tile, result, rows);
+    return value === undefined ? (
+      <div className="dashboard-stat" role="group" aria-label={`${tileTitle(tile)} value`}>
+        No values returned
+      </div>
+    ) : (
+      <GaugeChart
+        label={tileTitle(tile)}
+        model={gaugeModel(value, tile)}
+        text={formatValue(value)}
+      />
     );
   }
   if (tile.chartType === 'table' || (chart.categorical && tile.chartType !== 'query-value'))
