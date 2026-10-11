@@ -1,0 +1,54 @@
+{
+  "tile_id": "01K7A000000000000000000008",
+  "authorMode": "manual",
+  "title": "Recent events",
+  "tileType": "code",
+  "chartType": "table",
+  "chartQuery": "SELECT \"p_timestamp\", \"level\", \"message\" FROM \"app-logs\" LIMIT 100",
+  "dbName": ["app-logs"],
+  "config": {
+    "type": "table",
+    "colourScheme": "classic",
+    "layout": {
+      "legendPosition": "bottom",
+      "segments": {
+        "value": [10, 90],
+        "isPercent": true
+      },
+      "label": false,
+      "stacked": false
+    },
+    "axes": {
+      "x": {
+        "field": "p_timestamp",
+        "title": "p_timestamp",
+        "display": true
+      },
+      "y": {
+        "field": "level",
+        "title": "level",
+        "display": true,
+        "beginAtZero": true
+      },
+      "groupBy": {
+        "field": []
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 6
+  }
+}

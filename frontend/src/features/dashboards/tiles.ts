@@ -165,19 +165,28 @@ export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
     return { categorical: true, timestamps: [], series: [] };
   const timestamps = [...new Set(points.map((point) => point.time))].sort((a, b) => a - b);
   const builder = object(tile.chartQuery) ? record(tile.chartQuery) : undefined;
-  // Builder tiles declare their groups. Otherwise only repeated x values are split, and only by
-  // low-cardinality columns, so raw log rows with messages and ids stay one series per y field.
-  const groupFields = builder
-    ? [record(builder.x).groupBy, record(builder.y).groupBy]
-        .flatMap((groups) => (strings(groups) ? groups : []))
-        .filter((field) => fields.includes(field))
-    : timestamps.length === rows.length
-      ? []
-      : fields.filter((field) => {
-          if (field === xField || yFields.includes(field) || numeric(field)) return false;
-          const distinct = new Set(rows.map((row) => groupValue(row[field]))).size;
-          return distinct <= 20 && distinct < rows.length;
-        });
+  const configuredGroups = record(axes.groupBy).field;
+  const explicitGroups = strings(configuredGroups)
+    ? configuredGroups.filter((field) => fields.includes(field))
+    : [];
+  const useExplicitGroups =
+    explicitGroups.length > 0 &&
+    ![record(builder?.x).groupBy, record(builder?.y).groupBy].some(strings);
+  // Declared builder groups win over config groups. Without either, only repeated x values
+  // are split by low-cardinality columns, keeping raw log rows as one series per y field.
+  const groupFields = useExplicitGroups
+    ? explicitGroups
+    : builder
+      ? [record(builder.x).groupBy, record(builder.y).groupBy]
+          .flatMap((groups) => (strings(groups) ? groups : []))
+          .filter((field) => fields.includes(field))
+      : timestamps.length === rows.length
+        ? []
+        : fields.filter((field) => {
+            if (field === xField || yFields.includes(field) || numeric(field)) return false;
+            const distinct = new Set(rows.map((row) => groupValue(row[field]))).size;
+            return distinct <= 20 && distinct < rows.length;
+          });
   const position = new Map(timestamps.map((time, index) => [time, index]));
   const series = new Map<string, { id: string; label: string; values: (number | null)[] }>();
   if (!groupFields.length)
@@ -198,8 +207,10 @@ export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
         series.set(id, entry);
       }
       const value = row[field];
-      if (typeof value === 'number' && Number.isFinite(value))
-        entry.values[position.get(time)!] = value;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const index = position.get(time)!;
+        entry.values[index] = useExplicitGroups ? (entry.values[index] ?? 0) + value : value;
+      }
     }
   }
   return { categorical: false, timestamps, series: [...series.values()] };
