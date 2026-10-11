@@ -120,6 +120,8 @@
   gap: 12px;
 }
 .dashboard-server-grid > .dashboard-server-tile {
+  position: relative;
+  isolation: isolate;
   min-width: 0;
   overflow: hidden;
   padding: 16px;
@@ -150,6 +152,8 @@
   font-family: var(--font-mono);
 }
 .dashboard-stat {
+  position: relative;
+  isolation: isolate;
   display: flex;
   min-height: 120px;
   align-items: center;
@@ -157,6 +161,23 @@
   font-size: 32px;
   font-weight: 600;
   overflow-wrap: anywhere;
+}
+/* A percent value fills its whole tile; elsewhere, such as the editor preview, its stat box. */
+.dashboard-stat-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: -1;
+  background: var(--color-primary-soft);
+}
+.dashboard-stat-fill[data-direction='vertical'] {
+  inset: auto 0 0;
+}
+.dashboard-stat-fill[data-direction='diagonal'] {
+  inset: 0;
+}
+.dashboard-server-tile .dashboard-stat {
+  position: static;
+  isolation: auto;
 }
 .dashboard-chart,
 .dashboard-chart .charts-figure,

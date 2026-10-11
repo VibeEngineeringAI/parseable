@@ -858,6 +858,76 @@ test('a late tile response cannot replace the result of a new variable selection
   await expect(tile(page, 'Errors').getByLabel('Errors value')).toHaveText('222');
 });
 
+test('percent query values fill horizontally, vertically, diagonally or not at all; other units do not fill', async ({
+  page,
+}) => {
+  const stat = (title: string, unit: string, x: number) => ({
+    ...classic.tiles[1],
+    tile_id: createUlid(),
+    title,
+    tileType: 'code',
+    chartType: 'query-value',
+    chartQuery: `SELECT 42 AS value -- ${title}`,
+    layout: { x, y: 0, w: 6, h: 3 },
+    config: { type: 'query-value', layout: { unit, precision: 0 } },
+  });
+  await mockServer(page, {
+    document: { ...classic, tiles: [stat('CPU', '%', 0), stat('Latency', 'ms', 6)] },
+  });
+  await page.route('**/api/v1/query', (route) => route.fulfill({ json: [{ value: 42 }] }));
+  await page.goto(detail);
+  const cpu = tile(page, 'CPU').getByRole('group', { name: 'CPU value' });
+  await expect(cpu).toHaveText('42 %');
+  // The fill covers the card inside its border, so compare it with the card's client box.
+  const share = () =>
+    cpu.locator('.dashboard-stat-fill').evaluate((fill) => {
+      const card = fill.closest('[data-tile-id]')!,
+        outer = card.getBoundingClientRect(),
+        inner = fill.getBoundingClientRect(),
+        round = (value: number) => Math.round(value * 100) / 100;
+      return {
+        width: round(inner.width / card.clientWidth),
+        height: round(inner.height / card.clientHeight),
+        left: round(inner.left - outer.left - card.clientLeft),
+        bottom: round(outer.top + card.clientTop + card.clientHeight - inner.bottom),
+      };
+    });
+  expect(await share()).toEqual({ width: 0.42, height: 1, left: 0, bottom: 0 });
+  const heading = await tile(page, 'CPU').getByRole('heading', { name: 'CPU' }).boundingBox();
+  expect(
+    await page.evaluate(
+      ([x, y]) => document.elementFromPoint(x, y)?.textContent,
+      [heading!.x + 4, heading!.y + heading!.height / 2],
+    ),
+  ).toBe('CPU');
+  await expect(tile(page, 'Latency').getByRole('group', { name: 'Latency value' })).toHaveText(
+    '42 ms',
+  );
+  await expect(tile(page, 'Latency').locator('.dashboard-stat-fill')).toHaveCount(0);
+  await axe(page);
+  const restyle = async (style: string) => {
+    await tileAction(page, 'CPU', 'Edit');
+    await page
+      .getByRole('dialog', { name: 'Edit tile', exact: true })
+      .getByLabel('Percent fill', { exact: true })
+      .selectOption(style);
+    await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  };
+  await restyle('vertical');
+  await expect(cpu.locator('.dashboard-stat-fill')).toHaveAttribute('data-direction', 'vertical');
+  expect(await share()).toEqual({ width: 1, height: 0.42, left: 0, bottom: 0 });
+  await restyle('diagonal');
+  await expect(cpu.locator('.dashboard-stat-fill')).toHaveAttribute('data-direction', 'diagonal');
+  expect(await share()).toEqual({ width: 1, height: 1, left: 0, bottom: 0 });
+  // 42% of the tile lies below the line x + y = sqrt(0.84) in tile-relative coordinates.
+  await expect(cpu.locator('.dashboard-stat-fill')).toHaveCSS(
+    'clip-path',
+    'polygon(0% 0%, 91.65% 0%, 0% 91.65%)',
+  );
+  await restyle('none');
+  await expect(cpu).toHaveText('42 %');
+  await expect(cpu.locator('.dashboard-stat-fill')).toHaveCount(0);
+});
 test('pending saves freeze document edits and a failed save keeps the complete draft', async ({
   page,
 }) => {
