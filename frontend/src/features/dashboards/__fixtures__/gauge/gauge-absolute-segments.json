@@ -5,19 +5,14 @@
   "tileType": "code",
   "chartType": "gauge",
   "chartQuery": "SELECT AVG(\"disk_used_gb\") AS disk_used_gb FROM \"app-logs\"",
-  "dbName": [
-    "app-logs"
-  ],
+  "dbName": ["app-logs"],
   "config": {
     "type": "gauge",
     "colourScheme": "classic",
     "layout": {
       "legendPosition": "bottom",
       "segments": {
-        "value": [
-          300,
-          450
-        ],
+        "value": [300, 450],
         "isPercent": false
       },
       "label": false,

@@ -2,9 +2,7 @@
   "tile_id": "01M4P9DY1VQ0WWGVZXPK4SAHPK",
   "authorMode": "manual",
   "chartQuery": "SELECT ROUND(AVG(cpu_pct), 2) AS cpu_pct\nFROM \"web_requests\"\nWHERE demo_run = (SELECT MAX(demo_run) FROM \"web_requests\")",
-  "dbName": [
-    "web_requests"
-  ],
+  "dbName": ["web_requests"],
   "title": "gauge: average CPU utilization",
   "chartType": "gauge",
   "tileType": "code",
@@ -13,10 +11,7 @@
     "colourScheme": "teal",
     "layout": {
       "segments": {
-        "value": [
-          30,
-          80
-        ],
+        "value": [30, 80],
         "isPercent": true
       },
       "legendPosition": "left",

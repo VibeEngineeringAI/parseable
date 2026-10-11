@@ -5,19 +5,14 @@
   "tileType": "code",
   "chartType": "gauge",
   "chartQuery": "SELECT AVG(\"cpu_utilization\") AS utilization FROM \"app-logs\"",
-  "dbName": [
-    "app-logs"
-  ],
+  "dbName": ["app-logs"],
   "config": {
     "type": "gauge",
     "colourScheme": "classic",
     "layout": {
       "legendPosition": "bottom",
       "segments": {
-        "value": [
-          10,
-          90
-        ],
+        "value": [10, 90],
         "isPercent": true
       },
       "label": false,
