@@ -1,0 +1,56 @@
+{
+  "authorMode": "manual",
+  "tileType": "promql",
+  "dbName": "$metrics_dataset",
+  "config": {
+    "colourScheme": "classic",
+    "axes": {
+      "x": {
+        "field": "",
+        "title": "",
+        "display": true
+      },
+      "y": {
+        "field": "",
+        "title": "",
+        "display": true,
+        "beginAtZero": false
+      }
+    },
+    "layout": {
+      "legendPosition": "bottom",
+      "segments": {
+        "value": [10, 90],
+        "isPercent": true
+      },
+      "label": false,
+      "unit": "req/s",
+      "precision": 2,
+      "humanize": true,
+      "barOrientation": "vertical",
+      "stacked": false
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    },
+    "type": "bar"
+  },
+  "layout": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 6
+  },
+  "tile_id": "01K7ABCDEF0000000000000002",
+  "title": "Requests by status over time",
+  "chartType": "bar",
+  "chartQuery": ["sum by (status) (rate(http_requests_total{service=~\"$service\"}[5m]))"],
+  "promqlQueryType": ["range"]
+}
