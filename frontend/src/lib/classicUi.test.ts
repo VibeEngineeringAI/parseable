@@ -295,6 +295,12 @@ describe('classic Metrics links', () => {
       "WHERE (text env = 'x' OR text env = 'y')",
       'WHERE number n > 1',
       'WHERE listString tags contains [a]',
+      // Classic's parser also reads untyped conditions and leading whitespace.
+      "WHERE host = 'node-a'",
+      " WHERE text host = 'node-a'",
+      "\n where host != 'node-a'",
+      'WHERE `host.name` = 1',
+      'WHERE "host name" = \'a\'',
     ]) {
       expect(promqlErrors(query), query).not.toEqual([]);
       expect(translate(`?query=${encodeURIComponent(query)}`), query).toEqual({
@@ -302,8 +308,32 @@ describe('classic Metrics links', () => {
         dropped: ['1 filter'],
       });
     }
-    for (const query of ['WHERE', 'WHERE > 5', 'WHERE and on() up', 'WHERE{host="a"}'])
+    // PromQL with a metric named WHERE stays a query.
+    for (const query of [
+      'WHERE',
+      'WHERE > 5',
+      ' WHERE > 5',
+      'WHERE and on() up',
+      'WHERE or up',
+      'WHERE unless up',
+      'WHERE offset 5m',
+      'WHERE{host="a"}',
+      'WHERE [5m]',
+      'WHERE * 2',
+      'WHERE == bool 1',
+      'WHERE atan2 up',
+    ]) {
       expect(promqlErrors(query), query).toEqual([]);
+      expect(translate(`?query=${encodeURIComponent(query)}`), query).toBeUndefined();
+    }
+  });
+
+  it('reports untyped and indented classic filters with a range', () => {
+    for (const query of ["WHERE host = 'node-a'", " WHERE text host = 'node-a'"])
+      expect(
+        translate(`?query=${encodeURIComponent(query)}&query=cpu&start=1h&end=now&type=fixed`),
+        query,
+      ).toEqual({ search: '?query=cpu&range=1h', dropped: ['1 filter'] });
   });
 
   it('leaves a link from this frontend alone', () => {
@@ -396,6 +426,25 @@ describe('classic Logs filters', () => {
         "WHERE (text level = 'a' OR text level = 'b') AND text host IS NOT NULL AND number n > 3 AND text app = 'x AND y'",
       ),
     ).toEqual({ filters: [{ field: 'app', operator: '=', value: 'x AND y' }], skipped: 3 });
+  });
+
+  it('reads untyped conditions after leading whitespace, as classic does', () => {
+    for (const query of [
+      "WHERE host = 'node-a'",
+      " WHERE text host = 'node-a'",
+      "\n where host = 'node-a'",
+    ])
+      expect(classicLogFilters(query), query).toEqual({
+        filters: [{ field: 'host', operator: '=', value: 'node-a' }],
+        skipped: 0,
+      });
+    expect(
+      classicLogsState(new URLSearchParams(`query=${encodeURIComponent(" WHERE host = 'a'")}`)),
+    ).toEqual({
+      range: undefined,
+      filters: [{ field: 'host', operator: '=', value: 'a' }],
+      dropped: [],
+    });
   });
 
   it('reads untyped and boolean comparisons', () => {

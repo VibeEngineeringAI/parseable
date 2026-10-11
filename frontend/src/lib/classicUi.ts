@@ -1,3 +1,4 @@
+import { parser } from '@prometheus-io/lezer-promql';
 import { basePath } from './config';
 import { metricSelector, validateRange } from './promql';
 import type { LogFilter, TimeRange } from './types';
@@ -286,10 +287,22 @@ function droppedFromLink(params: URLSearchParams, unreadRange: boolean, filters:
 }
 
 /**
- * A classic Metrics filter, `WHERE ${type} ${column} …` or `WHERE (… OR …)`.
- * Neither form parses as PromQL, so a query here is never mistaken for one.
+ * Whether `query` is a classic Metrics filter rather than PromQL. Classic writes
+ * `WHERE ${type} ${column} …`, and its parser also reads untyped conditions and
+ * leading whitespace. None of them parse as PromQL, so a query that does, such
+ * as `WHERE > 5` for a metric named WHERE, is kept.
  */
-const classicMetricsFilter = new RegExp(`^WHERE\\s+(?:\\(|(?:${filterTypes})\\s)`, 'i');
+function isClassicMetricsFilter(query: string): boolean {
+  if (!/^\s*WHERE\s+\S/i.test(query)) return false;
+  let invalid = false;
+  parser.parse(query).iterate({
+    enter(node) {
+      if (node.type.isError) invalid = true;
+      return !invalid;
+    },
+  });
+  return invalid;
+}
 
 /** Classic Metrics parameters with no meaning here. */
 const classicMetricsOnly = ['tz', 'groupBy', 'view', 'viewType', 'viewMode', 'fromSavedFilter'];
@@ -309,11 +322,11 @@ export function classicMetricsSearch(
   const params = new URLSearchParams(search);
   const type = params.get('type');
   const classicTime = type === 'fixed' || type === 'custom';
-  const filters = params.getAll('query').filter((query) => classicMetricsFilter.test(query));
+  const filters = params.getAll('query').filter((query) => isClassicMetricsFilter(query));
   if (!classicTime && !filters.length) return;
   const next = new URLSearchParams();
   for (const [name, value] of params) {
-    if (name === 'query' ? classicMetricsFilter.test(value) : classicMetricsOnly.includes(name))
+    if (name === 'query' ? isClassicMetricsFilter(value) : classicMetricsOnly.includes(name))
       continue;
     if (!classicTime || !['type', 'start', 'end'].includes(name)) next.append(name, value);
   }

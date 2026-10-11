@@ -114,6 +114,16 @@ test('each classic Logs link opened while Logs is open is applied', async ({ pag
     expect(query.query).toContain(`"level" = 'info'`);
 });
 
+test('an untyped, indented classic Logs filter opens as a filter', async ({ page }) => {
+  const queries = await server(page);
+  await page.goto(
+    `/logs/explore/app?start=1h&end=now&type=fixed&query=${encodeURIComponent(" WHERE level = 'warn'")}`,
+  );
+  await expect(page.getByTestId('filter-pill-value')).toHaveText(['warn']);
+  await expect(page.getByText('Not carried over')).toHaveCount(0);
+  await expect.poll(() => queries.at(-1)?.query).toContain(`"level" = 'warn'`);
+});
+
 test('a classic Logs link replaces a search typed before it', async ({ page }) => {
   const queries = await server(page);
   await page.goto('/logs/explore/app');
@@ -219,6 +229,20 @@ test('a classic Metrics link names its filter on every state of the page', async
   await navigateInApp(page, '/metrics/explore/otel?range=1h');
   await expect(page.getByText('PromQL is not available on this server')).toBeVisible();
   await expect(notice(page)).toHaveCount(0);
+});
+
+test('untyped and indented classic Metrics filters are reported, not run', async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  const editor = page.getByRole('textbox', { name: 'PromQL query A', exact: true });
+  for (const filter of ["WHERE host = 'node-a'", " WHERE text host = 'node-a'"]) {
+    await page.goto(
+      `/metrics/explore/demo_metrics?start=1h&end=now&type=fixed&query=${encodeURIComponent(filter)}`,
+    );
+    await expect(page).toHaveURL('/metrics/explore/demo_metrics?range=1h');
+    await expect(editor).toBeVisible();
+    await expect(editor).not.toContainText('WHERE');
+    await expect(notice(page)).toHaveText(/1 filter\./);
+  }
 });
 
 test('editing after a classic Metrics link keeps its notice, and dismissing keeps the edit', async ({
