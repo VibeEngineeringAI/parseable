@@ -1,12 +1,13 @@
 import { expect, test, type Page } from '@playwright/test';
 
-/** A live server with one dataset; returns the query requests it receives. */
+/** A live server with two datasets; returns the query requests it receives. */
 async function server(page: Page) {
   const queries: { query: string; startTime: string; endTime: string }[] = [];
   await page.route('**/api/v1/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    if (path === '/api/v1/logstream') return route.fulfill({ json: [{ name: 'app' }] });
+    if (path === '/api/v1/logstream')
+      return route.fulfill({ json: [{ name: 'app' }, { name: 'other' }] });
     if (path.endsWith('/schema'))
       return route.fulfill({ json: { fields: [{ name: 'level' }, { name: 'message' }] } });
     if (path === '/api/v1/query') {
@@ -54,12 +55,83 @@ test('a classic quick range shows as that range', async ({ page }) => {
   expect(Date.parse(endTime) - Date.parse(startTime)).toBe(10 * 60_000);
 });
 
+/** Opens `path` the way the router's own navigation does, without reloading. */
+async function navigateInApp(page: Page, path: string, usr?: unknown) {
+  await page.evaluate(
+    ({ path, usr }) => {
+      const { idx } = window.history.state;
+      window.history.pushState({ usr, key: `link-${idx + 1}`, idx: idx + 1 }, '', path);
+      window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
+    },
+    { path, usr },
+  );
+}
+
+const link = (dataset: string, start: string, level: string, rest = '') =>
+  `/logs/explore/${dataset}?start=${start}&end=now&type=fixed&query=${encodeURIComponent(`WHERE text level = '${level}'`)}${rest}`;
+
+test('each classic Logs link opened while Logs is open is applied', async ({ page }) => {
+  const queries = await server(page);
+  const timeRange = page.getByLabel('Time range', { exact: true });
+  const pills = page.getByTestId('filter-pill-value');
+  const lastQuery = async () => {
+    await expect.poll(() => queries.length).toBeGreaterThan(0);
+    return queries[queries.length - 1];
+  };
+  await page.goto(link('app', '10m', 'error'));
+  await expect(timeRange).toHaveValue('10m');
+  await expect(pills).toHaveText(['error']);
+  await expect(page).toHaveURL('/logs/explore/app');
+
+  await navigateInApp(page, link('app', '3d', 'warn', '&tz=Asia%2FKolkata&keep=1#row-7'), {
+    from: 'test',
+  });
+  await expect(timeRange).toHaveValue('3d');
+  await expect(pills).toHaveText(['warn']);
+  await expect(page.getByRole('status').filter({ hasText: 'Not carried over' })).toHaveText(
+    /time zone Asia\/Kolkata/,
+  );
+  // The parameters come out, and the rest of the address and the history state stay.
+  await expect(page).toHaveURL('/logs/explore/app?keep=1#row-7');
+  expect(await page.evaluate(() => window.history.state.usr)).toEqual({ from: 'test' });
+  await expect.poll(async () => (await lastQuery()).query).toContain(`"level" = 'warn'`);
+  const warn = await lastQuery();
+  expect(Date.parse(warn.endTime) - Date.parse(warn.startTime)).toBe(3 * 86_400_000);
+
+  // A link to another dataset is applied after the dataset's own reset.
+  await navigateInApp(page, link('other', '30m', 'info'));
+  await expect(page.getByLabel('Dataset', { exact: true })).toHaveValue('other');
+  await expect(timeRange).toHaveValue('30m');
+  await expect(pills).toHaveText(['info']);
+  await expect(page.getByText('Not carried over')).toHaveCount(0);
+  await expect(page).toHaveURL('/logs/explore/other');
+  await expect.poll(async () => (await lastQuery()).query).toContain('FROM "other"');
+  const info = await lastQuery();
+  expect(info.query).toContain(`"level" = 'info'`);
+  expect(Date.parse(info.endTime) - Date.parse(info.startTime)).toBe(30 * 60_000);
+  // Every query of the other dataset used that link's filter.
+  for (const query of queries.filter((q) => q.query.includes('FROM "other"')))
+    expect(query.query).toContain(`"level" = 'info'`);
+});
+
 test('classic paths that moved open their page here', async ({ page }) => {
   await server(page);
   await page.goto('/logs/search/app?start=1h&end=now&type=fixed');
   await expect(page).toHaveURL('/logs/explore/app');
   await page.goto('/settings');
   await expect(page).toHaveURL('/alerts/targets');
+  // The dev server rejects a malformed escape itself, so these open from inside the app.
+  await page.goto('/');
+  for (const [path, target] of [
+    ['/logs/search/100%', '/logs/explore/100%'],
+    ['/logs/search/%E0%A4%A', '/logs/explore/%E0%A4%A'],
+    ['/metrics/explore/x/metric/%E0%A4%A', '/metrics/explore/x/metric/%E0%A4%A'],
+  ]) {
+    await navigateInApp(page, path);
+    await expect(page).toHaveURL(target);
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
+  }
   await page.goto('/apm/app/checkout.api');
   await expect(page.getByText('This page is only available in the classic UI.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
