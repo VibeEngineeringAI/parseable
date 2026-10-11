@@ -62,7 +62,9 @@ async function apiCreate(request: APIRequestContext, body: unknown, auth = heade
 test.beforeAll(async ({ request }) => {
   // Cookies are shared across ports only when both origins use the same host.
   if (new URL(live!).hostname !== new URL(server!).hostname)
-    throw new Error('The /next and classic origins must use the same host to share login cookies.');
+    throw new Error(
+      'The native and classic origins must use the same host to share login cookies.',
+    );
   const now = Math.floor(Date.now() / 1000);
   ingestAttempted = true;
   const points = ['node-a', 'node-b'].flatMap((host, hostIndex) =>
@@ -167,7 +169,7 @@ test.afterAll(async ({ request }) => {
   if (roleAttempted) await cleanup('reader role', () => remove(`/api/v1/role/${role}`, 404));
   if (errors.length) throw new AggregateError(errors, 'Dashboard live-test cleanup failed.');
 });
-test('create SQL and PromQL tiles and variables through /next; verify exact classic shapes', async ({
+test('create SQL and PromQL tiles and variables in the native UI; verify exact classic shapes', async ({
   page,
   request,
 }) => {
@@ -385,7 +387,7 @@ test('hard-load the saved dashboard on the classic origin; both tiles render wit
     contentType: 'image/png',
   });
 });
-test('classic-shaped API dashboard renders in /next and unknown document, tile and config fields survive editing', async ({
+test('classic-shaped API dashboard renders in the native UI and unknown document, tile and config fields survive editing', async ({
   page,
   request,
 }) => {

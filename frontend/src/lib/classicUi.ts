@@ -21,7 +21,7 @@ export function classicUiPath(pathname: string): string {
   return '/';
 }
 
-/** Incoming classic links retain their query and hash when opened under /next. */
+/** Incoming classic links retain their query and hash when opened in the native UI. */
 export function nextUiPath(path: string): string {
   return path.replace(/^\/alerts\/create\/?(?=[?#]|$)/, '/alerts/new');
 }
