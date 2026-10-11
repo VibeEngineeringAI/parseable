@@ -461,6 +461,8 @@ jobs:
   create-checksum:
     runs-on: ubuntu-22.04 # or ubuntu-24.04, ubuntu-20.04
     needs: [build-linux, build-windows, build-mac, build-kafka-linux, build-kafka-mac]
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts created
         uses: actions/download-artifact@v4.1.7
