@@ -2,6 +2,9 @@
 # and publishes the artifacts to the GitHub release page.
 # Automatic tag builds are temporarily paused. Run this workflow manually
 # with an existing release tag (e.g., v1.0.0, v2.3.4).
+# Binaries build on GitHub-hosted runners because this fork has no
+# self-hosted runners. The Docker images publish to upstream's Quay
+# repository, so that job runs only in parseablehq/parseable.
 # It also creates a checksum file for the artifacts and publishes it to the release page.
 # It also builds and pushes a Docker image to Docker Hub with the same version tag.
 
@@ -68,7 +71,7 @@ jobs:
 
   build-linux:
     name: Build for ${{matrix.target}}
-    runs-on: self-hosted
+    runs-on: ${{ matrix.os }}
     permissions:
       id-token: write
       contents: write
@@ -78,9 +81,13 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
             use-cross: false
+          # A hosted runner lost contact during the cross-compiled LTO build,
+          # so aarch64 builds natively on an Arm runner.
           - target: aarch64-unknown-linux-gnu
-            use-cross: true
+            os: ubuntu-24.04-arm
+            use-cross: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,6 +118,16 @@ jobs:
       - name: Build with cross
         if: matrix.use-cross
         run: cross build --profile release-lto --target ${{ matrix.target }}
+
+      # The aarch64 runner lost contact during the fat-LTO build twice, which
+      # GitHub attributes to CPU or memory starvation. Free disk, add swap and
+      # record the resources as annotations, which survive a lost runner.
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 16G /swap.release && sudo chmod 600 /swap.release
+          sudo mkswap /swap.release && sudo swapon /swap.release
+          echo "::notice title=Runner resources::$(nproc) CPUs; $(free -h | awk '/Mem/{print $2" RAM"} /Swap/{print $2" swap"}' | paste -sd ' '); $(df -h --output=avail / | tail -1 | tr -d ' ') free on /"
 
       - name: Build native
         if: ${{ !matrix.use-cross }}
@@ -266,7 +283,7 @@ jobs:
 
   build-kafka-linux:
     name: Build Kafka for x86_64-unknown-linux-gnu
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: write
@@ -444,6 +461,8 @@ jobs:
   create-checksum:
     runs-on: ubuntu-22.04 # or ubuntu-24.04, ubuntu-20.04
     needs: [build-linux, build-windows, build-mac, build-kafka-linux, build-kafka-mac]
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts created
         uses: actions/download-artifact@v4.1.7
@@ -470,6 +489,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-push-docker-image:
+    if: github.repository == 'parseablehq/parseable'
     runs-on: self-hosted
     steps:
       - name: Checkout
