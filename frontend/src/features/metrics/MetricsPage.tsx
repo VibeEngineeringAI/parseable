@@ -46,7 +46,12 @@ const datasetPath = (name: string) => `/metrics/explore/${encodeURIComponent(nam
  * History state of a Metrics location: the classic link notice that belongs to
  * the entry, and whether the page made the navigation itself.
  */
-type PageState = { classicDropped?: string[]; metricsOwnNavigation?: boolean } | null;
+type PageState = {
+  classicDropped?: string[];
+  metricsOwnNavigation?: boolean;
+  /** Set on the location a classic link was rewritten to, which is not rewritten again. */
+  classicTranslated?: boolean;
+} | null;
 
 export function MetricsPage() {
   const { client } = useApp();
@@ -117,9 +122,12 @@ export function MetricsPage() {
   // A classic link's range and filters are rewritten before the explorer reads the
   // address. The page's own navigations carry its own queries, which can look like
   // a classic filter while being typed (a metric named WHERE), so they are skipped.
-  const classicLink = pageState?.metricsOwnNavigation
-    ? undefined
-    : classicMetricsSearch(location.search);
+  // The result of a rewrite is not rewritten again, so a classic `promql` that is
+  // not valid PromQL, such as `WHERE >`, stays as classic shows it.
+  const classicLink =
+    pageState?.metricsOwnNavigation || pageState?.classicTranslated
+      ? undefined
+      : classicMetricsSearch(location.search);
   if (classicLink)
     return (
       <Navigate
@@ -128,6 +136,7 @@ export function MetricsPage() {
         state={{
           ...(location.state as object | null),
           metricsOwnNavigation: false,
+          classicTranslated: true,
           classicDropped: classicLink.dropped,
         }}
       />

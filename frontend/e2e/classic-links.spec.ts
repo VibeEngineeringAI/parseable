@@ -294,6 +294,18 @@ test('a query being typed is never taken for a classic filter', async ({ page })
   await expect(notice(page)).toHaveCount(0);
 });
 
+test('a classic PromQL link that does not parse opens as classic shows it', async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+  await page.goto(
+    `/metrics/explore/demo_metrics?${new URLSearchParams({ promql: 'WHERE >', viewType: 'explorer', tz: 'Asia/Kolkata' })}`,
+  );
+  const editor = page.getByRole('textbox', { name: 'PromQL query A', exact: true });
+  await expect(editor).toHaveText('WHERE >');
+  await expect(page).toHaveURL(/query=WHERE\+%3E/);
+  // Translated once: the notice is the link's, not a second rewrite's "1 filter".
+  await expect(notice(page)).toHaveText(/time zone Asia\/Kolkata \(times are shown in UTC\)\./);
+});
+
 test('a dismissed Metrics notice stays dismissed after reconnecting', async ({ page }) => {
   await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
   await page.goto(`/metrics/explore/demo_metrics?start=1h&end=now&type=fixed&query=${hostFilter}`);
