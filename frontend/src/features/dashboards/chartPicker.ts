@@ -73,6 +73,28 @@ export function applySeriesStyle(tile: DashboardTile, style: SeriesStyle): Parti
   return { config };
 }
 
+export const queryValueThemeKeys = [
+  'blue',
+  'brown',
+  'emerald',
+  'fuchsia',
+  'grey',
+  'orange',
+  'pink',
+  'purple',
+  'red',
+  'yellow',
+] as const;
+
+export function queryValueThemeOf(layout: unknown): (typeof queryValueThemeKeys)[number] {
+  const theme = record(layout).queryValueTheme;
+  return queryValueThemeKeys.find((key) => key === theme) ?? 'blue';
+}
+
+export function sparklineOf(layout: unknown): boolean {
+  return record(layout).sparkline === true;
+}
+
 export type Appearance = {
   colourScheme: boolean;
   legend: 'none' | 'basic' | 'full';
@@ -83,6 +105,8 @@ export type Appearance = {
   segments: boolean;
   humanize: boolean;
   axisTitles: boolean;
+  queryValueTheme: boolean;
+  sparkline: boolean;
 };
 
 export function appearanceFor(choice: ChartChoice | undefined): Appearance {
@@ -98,6 +122,8 @@ export function appearanceFor(choice: ChartChoice | undefined): Appearance {
     segments: choice === 'gauge',
     humanize: scalar,
     axisTitles: choice !== undefined && !scalar && !slices,
+    queryValueTheme: choice === 'query-value',
+    sparkline: choice === 'query-value',
   };
 }
 

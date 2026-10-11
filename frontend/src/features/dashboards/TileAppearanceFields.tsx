@@ -11,10 +11,13 @@ import {
   chartIssues,
   gaugeRange,
   gaugeSegments,
+  queryValueThemeKeys,
+  queryValueThemeOf,
   rescaleSegments,
   seriesStyle,
   setSegmentCount,
   setSegmentMode,
+  sparklineOf,
   type Segments,
   type SeriesStyle,
 } from './chartPicker';
@@ -179,6 +182,7 @@ export function TileAppearanceFields({ draft, change, onValidity }: AppearancePr
   const legendPositions =
     appearance.legend === 'full' ? ['top', 'bottom', 'left', 'right'] : ['top', 'bottom'];
   const legendPosition = text(layout.legendPosition, 'bottom');
+  const queryValueTheme = text(layout.queryValueTheme);
   function configLayout(key: string, value: unknown) {
     change({ config: { ...config, layout: { ...layout, [key]: value } } });
   }
@@ -293,6 +297,33 @@ export function TileAppearanceFields({ draft, change, onValidity }: AppearancePr
           <option value="vertical">Vertical</option>
           <option value="diagonal">Diagonal from top left</option>
           <option value="none">None</option>
+        </Select>
+      )}
+      {appearance.queryValueTheme && (
+        <Select
+          label="Theme"
+          value={queryValueTheme || queryValueThemeOf(layout)}
+          onChange={(event) => configLayout('queryValueTheme', event.target.value)}
+        >
+          {queryValueTheme !== '' &&
+            !queryValueThemeKeys.some((key) => key === queryValueTheme) && (
+              <option value={queryValueTheme}>{queryValueTheme} (preserved)</option>
+            )}
+          {queryValueThemeKeys.map((key) => (
+            <option key={key} value={key}>
+              {capitalized(key)}
+            </option>
+          ))}
+        </Select>
+      )}
+      {appearance.sparkline && (
+        <Select
+          label="Spark chart"
+          value={sparklineOf(layout) ? 'enabled' : 'disabled'}
+          onChange={(event) => configLayout('sparkline', event.target.value === 'enabled')}
+        >
+          <option value="enabled">Enabled</option>
+          <option value="disabled">Disabled</option>
         </Select>
       )}
       {appearance.colourScheme && (

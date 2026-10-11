@@ -1,4 +1,5 @@
 import type { DashboardTile, LogRecord, PromqlInstantResult } from '../../lib/types';
+import type { QueryResult } from '../../lib/promqlResults';
 import { chartValue } from './chartValue';
 import { gaugeRange as layoutRange } from './chartPicker';
 import { paletteColour, tilePalette } from './palettes';
@@ -104,6 +105,17 @@ function promqlValue(result: PromqlInstantResult | undefined): number | undefine
   }
 }
 
+/** Gauges and query values prefer a present instant envelope and use the last
+ * query with a finite value, taking the first finite series within each query. */
+export function promqlStatValue(queries: QueryResult[]): number | undefined {
+  let value: number | undefined;
+  for (const query of queries) {
+    const next = promqlValue(query.instant ?? query.range);
+    if (next !== undefined) value = next;
+  }
+  return value;
+}
+
 /** SQL gauges use the first row's first configured y field. Native-created tiles
  * with an empty field fall back to chartValue: the first numeric column of the
  * last row, matching the query-value tile. PromQL uses the last query with a value. */
@@ -112,14 +124,7 @@ export function gaugeValue(
   result: TileResults,
   rows: LogRecord[],
 ): number | undefined {
-  if (result.promql) {
-    let value: number | undefined;
-    for (const query of result.promql) {
-      const next = promqlValue(query.instant ?? query.range);
-      if (next !== undefined) value = next;
-    }
-    return value;
-  }
+  if (result.promql) return promqlStatValue(result.promql);
   const row = result.rows?.[0];
   if (!row) return;
   const configured = record(record(record(tile.config).axes).y).field;

@@ -12,7 +12,9 @@ import {
   type CartesianChart,
 } from './cartesian';
 import { gaugeModel, gaugeValue } from './gauge';
-import { chartValue, diagonalFill, fillStyle, percentFill } from './chartValue';
+import { fillStyle, percentFill } from './chartValue';
+import { QueryValue } from './QueryValue';
+import { queryValueNumber, queryValueTheme, sparklineValues } from './queryValue';
 import { formatValue as formatTileValue, valueFormat } from './formatValue';
 import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
@@ -191,27 +193,16 @@ export function TileChart({
       </div>
     );
   if (tile.chartType === 'query-value') {
-    const value = chartValue(rows, tile, !!result.promql);
+    const value = queryValueNumber(tile, result, rows);
     const fill = value === undefined ? undefined : percentFill(value, tile);
-    const style = fillStyle(tile);
     return (
-      <div className="dashboard-stat" role="group" aria-label={`${tileTitle(tile)} value`}>
-        {fill !== undefined && (
-          <span
-            className="dashboard-stat-fill"
-            data-direction={style}
-            style={
-              style === 'vertical'
-                ? { height: `${fill}%` }
-                : style === 'diagonal'
-                  ? { clipPath: diagonalFill(fill) }
-                  : { width: `${fill}%` }
-            }
-            aria-hidden="true"
-          />
-        )}
-        {value === undefined ? 'No values returned' : formatValue(value)}
-      </div>
+      <QueryValue
+        label={tileTitle(tile)}
+        text={value === undefined ? undefined : formatValue(value)}
+        theme={queryValueTheme(tile)}
+        fill={fill === undefined ? undefined : { style: fillStyle(tile), percent: fill }}
+        spark={sparklineValues(tile, result, chart)}
+      />
     );
   }
   const style = cartesianStyle(tile),

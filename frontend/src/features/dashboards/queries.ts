@@ -7,6 +7,7 @@ import type {
   LogRecord,
 } from '../../lib/types';
 import type { QueryResult } from '../../lib/promqlResults';
+import { sparklineEnabled } from './queryValue';
 import {
   instantCharts,
   promqlQueries,
@@ -54,8 +55,9 @@ export async function loadTile(
     queries.map(async ({ query: template, type }, index): Promise<QueryResult> => {
       const query = interpolatePromql(template, values);
       const stat = instantCharts.includes(text(tile.chartType));
+      const sparkline = index === 0 && sparklineEnabled(tile);
       const [range, instant] = await Promise.all([
-        !stat && type !== 'instant'
+        sparkline || (!stat && type !== 'instant')
           ? limit(
               () =>
                 client.promqlQueryRange(
