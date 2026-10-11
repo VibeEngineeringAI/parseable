@@ -2,11 +2,18 @@ import { useCallback, useMemo } from 'react';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
+import {
+  cartesianChart,
+  cartesianStyle,
+  promqlCategoryChart,
+  type CartesianChart,
+} from './cartesian';
 import { chartValue, diagonalFill, fillStyle, percentFill } from './chartValue';
+import { tilePalette } from './palettes';
 import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
-import { record, sqlChart, text, tileTitle } from './tiles';
+import { record, text, tileTitle } from './tiles';
 import type { TileResults } from './queries';
 export function TileChart({
   tile,
@@ -24,8 +31,12 @@ export function TileChart({
   const config = record(tile.config),
     layout = record(config.layout),
     axes = record(config.axes);
-  const chart = useMemo(() => {
-    if (!result.promql) return sqlChart(result.rows ?? [], tile);
+  const chart = useMemo<CartesianChart>(() => {
+    if (!result.promql) return cartesianChart(result.rows ?? [], tile);
+    if (['timeseries', 'line', 'area', 'bar'].includes(text(tile.chartType))) {
+      const categorical = promqlCategoryChart(result.promql);
+      if (categorical) return categorical;
+    }
     const converted = result.promql.map((row) =>
       row.range
         ? row
@@ -113,11 +124,16 @@ export function TileChart({
       </div>
     );
   }
+  const style = cartesianStyle(tile),
+    horizontal = style.horizontal && chart.categories !== undefined;
   return (
     <div
       ref={fitted.root}
       className="dashboard-chart"
       data-legend-position={text(layout.legendPosition, 'bottom')}
+      data-chart-kind={style.kind === 'bar' ? 'bar' : style.fill ? 'area' : 'line'}
+      data-stacked={style.stacked}
+      data-orientation={horizontal ? 'horizontal' : 'vertical'}
     >
       {text(record(axes.y).title) && (
         <p className="muted dashboard-axis-title">{text(record(axes.y).title)}</p>
@@ -125,24 +141,43 @@ export function TileChart({
       <TimeSeriesChart
         timestamps={chart.timestamps}
         series={chart.series}
+        categories={chart.categories}
+        kind={style.kind}
+        fill={style.fill}
+        smooth={style.smooth}
+        stacked={style.stacked}
+        horizontal={style.horizontal}
+        colors={tilePalette(tile)}
+        showXAxis={record(axes.x).display !== false}
+        paddedBounds
         title={`${tileTitle(tile)} chart`}
         showTitle={false}
         xAxisTitle={text(record(axes.x).title)}
         showSeriesCount={false}
         height={fitted.pixels}
-        yAxisSize={chart.series.reduce<number>(
-          (size, series) =>
-            series.values.reduce<number>(
-              (width, value) =>
-                value !== null && Number.isFinite(value)
-                  ? Math.max(width, formatValue(value).length * 7 + 24)
-                  : width,
-              size,
-            ),
-          64,
-        )}
+        yAxisSize={
+          horizontal
+            ? Math.max(
+                64,
+                Math.min(
+                  180,
+                  Math.max(0, ...(chart.categories ?? []).map((label) => label.length)) * 7 + 24,
+                ),
+              )
+            : chart.series.reduce<number>(
+                (size, series) =>
+                  series.values.reduce<number>(
+                    (width, value) =>
+                      value !== null && Number.isFinite(value)
+                        ? Math.max(width, formatValue(value).length * 7 + 24)
+                        : width,
+                    size,
+                  ),
+                64,
+              )
+        }
         announceSeries={false}
-        xRange={xRange}
+        xRange={chart.categories ? undefined : xRange}
         formatValue={formatValue}
         emptyMessage="No results for the selected time range"
       />

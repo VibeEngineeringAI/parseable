@@ -181,11 +181,18 @@
   font: 12px/1.5 var(--font-sans);
 }
 
-.charts-tooltip time {
+.charts-tooltip time,
+.charts-tooltip-category {
   display: block;
   margin-bottom: 6px;
   color: var(--color-muted);
   font-size: 11px;
+}
+
+.charts-tooltip-category {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .charts-tooltip-row {
