@@ -1,0 +1,55 @@
+{
+  "tile_id": "01K7A000000000000000000007",
+  "authorMode": "manual",
+  "title": "Total events",
+  "tileType": "code",
+  "chartType": "query-value",
+  "chartQuery": "SELECT COUNT(*) AS events FROM \"app-logs\"",
+  "dbName": ["app-logs"],
+  "config": {
+    "type": "query-value",
+    "colourScheme": "classic",
+    "layout": {
+      "legendPosition": "bottom",
+      "segments": {
+        "value": [10, 90],
+        "isPercent": true
+      },
+      "label": false,
+      "stacked": false,
+      "sparkline": false
+    },
+    "axes": {
+      "x": {
+        "field": "events",
+        "title": "events",
+        "display": true
+      },
+      "y": {
+        "field": "events",
+        "title": "events",
+        "display": true,
+        "beginAtZero": true
+      },
+      "groupBy": {
+        "field": []
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 6
+  }
+}

@@ -12,10 +12,13 @@ import {
   fieldList,
   gaugeRange,
   gaugeSegments,
+  queryValueThemeKeys,
+  queryValueThemeOf,
   rescaleSegments,
   seriesStyle,
   setSegmentCount,
   setSegmentMode,
+  sparklineOf,
 } from './chartPicker';
 import { record } from './tiles';
 
@@ -151,6 +154,38 @@ describe('chart choices', () => {
       );
     }
   });
+  it.each(['emerald', 'future-theme'])(
+    'keeps the stored theme %s and sparkline through Query value round trips',
+    (queryValueTheme) => {
+      const config = record(tile.config);
+      const source = {
+        ...tile,
+        config: {
+          ...config,
+          layout: { ...record(config.layout), queryValueTheme, sparkline: false },
+        },
+      };
+      const before = structuredClone(source);
+      const selected = { ...source, ...applyChartChoice(source, 'query-value') };
+      expect(record(record(selected.config).layout)).toMatchObject({
+        queryValueTheme,
+        sparkline: true,
+      });
+      for (const { value } of chartChoices.filter(({ value }) => value !== 'query-value')) {
+        const switched = { ...selected, ...applyChartChoice(selected, value) };
+        expect(record(record(switched.config).layout)).toMatchObject({
+          queryValueTheme,
+          sparkline: true,
+        });
+        const restored = { ...switched, ...applyChartChoice(switched, 'query-value') };
+        expect(record(record(restored.config).layout)).toMatchObject({
+          queryValueTheme,
+          sparkline: true,
+        });
+      }
+      expect(source).toEqual(before);
+    },
+  );
   it('creates only the config keys needed for a pick', () => {
     expect(applyChartChoice({ tile_id: 'x' }, 'pie')).toEqual({
       chartType: 'pie',
@@ -188,18 +223,18 @@ describe('chart choices', () => {
 
 describe('appearance controls', () => {
   it.each([
-    ['timeseries', true, 'basic', false, false, true, false, false, false, true],
-    ['line', true, 'basic', false, false, false, false, false, false, true],
-    ['bar', true, 'basic', false, true, false, false, false, false, true],
-    ['stacked-bar', true, 'basic', false, true, false, false, false, false, true],
-    ['area', true, 'basic', false, false, false, false, false, false, true],
-    ['pie', true, 'full', true, false, false, false, false, false, false],
-    ['donut', true, 'full', true, false, false, false, false, false, false],
-    ['query-value', false, 'none', false, false, false, false, false, true, false],
-    ['gauge', false, 'none', false, false, false, true, true, true, false],
-    ['table', true, 'basic', false, false, false, false, false, false, true],
-    ['bubble', true, 'basic', false, false, false, false, false, false, true],
-    [undefined, false, 'none', false, false, false, false, false, false, false],
+    ['timeseries', true, 'basic', false, false, true, false, false, false, true, false, false],
+    ['line', true, 'basic', false, false, false, false, false, false, true, false, false],
+    ['bar', true, 'basic', false, true, false, false, false, false, true, false, false],
+    ['stacked-bar', true, 'basic', false, true, false, false, false, false, true, false, false],
+    ['area', true, 'basic', false, false, false, false, false, false, true, false, false],
+    ['pie', true, 'full', true, false, false, false, false, false, false, false, false],
+    ['donut', true, 'full', true, false, false, false, false, false, false, false, false],
+    ['query-value', false, 'none', false, false, false, false, false, true, false, true, true],
+    ['gauge', false, 'none', false, false, false, true, true, true, false, false, false],
+    ['table', true, 'basic', false, false, false, false, false, false, true, false, false],
+    ['bubble', true, 'basic', false, false, false, false, false, false, true, false, false],
+    [undefined, false, 'none', false, false, false, false, false, false, false, false, false],
   ] as const)(
     'shows the controls for %s',
     (
@@ -213,6 +248,8 @@ describe('appearance controls', () => {
       segments,
       humanize,
       axisTitles,
+      queryValueTheme,
+      sparkline,
     ) => {
       expect(appearanceFor(choice)).toEqual({
         colourScheme,
@@ -224,9 +261,56 @@ describe('appearance controls', () => {
         segments,
         humanize,
         axisTitles,
+        queryValueTheme,
+        sparkline,
       });
     },
   );
+});
+
+describe('query-value configuration', () => {
+  it('offers the ten theme keys in the classic order', () => {
+    expect(queryValueThemeKeys).toEqual([
+      'blue',
+      'brown',
+      'emerald',
+      'fuchsia',
+      'grey',
+      'orange',
+      'pink',
+      'purple',
+      'red',
+      'yellow',
+    ]);
+  });
+  it.each(queryValueThemeKeys)('reads the stored %s theme key', (queryValueTheme) => {
+    expect(queryValueThemeOf({ queryValueTheme })).toBe(queryValueTheme);
+  });
+  it('defaults missing and unknown themes to Blue without rewriting stored values', () => {
+    for (const layout of [
+      undefined,
+      null,
+      {},
+      { queryValueTheme: 'future-theme' },
+      { queryValueTheme: '#3563E9' },
+      { queryValueTheme: 'Blue' },
+      { queryValueTheme: '' },
+      { queryValueTheme: null },
+      { queryValueTheme: 1 },
+    ]) {
+      const before = structuredClone(layout);
+      expect(queryValueThemeOf(layout)).toBe('blue');
+      expect(layout).toEqual(before);
+    }
+  });
+  it('enables the spark chart only for a stored boolean true', () => {
+    expect(sparklineOf({ sparkline: true })).toBe(true);
+    for (const sparkline of [false, undefined, null, 'true', 'enabled', 1, [], {}])
+      expect(sparklineOf({ sparkline })).toBe(false);
+    expect(sparklineOf({})).toBe(false);
+    expect(sparklineOf(undefined)).toBe(false);
+    expect(sparklineOf(null)).toBe(false);
+  });
 });
 
 describe('data bindings', () => {

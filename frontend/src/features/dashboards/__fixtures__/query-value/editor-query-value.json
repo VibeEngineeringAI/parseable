@@ -1,0 +1,54 @@
+{
+  "tile_id": "01M4P9DRFV0EG28CRJB8J30KTF",
+  "authorMode": "manual",
+  "chartQuery": "SELECT ROUND(AVG(cpu_pct), 2) AS cpu_pct\nFROM \"web_requests\"\nWHERE demo_run = (SELECT MAX(demo_run) FROM \"web_requests\")",
+  "dbName": ["web_requests"],
+  "title": "query-value: average CPU utilization",
+  "chartType": "query-value",
+  "tileType": "code",
+  "config": {
+    "type": "query-value",
+    "colourScheme": "teal",
+    "layout": {
+      "segments": {
+        "value": [10, 90],
+        "isPercent": true
+      },
+      "legendPosition": "left",
+      "label": false,
+      "stacked": false,
+      "sparkline": false,
+      "queryValueTheme": "emerald",
+      "unit": "%",
+      "precision": 2
+    },
+    "axes": {
+      "x": {
+        "field": "time_bucket",
+        "title": "Timestamp"
+      },
+      "y": {
+        "field": "cpu_pct",
+        "title": "cpu_pct",
+        "display": true,
+        "beginAtZero": true
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "x": 0,
+    "y": null,
+    "w": 6,
+    "h": 6
+  }
+}

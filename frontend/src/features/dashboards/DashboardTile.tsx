@@ -28,6 +28,7 @@ import {
 } from './tiles';
 import { storedRange } from './timeRange';
 import { tileHandoffs } from './handoffs';
+import { sparklineEnabled } from './queryValue';
 import type { VariableValues } from './variables';
 const typeLabel = (value: unknown) => {
   const name = text(value) || 'Unknown';
@@ -99,6 +100,7 @@ export function DashboardTile({
     ...(tile.tileType === 'promql'
       ? {
           stat: instantCharts.includes(text(tile.chartType)),
+          sparkline: sparklineEnabled(tile),
           step: storedStep(tile),
           maxDataPoints:
             record(tile.config).maxDataPoints ?? record(record(tile.config).layout).maxDataPoints,
