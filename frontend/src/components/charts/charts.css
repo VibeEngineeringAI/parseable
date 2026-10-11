@@ -133,6 +133,12 @@
   border: 1px solid rgba(147, 51, 234, 0.4);
 }
 
+/* uPlot clears selection geometry; the border would otherwise leave a visible dot or line. */
+.charts-plot[data-zoom-enabled='true'] .u-select:not([style]),
+.charts-plot[data-zoom-enabled='true'] .u-select[style*='width: 0px'] {
+  visibility: hidden;
+}
+
 .charts-empty {
   display: grid;
   place-items: center;
