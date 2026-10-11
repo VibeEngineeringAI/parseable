@@ -114,6 +114,18 @@ test('each classic Logs link opened while Logs is open is applied', async ({ pag
     expect(query.query).toContain(`"level" = 'info'`);
 });
 
+test('a classic Logs link replaces a search typed before it', async ({ page }) => {
+  const queries = await server(page);
+  await page.goto('/logs/explore/app');
+  await page.getByLabel('Search messages').fill('old-search');
+  await expect.poll(() => queries.at(-1)?.query).toContain('old-search');
+  await navigateInApp(page, link('app', '10m', 'warn'));
+  await expect(page.getByTestId('filter-pill-value')).toHaveText(['warn']);
+  await expect(page.getByLabel('Search messages')).toHaveValue('');
+  await expect.poll(() => queries.at(-1)?.query).toContain(`"level" = 'warn'`);
+  expect(queries.at(-1)?.query).not.toContain('old-search');
+});
+
 test('classic paths that moved open their page here', async ({ page }) => {
   await server(page);
   await page.goto('/logs/search/app?start=1h&end=now&type=fixed');
