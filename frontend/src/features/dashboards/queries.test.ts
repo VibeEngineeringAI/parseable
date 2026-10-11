@@ -1,5 +1,5 @@
 import { expect, it, vi } from 'vitest';
-import { createLimiter } from '../../lib/concurrency';
+import { createLimiter, type QueryLimiter } from '../../lib/concurrency';
 import type { DashboardTile, DashboardVariable, ParseableClient } from '../../lib/types';
 import { loadTile } from './queries';
 import type { VariableValues } from './variables';
@@ -16,6 +16,7 @@ const tiles: DashboardTile[] = [
 const mockClient = () =>
   ({
     query: vi.fn().mockResolvedValue([{ events: 12 }]),
+    promqlQuery: vi.fn().mockResolvedValue({ resultType: 'vector', result: [] }),
     promqlQueryRange: vi.fn().mockResolvedValue({ resultType: 'matrix', result: [] }),
   }) as unknown as ParseableClient;
 
@@ -43,6 +44,76 @@ it.each(tiles)(
       ).rejects.toThrow('Select values for all query variables.');
     expect(client.query).not.toHaveBeenCalled();
     expect(client.promqlQueryRange).not.toHaveBeenCalled();
+  },
+);
+
+const run: QueryLimiter = (operation) => operation();
+const statTile = (sparkline: boolean, type = 'instant'): DashboardTile => ({
+  tile_id: 'stat',
+  tileType: 'promql',
+  chartType: 'query-value',
+  chartQuery: ['up', 'process_cpu_seconds_total'],
+  promqlQueryType: [type, 'range'],
+  promqlStep: '15s',
+  dbName: 'metrics',
+  config: { layout: { sparkline } },
+});
+
+it.each(['instant', 'range', 'both'])(
+  'requests range and instant for only query zero with a sparkline, regardless of stored %s mode',
+  async (type) => {
+    const client = mockClient();
+    const result = await loadTile(client, statTile(true, type), [], {}, bounds, run, signal);
+    expect(client.promqlQueryRange).toHaveBeenCalledExactlyOnceWith(
+      {
+        stream: 'metrics',
+        query: 'up',
+        start: Date.parse(bounds.startTime) / 1000,
+        end: Date.parse(bounds.endTime) / 1000,
+        step: '15s',
+      },
+      signal,
+    );
+    expect(client.promqlQuery).toHaveBeenCalledTimes(2);
+    for (const [index, query] of ['up', 'process_cpu_seconds_total'].entries())
+      expect(client.promqlQuery).toHaveBeenNthCalledWith(
+        index + 1,
+        { stream: 'metrics', query, time: Date.parse(bounds.endTime) / 1000 },
+        signal,
+      );
+    expect(result.promql?.[0]).toMatchObject({
+      id: 'A',
+      range: { resultType: 'matrix', result: [] },
+      instant: { resultType: 'vector', result: [] },
+    });
+    expect(result.promql?.[1]?.range).toBeUndefined();
+    expect(result.promql?.[1]?.instant).toEqual({ resultType: 'vector', result: [] });
+  },
+);
+
+it.each(['instant', 'range', 'both'])(
+  'keeps query values instant-only without a sparkline even with stored %s mode',
+  async (type) => {
+    const client = mockClient();
+    await loadTile(client, statTile(false, type), [], {}, bounds, run, signal);
+    expect(client.promqlQueryRange).not.toHaveBeenCalled();
+    expect(client.promqlQuery).toHaveBeenCalledTimes(2);
+  },
+);
+
+it.each([
+  ['line', 'instant', 0, 1],
+  ['line', 'range', 1, 0],
+  ['line', 'both', 1, 1],
+  ['gauge', 'both', 0, 1],
+] as const)(
+  'leaves %s requests unchanged in %s mode with sparkline stored',
+  async (chartType, type, ranges, instants) => {
+    const client = mockClient();
+    const tile = { ...statTile(true), chartType, chartQuery: ['up'], promqlQueryType: [type] };
+    await loadTile(client, tile, [], {}, bounds, run, signal);
+    expect(client.promqlQueryRange).toHaveBeenCalledTimes(ranges);
+    expect(client.promqlQuery).toHaveBeenCalledTimes(instants);
   },
 );
 it.each(tiles)(
