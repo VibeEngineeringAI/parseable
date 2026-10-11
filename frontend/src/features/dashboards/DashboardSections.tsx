@@ -1,4 +1,5 @@
 import { EmptyState } from '../../components/ui';
+import type { TimeSeriesChartProps } from '../../components/charts/TimeSeriesChart';
 import type { Dashboard, DashboardTile as Tile } from '../../lib/types';
 import type { QueryLimiter } from '../../lib/concurrency';
 import { DashboardTile } from './DashboardTile';
@@ -15,6 +16,7 @@ export function DashboardSections({
   resolutions,
   limit,
   onAction,
+  onZoomRange,
 }: {
   dashboard: Dashboard;
   url: ReturnType<typeof useDashboardUrl>;
@@ -24,6 +26,7 @@ export function DashboardSections({
   resolutions: VariableResolutions;
   limit: QueryLimiter;
   onAction: (action: 'edit' | 'duplicate' | 'earlier' | 'later' | 'delete', tile: Tile) => void;
+  onZoomRange?: TimeSeriesChartProps['onZoomRange'];
 }) {
   const groups = sectionGroups(dashboard.tiles ?? [], dashboard.sections);
   return (
@@ -73,6 +76,7 @@ export function DashboardSections({
                     first={index === 0}
                     last={index === rows.length - 1}
                     onAction={onAction}
+                    onZoomRange={onZoomRange}
                   />
                 );
               })}

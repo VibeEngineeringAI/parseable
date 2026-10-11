@@ -15,6 +15,7 @@ export type CartesianChart = {
   categorical: boolean;
   timestamps: number[];
   categories?: string[];
+  legendTitle?: string;
   series: { id: string; label: string; values: (number | null)[] }[];
 };
 
@@ -102,6 +103,7 @@ export function cartesianChart(rows: LogRecord[], tile: DashboardTile): Cartesia
     categories,
     timestamps: categories.map((_, index) => index),
     series,
+    ...(groupFields.length ? { legendTitle: `${groupFields.join(' | ')}:` } : {}),
   };
 }
 

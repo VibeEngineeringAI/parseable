@@ -109,6 +109,52 @@ describe('Cartesian plot options', () => {
     ).toBeUndefined();
   });
 
+  it('labels only the horizontal value axis and reserves label space below its ticks', () => {
+    const { options } = cartesianPlot({
+      ...defaults,
+      kind: 'bar',
+      horizontal: true,
+      categories: ['one', 'two', 'three'],
+      xAxisTitle: 'Service',
+      valueAxisTitle: 'Requests',
+    });
+    expect(options.axes![0]).toMatchObject({ side: 3, label: 'Service' });
+    expect(options.axes![1]).toMatchObject({
+      scale: 'y',
+      side: 2,
+      size: 40,
+      label: 'Requests',
+      labelFont: defaults.font,
+      labelSize: 24,
+    });
+    for (const settings of [
+      {},
+      { kind: 'bar' as const, categories: ['one'] },
+      { kind: 'bar' as const, horizontal: true },
+      { horizontal: true, categories: ['one'] },
+    ]) {
+      const { options } = cartesianPlot({ ...defaults, ...settings, valueAxisTitle: 'Requests' });
+      expect(options.axes![1].label).toBeUndefined();
+      expect(options.axes![1].labelSize).toBeUndefined();
+    }
+  });
+
+  it('enables drag selection only for opted-in time charts without changing scales', () => {
+    expect(cartesianPlot({ ...defaults, zoomable: true }).options.cursor!.drag).toEqual({
+      x: true,
+      y: false,
+      setScale: false,
+      dist: 3,
+    });
+    for (const settings of [{}, { zoomable: true, categories: ['one'] }]) {
+      expect(cartesianPlot({ ...defaults, ...settings }).options.cursor!.drag).toEqual({
+        x: false,
+        y: false,
+        setScale: false,
+      });
+    }
+  });
+
   it('draws cumulative bars from the top down and recomputes after hiding a series', () => {
     const settings = {
       ...defaults,

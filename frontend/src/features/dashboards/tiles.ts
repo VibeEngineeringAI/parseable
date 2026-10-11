@@ -213,5 +213,10 @@ export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
       }
     }
   }
-  return { categorical: false, timestamps, series: [...series.values()] };
+  return {
+    categorical: false,
+    timestamps,
+    series: [...series.values()],
+    ...(groupFields.length ? { legendTitle: `${groupFields.join(' | ')}:` } : {}),
+  };
 }

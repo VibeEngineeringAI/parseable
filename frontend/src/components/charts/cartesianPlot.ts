@@ -36,6 +36,8 @@ type PlotSettings = {
   xMin?: number;
   xMax?: number;
   xAxisTitle?: string;
+  valueAxisTitle?: string;
+  zoomable?: boolean;
   references: readonly { value: number }[];
   yAxisSize: number;
   formatValue: (value: number) => string;
@@ -124,6 +126,8 @@ export function cartesianPlot({
   xMin,
   xMax,
   xAxisTitle,
+  valueAxisTitle,
+  zoomable = false,
   references,
   yAxisSize,
   formatValue,
@@ -176,6 +180,7 @@ export function cartesianPlot({
           side: 2,
           size: 40,
           space: (_self, _axis, _min, _max, plotSize) => Math.max(50, plotSize / 7),
+          ...(valueAxisTitle ? { label: valueAxisTitle, labelFont: font, labelSize: 24 } : {}),
         }
       : {}),
   };
@@ -261,7 +266,12 @@ export function cartesianPlot({
       ],
       axes: [xAxis, yAxis],
       cursor: {
-        drag: { x: false, y: false, setScale: false },
+        drag: {
+          x: zoomable && categories === undefined,
+          y: false,
+          setScale: false,
+          ...(zoomable && categories === undefined ? { dist: 3 } : {}),
+        },
         focus: { prox: bars ? -1 : 16 },
         points: bars
           ? { show: false }
