@@ -1,10 +1,12 @@
+import { useLayoutEffect, useRef, useState } from 'react';
 import {
   GAUGE_CENTRE,
   GAUGE_INNER_RADIUS,
   GAUGE_OUTER_RADIUS,
-  GAUGE_TEXT,
   GAUGE_VIEWBOX,
+  estimateEmWidth,
   fitGaugeText,
+  gaugeTextBaseline,
   type GaugeModel,
 } from '../../features/dashboards/gauge';
 import './charts.css';
@@ -19,6 +21,31 @@ const track = `M ${x - outer} ${y} A ${outer} ${outer} 0 0 1 ${x + outer} ${y} L
 const arc = `M ${x - radius} ${y} A ${radius} ${radius} 0 0 1 ${x + radius} ${y}`;
 
 export function GaugeChart({ label, model, text }: GaugeChartProps) {
+  const textRef = useRef<SVGTextElement>(null);
+  const [measured, setMeasured] = useState<{ text: string; emWidth: number }>();
+  const emWidth = measured?.text === text ? measured.emWidth : estimateEmWidth(text);
+  const fontSize = fitGaugeText(text, emWidth);
+  useLayoutEffect(() => {
+    let active = true;
+    const measure = () => {
+      const node = textRef.current;
+      if (!active || !node || typeof node.getComputedTextLength !== 'function') return;
+      const length = node.getComputedTextLength();
+      const size = Number(node.getAttribute('font-size'));
+      if (!Number.isFinite(length) || length <= 0 || !Number.isFinite(size) || size <= 0) return;
+      const emWidth = (length / size) * 1.02;
+      setMeasured((previous) =>
+        previous?.text === text && Math.abs(previous.emWidth - emWidth) <= 0.001
+          ? previous
+          : { text, emWidth },
+      );
+    };
+    measure();
+    void document.fonts?.ready.then(measure);
+    return () => {
+      active = false;
+    };
+  }, [text]);
   const max = Math.max(model.min, model.max);
   const value = Math.max(model.min, Math.min(max, model.value));
   return (
@@ -48,12 +75,13 @@ export function GaugeChart({ label, model, text }: GaugeChartProps) {
             data-fraction={model.fraction}
           />
           <text
+            ref={textRef}
             className="charts-gauge-text"
             textAnchor="middle"
             x={x}
-            y={GAUGE_TEXT.baseline}
+            y={gaugeTextBaseline(fontSize)}
             fontWeight={700}
-            fontSize={fitGaugeText(text)}
+            fontSize={fontSize}
             fill={model.colour}
           >
             {text}

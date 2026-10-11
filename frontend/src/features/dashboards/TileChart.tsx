@@ -77,7 +77,11 @@ export function TileChart({
   if (tile.chartType === 'gauge') {
     const value = gaugeValue(tile, result, rows);
     return value === undefined ? (
-      <div className="dashboard-stat" role="group" aria-label={`${tileTitle(tile)} value`}>
+      <div
+        className="charts-empty charts-gauge-empty"
+        role="group"
+        aria-label={`${tileTitle(tile)} value`}
+      >
         No values returned
       </div>
     ) : (

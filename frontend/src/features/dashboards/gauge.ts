@@ -20,15 +20,20 @@ export const GAUGE_CENTRE = { x: 100, y: 100 } as const;
 export const GAUGE_OUTER_RADIUS = 100;
 export const GAUGE_INNER_RADIUS = 50;
 export const GAUGE_TEXT = {
-  baseline: 94,
-  fitRadius: 46,
+  centreOffset: 24,
+  fitRadius: 45,
   capHeight: 0.72,
   maxSize: 32,
-  minSize: 8,
-  sizeStep: 0.5,
+  minSize: 4,
+  sizeStep: 0.25,
   digitAdvance: 0.6,
   narrowAdvance: 0.3,
-  otherAdvance: 0.62,
+  spaceAdvance: 0.28,
+  percentAdvance: 0.92,
+  uppercaseAdvance: 0.72,
+  lowercaseAdvance: 0.62,
+  wideAdvance: 0.95,
+  otherAdvance: 0.7,
 } as const;
 
 export function gaugeRange(tile: DashboardTile): GaugeRange {
@@ -124,27 +129,39 @@ export function gaugeValue(
   return Number.isFinite(value) ? value : undefined;
 }
 
-/** Estimate bold Inter advances and fit both cap-height corners inside the hole.
- * This stays deterministic without canvas or DOM font measurements. */
-export function fitGaugeText(text: string): number {
-  const advance = [...text].reduce(
-    (width, character) =>
-      width +
-      (/\d/.test(character)
-        ? GAUGE_TEXT.digitAdvance
-        : '., :'.includes(character)
-          ? GAUGE_TEXT.narrowAdvance
-          : GAUGE_TEXT.otherAdvance),
-    0,
-  );
+/** Conservative bold Inter advances keep rendering deterministic without font measurements. */
+export function estimateEmWidth(text: string): number {
+  return [...text].reduce((width, character) => {
+    let advance: number = GAUGE_TEXT.otherAdvance;
+    if (/\d/.test(character)) advance = GAUGE_TEXT.digitAdvance;
+    else if ('.,:ilj'.includes(character)) advance = GAUGE_TEXT.narrowAdvance;
+    else if (character === ' ') advance = GAUGE_TEXT.spaceAdvance;
+    else if (character === '%') advance = GAUGE_TEXT.percentAdvance;
+    else if (/[A-Z]/.test(character)) advance = GAUGE_TEXT.uppercaseAdvance;
+    else if ('mw'.includes(character)) advance = GAUGE_TEXT.wideAdvance;
+    else if (/[a-z]/.test(character)) advance = GAUGE_TEXT.lowercaseAdvance;
+    return width + advance;
+  }, 0);
+}
+
+/** Centre the visual cap box 48% of the hole radius above the centre line. */
+export function gaugeTextBaseline(size: number): number {
+  return GAUGE_CENTRE.y - GAUGE_TEXT.centreOffset + (GAUGE_TEXT.capHeight * size) / 2;
+}
+
+/** Fit all four cap-box corners inside the hole with a 10% margin from the arc.
+ * Measured advances can replace the deterministic estimate in the browser. */
+export function fitGaugeText(text: string, emWidth = estimateEmWidth(text)): number {
+  const fits = (size: number) => {
+    const baseline = gaugeTextBaseline(size);
+    return [-0.5, 0.5].every((side) =>
+      [baseline - GAUGE_TEXT.capHeight * size, baseline].every(
+        (height) =>
+          Math.hypot(emWidth * size * side, height - GAUGE_CENTRE.y) <= GAUGE_TEXT.fitRadius,
+      ),
+    );
+  };
   let size: number = GAUGE_TEXT.maxSize;
-  while (
-    size > GAUGE_TEXT.minSize &&
-    Math.hypot(
-      (advance * size) / 2,
-      GAUGE_CENTRE.y - GAUGE_TEXT.baseline + GAUGE_TEXT.capHeight * size,
-    ) > GAUGE_TEXT.fitRadius
-  )
-    size -= GAUGE_TEXT.sizeStep;
+  while (size > GAUGE_TEXT.minSize && !fits(size)) size -= GAUGE_TEXT.sizeStep;
   return size;
 }
