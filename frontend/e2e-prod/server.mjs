@@ -34,7 +34,8 @@ createServer((req, res) => {
   const { pathname } = new URL(req.url ?? '/', 'http://localhost');
   const mount = pathname === '/next' || pathname.startsWith('/next/') ? '/next' : '';
   const path = decodeURIComponent(pathname.slice(mount.length)).replace(/^\/+/, '');
-  const file = files.get(path);
+  // `index.html` itself is served rewritten, like every client route.
+  const file = path === 'index.html' ? undefined : files.get(path);
   if (file) {
     res.writeHead(200, { 'content-type': types[extname(path)] ?? 'application/octet-stream' });
     res.end(file);

@@ -37,6 +37,19 @@ for (const mount of ['', '/next']) {
       expect(entries.size).toBe(1);
     });
 
+    test('resolves against its mount whichever path serves index.html', async ({ page }) => {
+      for (const path of [`${mount}/`, `${mount}/index.html`, `${mount}/a/b/c`]) {
+        const response = await page.request.get(path);
+        expect(response.status(), path).toBe(200);
+        expect(await response.text(), path).toContain(`<base href="${mount}/"`);
+      }
+      const failed = problems(page);
+      await page.goto(`${mount}/index.html`);
+      expect(await page.evaluate(() => document.baseURI)).toMatch(new RegExp(`${mount}/$`));
+      await expect(page.locator('#root > *').first()).toBeVisible();
+      expect(failed).toEqual([]);
+    });
+
     test('links a favicon that resolves under its mount', async ({ page, request }) => {
       await page.goto(`${mount}/logs/explore/application_logs`);
       const icons = await page
