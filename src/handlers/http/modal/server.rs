@@ -945,8 +945,29 @@ fn mounted_index(index: &'static [u8], mount: &str) -> &'static [u8] {
 /// The native frontend moved from `/next` to `/`. Old links, bookmarks and
 /// logins started there keep their path and query. The redirect is temporary so
 /// browsers do not keep it while `P_UI_ROOT=classic` can move the UI back.
+///
+/// Assets are not redirected. A tab still running the build it loaded from
+/// `/next` would import a chunk from `/assets/`, and that chunk's own imports
+/// would load a second copy of the app beside the first. A 404 fails the
+/// import like any chunk a deploy removed.
 async fn redirect_from_next(req: HttpRequest) -> HttpResponse {
-    let rest = req.path().strip_prefix("/next").unwrap_or_default();
+    if is_hashed_asset(
+        req.match_info()
+            .unprocessed()
+            .trim_start_matches(['/', '\\']),
+    ) {
+        return HttpResponse::NotFound()
+            .insert_header((CACHE_CONTROL, "no-cache"))
+            .finish();
+    }
+    // The router matched the decoded path, so `/%6Eext` lands here too. It never
+    // decodes `/`, so the raw path past its first segment is the rest of the URL,
+    // still encoded as sent. The decoded rest could hold a `?` or a tab.
+    let raw = req.path();
+    let rest = raw
+        .get(1..)
+        .and_then(|path| path.find('/').map(|i| &path[i..]))
+        .unwrap_or_default();
     // A leading `//` or `/\` would leave the origin.
     let path = format!("/{}", rest.trim_start_matches(['/', '\\']));
     let location = match req.query_string() {
@@ -1153,6 +1174,26 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn next_assets_are_not_found_once_the_native_frontend_moves_to_the_root() {
+        // A tab loaded from `/next` before the switch must not import chunks
+        // from `/assets/`, whose imports would start a second copy of the app.
+        for path in [
+            "/next/assets/index-abc123.js",
+            "/next/assets/LogsPage-gone.js",
+            "/next//assets/index-abc123.js",
+            "/%6Eext/assets/index-abc123.js",
+            "/next/%61ssets/index-abc123.js",
+        ] {
+            let response = serve(path, ui(b"native"), UiRoot::Native).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+            assert_eq!(cache_control(&response), "no-cache", "GET {path}");
+            assert!(response.headers().get(LOCATION).is_none(), "GET {path}");
+        }
+        let response = serve("/assets/index-abc123.js", ui(b"native"), UiRoot::Native).await;
+        assert_eq!(to_bytes(response.into_body()).await.unwrap(), "chunk");
+    }
+
+    #[actix_web::test]
     async fn next_links_redirect_to_the_same_page_at_the_root() {
         for (path, target) in [
             ("/next", "/"),
@@ -1166,6 +1207,16 @@ mod tests {
             ("/next/\\evil.example", "/evil.example"),
             ("/next/\\/evil.example", "/evil.example"),
             ("/next/%5Cevil.example", "/%5Cevil.example"),
+            ("/next/%2F%2Fevil.example", "/%2F%2Fevil.example"),
+            ("/next/%09/evil.example", "/%09/evil.example"),
+            ("/next/%3Fx/logs", "/%3Fx/logs"),
+            ("/next/assets", "/assets"),
+            // The router decodes `%6E`, the redirect keeps the raw rest.
+            ("/%6Eext/logs?x=1", "/logs?x=1"),
+            ("/%6eext", "/"),
+            ("/%6Eext/%2F%2Fevil.example", "/%2F%2Fevil.example"),
+            ("/%6Eext//evil.example", "/evil.example"),
+            ("/%6Eext/\\evil.example", "/evil.example"),
         ] {
             let response = serve(path, ui(b"native"), UiRoot::Native).await;
             assert_eq!(
