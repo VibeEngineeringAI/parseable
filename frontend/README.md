@@ -136,3 +136,31 @@ flock /home/ajs/.cache/parseable-playwright.lock bash -c '
 ```
 
 On shared machines, run every Playwright invocation (including `npm run check`, `test:ui`, `test:prod` and `test:stories`) under this lock, checking ports 5173, 4180 and 6006 inside the lock before running. Do not reuse another worktree's server.
+
+### Storybook chart regression tests
+
+`story-tests/tile-chart.spec.ts` exercises real binding controls and `TileChart`: inherited
+unsupported bindings, saving/reloading a corrected tile, independent legend toggles for
+identical labels, and keyboard/pointer zoom with dashboard versus tile-specific ranges.
+`story-tests/chart-visuals.spec.ts` compares chart screenshots in light and dark themes,
+including a narrow tile. Baseline PNGs are versioned beside the spec; missing baselines fail.
+CI runs these through `npm run check` and uploads image diffs and traces on failure.
+
+Screenshot rendering depends on the OS, browser and fonts (see
+[Playwright visual comparisons](https://playwright.dev/docs/test-snapshots)). Use the same
+pinned Playwright image as `.github/workflows/frontend.yaml`, with the lockfile's Playwright
+version, to reproduce or intentionally update baselines. From the repository root, after
+`(cd frontend && npm ci && npm run build-storybook)`, run:
+
+```sh
+flock /home/ajs/.cache/parseable-playwright.lock docker run --rm --ipc=host \
+  --user "$(id -u):$(id -g)" -e CI=1 \
+  -v "$PWD:/work" -w /work/frontend \
+  mcr.microsoft.com/playwright:v1.63.0-noble \
+  npx playwright test -c playwright.storybook.config.ts --workers=2
+```
+
+Use your own lock location on other machines. Container ports are isolated from local dev
+servers. To approve an intentional visual change, append `--update-snapshots` and restrict
+the run to `chart-visuals.spec.ts`; inspect every changed PNG and rerun without the update
+flag before committing. Do not regenerate baselines just to silence a failing comparison.

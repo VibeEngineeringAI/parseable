@@ -86,6 +86,24 @@ describe('cartesianStyle', () => {
 });
 
 describe('cartesianChart categories', () => {
+  it('preserves group boundaries when labels contain the display delimiter', () => {
+    const chart = cartesianChart(
+      [
+        { category: 'one', service: 'api | east', region: 'us', value: 2 },
+        { category: 'one', service: 'api', region: 'east | us', value: 3 },
+        { category: 'two', service: 'api | east', region: 'us', value: 4 },
+        { category: 'two', service: 'api', region: 'east | us', value: 5 },
+        { category: 'two', service: 'api', region: 'east | us', value: 1 },
+      ],
+      categoryTile('value', ['service', 'region']),
+    );
+    expect(chart.series.map(({ values }) => values)).toEqual([
+      [2, 4],
+      [3, 6],
+    ]);
+    expect(new Set(chart.series.map(({ id }) => id)).size).toBe(2);
+    expect(chart.series.map(({ label }) => label)).toEqual(['api | east | us', 'api | east | us']);
+  });
   it.each([
     [['a'], 'a:'],
     [['a', 'b'], 'a | b:'],

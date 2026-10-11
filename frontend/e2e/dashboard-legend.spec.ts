@@ -195,7 +195,7 @@ type QueryCall = { query: string; startTime: string; endTime: string };
 type CanvasLabel = { text: string; x: number; y: number; color: string };
 type RecordedCanvas = HTMLCanvasElement & { legendLabels?: CanvasLabel[] };
 
-async function openDashboard(page: Page, theme: 'light' | 'dark' = 'light') {
+async function openDashboard(page: Page, theme: 'light' | 'dark' = 'light', overrideRange = false) {
   const calls: QueryCall[] = [];
   await page.addInitScript((theme) => {
     localStorage.setItem('parseable-theme', theme);
@@ -236,7 +236,18 @@ async function openDashboard(page: Page, theme: 'light' | 'dark' = 'light') {
     if (path.endsWith('/info'))
       return route.fulfill({ json: { logSource: [{ log_source_format: 'json' }] } });
     if (path === `/api/v1/dashboards/${dashboard.dashboardId}`)
-      return route.fulfill({ json: dashboard });
+      return route.fulfill({
+        json: overrideRange
+          ? {
+              ...dashboard,
+              tiles: tiles.map((entry) =>
+                entry.chartQuery === queryFor('timeseries-grouped')
+                  ? { ...entry, timeRange: { type: 'custom', startTime: start, endTime: end } }
+                  : entry,
+              ),
+            }
+          : dashboard,
+      });
     if (path === '/api/v1/query') {
       const body = request.postDataJSON() as QueryCall;
       calls.push(body);
@@ -595,6 +606,26 @@ test('a one-point drag, a plain click and Escape cancellation leave the range an
     'Selection cleared.',
   );
   await plot.press('Enter');
+  await expectNoZoom(page, calls, previousCount, previousUrl);
+});
+
+test('a tile with its own range cannot change the dashboard URL or other tile queries by zooming', async ({
+  page,
+}) => {
+  const calls = await openDashboard(page, 'light', true);
+  const previousCount = calls.length;
+  const previousUrl = page.url();
+  const card = tile(page, 'timeseries-grouped');
+  const plot = card.getByRole('img');
+  await expect(plot).not.toHaveAttribute('data-zoom-enabled');
+  await plot.press('ArrowRight');
+  await plot.press('Shift+ArrowRight');
+  await plot.press('Enter');
+  await expectNoZoom(page, calls, previousCount, previousUrl);
+  await beginDrag(page, 'timeseries-grouped', 0.28, 0.74);
+  await page.mouse.up();
+  await expect(card.locator('.u-select')).toBeHidden();
+  await expect(card.getByText(/Zoomed to/)).toHaveCount(0);
   await expectNoZoom(page, calls, previousCount, previousUrl);
 });
 

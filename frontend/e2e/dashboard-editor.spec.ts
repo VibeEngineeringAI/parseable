@@ -381,3 +381,39 @@ test('column suggestions come from the preview and group by is limited to two', 
     editor.getByRole('list', { name: 'Y axis fields' }).getByRole('listitem'),
   ).toHaveCount(2);
 });
+
+for (const choice of ['Stacked bar', 'Bubble'] as const) {
+  test(`${choice} blocks applying unsupported inherited bindings until explicitly corrected`, async ({
+    page,
+  }) => {
+    await serve(page);
+    const editor = await openEditor(
+      page,
+      'Binding limits',
+      'Bar',
+      'SELECT time, service, requests, size FROM "app-logs"',
+    );
+    await editor.getByLabel('X axis (time or category)').fill('time');
+    await addField(editor, 'Y axis', 'requests');
+    if (choice === 'Stacked bar') await addField(editor, 'Y axis', 'size');
+    await addField(editor, 'Group by', 'service');
+    if (choice === 'Bubble') await addField(editor, 'Group by', 'region');
+    await editor.getByLabel('Chart type').selectOption({ label: choice });
+    const submit = editor.getByRole('button', { name: 'Add tile', exact: true });
+    await expect(submit).toBeDisabled();
+    await expect(submit).toHaveAccessibleDescription(
+      choice === 'Stacked bar'
+        ? 'Stacked bar supports one Y column. Remove extra Y fields and use Group by for series.'
+        : 'Bubble supports one Group by column. Remove extra grouping fields.',
+    );
+    await editor
+      .getByRole('button', {
+        name: choice === 'Stacked bar' ? 'Remove size' : 'Remove region',
+        exact: true,
+      })
+      .click();
+    await expect(submit).toBeEnabled();
+    await submit.click();
+    await expect(editor).toHaveCount(0);
+  });
+}

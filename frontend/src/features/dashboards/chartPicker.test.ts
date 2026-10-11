@@ -314,7 +314,7 @@ describe('query-value configuration', () => {
 });
 
 describe('data bindings', () => {
-  it.each(['timeseries', 'line', 'area', 'bar', 'stacked-bar'] as const)(
+  it.each(['timeseries', 'line', 'area', 'bar'] as const)(
     'offers X, multiple Y fields and groups for %s',
     (choice) => {
       expect(bindingsFor(choice)).toEqual({
@@ -364,10 +364,33 @@ describe('data bindings', () => {
       x: 'single',
       y: 'single',
       groupBy: true,
+      groupByMax: 1,
       size: true,
       xLabel: 'X axis',
       yLabel: 'Y axis',
     });
+  });
+  it('limits stacked bars to one Y column and retains invalid fields for explicit correction', () => {
+    expect(bindingsFor('stacked-bar')).toMatchObject({ y: 'multi', yMax: 1, groupBy: true });
+    const source = { ...tile, ...applyBinding(tile, 'y', ['requests', 'errors']) };
+    const stacked = { ...source, ...applyChartChoice(source, 'stacked-bar') };
+    expect(record(record(stacked.config).axes).y).toMatchObject({ field: ['requests', 'errors'] });
+    expect(chartIssues(stacked)).toEqual([
+      'Stacked bar supports one Y column. Remove extra Y fields and use Group by for series.',
+    ]);
+    expect(chartIssues({ ...stacked, ...applyBinding(stacked, 'y', ['requests']) })).toEqual([]);
+    expect(chartIssues({ ...stacked, tileType: 'promql' })).toEqual([]);
+  });
+  it('requires correction of extra bubble groups without dropping stored fields', () => {
+    const source = { ...tile, ...applyBinding(tile, 'groupBy', ['service', 'region']) };
+    const bubble = { ...source, ...applyChartChoice(source, 'bubble') };
+    expect(record(record(bubble.config).axes).groupBy).toMatchObject({
+      field: ['service', 'region'],
+    });
+    expect(chartIssues(bubble)).toEqual([
+      'Bubble supports one Group by column. Remove extra grouping fields.',
+    ]);
+    expect(chartIssues({ ...bubble, ...applyBinding(bubble, 'groupBy', ['service']) })).toEqual([]);
   });
   it.each(['table', undefined] as const)('hides bindings for %s', (choice) => {
     expect(bindingsFor(choice)).toEqual({

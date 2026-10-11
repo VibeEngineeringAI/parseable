@@ -131,6 +131,8 @@ export type Bindings = {
   x: false | 'single';
   y: false | 'single' | 'multi';
   groupBy: boolean;
+  yMax?: number;
+  groupByMax?: number;
   size: boolean;
   yLabel: string;
   yHint?: string;
@@ -170,6 +172,10 @@ export function bindingsFor(choice: ChartChoice | undefined): Bindings {
     x: 'single',
     y: choice === 'bubble' ? 'single' : 'multi',
     groupBy: true,
+    ...(choice === 'stacked-bar'
+      ? { yMax: 1, yHint: 'Choose one Y column; use Group by to split it into stacked series.' }
+      : {}),
+    ...(choice === 'bubble' ? { groupByMax: 1 } : {}),
     size: choice === 'bubble',
     xLabel: choice === 'bubble' ? 'X axis' : 'X axis (time or category)',
   };
@@ -273,6 +279,16 @@ export function rescaleSegments(
 }
 
 export function chartIssues(tile: DashboardTile): string[] {
+  const choice = chartChoice(tile);
+  const axes = record(record(tile.config).axes);
+  if (tile.tileType !== 'promql') {
+    if (choice === 'stacked-bar' && fieldList(record(axes.y).field).length > 1)
+      return [
+        'Stacked bar supports one Y column. Remove extra Y fields and use Group by for series.',
+      ];
+    if (choice === 'bubble' && fieldList(record(axes.groupBy).field).length > 1)
+      return ['Bubble supports one Group by column. Remove extra grouping fields.'];
+  }
   if (chartChoice(tile) !== 'gauge') return [];
   const layout = record(record(tile.config).layout),
     range = gaugeRange(layout),

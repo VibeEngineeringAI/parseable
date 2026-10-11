@@ -76,7 +76,7 @@ export function cartesianChart(rows: LogRecord[], tile: DashboardTile): Cartesia
         category = String(row[xField] ?? group);
       categorySet.add(category);
       for (const field of yFields) {
-        const id = JSON.stringify([group, field]);
+        const id = JSON.stringify([parts, field]);
         let entry = groups.get(id);
         if (!entry) {
           entry = {

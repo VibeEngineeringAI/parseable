@@ -229,7 +229,7 @@ export function TileChart({
         series={chart.series}
         legendTitle={chart.legendTitle}
         onZoomRange={
-          tile.chartType === 'timeseries' && chart.categories === undefined
+          tile.chartType === 'timeseries' && chart.categories === undefined && !tile.timeRange
             ? onZoomRange
             : undefined
         }

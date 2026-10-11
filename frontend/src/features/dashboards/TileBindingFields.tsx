@@ -121,15 +121,20 @@ export function TileBindingFields({
             hint={bindings.yHint}
             list={list}
             fields={fieldList(record(axes.y).field)}
+            max={bindings.yMax}
             onChange={(fields) => change(applyBinding(draft, 'y', fields))}
           />
         )}
         {bindings.groupBy && (
           <BindingList
             label="Group by"
-            hint="Up to 2 columns split the data into series."
+            hint={
+              bindings.groupByMax === 1
+                ? 'One column splits the data into series.'
+                : 'Up to 2 columns split the data into series.'
+            }
             list={list}
-            max={2}
+            max={bindings.groupByMax ?? 2}
             fields={fieldList(record(axes.groupBy).field)}
             onChange={(fields) => change(applyBinding(draft, 'groupBy', fields))}
           />
