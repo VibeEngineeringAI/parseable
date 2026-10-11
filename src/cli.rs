@@ -162,14 +162,15 @@ pub struct Options {
     )]
     pub allow_origins: Vec<Url>,
 
+    // Unset means native. Kept apart so a build without the native frontend only
+    // warns when the operator asked for it.
     #[arg(
         long,
         env = "P_UI_ROOT",
-        default_value = "native",
         value_parser = validation::ui_root,
-        help = "UI served at /: native, or classic to restore the Prism UI with the native frontend under /next"
+        help = "UI served at /: native (default), or classic to restore the Prism UI with the native frontend under /next"
     )]
-    pub ui_root: UiRoot,
+    pub ui_root: Option<UiRoot>,
 
     // Actix request timeout in seconds
     #[arg(

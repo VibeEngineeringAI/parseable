@@ -860,16 +860,24 @@ impl Server {
     /// The native frontend serves `/` unless `root` is classic or no native build
     /// was embedded; the classic UI then serves `/` and the native one, if any,
     /// `/next`. `/next` is registered ahead of the catch-all `/` either way.
-    fn mount_ui(config: &mut web::ServiceConfig, classic: UiFiles, native: UiFiles, root: UiRoot) {
+    /// `root` is `None` when `P_UI_ROOT` is unset, which means native.
+    fn mount_ui(
+        config: &mut web::ServiceConfig,
+        classic: UiFiles,
+        native: UiFiles,
+        root: Option<UiRoot>,
+    ) {
         if native.is_empty() {
-            if root == UiRoot::Native {
-                static WARNED: Once = Once::new();
-                WARNED.call_once(|| {
-                    tracing::warn!("P_UI_ROOT=native, but no native frontend was embedded; serving the classic UI")
-                });
-            }
+            static LOGGED: Once = Once::new();
+            LOGGED.call_once(|| match root {
+                Some(UiRoot::Native) => tracing::warn!(
+                    "P_UI_ROOT=native, but no native frontend was embedded; serving the classic UI"
+                ),
+                Some(UiRoot::Classic) => {}
+                None => tracing::info!("No native frontend was embedded; serving the classic UI"),
+            });
             config.service(Self::ui_scope("", classic));
-        } else if root == UiRoot::Native {
+        } else if root.unwrap_or_default() == UiRoot::Native {
             config.service(web::scope("/next").default_service(web::to(redirect_from_next)));
             config.service(Self::ui_scope("", native));
         } else {
@@ -1020,6 +1028,10 @@ mod tests {
     }
 
     async fn serve(path: &str, native: UiFiles, root: UiRoot) -> ServiceResponse {
+        serve_with(path, native, Some(root)).await
+    }
+
+    async fn serve_with(path: &str, native: UiFiles, root: Option<UiRoot>) -> ServiceResponse {
         let app = test::init_service(
             App::new().configure(|config| Server::mount_ui(config, ui(b"classic"), native, root)),
         )
@@ -1133,7 +1145,11 @@ mod tests {
                 "native",
                 "GET {path}"
             );
+            let unset = serve_with(path, ui(b"native"), None).await;
+            assert_eq!(to_bytes(unset.into_body()).await.unwrap(), "native");
         }
+        let unset = serve_with("/next/logs", ui(b"native"), None).await;
+        assert_eq!(unset.status(), StatusCode::TEMPORARY_REDIRECT);
     }
 
     #[actix_web::test]
