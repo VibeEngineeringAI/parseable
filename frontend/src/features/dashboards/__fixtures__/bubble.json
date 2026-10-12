@@ -1,0 +1,52 @@
+{
+  "tile_id": "01K7A000000000000000000010",
+  "title": "Trace duration and payload size",
+  "tileType": "code",
+  "chartType": "bubble",
+  "chartQuery": "SELECT \"duration_ms\", \"payload_bytes\" FROM \"app-logs\" LIMIT 100",
+  "dbName": ["app-logs"],
+  "config": {
+    "type": "bubble",
+    "colourScheme": "classic",
+    "layout": {
+      "legendPosition": "bottom",
+      "segments": {
+        "value": [10, 90],
+        "isPercent": true
+      },
+      "label": false
+    },
+    "axes": {
+      "x": {
+        "field": "duration_ms",
+        "title": "duration_ms",
+        "display": true
+      },
+      "y": {
+        "field": "payload_bytes",
+        "title": "payload_bytes",
+        "display": true,
+        "beginAtZero": true
+      },
+      "groupBy": {
+        "field": []
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 6
+  }
+}

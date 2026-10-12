@@ -1,23 +1,188 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Input, Select } from '../../components/ui';
 import type { DashboardTile } from '../../lib/types';
 import { fillStyle } from './chartValue';
-import { record, resolvedLayouts, text, supportedCharts } from './tiles';
-export function TileAppearanceFields({
-  draft,
-  change,
-  onValidity,
-}: {
+import {
+  appearanceFor,
+  applyChartChoice,
+  applySeriesStyle,
+  chartChoice,
+  chartChoices,
+  chartIssues,
+  gaugeRange,
+  gaugeSegments,
+  queryValueThemeKeys,
+  queryValueThemeOf,
+  rescaleSegments,
+  seriesStyle,
+  setSegmentCount,
+  setSegmentMode,
+  sparklineOf,
+  type Segments,
+  type SeriesStyle,
+} from './chartPicker';
+import { colourScheme, colourSchemes, pickableSchemes } from './palettes';
+import { record, resolvedLayouts, text } from './tiles';
+
+type AppearanceProps = {
   draft: DashboardTile;
   change: (edits: Partial<DashboardTile>) => void;
-  onValidity: (valid: boolean) => void;
-}) {
+  onValidity: (key: string, valid: boolean) => void;
+};
+const capitalized = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
+const finiteText = (value: string) => value.trim() !== '' && Number.isFinite(Number(value));
+
+function GaugeFields({ draft, change, onValidity }: AppearanceProps) {
+  const config = record(draft.config),
+    layout = record(config.layout),
+    range = gaugeRange(layout),
+    segments = gaugeSegments(layout);
+  const [rangeText, setRangeText] = useState({ from: String(range.from), to: String(range.to) });
+  const [thresholdText, setThresholdText] = useState(() => segments.value.map(String));
+  const issues = chartIssues(draft);
+  useEffect(
+    () => () => {
+      for (const key of ['range', 'threshold1', 'threshold2']) onValidity(key, true);
+    },
+    [onValidity],
+  );
+  function changeSegments(next: Segments) {
+    setThresholdText(next.value.map(String));
+    for (const index of [0, 1])
+      onValidity(
+        `threshold${index + 1}`,
+        next.value[index] === undefined || Number.isFinite(next.value[index]),
+      );
+    change({
+      config: {
+        ...config,
+        layout: { ...layout, segments: { ...record(layout.segments), ...next } },
+      },
+    });
+  }
+  function changeRange(bound: 'from' | 'to', value: string) {
+    const nextText = { ...rangeText, [bound]: value };
+    setRangeText(nextText);
+    onValidity('range', finiteText(nextText.from) && finiteText(nextText.to));
+    if (!finiteText(value)) return;
+    const nextRange = { ...range, [bound]: Number(value) };
+    const nextLayout = { ...layout, [bound === 'from' ? 'rangeFrom' : 'rangeTo']: Number(value) };
+    if (!segments.isPercent) {
+      const next = rescaleSegments(range, nextRange, segments);
+      nextLayout.segments = { ...record(layout.segments), ...next };
+      setThresholdText((current) =>
+        next.value.map((threshold, index) =>
+          current[index] !== undefined && !finiteText(current[index])
+            ? current[index]
+            : String(threshold),
+        ),
+      );
+    }
+    change({ config: { ...config, layout: nextLayout } });
+  }
+  function changeThreshold(index: number, value: string) {
+    setThresholdText((current) => current.map((threshold, i) => (i === index ? value : threshold)));
+    onValidity(`threshold${index + 1}`, finiteText(value));
+    if (!finiteText(value)) return;
+    change({
+      config: {
+        ...config,
+        layout: {
+          ...layout,
+          segments: {
+            ...record(layout.segments),
+            ...segments,
+            value: segments.value.map((threshold, i) => (i === index ? Number(value) : threshold)),
+          },
+        },
+      },
+    });
+  }
+  return (
+    <>
+      <Input
+        label="Range from"
+        type="number"
+        step="any"
+        required
+        value={rangeText.from}
+        error={!finiteText(rangeText.from) ? 'Enter a number for Range from.' : undefined}
+        onChange={(event) => changeRange('from', event.target.value)}
+      />
+      <Input
+        label="Range to"
+        type="number"
+        step="any"
+        required
+        value={rangeText.to}
+        error={!finiteText(rangeText.to) ? 'Enter a number for Range to.' : undefined}
+        onChange={(event) => changeRange('to', event.target.value)}
+      />
+      <Select
+        label="Segments"
+        value={segments.value.length}
+        onChange={(event) =>
+          changeSegments(setSegmentCount(layout, Number(event.target.value) as 0 | 1 | 2))
+        }
+      >
+        <option value={0}>0 (single colour)</option>
+        <option value={1}>1 threshold</option>
+        <option value={2}>2 thresholds</option>
+      </Select>
+      <Select
+        label="Threshold mode"
+        value={segments.isPercent ? 'percent' : 'absolute'}
+        onChange={(event) =>
+          changeSegments(setSegmentMode(layout, event.target.value === 'percent'))
+        }
+      >
+        <option value="percent">Percent</option>
+        <option value="absolute">Absolute</option>
+      </Select>
+      {segments.value.map((threshold, index) => (
+        <Input
+          key={index}
+          label={`Threshold ${index + 1}`}
+          type="number"
+          step="any"
+          required
+          value={thresholdText[index] ?? String(threshold)}
+          error={
+            !finiteText(thresholdText[index] ?? String(threshold))
+              ? 'Enter a number for the threshold.'
+              : undefined
+          }
+          onChange={(event) => changeThreshold(index, event.target.value)}
+        />
+      ))}
+      {!!issues.length && (
+        <div className="ui-field" data-invalid="true">
+          {issues.map((issue) => (
+            <p className="ui-field-message" role="alert" key={issue}>
+              {issue}
+            </p>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+export function TileAppearanceFields({ draft, change, onValidity }: AppearanceProps) {
   const config = record(draft.config),
     layout = record(config.layout),
     axes = record(config.axes);
   const position = resolvedLayouts([draft])[0].layout;
   const [heightText, setHeightText] = useState(String(position.h));
   const heightChanged = useRef(false);
+  const choice = chartChoice(draft),
+    appearance = appearanceFor(choice),
+    scheme = colourScheme(draft);
+  const schemes = scheme === 'agentObservability' ? [...pickableSchemes, scheme] : pickableSchemes;
+  const legendPositions =
+    appearance.legend === 'full' ? ['top', 'bottom', 'left', 'right'] : ['top', 'bottom'];
+  const legendPosition = text(layout.legendPosition, 'bottom');
+  const queryValueTheme = text(layout.queryValueTheme);
   function configLayout(key: string, value: unknown) {
     change({ config: { ...config, layout: { ...layout, [key]: value } } });
   }
@@ -30,20 +195,18 @@ export function TileAppearanceFields({
     <div className="dashboard-editor-grid">
       <Select
         label="Chart type"
-        value={text(draft.chartType, 'timeseries')}
-        onChange={(event) =>
-          change({
-            chartType: event.target.value,
-            config: { ...config, type: event.target.value },
-          })
-        }
+        value={choice ?? text(draft.chartType)}
+        onChange={(event) => {
+          const pick = chartChoices.find(({ value }) => value === event.target.value);
+          if (pick) change(applyChartChoice(draft, pick.value));
+        }}
       >
-        {!supportedCharts.includes(text(draft.chartType)) && (
+        {choice === undefined && (
           <option value={text(draft.chartType)}>{text(draft.chartType)} (preserved)</option>
         )}
-        {supportedCharts.map((type) => (
-          <option key={type} value={type}>
-            {type === 'query-value' ? 'Query value' : type[0].toUpperCase() + type.slice(1)}
+        {chartChoices.map(({ value, label }) => (
+          <option key={value} value={value}>
+            {label}
           </option>
         ))}
       </Select>
@@ -87,7 +250,7 @@ export function TileAppearanceFields({
             Number.isFinite(Number(value)) &&
             Number(value) >= 1 &&
             Number(value) <= 24;
-          onValidity(valid);
+          onValidity('height', valid);
           if (valid) change({ layout: { ...record(draft.layout), h: Math.floor(Number(value)) } });
         }}
         onBlur={() => {
@@ -95,7 +258,7 @@ export function TileAppearanceFields({
           const h = Math.max(1, Math.min(24, Math.floor(Number(heightText))));
           if (!Number.isFinite(h)) return;
           setHeightText(String(h));
-          onValidity(true);
+          onValidity('height', true);
           change({ layout: { ...record(draft.layout), h } });
         }}
       />
@@ -107,8 +270,9 @@ export function TileAppearanceFields({
       <Input
         label="Precision"
         type="number"
-        min={0}
+        min={-1}
         max={20}
+        hint="Use -1 for a precise value (up to 2 decimals)."
         value={typeof layout.precision === 'number' ? layout.precision : ''}
         onChange={(event) => {
           const value = event.target.value;
@@ -119,7 +283,7 @@ export function TileAppearanceFields({
           } else {
             const number = Number(value);
             if (Number.isFinite(number))
-              configLayout('precision', Math.max(0, Math.min(20, Math.floor(number))));
+              configLayout('precision', Math.max(-1, Math.min(20, Math.floor(number))));
           }
         }}
       />
@@ -135,25 +299,118 @@ export function TileAppearanceFields({
           <option value="none">None</option>
         </Select>
       )}
-      <Select
-        label="Legend position"
-        value={text(layout.legendPosition, 'bottom')}
-        onChange={(event) => configLayout('legendPosition', event.target.value)}
-      >
-        {['top', 'bottom', 'left', 'right'].map((position) => (
-          <option key={position}>{position}</option>
-        ))}
-      </Select>
-      <Input
-        label="X-axis title"
-        value={text(record(axes.x).title)}
-        onChange={(event) => axisTitle('x', event.target.value)}
-      />
-      <Input
-        label="Y-axis title"
-        value={text(record(axes.y).title)}
-        onChange={(event) => axisTitle('y', event.target.value)}
-      />
+      {appearance.queryValueTheme && (
+        <Select
+          label="Theme"
+          value={queryValueTheme || queryValueThemeOf(layout)}
+          onChange={(event) => configLayout('queryValueTheme', event.target.value)}
+        >
+          {queryValueTheme !== '' &&
+            !queryValueThemeKeys.some((key) => key === queryValueTheme) && (
+              <option value={queryValueTheme}>{queryValueTheme} (preserved)</option>
+            )}
+          {queryValueThemeKeys.map((key) => (
+            <option key={key} value={key}>
+              {capitalized(key)}
+            </option>
+          ))}
+        </Select>
+      )}
+      {appearance.sparkline && (
+        <Select
+          label="Spark chart"
+          value={sparklineOf(layout) ? 'enabled' : 'disabled'}
+          onChange={(event) => configLayout('sparkline', event.target.value === 'enabled')}
+        >
+          <option value="enabled">Enabled</option>
+          <option value="disabled">Disabled</option>
+        </Select>
+      )}
+      {appearance.colourScheme && (
+        <Select
+          label="Color scheme"
+          value={scheme}
+          onChange={(event) => change({ config: { ...config, colourScheme: event.target.value } })}
+        >
+          {schemes.map((id) => (
+            <option key={id} value={id}>
+              {colourSchemes[id].label}
+            </option>
+          ))}
+        </Select>
+      )}
+      {appearance.legend !== 'none' && (
+        <Select
+          label="Legend position"
+          value={legendPosition}
+          onChange={(event) => configLayout('legendPosition', event.target.value)}
+        >
+          {!legendPositions.includes(legendPosition) && (
+            <option value={legendPosition}>{capitalized(legendPosition)} (preserved)</option>
+          )}
+          {legendPositions.map((position) => (
+            <option key={position} value={position}>
+              {capitalized(position)}
+            </option>
+          ))}
+        </Select>
+      )}
+      {appearance.label && (
+        <Select
+          label="Labels"
+          value={layout.label === true ? 'show' : 'hide'}
+          onChange={(event) => configLayout('label', event.target.value === 'show')}
+        >
+          <option value="show">Show</option>
+          <option value="hide">Hide</option>
+        </Select>
+      )}
+      {appearance.orientation && (
+        <Select
+          label="Orientation"
+          value={text(layout.barOrientation, 'vertical')}
+          onChange={(event) => configLayout('barOrientation', event.target.value)}
+        >
+          <option value="vertical">Vertical</option>
+          <option value="horizontal">Horizontal</option>
+        </Select>
+      )}
+      {appearance.seriesStyle && (
+        <Select
+          label="Series style"
+          value={seriesStyle(draft)}
+          onChange={(event) => change(applySeriesStyle(draft, event.target.value as SeriesStyle))}
+        >
+          <option value="line">Line</option>
+          <option value="bar">Bar</option>
+          <option value="area">Area</option>
+        </Select>
+      )}
+      {appearance.range && <GaugeFields draft={draft} change={change} onValidity={onValidity} />}
+      {appearance.humanize && (
+        <Select
+          label="Auto-formatting"
+          value={layout.humanize === true ? 'on' : 'off'}
+          onChange={(event) => configLayout('humanize', event.target.value === 'on')}
+        >
+          <option value="on">On</option>
+          <option value="off">Off</option>
+        </Select>
+      )}
+      {(appearance.axisTitles || choice === undefined) && (
+        <>
+          <Input
+            label="X-axis title"
+            value={text(record(axes.x).title)}
+            onChange={(event) => axisTitle('x', event.target.value)}
+          />
+          <Input
+            label="Y-axis title"
+            value={text(record(axes.y).title)}
+            onChange={(event) => axisTitle('y', event.target.value)}
+          />
+        </>
+      )}
     </div>
   );
 }

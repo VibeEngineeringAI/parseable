@@ -3,6 +3,9 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './story-tests',
   fullyParallel: true,
+  workers: process.env.CI ? 2 : 4,
+  // Missing baselines must fail, including in CI; updates are an explicit review step.
+  updateSnapshots: 'none',
   retries: process.env.CI ? 1 : 0,
   outputDir: 'test-results/storybook',
   reporter: [['list'], ['html', { open: 'never', outputFolder: 'playwright-report/storybook' }]],

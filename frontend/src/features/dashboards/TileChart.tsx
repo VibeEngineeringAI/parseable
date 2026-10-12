@@ -1,31 +1,56 @@
 import { useCallback, useMemo } from 'react';
-import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
+import { PieChart } from '../../components/charts/PieChart';
+import {
+  TimeSeriesChart,
+  type TimeSeriesChartProps,
+} from '../../components/charts/TimeSeriesChart';
+import { BubbleChart } from '../../components/charts/BubbleChart';
+import { GaugeChart } from '../../components/charts/GaugeChart';
 import { DataTable } from '../../components/explorer/DataTable';
 import { chartResults, promqlTableRows } from '../../lib/promqlResults';
-import { chartValue, diagonalFill, fillStyle, percentFill } from './chartValue';
+import {
+  cartesianChart,
+  cartesianStyle,
+  promqlCategoryChart,
+  type CartesianChart,
+} from './cartesian';
+import { gaugeModel, gaugeValue } from './gauge';
+import { fillStyle, percentFill } from './chartValue';
+import { QueryValue } from './QueryValue';
+import { queryValueNumber, queryValueTheme, sparklineValues } from './queryValue';
+import { formatValue as formatTileValue, valueFormat } from './formatValue';
 import { useChartHeight } from './useChartHeight';
 import { toChartSeries } from '../../lib/promql';
 import type { DashboardTile } from '../../lib/types';
-import { record, sqlChart, text, tileTitle } from './tiles';
+import { record, text, tileTitle } from './tiles';
 import type { TileResults } from './queries';
+import { bubbleChart } from './bubble';
+import { tilePalette } from './palettes';
+import { tileSlices } from './slices';
 export function TileChart({
   tile,
   result,
   start,
   end,
   height,
+  onZoomRange,
 }: {
   tile: DashboardTile;
   result: TileResults;
   start: number;
   end: number;
   height: number | 'fit';
+  onZoomRange?: TimeSeriesChartProps['onZoomRange'];
 }) {
   const config = record(tile.config),
     layout = record(config.layout),
     axes = record(config.axes);
-  const chart = useMemo(() => {
-    if (!result.promql) return sqlChart(result.rows ?? [], tile);
+  const chart = useMemo<CartesianChart>(() => {
+    if (!result.promql) return cartesianChart(result.rows ?? [], tile);
+    if (['timeseries', 'line', 'area', 'bar'].includes(text(tile.chartType))) {
+      const categorical = promqlCategoryChart(result.promql);
+      if (categorical) return categorical;
+    }
     const converted = result.promql.map((row) =>
       row.range
         ? row
@@ -58,21 +83,104 @@ export function TileChart({
     () => result.rows ?? (result.promql ? promqlTableRows(result.promql) : []),
     [result],
   );
-  const precision =
-    typeof layout.precision === 'number' && Number.isFinite(layout.precision)
-      ? Math.max(0, Math.min(20, Math.floor(layout.precision)))
-      : undefined;
-  const unit = text(layout.unit);
-  const formatValue = useCallback(
-    (value: number) =>
-      `${precision === undefined ? value.toLocaleString() : value.toFixed(precision)}${unit ? ` ${unit}` : ''}`,
-    [precision, unit],
+  const bubble = useMemo(
+    () =>
+      tile.chartType === 'bubble' && !result.promql && tile.tileType !== 'promql'
+        ? bubbleChart(result.rows ?? [], tile)
+        : undefined,
+    [result, tile],
   );
+  const slices = useMemo(
+    () => (['pie', 'donut'].includes(text(tile.chartType)) ? tileSlices(result, tile) : []),
+    [result, tile],
+  );
+  const unit = text(layout.unit),
+    precision = typeof layout.precision === 'number' ? layout.precision : undefined,
+    humanize = layout.humanize === true;
+  const format = useMemo(
+    () => valueFormat({ unit, precision, humanize }),
+    [unit, precision, humanize],
+  );
+  const formatValue = useCallback((value: number) => formatTileValue(value, format), [format]);
   const xRange = useMemo(() => [start, end] as const, [start, end]);
   const fitted = useChartHeight(
     height,
-    JSON.stringify([tile.config, chart.categorical, chart.series.map((series) => series.id)]),
+    JSON.stringify([
+      tile.config,
+      chart.categorical,
+      chart.series.map((series) => series.id),
+      bubble?.groups.map((group) => group.id),
+      bubble?.truncated,
+    ]),
   );
+  const chartType = text(tile.chartType);
+  if (chartType === 'pie' || chartType === 'donut') {
+    const legendPosition = text(layout.legendPosition);
+    return (
+      <PieChart
+        slices={slices}
+        variant={chartType}
+        palette={tilePalette(tile)}
+        showLabels={layout.label === true}
+        legendPosition={
+          legendPosition === 'top' || legendPosition === 'left' || legendPosition === 'right'
+            ? legendPosition
+            : 'bottom'
+        }
+        formatValue={formatValue}
+        title={`${tileTitle(tile)} chart`}
+        height={height === 'fit' ? undefined : height}
+      />
+    );
+  }
+  if (tile.chartType === 'bubble') {
+    if (result.promql || tile.tileType === 'promql')
+      return (
+        <p className="muted dashboard-chart-note" role="status">
+          Bubble charts are not available for PromQL tiles.
+        </p>
+      );
+    const legend = text(layout.legendPosition);
+    const legendPosition =
+      legend === 'top' || legend === 'left' || legend === 'right' ? legend : 'bottom';
+    const { xField, yField, sizeField, groupField, ...data } = bubble!;
+    return (
+      <div ref={fitted.root} className="dashboard-chart" data-legend-position={legendPosition}>
+        <BubbleChart
+          {...data}
+          xTitle={text(record(axes.x).title) || xField}
+          yTitle={text(record(axes.y).title) || yField}
+          xLabel={xField}
+          yLabel={yField}
+          sizeLabel={sizeField}
+          groupLabel={groupField}
+          legendPosition={legendPosition}
+          formatValue={formatValue}
+          title={`${tileTitle(tile)} chart`}
+          height={fitted.pixels}
+          emptyMessage="No results for the selected time range"
+        />
+      </div>
+    );
+  }
+  if (tile.chartType === 'gauge') {
+    const value = gaugeValue(tile, result, rows);
+    return value === undefined ? (
+      <div
+        className="charts-empty charts-gauge-empty"
+        role="group"
+        aria-label={`${tileTitle(tile)} value`}
+      >
+        No values returned
+      </div>
+    ) : (
+      <GaugeChart
+        label={tileTitle(tile)}
+        model={gaugeModel(value, tile)}
+        text={formatValue(value)}
+      />
+    );
+  }
   if (tile.chartType === 'table' || (chart.categorical && tile.chartType !== 'query-value'))
     return (
       <div
@@ -90,59 +198,79 @@ export function TileChart({
       </div>
     );
   if (tile.chartType === 'query-value') {
-    const value = chartValue(rows, tile, !!result.promql);
+    const value = queryValueNumber(tile, result, rows);
     const fill = value === undefined ? undefined : percentFill(value, tile);
-    const style = fillStyle(tile);
     return (
-      <div className="dashboard-stat" role="group" aria-label={`${tileTitle(tile)} value`}>
-        {fill !== undefined && (
-          <span
-            className="dashboard-stat-fill"
-            data-direction={style}
-            style={
-              style === 'vertical'
-                ? { height: `${fill}%` }
-                : style === 'diagonal'
-                  ? { clipPath: diagonalFill(fill) }
-                  : { width: `${fill}%` }
-            }
-            aria-hidden="true"
-          />
-        )}
-        {value === undefined ? 'No values returned' : formatValue(value)}
-      </div>
+      <QueryValue
+        label={tileTitle(tile)}
+        text={value === undefined ? undefined : formatValue(value)}
+        theme={queryValueTheme(tile)}
+        fill={fill === undefined ? undefined : { style: fillStyle(tile), percent: fill }}
+        spark={sparklineValues(tile, result, chart)}
+      />
     );
   }
+  const style = cartesianStyle(tile),
+    horizontal = style.horizontal && chart.categories !== undefined;
   return (
     <div
       ref={fitted.root}
       className="dashboard-chart"
       data-legend-position={text(layout.legendPosition, 'bottom')}
+      data-chart-kind={style.kind === 'bar' ? 'bar' : style.fill ? 'area' : 'line'}
+      data-stacked={style.stacked}
+      data-orientation={horizontal ? 'horizontal' : 'vertical'}
     >
-      {text(record(axes.y).title) && (
+      {!horizontal && text(record(axes.y).title) && (
         <p className="muted dashboard-axis-title">{text(record(axes.y).title)}</p>
       )}
       <TimeSeriesChart
         timestamps={chart.timestamps}
         series={chart.series}
+        legendTitle={chart.legendTitle}
+        onZoomRange={
+          tile.chartType === 'timeseries' && chart.categories === undefined && !tile.timeRange
+            ? onZoomRange
+            : undefined
+        }
+        categories={chart.categories}
+        kind={style.kind}
+        fill={style.fill}
+        smooth={style.smooth}
+        stacked={style.stacked}
+        horizontal={style.horizontal}
+        colors={tilePalette(tile)}
+        showXAxis={record(axes.x).display !== false}
+        paddedBounds
         title={`${tileTitle(tile)} chart`}
         showTitle={false}
         xAxisTitle={text(record(axes.x).title)}
+        valueAxisTitle={horizontal ? text(record(axes.y).title) : undefined}
         showSeriesCount={false}
         height={fitted.pixels}
-        yAxisSize={chart.series.reduce<number>(
-          (size, series) =>
-            series.values.reduce<number>(
-              (width, value) =>
-                value !== null && Number.isFinite(value)
-                  ? Math.max(width, formatValue(value).length * 7 + 24)
-                  : width,
-              size,
-            ),
-          64,
-        )}
+        yAxisSize={
+          horizontal
+            ? Math.max(
+                64,
+                Math.min(
+                  180,
+                  Math.max(0, ...(chart.categories ?? []).map((label) => label.length)) * 7 + 24,
+                ),
+              )
+            : chart.series.reduce<number>(
+                (size, series) =>
+                  series.values.reduce<number>(
+                    (width, value) =>
+                      value !== null && Number.isFinite(value)
+                        ? Math.max(width, formatValue(value).length * 7 + 24)
+                        : width,
+                    size,
+                  ),
+                64,
+              )
+        }
         announceSeries={false}
-        xRange={xRange}
+        xRange={chart.categories ? undefined : xRange}
         formatValue={formatValue}
         emptyMessage="No results for the selected time range"
       />

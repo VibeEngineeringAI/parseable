@@ -9,8 +9,10 @@ import { timeBounds } from '../../lib/query';
 import type { QueryLimiter } from '../../lib/concurrency';
 import type { DashboardTile as Tile, DashboardVariable, QueryRequest } from '../../lib/types';
 import { TileChart } from './TileChart';
+import type { TimeSeriesChartProps } from '../../components/charts/TimeSeriesChart';
 import { loadTile, type TileResults } from './queries';
 import {
+  instantCharts,
   knownTile,
   supportedCharts,
   text,
@@ -26,6 +28,7 @@ import {
 } from './tiles';
 import { storedRange } from './timeRange';
 import { tileHandoffs } from './handoffs';
+import { sparklineEnabled } from './queryValue';
 import type { VariableValues } from './variables';
 const typeLabel = (value: unknown) => {
   const name = text(value) || 'Unknown';
@@ -49,6 +52,7 @@ export function DashboardTile({
   first,
   last,
   onAction,
+  onZoomRange,
 }: {
   tile: Tile;
   layout: TileLayout;
@@ -67,11 +71,13 @@ export function DashboardTile({
   first: boolean;
   last: boolean;
   onAction: (action: 'edit' | 'duplicate' | 'earlier' | 'later' | 'delete', tile: Tile) => void;
+  onZoomRange?: TimeSeriesChartProps['onZoomRange'];
 }) {
   const { client, mode } = useApp(),
     navigate = useNavigate();
   const [viewQuery, setViewQuery] = useState(false);
   const supported = knownTile(tile) && supportedCharts.includes(text(tile.chartType, 'timeseries'));
+  const unavailable = tile.tileType === 'promql' && tile.chartType === 'bubble';
   const locked = tile.tileType === 'promql' && promqlEnabled !== true;
   const effectiveBounds = useMemo(
     () => (tile.timeRange ? timeBounds(storedRange(tile.timeRange, anchor), anchor) : bounds),
@@ -93,7 +99,8 @@ export function DashboardTile({
       .map((variable) => variable.name),
     ...(tile.tileType === 'promql'
       ? {
-          stat: tile.chartType === 'query-value',
+          stat: instantCharts.includes(text(tile.chartType)),
+          sparkline: sparklineEnabled(tile),
           step: storedStep(tile),
           maxDataPoints:
             record(tile.config).maxDataPoints ?? record(record(tile.config).layout).maxDataPoints,
@@ -103,13 +110,14 @@ export function DashboardTile({
     end: effectiveBounds.endTime,
     revision,
     supported,
+    unavailable,
     locked,
     ready,
   });
   const results = useAsync(
     useCallback(
       (signal) =>
-        supported && !locked && ready
+        supported && !unavailable && !locked && ready
           ? loadTile(client, tile, variables, values, effectiveBounds, limit, signal)
           : Promise.resolve(undefined),
       [client, limit, inputKey],
@@ -136,7 +144,7 @@ export function DashboardTile({
       className="dashboard-server-tile"
       role="region"
       aria-label={`Tile ${tileTitle(tile)}`}
-      aria-busy={supported && !locked && ready && results.loading}
+      aria-busy={supported && !unavailable && !locked && ready && results.loading}
       data-tile-id={tile.tile_id}
       style={{
         gridColumn: `${layout.x + 1} / span ${layout.w}`,
@@ -226,6 +234,14 @@ export function DashboardTile({
             <pre>{handoff.queries.join('\n\n') || JSON.stringify(tile.chartQuery, null, 2)}</pre>
             {classicLink}
           </div>
+        ) : unavailable ? (
+          <TileChart
+            tile={tile}
+            result={{}}
+            start={Date.parse(effectiveBounds.startTime) / 1000}
+            end={Date.parse(effectiveBounds.endTime) / 1000}
+            height="fit"
+          />
         ) : locked ? (
           <p className="notice">
             {promqlEnabled === undefined
@@ -261,6 +277,7 @@ export function DashboardTile({
                 start={Date.parse(effectiveBounds.startTime) / 1000}
                 end={Date.parse(effectiveBounds.endTime) / 1000}
                 height="fit"
+                onZoomRange={onZoomRange}
               />
             )}
           </>

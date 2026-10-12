@@ -9,8 +9,11 @@ import {
 } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
+import { cartesianPlot, drawThresholds, seriesWidth, type PositionedSeries } from './cartesianPlot';
 import { formatChartValue } from './format';
+import { shortenLegendLabel } from './legend';
 import { PALETTE_SIZE, assignSeriesSlots, rankSeries, selectTopSeries } from './seriesSelection';
+import { zoomRange, type ZoomRange } from './zoomRange';
 import './charts.css';
 
 export type ChartSeries = { id: string; label: string; values: (number | null)[] };
@@ -30,6 +33,12 @@ export interface TimeSeriesChartProps {
   showTitle?: boolean;
   /** Place a title immediately below the time axis, before counts and legend. */
   xAxisTitle?: string;
+  /** Numeric axis label for horizontal category bars. */
+  valueAxisTitle?: string;
+  /** Group field names shown before the series visibility controls. */
+  legendTitle?: string;
+  /** Opt time charts into selecting an absolute dashboard range. */
+  onZoomRange?: (range: ZoomRange) => void;
   /** Compact cards can omit counts while retaining the Show all control. */
   showSeriesCount?: boolean;
   /** Fixed x-axis bounds in Unix seconds, independent of the sample timestamps. */
@@ -41,25 +50,29 @@ export interface TimeSeriesChartProps {
   emptyMessage?: string;
   /** Horizontal reference lines, included in the automatic y range. */
   thresholds?: readonly ChartThreshold[];
+  /** Numeric x indices with category labels instead of timestamps. */
+  categories?: readonly string[];
+  kind?: 'line' | 'bar';
+  fill?: boolean;
+  smooth?: boolean;
+  /** Bars share one stack; inspected values remain unstacked. */
+  stacked?: boolean;
+  /** Category bars with their category axis on the left. */
+  horizontal?: boolean;
+  /** Hex colours by incoming series index, cycling through the supplied palette. */
+  colors?: readonly string[];
+  showXAxis?: boolean;
+  /** Five percent value-axis padding, starting nonnegative data at zero. */
+  paddedBounds?: boolean;
 }
 
 type Cursor = { index: number; left: number; top: number };
-// `slot` is the colour slot, which follows the series id; the plot index is its position in `entries`.
-type PositionedSeries = { series: ChartSeries; slot: number };
 
-// 24-hour ticks matching the tooltip; columns follow uPlot's time-axis format table:
-// [min increment, default, year, month, day, hour, minute, second, mode].
-const timeAxisFormats: uPlot.Axis.Values = [
-  [3600 * 24 * 365, '{YYYY}', null, null, null, null, null, null, 1],
-  [3600 * 24 * 28, '{MMM}', '\n{YYYY}', null, null, null, null, null, 1],
-  [3600 * 24, '{MMM} {D}', '\n{YYYY}', null, null, null, null, null, 1],
-  [3600, '{HH}:{mm}', '\n{MMM} {D}', null, '\n{MMM} {D}', null, null, null, 1],
-  [60, '{HH}:{mm}', '\n{MMM} {D}', null, '\n{MMM} {D}', null, null, null, 1],
-  [1, '{HH}:{mm}:{ss}', '\n{MMM} {D}', null, '\n{MMM} {D}', null, null, null, 1],
-];
-
-function seriesColor(slot: number): string {
-  return slot < PALETTE_SIZE ? `var(--chart-series-${slot + 1})` : 'var(--color-border-strong)';
+function seriesColor(slot: number, color?: string): string {
+  return (
+    color ??
+    (slot < PALETTE_SIZE ? `var(--chart-series-${slot + 1})` : 'var(--color-border-strong)')
+  );
 }
 
 function formatTime(timestamp: number, timeZone: 'UTC' | 'local'): string {
@@ -80,6 +93,7 @@ function ChartTooltip({
   cursor,
   entries,
   timestamps,
+  categories,
   timeZone,
   formatValue,
   id,
@@ -87,6 +101,7 @@ function ChartTooltip({
   cursor: Cursor;
   entries: PositionedSeries[];
   timestamps: number[];
+  categories?: readonly string[];
   timeZone: 'UTC' | 'local';
   formatValue: (value: number) => string;
   id: string;
@@ -94,7 +109,7 @@ function ChartTooltip({
   const element = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({ left: 8, top: 8 });
   const rows = entries
-    .map(({ series, slot }) => ({ series, slot, value: series.values[cursor.index] }))
+    .map(({ series, slot, color }) => ({ series, slot, color, value: series.values[cursor.index] }))
     .sort((left, right) => {
       const a = Number.isFinite(left.value) ? left.value! : -Infinity;
       const b = Number.isFinite(right.value) ? right.value! : -Infinity;
@@ -121,16 +136,20 @@ function ChartTooltip({
 
   return (
     <div ref={element} id={id} role="tooltip" className="charts-tooltip" style={position}>
-      <time dateTime={new Date(timestamps[cursor.index] * 1000).toISOString()}>
-        {formatTime(timestamps[cursor.index], timeZone)}
-      </time>
-      {rows.slice(0, 10).map(({ series, slot, value }) => (
+      {categories !== undefined ? (
+        <span className="charts-tooltip-category">{categories[cursor.index]}</span>
+      ) : (
+        <time dateTime={new Date(timestamps[cursor.index] * 1000).toISOString()}>
+          {formatTime(timestamps[cursor.index], timeZone)}
+        </time>
+      )}
+      {rows.slice(0, 10).map(({ series, slot, color, value }) => (
         <div key={series.id} className="charts-tooltip-row">
           <strong>{value != null && Number.isFinite(value) ? formatValue(value) : '-'}</strong>
           <span
             aria-hidden="true"
             className="charts-line-key"
-            style={{ borderColor: seriesColor(slot) }}
+            style={{ borderColor: seriesColor(slot, color) }}
           />
           <span className="charts-tooltip-label">{series.label}</span>
         </div>
@@ -149,6 +168,9 @@ export function TimeSeriesChart({
   title = 'Time series',
   showTitle = true,
   xAxisTitle,
+  valueAxisTitle,
+  legendTitle,
+  onZoomRange,
   showSeriesCount = true,
   xRange,
   maxSeries = 20,
@@ -156,16 +178,28 @@ export function TimeSeriesChart({
   formatValue = formatChartValue,
   emptyMessage = 'No data',
   thresholds = noThresholds,
+  categories,
+  kind = 'line',
+  fill = false,
+  smooth = false,
+  stacked = false,
+  horizontal = false,
+  colors,
+  showXAxis = true,
+  paddedBounds = false,
 }: TimeSeriesChartProps) {
   const container = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
   const cursorIndex = useRef<number | null>(null);
   const highlighted = useRef<string | null>(null);
+  const keyboardSelection = useRef<{ anchor: number; index: number } | null>(null);
+  const onZoomRangeRef = useRef(onZoomRange);
   const hiddenRef = useRef(new Set<string>());
   const [hidden, setHidden] = useState(new Set<string>());
   const [showAll, setShowAll] = useState(false);
   const [cursor, setCursor] = useState<Cursor | null>(null);
   const [themeRevision, setThemeRevision] = useState(0);
+  const [zoomStatus, setZoomStatus] = useState('');
   const instructionsId = useId();
   const tooltipId = useId();
   const xMin = xRange?.[0];
@@ -177,6 +211,16 @@ export function TimeSeriesChart({
     () => thresholds.filter(({ value }) => Number.isFinite(value)),
     [thresholdsKey],
   );
+  const categoriesKey = JSON.stringify(categories);
+  const categoryLabels = useMemo(() => categories, [categoriesKey]);
+  const colorsKey = JSON.stringify(colors ?? []);
+  const isHorizontal = kind === 'bar' && categoryLabels !== undefined && horizontal;
+  const horizontalTitle = isHorizontal ? xAxisTitle : undefined;
+  const horizontalValueTitle = isHorizontal ? valueAxisTitle : undefined;
+  const zoomEnabled = onZoomRange !== undefined && categoryLabels === undefined;
+  onZoomRangeRef.current = onZoomRange;
+  // Bar visibility changes require fresh stack totals and group positions.
+  const barVisibility = kind === 'bar' ? hidden : undefined;
   const slotHistory = useRef(new Map<string, number>());
   const entries = useMemo<PositionedSeries[]>(() => {
     const drawn = showAll ? series : selectTopSeries(series, limit);
@@ -185,8 +229,22 @@ export function TimeSeriesChart({
       rankSeries(drawn).map((entry) => entry.id),
     );
     slotHistory.current = history;
-    return drawn.map((entry) => ({ series: entry, slot: slots.get(entry.id)! }));
-  }, [series, showAll, limit]);
+    const incomingColors = new Map(
+      series.map((entry, index) => [
+        entry.id,
+        colors?.length ? colors[index % colors.length] : undefined,
+      ]),
+    );
+    return drawn.map((entry) => ({
+      series: entry,
+      slot: slots.get(entry.id)!,
+      color: incomingColors.get(entry.id),
+    }));
+  }, [series, showAll, limit, colorsKey]);
+  const plotEntries = useMemo(
+    () => (kind === 'bar' && stacked ? [...entries].reverse() : entries),
+    [entries, kind, stacked],
+  );
   const visibleEntries = useMemo(
     () => entries.filter((entry) => !hidden.has(entry.series.id)),
     [entries, hidden],
@@ -203,10 +261,30 @@ export function TimeSeriesChart({
     [timestamps, series],
   );
   const summary = hasData
-    ? `${title}: ${series.length} series from ${formatTime(timestamps[0], timeZone)} to ${formatTime(timestamps[timestamps.length - 1], timeZone)}`
+    ? categoryLabels !== undefined
+      ? `${title}: ${series.length} series across ${categoryLabels.length} categories`
+      : `${title}: ${series.length} series from ${formatTime(timestamps[0], timeZone)} to ${formatTime(timestamps[timestamps.length - 1], timeZone)}`
     : `${title}: ${emptyMessage}`;
   // A shorter result can arrive while a cursor still points into the previous data.
   const activeCursor = cursor && cursor.index < timestamps.length ? cursor : null;
+
+  function clearSelection(chart = plot.current) {
+    const selected = keyboardSelection.current !== null || (chart?.select.width ?? 0) > 0;
+    keyboardSelection.current = null;
+    chart?.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+    if (selected) setZoomStatus('Selection cleared.');
+  }
+
+  function applyZoom(chart: uPlot, from: number, to: number) {
+    const range = zoomRange(timestamps, from, to);
+    if (range) onZoomRangeRef.current?.(range);
+    clearSelection(chart);
+    setZoomStatus(
+      range
+        ? `Zoomed to ${formatTime(Date.parse(range.startTime) / 1000, timeZone)} to ${formatTime(Date.parse(range.endTime) / 1000, timeZone)}.`
+        : 'Selection cleared. Select at least two points to zoom.',
+    );
+  }
 
   useEffect(() => {
     const observer = new MutationObserver(() => setThemeRevision((revision) => revision + 1));
@@ -220,27 +298,50 @@ export function TimeSeriesChart({
   useEffect(() => {
     const host = container.current;
     cursorIndex.current = null;
+    keyboardSelection.current = null;
     setCursor(null);
     if (!host || !hasData) return;
     const styles = getComputedStyle(host);
     const neutral = styles.getPropertyValue('--color-border-strong').trim();
-    const colors = entries.map(({ slot }) =>
-      slot < PALETTE_SIZE ? styles.getPropertyValue(`--chart-series-${slot + 1}`).trim() : neutral,
+    const plotColors = plotEntries.map(
+      ({ slot, color }) =>
+        color ??
+        (slot < PALETTE_SIZE
+          ? styles.getPropertyValue(`--chart-series-${slot + 1}`).trim()
+          : neutral),
     );
     const grid = styles.getPropertyValue('--color-border').trim();
     const muted = styles.getPropertyValue('--color-muted').trim();
     const surface = styles.getPropertyValue('--color-surface').trim();
     const thresholdColor = styles.getPropertyValue('--color-warning').trim();
     const font = `11px ${styles.getPropertyValue('--font-sans').trim()}`;
-    const data: uPlot.AlignedData = [
+    const { data, options } = cartesianPlot({
       timestamps,
-      ...entries.map(({ series: entry }) =>
-        timestamps.map((_, index) => {
-          const value = entry.values[index];
-          return value != null && Number.isFinite(value) ? value : null;
-        }),
-      ),
-    ];
+      entries: plotEntries,
+      colors: plotColors,
+      hidden: hiddenRef.current,
+      highlighted: highlighted.current,
+      categories: categoryLabels,
+      kind,
+      fill,
+      smooth,
+      stacked,
+      horizontal: isHorizontal,
+      showXAxis,
+      paddedBounds,
+      xMin,
+      xMax,
+      xAxisTitle: horizontalTitle,
+      valueAxisTitle: horizontalValueTitle,
+      zoomable: zoomEnabled,
+      references,
+      yAxisSize,
+      formatValue,
+      font,
+      grid,
+      muted,
+      surface,
+    });
     let chart: uPlot | null = null;
 
     function resize(width: number) {
@@ -255,86 +356,29 @@ export function TimeSeriesChart({
           width,
           height,
           legend: { show: false },
-          select: { show: false, left: 0, top: 0, width: 0, height: 0 },
+          select: { show: zoomEnabled, left: 0, top: 0, width: 0, height: 0 },
           tzDate: (timestamp) =>
             timeZone === 'UTC'
               ? uPlot.tzDate(new Date(timestamp * 1000), 'UTC')
               : new Date(timestamp * 1000),
-          scales: {
-            x: { range: xMin !== undefined && xMax !== undefined ? [xMin, xMax] : undefined },
-            ...(references.length
+          ...options,
+          focus: { alpha: 1 },
+          hooks: {
+            ...(zoomEnabled
               ? {
-                  y: {
-                    range: (_, min, max) =>
-                      uPlot.rangeNum(
-                        Math.min(min, ...references.map(({ value }) => value)),
-                        Math.max(max, ...references.map(({ value }) => value)),
-                        0.1,
-                        true,
-                      ),
-                  },
+                  setSelect: [
+                    (self: uPlot) => {
+                      if (self.select.width <= 0) return;
+                      applyZoom(
+                        self,
+                        self.posToVal(self.select.left, 'x'),
+                        self.posToVal(self.select.left + self.select.width, 'x'),
+                      );
+                    },
+                  ],
                 }
               : {}),
-          },
-          series: [
-            {},
-            ...entries.map(({ series: entry, slot }, index) => ({
-              label: entry.label,
-              stroke: colors[index],
-              width: highlighted.current === entry.id ? 2 : slot < PALETTE_SIZE ? 1.5 : 1,
-              show: !hiddenRef.current.has(entry.id),
-              spanGaps: false,
-              points: { show: false },
-            })),
-          ],
-          axes: [
-            {
-              stroke: muted,
-              font,
-              grid: { stroke: grid, width: 1 },
-              ticks: { stroke: grid, width: 1 },
-              values: timeAxisFormats,
-            },
-            {
-              stroke: muted,
-              font,
-              size: yAxisSize,
-              grid: { stroke: grid, width: 1 },
-              ticks: { stroke: grid, width: 1 },
-              values: (_, values) => values.map(formatValue),
-            },
-          ],
-          focus: { alpha: 1 },
-          cursor: {
-            drag: { x: false, y: false, setScale: false },
-            focus: { prox: 16 },
-            points: { size: 8, width: 2, stroke: (_, index) => colors[index - 1], fill: surface },
-            dataIdx: (_, __, closest) => closest,
-            move: (self, left, top) =>
-              left < 0 ? [left, top] : [self.valToPos(timestamps[self.posToIdx(left)], 'x'), top],
-          },
-          hooks: {
-            draw: [
-              (self) => {
-                if (!references.length) return;
-                const { ctx, bbox } = self;
-                ctx.save();
-                ctx.beginPath();
-                ctx.rect(bbox.left, bbox.top, bbox.width, bbox.height);
-                ctx.clip();
-                ctx.strokeStyle = thresholdColor;
-                ctx.lineWidth = uPlot.pxRatio;
-                ctx.setLineDash([6 * uPlot.pxRatio, 4 * uPlot.pxRatio]);
-                for (const { value } of references) {
-                  const y = self.valToPos(value, 'y', true);
-                  ctx.beginPath();
-                  ctx.moveTo(bbox.left, y);
-                  ctx.lineTo(bbox.left + bbox.width, y);
-                  ctx.stroke();
-                }
-                ctx.restore();
-              },
-            ],
+            draw: [(self) => drawThresholds(self, references, thresholdColor, isHorizontal)],
             setCursor: [
               (self) => {
                 const index = self.cursor.idx;
@@ -354,16 +398,15 @@ export function TimeSeriesChart({
               (self, index, options) => {
                 if (options.show !== undefined) return;
                 highlighted.current =
-                  index == null ? null : (entries[index - 1]?.series.id ?? null);
+                  index == null ? null : (plotEntries[index - 1]?.series.id ?? null);
                 self.series.forEach((entry, plotIndex) => {
                   if (plotIndex === 0) return;
-                  const positioned = entries[plotIndex - 1];
-                  entry.width =
-                    positioned.series.id === highlighted.current
-                      ? 2
-                      : positioned.slot < PALETTE_SIZE
-                        ? 1.5
-                        : 1;
+                  entry.width = seriesWidth(
+                    plotEntries[plotIndex - 1],
+                    highlighted.current,
+                    kind,
+                    fill,
+                  );
                 });
                 self.redraw(true, false);
               },
@@ -387,7 +430,7 @@ export function TimeSeriesChart({
     };
   }, [
     timestamps,
-    entries,
+    plotEntries,
     height,
     yAxisSize,
     timeZone,
@@ -397,17 +440,29 @@ export function TimeSeriesChart({
     references,
     xMin,
     xMax,
+    categoryLabels,
+    kind,
+    fill,
+    smooth,
+    stacked,
+    isHorizontal,
+    horizontalTitle,
+    horizontalValueTitle,
+    zoomEnabled,
+    showXAxis,
+    paddedBounds,
+    barVisibility,
   ]);
 
   useEffect(() => {
     const chart = plot.current;
     if (!chart) return;
     chart.batch(() =>
-      entries.forEach(({ series: entry }, index) =>
+      plotEntries.forEach(({ series: entry }, index) =>
         chart.setSeries(index + 1, { show: !hidden.has(entry.id) }),
       ),
     );
-  }, [hidden, entries]);
+  }, [hidden, plotEntries]);
 
   function hideCursor() {
     setCursor(null);
@@ -418,25 +473,68 @@ export function TimeSeriesChart({
     if (event.key === 'Escape') {
       event.preventDefault();
       hideCursor();
+      if (zoomEnabled) clearSelection();
       return;
     }
     const chart = plot.current;
-    if (!chart || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
+    const selection = keyboardSelection.current;
+    if (zoomEnabled && chart && event.key === 'Enter' && selection) {
+      event.preventDefault();
+      applyZoom(chart, timestamps[selection.anchor], timestamps[selection.index]);
+      return;
+    }
+    const forward = event.key === 'ArrowRight' || (isHorizontal && event.key === 'ArrowDown');
+    const backward = event.key === 'ArrowLeft' || (isHorizontal && event.key === 'ArrowUp');
+    if (!chart || (!forward && !backward)) return;
     event.preventDefault();
     const current = cursorIndex.current;
+    const extending =
+      zoomEnabled &&
+      event.shiftKey &&
+      current !== null &&
+      chart.cursor.idx != null &&
+      chart.cursor.left! >= 0 &&
+      chart.cursor.top! >= 0;
+    if (zoomEnabled && !extending && selection) clearSelection(chart);
     const index =
       current == null
         ? 0
-        : Math.max(
-            0,
-            Math.min(timestamps.length - 1, current + (event.key === 'ArrowRight' ? 1 : -1)),
-          );
+        : Math.max(0, Math.min(timestamps.length - 1, current + (forward ? 1 : -1)));
     const value = visibleEntries.find((entry) => Number.isFinite(entry.series.values[index]))
       ?.series.values[index];
-    chart.setCursor({
-      left: chart.valToPos(timestamps[index], 'x'),
-      top: value != null ? chart.valToPos(value, 'y') : chart.bbox.height / uPlot.pxRatio / 2,
-    });
+    const categoryPosition = chart.valToPos(timestamps[index], 'x');
+    const valuePosition =
+      value != null
+        ? chart.valToPos(value, 'y')
+        : (isHorizontal ? chart.bbox.width : chart.bbox.height) / uPlot.pxRatio / 2;
+    chart.setCursor(
+      isHorizontal
+        ? { left: valuePosition, top: categoryPosition }
+        : { left: categoryPosition, top: valuePosition },
+    );
+    if (extending) {
+      const anchor = selection?.anchor ?? current;
+      keyboardSelection.current = { anchor, index };
+      const from = timestamps[anchor],
+        to = timestamps[index],
+        left = chart.valToPos(from, 'x'),
+        right = chart.valToPos(to, 'x');
+      chart.setSelect(
+        {
+          left: Math.min(left, right),
+          top: 0,
+          width: Math.abs(right - left),
+          height: chart.bbox.height / uPlot.pxRatio,
+        },
+        false,
+      );
+      const start = Math.min(from, to),
+        end = Math.max(from, to),
+        count = timestamps.filter((time) => time >= start && time <= end).length;
+      setZoomStatus(
+        `Selected ${count} ${count === 1 ? 'point' : 'points'} from ${formatTime(start, timeZone)} to ${formatTime(end, timeZone)}. Press Enter to zoom.`,
+      );
+    }
   }
 
   function toggleSeries(id: string, isolate = false) {
@@ -450,8 +548,11 @@ export function TimeSeriesChart({
     });
   }
 
-  function emphasize(index: number | null) {
-    plot.current?.setSeries(index == null ? null : index + 1, { focus: true });
+  function emphasize(id: string | null) {
+    plot.current?.setSeries(
+      id == null ? null : plotEntries.findIndex((entry) => entry.series.id === id) + 1,
+      { focus: true },
+    );
   }
 
   return (
@@ -463,12 +564,23 @@ export function TimeSeriesChart({
         </figcaption>
       )}
       <p id={instructionsId} className="charts-sr-only">
-        Use Left and Right arrow keys to inspect values. Escape hides the tooltip.
+        {isHorizontal
+          ? 'Use Up and Down or Left and Right arrow keys to inspect values. Escape hides the tooltip.'
+          : 'Use Left and Right arrow keys to inspect values. Escape hides the tooltip.'}
+        {' Click to toggle; Alt-click or double-click to show only this series.'}
+        {zoomEnabled &&
+          ' Drag to select a time range, or use Shift+ArrowLeft and Shift+ArrowRight to select points, then Enter to zoom. Escape cancels the selection.'}
       </p>
+      {zoomEnabled && (
+        <p className="charts-sr-only" aria-live="polite" aria-atomic="true">
+          {zoomStatus}
+        </p>
+      )}
       <div className="charts-plot-box" style={{ height }}>
         <div
           ref={container}
           className="charts-plot"
+          data-zoom-enabled={zoomEnabled ? 'true' : undefined}
           style={{ height }}
           role="img"
           tabIndex={0}
@@ -477,6 +589,7 @@ export function TimeSeriesChart({
           onKeyDown={moveCursor}
           onBlur={hideCursor}
           onMouseLeave={hideCursor}
+          onMouseDown={zoomEnabled ? () => clearSelection() : undefined}
         >
           {!hasData && <div className="charts-empty">{emptyMessage}</div>}
         </div>
@@ -485,13 +598,14 @@ export function TimeSeriesChart({
             cursor={activeCursor}
             entries={visibleEntries}
             timestamps={timestamps}
+            categories={categoryLabels}
             timeZone={timeZone}
             formatValue={formatValue}
             id={tooltipId}
           />
         )}
       </div>
-      {xAxisTitle && <p className="charts-axis-title">{xAxisTitle}</p>}
+      {xAxisTitle && !isHorizontal && <p className="charts-axis-title">{xAxisTitle}</p>}
       {references.length > 0 && (
         <div className="charts-thresholds">
           {references.map(({ value, label }, index) => (
@@ -524,27 +638,42 @@ export function TimeSeriesChart({
         </div>
       )}
       {series.length > 0 && (series.length > 1 || !showTitle) && (
-        <ul className="charts-legend" aria-label="Series visibility">
-          {entries.map(({ series: entry, slot }, index) => (
+        <ul
+          className="charts-legend"
+          aria-label={legendTitle ? `${legendTitle} series visibility` : 'Series visibility'}
+        >
+          {legendTitle && (
+            <li className="charts-legend-title" aria-hidden="true">
+              {legendTitle}
+            </li>
+          )}
+          {entries.map(({ series: entry, slot, color }) => (
             <li key={entry.id}>
               <button
                 type="button"
                 className="charts-legend-item"
                 aria-pressed={!hidden.has(entry.id)}
-                title="Click to toggle; Alt-click or double-click to show only this series"
+                aria-label={entry.label}
+                title={entry.label}
+                aria-describedby={instructionsId}
                 onClick={(event) => toggleSeries(entry.id, event.altKey)}
                 onDoubleClick={() => toggleSeries(entry.id, true)}
-                onMouseEnter={() => emphasize(index)}
+                onMouseEnter={() => emphasize(entry.id)}
                 onMouseLeave={() => emphasize(null)}
-                onFocus={() => emphasize(index)}
+                onFocus={() => emphasize(entry.id)}
                 onBlur={() => emphasize(null)}
               >
                 <span
                   aria-hidden="true"
-                  className="charts-line-key"
-                  style={{ borderColor: seriesColor(slot) }}
+                  className={kind === 'bar' || fill ? 'charts-legend-swatch' : 'charts-line-key'}
+                  data-legend-swatch={kind === 'bar' || fill ? 'square' : 'line'}
+                  style={
+                    kind === 'bar' || fill
+                      ? { background: seriesColor(slot, color) }
+                      : { borderColor: seriesColor(slot, color) }
+                  }
                 />
-                <span>{entry.label}</span>
+                <span>{shortenLegendLabel(entry.label)}</span>
               </button>
             </li>
           ))}

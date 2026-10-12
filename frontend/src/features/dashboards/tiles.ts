@@ -12,7 +12,20 @@ export const record = (value: unknown): Record<string, unknown> => (object(value
 export const text = (value: unknown, fallback = '') =>
   typeof value === 'string' ? value : fallback;
 export const tileTitle = (tile: DashboardTile) => text(tile.title, 'Untitled tile');
-export const supportedCharts = ['timeseries', 'line', 'area', 'bar', 'table', 'query-value'];
+export const supportedCharts = [
+  'timeseries',
+  'line',
+  'area',
+  'bar',
+  'table',
+  'query-value',
+  'pie',
+  'donut',
+  'gauge',
+  'bubble',
+];
+/** Chart types that show one value per series, so PromQL tiles ask for instant results. */
+export const instantCharts = ['query-value', 'gauge', 'pie', 'donut'];
 export const tileType = (tile: DashboardTile) => text(tile.tileType) || 'builder';
 export const knownTile = (tile: DashboardTile) =>
   ['code', 'builder', 'promql'].includes(tileType(tile));
@@ -94,6 +107,7 @@ export function chartConfig(chartType: string) {
     axes: {
       x: { field: '', title: '', display: true },
       y: { field: '', title: '', display: true, beginAtZero: false },
+      groupBy: { field: [] },
     },
     advanced: {
       dataLabels: { enabled: false },
@@ -115,7 +129,7 @@ export function newTile(tiles: DashboardTile[]): DashboardTile {
   };
 }
 // Numbers count as Unix seconds or milliseconds; smaller numbers and numeric strings are not times.
-const timeValue = (value: unknown) => {
+export const timeValue = (value: unknown) => {
   if (typeof value === 'number')
     return value >= 1e9 && value < 1e11
       ? value
@@ -125,7 +139,7 @@ const timeValue = (value: unknown) => {
   if (typeof value === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(value)) return NaN;
   return parseEventTimestamp(value) / 1000;
 };
-const groupValue = (value: unknown) =>
+export const groupValue = (value: unknown) =>
   value == null || value === ''
     ? '(empty)'
     : typeof value === 'string'
@@ -151,19 +165,28 @@ export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
     return { categorical: true, timestamps: [], series: [] };
   const timestamps = [...new Set(points.map((point) => point.time))].sort((a, b) => a - b);
   const builder = object(tile.chartQuery) ? record(tile.chartQuery) : undefined;
-  // Builder tiles declare their groups. Otherwise only repeated x values are split, and only by
-  // low-cardinality columns, so raw log rows with messages and ids stay one series per y field.
-  const groupFields = builder
-    ? [record(builder.x).groupBy, record(builder.y).groupBy]
-        .flatMap((groups) => (strings(groups) ? groups : []))
-        .filter((field) => fields.includes(field))
-    : timestamps.length === rows.length
-      ? []
-      : fields.filter((field) => {
-          if (field === xField || yFields.includes(field) || numeric(field)) return false;
-          const distinct = new Set(rows.map((row) => groupValue(row[field]))).size;
-          return distinct <= 20 && distinct < rows.length;
-        });
+  const configuredGroups = record(axes.groupBy).field;
+  const explicitGroups = strings(configuredGroups)
+    ? configuredGroups.filter((field) => fields.includes(field))
+    : [];
+  const useExplicitGroups =
+    explicitGroups.length > 0 &&
+    ![record(builder?.x).groupBy, record(builder?.y).groupBy].some(strings);
+  // Declared builder groups win over config groups. Without either, only repeated x values
+  // are split by low-cardinality columns, keeping raw log rows as one series per y field.
+  const groupFields = useExplicitGroups
+    ? explicitGroups
+    : builder
+      ? [record(builder.x).groupBy, record(builder.y).groupBy]
+          .flatMap((groups) => (strings(groups) ? groups : []))
+          .filter((field) => fields.includes(field))
+      : timestamps.length === rows.length
+        ? []
+        : fields.filter((field) => {
+            if (field === xField || yFields.includes(field) || numeric(field)) return false;
+            const distinct = new Set(rows.map((row) => groupValue(row[field]))).size;
+            return distinct <= 20 && distinct < rows.length;
+          });
   const position = new Map(timestamps.map((time, index) => [time, index]));
   const series = new Map<string, { id: string; label: string; values: (number | null)[] }>();
   if (!groupFields.length)
@@ -184,9 +207,16 @@ export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
         series.set(id, entry);
       }
       const value = row[field];
-      if (typeof value === 'number' && Number.isFinite(value))
-        entry.values[position.get(time)!] = value;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const index = position.get(time)!;
+        entry.values[index] = useExplicitGroups ? (entry.values[index] ?? 0) + value : value;
+      }
     }
   }
-  return { categorical: false, timestamps, series: [...series.values()] };
+  return {
+    categorical: false,
+    timestamps,
+    series: [...series.values()],
+    ...(groupFields.length ? { legendTitle: `${groupFields.join(' | ')}:` } : {}),
+  };
 }

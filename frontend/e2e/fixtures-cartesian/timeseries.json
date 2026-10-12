@@ -1,0 +1,47 @@
+{
+  "tile_id": "01K7A000000000000000000009",
+  "authorMode": "manual",
+  "title": "Events over time",
+  "tileType": "builder",
+  "chartType": "timeseries",
+  "chartQuery": "SELECT DATE_TRUNC('minute', `p_timestamp`) AS `time_bucket`, COUNT(*) AS `COUNT_STAR` FROM `app-logs` GROUP BY `time_bucket` ORDER BY `time_bucket` ASC",
+  "dbName": ["app-logs"],
+  "config": {
+    "type": "line",
+    "colourScheme": "classic",
+    "layout": {
+      "legendPosition": "bottom",
+      "segments": {
+        "value": [10, 90],
+        "isPercent": true
+      },
+      "label": false
+    },
+    "axes": {
+      "x": {
+        "field": "time_bucket",
+        "title": "Timestamp"
+      },
+      "y": {
+        "field": "COUNT_STAR",
+        "title": "All rows (*)"
+      }
+    },
+    "advanced": {
+      "dataLabels": {
+        "enabled": false
+      },
+      "tooltip": {
+        "enabled": true,
+        "mode": "index",
+        "intersect": false
+      }
+    }
+  },
+  "layout": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 6
+  }
+}

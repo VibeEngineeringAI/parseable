@@ -162,6 +162,30 @@
   font-weight: 600;
   overflow-wrap: anywhere;
 }
+.dashboard-stat[data-qv] {
+  --qv: var(--qv-light);
+  --qv-ink: var(--qv-ink-light);
+  min-width: 0;
+  padding: 0 8px;
+  color: var(--qv-ink);
+  font-size: 48px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+[data-theme='dark'] .dashboard-stat[data-qv] {
+  --qv: var(--qv-dark);
+  --qv-ink: var(--qv-dark);
+}
+.dashboard-stat[data-qv][data-empty='true'] {
+  color: var(--color-muted);
+  font-size: 16px;
+  font-weight: 600;
+}
+/* Give the editor preview room independently of the fitted text's height. */
+.dashboard-preview .dashboard-stat[data-qv] {
+  height: 200px;
+}
 /* A percent value fills its whole tile; elsewhere, such as the editor preview, its stat box. */
 .dashboard-stat-fill {
   position: absolute;
@@ -174,6 +198,25 @@
 }
 .dashboard-stat-fill[data-direction='diagonal'] {
   inset: 0;
+}
+.dashboard-stat[data-qv] .dashboard-stat-fill {
+  background: color-mix(in srgb, var(--qv) 16%, transparent);
+}
+.dashboard-stat-spark {
+  position: absolute;
+  inset: auto 0 0;
+  width: 100%;
+  height: 60%;
+  z-index: -1;
+  color: var(--qv);
+  pointer-events: none;
+}
+.dashboard-stat-spark-area {
+  fill: currentColor;
+  fill-opacity: 0.14;
+}
+.dashboard-stat-spark-line {
+  stroke-opacity: 0.6;
 }
 .dashboard-server-tile .dashboard-stat {
   position: static;
@@ -276,11 +319,21 @@
   grid-column: 2;
   grid-row: 1 / -1;
   flex-direction: column;
+  flex-wrap: nowrap;
   align-items: flex-start;
   min-height: 0;
   max-height: 100%;
   overflow: auto;
   margin: 0;
+}
+.dashboard-chart:is([data-legend-position='left'], [data-legend-position='right'])
+  .charts-legend-title {
+  align-self: flex-start;
+}
+.dashboard-chart:is([data-legend-position='left'], [data-legend-position='right'])
+  .charts-legend
+  > li {
+  flex-shrink: 0;
 }
 .dashboard-chart:is([data-legend-position='left'], [data-legend-position='right']) .charts-plot-box,
 .dashboard-chart:is([data-legend-position='left'], [data-legend-position='right'])

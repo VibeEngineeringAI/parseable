@@ -3,7 +3,9 @@ import classic from './__fixtures__/classic.json';
 import ingestDemoTile from './__fixtures__/ingest-demo-tile.json';
 import {
   appendLayout,
+  chartConfig,
   moveTile,
+  newTile,
   promqlQueries,
   resolvedLayouts,
   sqlChart,
@@ -23,6 +25,15 @@ const make = (id: string, layout: unknown): DashboardTile => ({
   unknown: 'keep',
 });
 describe('classic tile helpers', () => {
+  it('starts new tiles with the classic groupBy axis without selecting a series split', () => {
+    const config = chartConfig('timeseries');
+    expect(config.axes).toEqual({
+      x: { field: '', title: '', display: true },
+      y: { field: '', title: '', display: true, beginAtZero: false },
+      groupBy: { field: [] },
+    });
+    expect(newTile([]).config).toEqual(config);
+  });
   it('tracks only variables used in the tile query and dataset', () => {
     expect([
       ...tileVariableNames(
@@ -141,6 +152,7 @@ describe('classic tile helpers', () => {
       ingestDemoTile,
     );
     expect(chart.categorical).toBe(false);
+    expect(chart.legendTitle).toBe('severity_text:');
     expect(chart.timestamps).toEqual(
       [Date.UTC(2026, 9, 10, 10), Date.UTC(2026, 9, 10, 10, 1)].map((ms) => ms / 1000),
     );
@@ -150,6 +162,18 @@ describe('classic tile helpers', () => {
       { label: 'WARN', values: [7, null] },
     ]);
     expect(new Set(chart.series.map(({ id }) => id)).size).toBe(3);
+  });
+  it.each([
+    [['a'], 'a:'],
+    [['a', 'b'], 'a | b:'],
+    [[], undefined],
+  ])('derives a time-series legend title from group fields %j', (groups, title) => {
+    const chart = sqlChart([{ time: '2026-10-10T10:00:00.000Z', value: 2, a: 'api', b: 'error' }], {
+      tile_id: 'groups',
+      config: { axes: { y: { field: 'value' }, groupBy: { field: groups } } },
+    });
+    expect(chart.legendTitle).toBe(title);
+    if (!groups.length) expect(chart).not.toHaveProperty('legendTitle');
   });
   it('keeps raw rows with distinct x values as one series per y field', () => {
     const rows = Array.from({ length: 30 }, (_, index) => ({
