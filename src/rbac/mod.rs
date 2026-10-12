@@ -465,6 +465,7 @@ mod lock_order_tests {
     //! interleaving at the lock boundaries and bounds every wait, so a lock-order
     //! cycle fails the test instead of hanging the run.
 
+    use std::io::Write;
     use std::sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -563,15 +564,31 @@ mod lock_order_tests {
         rx
     }
 
+    // A deadlocked thread holds the process-wide maps forever and would hang
+    // every later test, so abort the run instead of panicking.
+    fn deadlock(what: &str) -> ! {
+        // Bypass libtest's output capture, which an abort would discard.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{what} within {DEADLINE:?}: lock-order deadlock, aborting"
+        );
+        std::process::abort()
+    }
+
     fn finish<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
-        rx.recv_timeout(DEADLINE)
-            .unwrap_or_else(|_| panic!("{what} did not finish within {DEADLINE:?}: deadlock"))
+        match rx.recv_timeout(DEADLINE) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => deadlock(&format!("{what} did not finish")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{what} panicked"),
+        }
     }
 
     fn wait_until(what: &str, done: impl Fn() -> bool) {
         let start = Instant::now();
         while !done() {
-            assert!(start.elapsed() < DEADLINE, "timed out waiting for {what}");
+            if start.elapsed() >= DEADLINE {
+                deadlock(&format!("timed out waiting for {what}"));
+            }
             thread::sleep(Duration::from_millis(1));
         }
     }
@@ -890,6 +907,106 @@ mod lock_order_tests {
         assert!(!Users.session_exists(&login));
     }
 
+    // A role change that lands while a first login is verifying must apply to
+    // the session that login creates.
+    #[test]
+    fn role_change_during_first_login_applies_to_the_session() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (user, login) = native_user(&tenant, &[ROLE]);
+
+        let reader = sessions();
+        let login_rx = first_login(&login);
+        wait_until("the login to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        let writer = queue_user_writer(move || {
+            let mut demoted = user;
+            demoted.roles.clear();
+            mut_users().insert(demoted);
+        });
+        finish(&writer, "role change");
+        drop(reader);
+
+        assert_eq!(finish(&login_rx, "login"), Response::UnAuthorized);
+        assert_eq!(sessions().get(&login), Some(&Vec::new()));
+    }
+
+    // Resetting the password to the same value mid-login changes the stored
+    // hash; the login verifies again and still succeeds.
+    #[test]
+    fn same_password_reset_during_first_login_retries_and_succeeds() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (user, login) = native_user(&tenant, &[ROLE]);
+
+        let reader = sessions();
+        let login_rx = first_login(&login);
+        wait_until("the login to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        let new_hash = cheap_hash(credentials(&login).1);
+        let writer = queue_user_writer(move || {
+            if let Some(users) = mut_users().get_mut(user.tenant.as_deref().unwrap())
+                && let Some(User {
+                    ty: UserType::Native(basic),
+                    ..
+                }) = users.get_mut(user.userid())
+            {
+                basic.password_hash = new_hash;
+            }
+        });
+        finish(&writer, "password reset");
+        drop(reader);
+
+        assert_eq!(finish(&login_rx, "login"), Response::Authorized);
+        assert!(Users.session_exists(&login));
+    }
+
+    // Reproduction: `GET /users` rendered each user while holding USERS(read),
+    // and rendering read USERS again for the user's roles and groups.
+    #[test]
+    fn rendering_users_survives_a_queued_user_write() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let group_name = format!("group-{}", Ulid::new());
+        let (mut user, _) = basic_user(&tenant, &[ROLE]);
+        user.user_groups.insert(group_name.clone());
+        mut_users().insert(user.clone());
+        write_user_groups().insert(
+            UserGroup::new(
+                group_name.clone(),
+                HashSet::from([ROLE.to_owned()]),
+                HashSet::from([GroupUser::from_user(&user)]),
+            ),
+            &tenant,
+        );
+        let (newcomer, _) = basic_user(&tenant, &[ROLE]);
+
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let render = spawn({
+            let tenant = tenant.clone();
+            let userid = user.userid().to_owned();
+            move || {
+                // Like `list_users_prism`, which renders inside `users().get(..)`.
+                let users = users();
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                utils::prism_roles(&users[&tenant][&userid])
+            }
+        });
+        finish(&held_rx, "the render to take USERS");
+        let writer = queue_user_writer(move || mut_users().insert(newcomer));
+        go_tx.send(()).unwrap();
+
+        let (direct, groups, group_names) = finish(&render, "user render");
+        finish(&writer, "user write");
+        assert_eq!(direct.into_keys().collect::<Vec<_>>(), [ROLE]);
+        assert_eq!(groups[&group_name].keys().collect::<Vec<_>>(), [ROLE]);
+        assert_eq!(group_names, HashSet::from([group_name]));
+    }
+
     #[test]
     fn deletion_during_first_login_leaves_no_session() {
         let _serial = auth_state();
@@ -906,9 +1023,9 @@ mod lock_order_tests {
             users.delete_user(user.userid(), &user.tenant)
         });
         wait_until("the user to be removed", || {
-            !users_lock()
+            users_lock()
                 .try_read()
-                .is_some_and(|users| users[&tenant].contains_key(user_id(&login)))
+                .is_some_and(|users| !users[&tenant].contains_key(credentials(&login).0))
         });
         drop(reader);
 
@@ -917,9 +1034,9 @@ mod lock_order_tests {
         assert!(!Users.session_exists(&login));
     }
 
-    fn user_id(key: &SessionKey) -> &str {
+    fn credentials(key: &SessionKey) -> (&str, &str) {
         match key {
-            SessionKey::BasicAuth { username, .. } => username,
+            SessionKey::BasicAuth { username, password } => (username, password),
             SessionKey::SessionId(_) => unreachable!(),
         }
     }

@@ -25,13 +25,12 @@ use crate::{
 };
 
 use super::{
-    Users, UsersPrism,
+    UsersPrism,
     map::roles,
     user::{User, UserType},
 };
 
 pub fn to_prism_user(user: &User) -> UsersPrism {
-    let tenant_id = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
     let (id, username, method, email, picture) = match &user.ty {
         UserType::Native(basic) => (
             user.userid(),
@@ -59,8 +58,29 @@ pub fn to_prism_user(user: &User) -> UsersPrism {
             None,
         ),
     };
-    let direct_roles: HashMap<String, RoleUI> = Users
-        .get_role(id, &user.tenant)
+    let (direct_roles, group_roles, user_groups) = prism_roles(user);
+
+    UsersPrism {
+        id: id.into(),
+        username: username.into(),
+        method: method.into(),
+        email: mask_pii_string(email),
+        picture: mask_pii_url(picture),
+        roles: direct_roles,
+        group_roles,
+        user_groups,
+    }
+}
+
+type GroupRoles = HashMap<String, HashMap<String, RoleUI>>;
+
+/// The user's direct roles, roles inherited per group, and group names.
+pub(super) fn prism_roles(user: &User) -> (HashMap<String, RoleUI>, GroupRoles, HashSet<String>) {
+    let tenant_id = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
+    // Read roles and groups from `user` itself: callers render while holding
+    // USERS(read), and reading it again deadlocks behind a queued writer.
+    let direct_roles: HashMap<String, RoleUI> = user
+        .roles
         .iter()
         .filter_map(|role_name| {
             roles()
@@ -79,12 +99,12 @@ pub fn to_prism_user(user: &User) -> UsersPrism {
         })
         .collect();
 
-    let mut group_roles: HashMap<String, HashMap<String, RoleUI>> = HashMap::new();
+    let mut group_roles: GroupRoles = HashMap::new();
     let mut user_groups = HashSet::new();
     // user might be part of some user groups, fetch the roles from there as well
-    for user_group in Users.get_user_groups(user.userid(), &user.tenant) {
+    for user_group in &user.user_groups {
         if let Some(groups) = read_user_groups().get(tenant_id)
-            && let Some(group) = groups.get(&user_group)
+            && let Some(group) = groups.get(user_group)
         {
             let ug_roles: HashMap<String, RoleUI> = group
                 .roles
@@ -100,20 +120,11 @@ pub fn to_prism_user(user: &User) -> UsersPrism {
                 })
                 .collect();
             group_roles.insert(group.name.clone(), ug_roles);
-            user_groups.insert(user_group);
+            user_groups.insert(user_group.clone());
         }
     }
 
-    UsersPrism {
-        id: id.into(),
-        username: username.into(),
-        method: method.into(),
-        email: mask_pii_string(email),
-        picture: mask_pii_url(picture),
-        roles: direct_roles,
-        group_roles,
-        user_groups,
-    }
+    (direct_roles, group_roles, user_groups)
 }
 
 //mask PII string if the P_MASK_PII is set
