@@ -243,6 +243,7 @@ test('error span sorting and range changes issue the matching transport requests
   page,
 }) => {
   await story(page, 'operations-errors--success');
+  await page.getByRole('tab', { name: 'Error spans', exact: true }).click();
   await expect(page.getByRole('table')).toBeVisible();
   const requests = async () =>
     JSON.parse((await page.getByTestId('error-list-requests').textContent()) ?? '[]') as Array<{
