@@ -1,0 +1,53 @@
+id: 996ab300-cde5-4442-97bb-24731aa58f33
+name: post-pr-review
+description: Post a gh-comment report as comment-clanker[bot], preferring resolvable review threads
+tags:
+  bot: comment-clanker
+inputs:
+  properties:
+    pr:
+      type: string
+      description: Pull request number or URL
+    report:
+      type: string
+      description: Markdown report with actionable findings as gh-comment:thread entries (or standalone gh-comment:file entries); a review summary is allowed. Path relative to cwd or absolute.
+    repo:
+      type: string
+      default: VibeEngineeringAI/parseable
+      description: Target repository (OWNER/REPO)
+    cwd:
+      type: string
+      default: ""
+      description: Checkout used to resolve source links (default is the repo root)
+    dryRun:
+      type: boolean
+      default: false
+      description: Plan the comments without publishing
+    allowConversationComments:
+      type: boolean
+      default: false
+      description: Explicitly allow non-resolvable top-level PR comments for general discussion; actionable findings should use review threads
+  required: ["pr", "report"]
+jobs:
+  - name: review
+    description: Mint a comment-clanker installation token and post the report
+    steps:
+      - name: post
+        description: Run gh-comment post with the comment-clanker App credentials
+        task:
+          type: model_method
+          modelIdOrName: comment-clanker-post
+          methodName: execute
+          inputs:
+            pr: ${{ inputs.pr }}
+            report: ${{ inputs.report }}
+            repo: ${{ inputs.repo }}
+            cwd: ${{ inputs.cwd }}
+            dryRun: ${{ inputs.dryRun }}
+            allowConversationComments: ${{ inputs.allowConversationComments }}
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

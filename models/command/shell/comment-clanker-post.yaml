@@ -1,0 +1,48 @@
+type: command/shell
+typeVersion: 2026.02.09.1
+id: 8a729281-0c53-4ba6-82e3-c6cf3350ffa4
+name: comment-clanker-post
+version: 1
+tags:
+  bot: comment-clanker
+inputs:
+  properties:
+    pr:
+      type: string
+      description: Pull request number or URL
+    report:
+      type: string
+      description: Markdown report using resolvable review threads for findings; relative to cwd or absolute
+    repo:
+      type: string
+      default: VibeEngineeringAI/parseable
+      description: Target repository (OWNER/REPO)
+    cwd:
+      type: string
+      default: ""
+      description: Checkout used to resolve source links (default is the repo root)
+    dryRun:
+      type: boolean
+      default: false
+      description: Plan the comments without publishing
+    allowConversationComments:
+      type: boolean
+      default: false
+      description: Allow non-resolvable top-level comments for intentional general discussion
+  required: ["pr", "report"]
+globalArguments: {}
+methods:
+  execute:
+    arguments:
+      # Inputs travel as environment variables so they are never parsed by the shell.
+      run: node scripts/comment-clanker-post.mjs
+      timeout: 300000
+      env:
+        GH_APP_CLIENT_ID: ${{ vault.get(comment-clanker, GH_APP_CLIENT_ID) }}
+        GH_APP_PRIVATE_KEY: ${{ vault.get(comment-clanker, GH_APP_PRIVATE_KEY) }}
+        CLANKER_PR: ${{ inputs.pr }}
+        CLANKER_REPORT: ${{ inputs.report }}
+        CLANKER_REPO: ${{ inputs.repo }}
+        CLANKER_CWD: ${{ inputs.cwd }}
+        CLANKER_DRY_RUN: '${{ inputs.dryRun ? "true" : "false" }}'
+        CLANKER_ALLOW_CONVERSATION_COMMENTS: '${{ inputs.allowConversationComments ? "true" : "false" }}'
