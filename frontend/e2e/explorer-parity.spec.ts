@@ -102,9 +102,10 @@ test('event field search, JSON view, and exclusion compose without losing modal 
 
 test('SQL dataset selection quotes the chosen dataset and runs its query', async ({ page }) => {
   await demo(page, '/sql-editor');
-  const sidebar = page.getByRole('complementary', { name: 'SQL datasets' });
+  const sidebar = page.getByRole('complementary', { name: 'SQL datasets and saved queries' });
   await sidebar.getByLabel('Search SQL datasets').fill('api_logs');
-  await sidebar.getByRole('button', { name: 'api_logs', exact: true }).click();
+  await sidebar.getByRole('checkbox', { name: 'Select api_logs', exact: true }).check();
+  await sidebar.getByRole('button', { name: 'New query from selection' }).click();
   await expect(page.getByRole('textbox', { name: 'SQL query' })).toContainText('FROM "api_logs"');
   await page.getByRole('button', { name: 'Run query' }).click();
   await expect(page.getByRole('table')).toBeVisible();

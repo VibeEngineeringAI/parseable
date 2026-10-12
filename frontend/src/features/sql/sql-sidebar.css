@@ -1,0 +1,64 @@
+.sql-library-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  min-height: 0;
+}
+.sql-library-sidebar .panel-heading {
+  flex-shrink: 0;
+}
+.sql-library-sidebar .ui-field {
+  flex-shrink: 0;
+}
+.sql-library-datasets,
+.sql-library-items {
+  display: grid;
+  gap: 3px;
+}
+.sql-library-dataset,
+.sql-library-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.sql-library-dataset > span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.sql-library-dataset input {
+  accent-color: var(--color-primary);
+}
+.sql-library-schema {
+  padding-left: 20px;
+  display: grid;
+  gap: 2px;
+}
+.sql-library-schema button {
+  justify-content: flex-start;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  text-align: left;
+}
+.sql-library-item > button:first-child {
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sql-library-save {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.sql-library-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
