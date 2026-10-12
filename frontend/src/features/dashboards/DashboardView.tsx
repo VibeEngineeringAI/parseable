@@ -11,8 +11,9 @@ import { createLimiter } from '../../lib/concurrency';
 import type { Dashboard, DashboardTile as Tile } from '../../lib/types';
 import { useDashboardAccess } from './owner';
 import { dashboardError, dashboardPresets, duplicateDashboard } from './helpers';
-import { moveTile, text, tileType } from './tiles';
+import { moveTile, text } from './tiles';
 import { duplicateTile } from './draft';
+import { moveSection, patchSection } from './sections';
 import { DashboardSections } from './DashboardSections';
 import { VariablesBar } from './VariablesBar';
 import type { VariableResolutions } from './VariableControl';
@@ -21,6 +22,9 @@ import { useDashboardDraft } from './useDashboardDraft';
 import { useDashboardUrl } from './useDashboardUrl';
 import { downloadDashboard } from './importExport';
 import { DashboardRefreshProvider, DashboardRefreshControls } from './DashboardRefresh';
+import { useDashboardPresentation } from './useDashboardPresentation';
+import { DashboardPresentationControls } from './presentation';
+import { useDashboardPngExport } from './exportPng';
 import './dashboards.css';
 
 export function DashboardView() {
@@ -55,12 +59,14 @@ function DashboardFields({ original }: { original: Dashboard }) {
   const workspace = useDashboardDraft(original, focusHeading),
     { draft, dirty, mutation } = workspace;
   const url = useDashboardUrl(draft);
+  const presentation = useDashboardPresentation(page);
+  const png = useDashboardPngExport(page, draft.title);
   const [dialog, setDialog] = useState<DashboardDialog>();
   const [resolutions, setResolutions] = useState<VariableResolutions>({});
   const about = useAsync(useCallback((signal) => client.about(signal), [client]));
   const promqlEnabled = about.data ? about.data.capabilities.promqlDashboard === true : undefined;
   const writable = !!access.hash && access.hash === draft.author;
-  const editing = writable && !mutation.pending;
+  const editing = writable && !mutation.pending && !presentation.presenting;
   const limit = useMemo(() => createLimiter(4), [client]);
   const tileFocus = useRowDeletionFocus(
     (draft.tiles ?? []).map((tile) => tile.tile_id),
@@ -71,8 +77,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
     false,
   );
   function tileAction(action: 'edit' | 'duplicate' | 'earlier' | 'later' | 'delete', tile: Tile) {
-    if (action === 'edit')
-      setDialog({ kind: tileType(tile) === 'builder' ? 'convert' : 'tile', tile });
+    if (action === 'edit') setDialog({ kind: 'tile', tile });
     if (action === 'delete') setDialog({ kind: 'remove', tile });
     if (action === 'duplicate')
       workspace.changeDraft(
@@ -95,7 +100,11 @@ function DashboardFields({ original }: { original: Dashboard }) {
   }
   return (
     <DashboardRefreshProvider onRefresh={url.refresh}>
-      <div ref={page} className="page dashboards-page">
+      <div
+        ref={page}
+        className={`page dashboards-page${presentation.presenting ? ' dashboard-presentation' : ''}`}
+      >
+        {presentation.presenting && <DashboardPresentationControls onExit={presentation.exit} />}
         <nav aria-label="Dashboard breadcrumb" className="dashboard-breadcrumb">
           <Link to="/dashboards">Dashboards</Link>
           <span aria-hidden="true">/</span>
@@ -142,6 +151,14 @@ function DashboardFields({ original }: { original: Dashboard }) {
                         },
                       ]
                     : []),
+                  { id: 'present', label: 'Presentation mode', onSelect: presentation.enter },
+                  {
+                    id: 'png',
+                    label: png.exporting ? 'Exporting PNG…' : 'Export PNG',
+                    description: 'Exports visible tiles. Expand sections to include their tiles.',
+                    disabled: png.exporting,
+                    onSelect: () => void png.exportPng(),
+                  },
                   { id: 'export', label: 'Export JSON', onSelect: () => downloadDashboard(draft) },
                   {
                     id: 'duplicate',
@@ -201,26 +218,40 @@ function DashboardFields({ original }: { original: Dashboard }) {
             }
           />
           {writable && (
-            <Badge tone={dirty ? 'warning' : 'success'}>
+            <Badge
+              data-dashboard-export-ignore
+              data-dashboard-presentation-hide
+              tone={dirty ? 'warning' : 'success'}
+            >
               {dirty ? 'Unsaved changes' : 'All changes saved'}
             </Badge>
           )}
         </div>
         {!access.loading && !writable && (
-          <p className="notice">
+          <p className="notice" data-dashboard-presentation-hide data-dashboard-export-ignore>
             This dashboard is read-only. Only its owner can edit it.
             {access.canCreate ? ' Duplicate it to make an editable copy.' : ''}
           </p>
         )}
         {writable && !!workspace.repaired && (
-          <p className="notice">
+          <p className="notice" data-dashboard-presentation-hide data-dashboard-export-ignore>
             This dashboard has duplicate or nil tile IDs. The next save will assign new IDs to{' '}
             {workspace.repaired} {workspace.repaired === 1 ? 'tile' : 'tiles'}.
           </p>
         )}
-        <p className="dashboards-status muted" role="status" aria-live="polite">
+        <p
+          data-dashboard-export-ignore
+          data-dashboard-presentation-hide
+          className="dashboards-status muted"
+          role="status"
+          aria-live="polite"
+        >
           {workspace.status}
         </p>
+        <div data-dashboard-export-ignore>
+          <InlineError error={png.error} />
+          {png.status && <p role="status">{png.status}</p>}
+        </div>
         <InlineError error={!workspace.conflict ? dashboardError(mutation.error) : undefined} />
         {about.error && (
           <div>
@@ -252,6 +283,9 @@ function DashboardFields({ original }: { original: Dashboard }) {
               >
                 Add variable
               </Button>
+              <Button disabled={mutation.pending} onClick={() => setDialog({ kind: 'section' })}>
+                Add section
+              </Button>
               <Button disabled={mutation.pending} onClick={() => setDialog({ kind: 'tile' })}>
                 Add tile
               </Button>
@@ -268,6 +302,32 @@ function DashboardFields({ original }: { original: Dashboard }) {
             resolutions={resolutions}
             limit={limit}
             onAction={tileAction}
+            onLayoutChange={(tiles, message) =>
+              workspace.changeDraft(
+                (current) => ({
+                  ...current,
+                  tiles: (current.tiles ?? []).map(
+                    (tile) => tiles.find((next) => next.tile_id === tile.tile_id) ?? tile,
+                  ),
+                }),
+                message ?? 'Tile layout updated. Save to keep this change.',
+              )
+            }
+            onSectionAction={(action, id, title) => {
+              if (action === 'rename') setDialog({ kind: 'section', id, title });
+              else if (action === 'delete') setDialog({ kind: 'section-remove', id, title });
+              else
+                workspace.changeDraft(
+                  (current) => moveSection(current, id, action === 'earlier' ? -1 : 1),
+                  'Section moved. Save to keep this change.',
+                );
+            }}
+            onSectionCollapse={(id, collapsed) =>
+              workspace.changeDraft(
+                (current) => patchSection(current, id, { collapsed }),
+                'Section updated. Save to keep this change.',
+              )
+            }
             onZoomRange={(range) => {
               url.setRange(range);
               workspace.setRangeDirty(writable);

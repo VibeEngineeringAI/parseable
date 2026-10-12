@@ -464,3 +464,28 @@
     max-width: none;
   }
 }
+
+.dashboard-section-heading {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin: 8px 0;
+}
+.dashboard-section-heading h2 {
+  margin: 0;
+  min-width: 0;
+}
+.dashboard-section-heading > .muted {
+  flex: 1;
+}
+.dashboard-section-toggle {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 8px 4px;
+}

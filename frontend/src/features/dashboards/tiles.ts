@@ -153,8 +153,12 @@ export function sqlChart(rows: LogRecord[], tile: DashboardTile) {
     y = record(axes.y);
   const fields = [...new Set(rows.flatMap(Object.keys))];
   const numeric = (field: string) => rows.some((row) => typeof row[field] === 'number');
+  // Visual queries project DATE_TRUNC as time_bucket; infer it just like other
+  // timestamp columns while leaving a stored X binding authoritative.
   const xField =
-    text(x.field) || fields.find((field) => /timestamp|^time$|^ts$/i.test(field)) || '';
+    text(x.field) ||
+    fields.find((field) => /timestamp|^time_bucket$|^time$|^ts$/i.test(field)) ||
+    '';
   const yFields = strings(y.field)
     ? y.field
     : text(y.field)

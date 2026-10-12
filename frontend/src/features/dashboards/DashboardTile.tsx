@@ -203,7 +203,7 @@ export function DashboardTile({
               ? [
                   {
                     id: 'edit',
-                    label: tileType(tile) === 'builder' ? 'Edit as SQL' : 'Edit',
+                    label: 'Edit',
                     description: locked
                       ? promqlEnabled === undefined
                         ? 'Loading server capabilities.'

@@ -111,7 +111,7 @@ export function legacySql(tile: DashboardTile, query: Record<string, unknown>): 
     if (!expressions.has(name)) expressions.set(name, `${id(name)} AS ${id(name)}`);
     groups.add(name);
   }
-  const order: string[] = timeseries && !stat ? [`${id('time_bucket')} DESC`] : [];
+  const order: string[] = [];
   const sort = record(y.sortBy ?? x.sortBy);
   if (!stat && Object.keys(sort).length) {
     const field = text(sort.field),
@@ -119,7 +119,7 @@ export function legacySql(tile: DashboardTile, query: Record<string, unknown>): 
     if (!field || !['ASC', 'DESC'].includes(text(sort.direction))) return unavailable('sort');
     if (!expressions.has(alias)) expressions.set(alias, `${id(field)} AS ${id(alias)}`);
     order.push(`${id(alias)} ${sort.direction}`);
-  }
+  } else if (timeseries && !stat) order.push(`${id('time_bucket')} DESC`);
   const where = filtersSql(query.filters);
   if (!expressions.size) return unavailable('query');
   if (!stat && y.limit != null && (!Number.isInteger(y.limit) || Number(y.limit) < 1))

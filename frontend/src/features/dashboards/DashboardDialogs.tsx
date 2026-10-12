@@ -1,5 +1,5 @@
-import { lazy, Suspense, useCallback, useState } from 'react';
-import { Button, Dialog, InlineError, Spinner, TypedConfirmDialog } from '../../components/ui';
+import { lazy, Suspense, useCallback } from 'react';
+import { Button, Dialog, Spinner, TypedConfirmDialog } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import type { DashboardTile, DashboardVariable } from '../../lib/types';
@@ -8,7 +8,8 @@ import { applyTile, applyVariable, removeTile, removeVariable, variableNames } f
 import { DashboardForm } from './DashboardForm';
 import { ConflictDialog } from './ConflictDialog';
 import { dashboardError, editDashboardMetadata } from './helpers';
-import { convertBuilder } from './tileEditing';
+import { SectionDialog } from './SectionDialog';
+import { addSection, patchSection, removeSection } from './sections';
 import { tileTitle } from './tiles';
 import type { useDashboardDraft } from './useDashboardDraft';
 import type { useDashboardUrl } from './useDashboardUrl';
@@ -22,7 +23,8 @@ const VariableEditor = lazy(() =>
 export type DashboardDialog =
   | { kind: 'tile'; tile?: DashboardTile }
   | { kind: 'variable'; variable?: DashboardVariable }
-  | { kind: 'convert'; tile: DashboardTile }
+  | { kind: 'section'; id?: string; title?: string }
+  | { kind: 'section-remove'; id: string; title: string }
   | { kind: 'remove'; tile?: DashboardTile; variable?: DashboardVariable }
   | { kind: 'metadata' }
   | { kind: 'dashboard-delete' };
@@ -53,7 +55,6 @@ export function DashboardDialogs({
   const { client } = useApp(),
     { draft, mutation } = workspace;
   const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
-  const [conversionError, setConversionError] = useState<string>();
   function closeEditor() {
     if (workspace.editorDirty && !window.confirm('Discard changes in this editor?')) return;
     setDialog(undefined);
@@ -66,6 +67,7 @@ export function DashboardDialogs({
           <TileEditor
             original={dialog.tile}
             tiles={draft.tiles ?? []}
+            sections={draft.sections}
             variables={url.variables}
             values={url.values}
             limit={limit}
@@ -120,44 +122,49 @@ export function DashboardDialogs({
           }}
         />
       )}
-      <Dialog
-        open={dialog?.kind === 'convert'}
-        onOpenChange={(open) => {
-          if (!open) {
+      {dialog?.kind === 'section' && (
+        <SectionDialog
+          title={dialog.title}
+          onClose={closeEditor}
+          onDirty={workspace.setEditorDirty}
+          onApply={(title) => {
+            workspace.changeDraft(
+              (current) =>
+                dialog.id
+                  ? patchSection(current, dialog.id, { title })
+                  : addSection(current, title),
+              'Section applied. Save to keep this change.',
+            );
+            workspace.setEditorDirty(false);
             setDialog(undefined);
-            setConversionError(undefined);
-          }
+          }}
+        />
+      )}
+      <Dialog
+        open={dialog?.kind === 'section-remove'}
+        title="Delete section?"
+        description={`Remove ${dialog?.kind === 'section-remove' ? dialog.title : ''}? Its tiles will move to Dashboard tiles. Save to keep this change.`}
+        onOpenChange={(open) => {
+          if (!open) setDialog(undefined);
         }}
-        title="Edit builder tile as SQL?"
-        description="The visual builder isn't available in this UI. Applying this edit converts the tile to SQL; its query and chart settings are kept."
       >
-        <div className="stack">
-          <InlineError error={conversionError} />
-          <div className="dialog-actions">
-            <Button
-              autoFocus
-              onClick={() => {
-                setDialog(undefined);
-                setConversionError(undefined);
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="primary"
-              onClick={() => {
-                if (dialog?.kind !== 'convert') return;
-                try {
-                  setDialog({ kind: 'tile', tile: convertBuilder(dialog.tile) });
-                  setConversionError(undefined);
-                } catch (error) {
-                  setConversionError(error instanceof Error ? error.message : String(error));
-                }
-              }}
-            >
-              Edit as SQL
-            </Button>
-          </div>
+        <div className="dialog-actions">
+          <Button autoFocus onClick={() => setDialog(undefined)}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            onClick={() => {
+              if (dialog?.kind !== 'section-remove') return;
+              workspace.changeDraft(
+                (current) => removeSection(current, dialog.id),
+                'Section deleted. Its tiles were kept. Save to keep this change.',
+              );
+              setDialog(undefined);
+            }}
+          >
+            Delete section
+          </Button>
         </div>
       </Dialog>
       <Dialog

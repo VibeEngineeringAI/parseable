@@ -555,3 +555,35 @@ Results from `fix/frontend-alerts-cleanup`, run in Chromium (`/usr/bin/chromium`
 - The "detail, preview and target sheet have padded cards..." flake (`.uplot` lost its `data-retained` marker after Unmute, 4 to 5 of 15 runs, also on `origin/main`) was a test race, not a product bug. The runtime chart's window ends at the current second and moves forward when the alert reloads, which rebuilds the plot with the new range. In 12 serial runs the marker was lost exactly when the mocked `query_range` saw two different `end` values. The test now pins the clock with `page.clock.setFixedTime`, and passed 30 of 30 with `--repeat-each=30 --workers=4`.
 - `InlineError` was identical in Alerts and Team (only the attribute order differed) and now lives in `src/components/ui/InlineError.tsx`, exported from the UI index.
 - The final `npm run check` passed with 819 unit tests, 173 browser tests and 42 Storybook tests. An earlier full run had one unrelated failure in `e2e/app.spec.ts` "native login switches from demo to live" while the machine was at load average 36. That test then passed 20 of 20 in isolation and the check passed on rerun.
+
+## Dashboard review regressions (2026-10-11)
+
+PR #24's pointer reorder, automatic time-bucket binding, and explicit sort defects
+were reproduced with tests before changing production code:
+
+- The vertical-drag Playwright regression failed when the captured tile crossed
+  a sibling: the preview returned to its original row instead of committing.
+- `npx vitest run src/features/dashboards/tiles.test.ts src/features/dashboards/builder.test.ts`
+  initially failed 11 regressions (28 existing tests passed). The failures covered
+  automatic `time_bucket` inference and explicit time/aggregate sort precedence.
+- The two new builder Storybook interactions and the initial two application
+  regressions failed before the fix: the preview rendered a table and ascending
+  order still sent a leading descending time sort.
+
+After the fixes, the focused unit run passed all 39 tests; all eight builder
+Storybook interactions and the expanded three-test builder application file passed.
+The three pointer application tests passed, covering live preview, persistence,
+Escape cancellation, and keyboard reading order. The new stacked-tile Storybook
+scenario exercises the same production grid.
+
+Combined validation passed the production build, 1,896 unit tests, and all 99
+Storybook tests in `mcr.microsoft.com/playwright:v1.63.0-noble`, including unchanged
+visual baselines. The dashboard browser run passed 165 tests and skipped two optional
+captures; one test was renamed while workers were running and could not be loaded.
+Rerunning the finalized pointer file passed all three tests, completing coverage of
+all 166 enabled dashboard tests.
+
+The browser tests use deterministic transports. They check generated SQL and
+limited-result tooltip values, chart rendering, save/reload, explicit legacy
+bindings, and opaque metadata preservation. They do not establish live backend
+ingestion or cross-browser coverage.

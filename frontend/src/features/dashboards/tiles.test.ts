@@ -14,6 +14,7 @@ import {
   tileVariableNames,
 } from './tiles';
 import type { DashboardTile, DashboardVariable } from '../../lib/types';
+import { setQueryLanguage } from './tileEditing';
 const variables: DashboardVariable[] = ['dataset', 'level', 'host', 'zone'].map((name) => ({
   name,
   label: name,
@@ -25,6 +26,48 @@ const make = (id: string, layout: unknown): DashboardTile => ({
   unknown: 'keep',
 });
 describe('classic tile helpers', () => {
+  it('plots the default visual time buckets with unbound axes without rewriting the tile', () => {
+    const tile = setQueryLanguage({ ...newTile([]), dbName: ['logs'] }, 'builder');
+    const original = structuredClone(tile);
+    const chart = sqlChart(
+      [
+        { time_bucket: '2026-10-10T10:01:00Z', COUNT_STAR: 9 },
+        { time_bucket: '2026-10-10T10:00:00Z', COUNT_STAR: 3 },
+      ],
+      tile,
+    );
+    expect(chart).toMatchObject({
+      categorical: false,
+      timestamps: [Date.UTC(2026, 9, 10, 10) / 1000, Date.UTC(2026, 9, 10, 10, 1) / 1000],
+      series: [{ id: 'COUNT_STAR', values: [3, 9] }],
+    });
+    expect(tile).toEqual(original);
+  });
+  it.each(['builder', 'code', undefined])(
+    'infers time_bucket for %s tiles and gives an explicit binding precedence',
+    (tileType) => {
+      const tile: DashboardTile = {
+        tile_id: 'buckets',
+        tileType,
+        chartType: 'timeseries',
+        config: chartConfig('timeseries'),
+        chartQuery: tileType === 'code' ? 'SELECT time_bucket, COUNT_STAR FROM logs' : {},
+      };
+      const original = structuredClone(tile);
+      const rows = [{ time_bucket: '2026-10-10T10:00:00Z', COUNT_STAR: 3, service: 'api' }];
+      expect(sqlChart(rows, tile).categorical).toBe(false);
+      expect(
+        sqlChart(rows, { ...tile, config: { axes: { x: { field: 'service' } } } }).categorical,
+      ).toBe(true);
+      expect(
+        sqlChart(rows, { ...tile, config: { axes: { x: { field: 'missing' } } } }).categorical,
+      ).toBe(true);
+      expect(sqlChart([{ time_bucket: 'not a timestamp', COUNT_STAR: 3 }], tile).categorical).toBe(
+        true,
+      );
+      expect(tile).toEqual(original);
+    },
+  );
   it('starts new tiles with the classic groupBy axis without selecting a series split', () => {
     const config = chartConfig('timeseries');
     expect(config.axes).toEqual({

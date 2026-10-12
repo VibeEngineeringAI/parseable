@@ -536,15 +536,10 @@ test('403 reads and saves stay inline without signing the user out', async ({ pa
   expect(server.writes).toHaveLength(0);
 });
 
-test('builder conversion requires confirmation and a stored pie type is retained on title edit', async ({
-  page,
-}) => {
+test('builder definitions and a stored pie type are retained on title edit', async ({ page }) => {
   const server = await mockServer(page);
   await page.goto(detail);
-  await tileAction(page, 'Errors', 'Edit as SQL');
-  const confirmation = page.getByRole('dialog', { name: 'Edit builder tile as SQL?', exact: true });
-  await expect(confirmation).toContainText("visual builder isn't available");
-  await confirmation.getByRole('button', { name: 'Edit as SQL', exact: true }).click();
+  await tileAction(page, 'Errors', 'Edit');
   await page
     .getByRole('dialog', { name: 'Edit tile' })
     .getByRole('button', { name: 'Apply tile', exact: true })
@@ -555,7 +550,7 @@ test('builder conversion requires confirmation and a stored pie type is retained
   await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
-  expect(server.writes[0].tiles![1].tileType).toBe('code');
+  expect(server.writes[0].tiles![1]).toEqual(classic.tiles[1]);
   expect(server.writes[0].tiles![3]).toEqual({ ...classic.tiles[3], title: 'Saved pie' });
 });
 
@@ -793,11 +788,7 @@ test('time ranges refresh every tile and a dirty leave guard lets the user stay 
   await expect
     .poll(() => server.calls.filter((call) => call.path === '/api/v1/query').length)
     .toBeGreaterThan(queries);
-  await tileAction(page, 'Errors', 'Edit as SQL');
-  await page
-    .getByRole('dialog', { name: 'Edit builder tile as SQL?', exact: true })
-    .getByRole('button', { name: 'Edit as SQL', exact: true })
-    .click();
+  await tileAction(page, 'Errors', 'Edit');
   await page.getByRole('dialog').getByLabel('Tile title').fill('Dirty');
   await page.getByRole('button', { name: 'Apply tile', exact: true }).click();
   expect(await blocksUnload(page)).toBe(true);
@@ -1136,7 +1127,7 @@ test('sections have independent grids at identical coordinates; moves preserve o
   await page.goto(detail);
   for (const name of tiles.map((tile) => tile.title))
     await expect(tile(page, name).getByLabel(`${name} value`)).toHaveText('12');
-  await expect(page.locator('.dashboard-section > h2')).toHaveText(['API', 'DB']);
+  await expect(page.locator('.dashboard-section-heading h2')).toHaveText([/API/, /DB/]);
   const a = await tile(page, 'API first').boundingBox(),
     b = await tile(page, 'DB first').boundingBox();
   expect(b!.y).toBeGreaterThan(a!.y + a!.height);
@@ -1174,10 +1165,10 @@ test('legacy object builder from ingest_demo_data renders, converts and saves a 
   await expect(tile(page, source.title).getByRole('img')).toHaveAccessibleName(/2 series from/);
   for (const label of ['ERROR', 'INFO'])
     await expect(tile(page, source.title).locator('.charts-legend')).toContainText(label);
-  await tileAction(page, source.title, 'Edit as SQL');
-  await page.getByRole('dialog').getByRole('button', { name: 'Edit as SQL', exact: true }).click();
+  await tileAction(page, source.title, 'Edit');
   const editor = page.getByRole('dialog', { name: 'Edit tile', exact: true });
   await expect(editor.getByLabel('Tile title')).toBeFocused();
+  await editor.getByLabel('Query language').selectOption('code');
   await editor.getByLabel('Tile title').fill('Converted builder');
   const query =
     'SELECT DATE_TRUNC(\'minute\', "p_timestamp") AS "time_bucket", COUNT("severity_number") AS "COUNT_severity_number", "severity_text" AS "severity_text" FROM "app-logs" GROUP BY "time_bucket", "severity_text" ORDER BY "time_bucket" DESC';

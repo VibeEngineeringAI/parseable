@@ -159,6 +159,30 @@ visibility, variable queries, range overrides, and concurrent PromQL branches.
 `Dashboards/Refresh` provides interactive slow-response, failure, recovery, and
 timer stories, covered by `story-tests/dashboard-refresh.spec.ts`.
 
+### Dashboard editing stories and tests
+
+`Dashboards/Editing` renders the production dashboard with a deterministic in-memory
+transport. Editable and read-only stories cover tile drag/resize, keyboard movement,
+save/reload, Escape/Discard, section creation/rename/reordering/deletion, and transient
+versus saved collapse through `story-tests/dashboard-editing.spec.ts`.
+
+`Dashboards/Tile editor` provides visual authoring, stored SQL, legacy missing-type,
+typed-filter/limit, and opaque-query examples. `story-tests/dashboard-builder.spec.ts`
+checks generated SQL execution, preserved metadata, typed values, validation, ordering,
+and chart-type changes against the production editor.
+
+`e2e/dashboard-pointer-reorder.spec.ts` exercises vertical drags across siblings,
+cancellation, and keyboard ordering after a committed drag.
+`e2e/dashboard-builder-regressions.spec.ts` covers automatic time-bucket plotting,
+explicit sort precedence with limited results, and save/reload without rewriting
+legacy bindings or opaque metadata. The editing and builder Storybook interaction
+tests also cover these regressions in isolation.
+
+`Dashboards/Presentation` exercises the production presentation and PNG-export hooks
+with deterministic canvas and SVG fixtures. `story-tests/dashboard-presentation.spec.ts`
+checks focus/Escape behavior, retained state, shell isolation, and downloaded PNG pixels
+and full scroll dimensions. These tests run with the complete Storybook suite in CI.
+
 ### Storybook chart regression tests
 
 `story-tests/tile-chart.spec.ts` exercises real binding controls and `TileChart`: inherited

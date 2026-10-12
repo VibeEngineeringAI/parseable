@@ -19,16 +19,20 @@ import {
   supportedCharts,
   text,
   tileDatasets,
+  tileType,
 } from './tiles';
 import { TileQueryFields } from './TileQueryFields';
 import { TileAppearanceFields } from './TileAppearanceFields';
 import { TileBindingFields } from './TileBindingFields';
 import { chartIssues } from './chartPicker';
+import { builderIssue } from './builder';
 import { setQueryLanguage } from './tileEditing';
+import { dashboardSections } from './sections';
 import { resolveDataset, type VariableValues } from './variables';
 
 export function TileEditor({
   original,
+  sections,
   tiles,
   variables,
   values,
@@ -42,6 +46,7 @@ export function TileEditor({
   onDirty,
 }: {
   original?: DashboardTile;
+  sections?: unknown;
   tiles: DashboardTile[];
   variables: DashboardVariable[];
   values: VariableValues;
@@ -97,16 +102,28 @@ export function TileEditor({
       revision: (current?.revision ?? 0) + 1,
     }));
   const reason = useId();
-  const sql = useMemo(() => {
+  const { sql, sqlError } = useMemo(() => {
     try {
-      return sqlQuery(draft);
-    } catch {
-      return '';
+      return { sql: sqlQuery(draft), sqlError: '' };
+    } catch (error) {
+      return {
+        sql: '',
+        sqlError: error instanceof Error ? error.message : 'Could not generate SQL.',
+      };
     }
-  }, [draft.chartQuery, draft.dbName]);
+  }, [draft.chartQuery, draft.dbName, draft.chartType]);
   const queries = promqlQueries(draft),
     dataset = tileDatasets(draft)[0] ?? '',
-    isPromql = draft.tileType === 'promql';
+    isPromql = tileType(draft) === 'promql';
+  const schema = useAsync(
+    useCallback(
+      (signal) =>
+        dataset && !isPromql
+          ? client.schema(resolveDataset(dataset, values), signal)
+          : Promise.resolve([]),
+      [client, dataset, JSON.stringify(values), isPromql],
+    ),
+  );
   const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
   const metrics = useAsync(
     useCallback(
@@ -128,7 +145,14 @@ export function TileEditor({
     setDraft((current) => ({ ...current, ...edits }));
     onDirty(true);
   }
-  const issue = chartIssues(draft)[0];
+  const queryChanged = JSON.stringify(draft.chartQuery) !== JSON.stringify(initial.chartQuery);
+  const datasetChanged = dataset !== (tileDatasets(initial)[0] ?? '');
+  const builderValidation =
+    tileType(draft) === 'builder' &&
+    (queryChanged || datasetChanged || draft.chartType !== initial.chartType)
+      ? builderIssue(draft, datasetChanged && !schema.loading ? schema.data : undefined)
+      : '';
+  const issue = builderValidation || chartIssues(draft)[0];
   const validation = invalidFields.size
     ? invalidFields.has('height')
       ? 'Enter a height between 1 and 24.'
@@ -149,8 +173,17 @@ export function TileEditor({
               ? !queries.length || queries.some((row) => !row.query.trim())
                 ? 'Enter a PromQL query for every row.'
                 : ''
-              : !sql.trim()
-                ? 'Enter a SQL query.'
+              : !sql.trim() &&
+                  !(
+                    original &&
+                    tileType(draft) === 'builder' &&
+                    !queryChanged &&
+                    !datasetChanged &&
+                    draft.chartType === initial.chartType
+                  )
+                ? tileType(draft) === 'builder'
+                  ? sqlError || 'Complete the visual query fields.'
+                  : 'Enter a SQL query.'
                 : '';
   return (
     <Dialog
@@ -170,7 +203,7 @@ export function TileEditor({
           onApply({
             ...draft,
             title: text(draft.title).trim(),
-            ...(!isPromql ? { chartQuery: sql } : {}),
+            ...(tileType(draft) === 'code' ? { chartQuery: sql } : {}),
           });
         }}
       >
@@ -183,14 +216,26 @@ export function TileEditor({
         />
         <Select
           label="Query language"
-          value={isPromql ? 'promql' : 'code'}
+          value={isPromql ? 'promql' : tileType(draft) === 'builder' ? 'builder' : 'code'}
           onChange={(event) => {
-            const tileType = event.target.value;
-            setDraft((current) => setQueryLanguage(current, tileType as 'code' | 'promql'));
+            const language = event.target.value;
+            if (
+              language === 'builder' &&
+              tileType(draft) === 'code' &&
+              sql.trim() &&
+              !window.confirm('Replace this SQL query with a new visual query?')
+            )
+              return;
+            setDraft((current) =>
+              setQueryLanguage(current, language as 'code' | 'promql' | 'builder'),
+            );
             onDirty(true);
           }}
         >
-          <option value="code">SQL</option>
+          <option value="builder">Visual builder</option>
+          <option value="code" disabled={tileType(draft) === 'builder' && !sql.trim()}>
+            SQL
+          </option>
           <option value="promql" disabled={!promqlEnabled}>
             PromQL
             {promqlEnabled === undefined
@@ -228,9 +273,29 @@ export function TileEditor({
             <option key={name}>{name}</option>
           ))}
         </Select>
+        <Select
+          label="Section"
+          value={text(draft.sectionId)}
+          onChange={(event) => change({ sectionId: event.target.value || undefined })}
+        >
+          <option value="">Unsectioned</option>
+          {dashboardSections(sections).map((section) => (
+            <option key={text(section.sectionId)} value={text(section.sectionId)}>
+              {text(section.title) || 'Untitled section'}
+            </option>
+          ))}
+          {text(draft.sectionId) &&
+            !(Array.isArray(sections) ? sections : []).some(
+              (section) => text(record(section).sectionId) === text(draft.sectionId),
+            ) && <option value={text(draft.sectionId)}>{text(draft.sectionId)}</option>}
+        </Select>
+        {tileType(draft) === 'builder' && (
+          <QueryState loading={schema.loading} error={schema.error} retry={schema.reload} />
+        )}
         <TileQueryFields
-          key={draft.tileType as string}
+          key={tileType(draft)}
           draft={draft}
+          fields={schema.data ?? []}
           sql={sql}
           change={change}
           metadata={metadata}
@@ -240,6 +305,7 @@ export function TileEditor({
           onClick={runPreview}
           disabled={
             !dataset ||
+            !!builderValidation ||
             (isPromql
               ? !queries.length || queries.some((row) => !row.query.trim()) || !promqlEnabled
               : !sql.trim())
