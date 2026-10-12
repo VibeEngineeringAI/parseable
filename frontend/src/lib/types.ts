@@ -366,6 +366,7 @@ export type ApiKey = {
   createdBy: string;
   createdAt: string;
   modifiedAt: string;
+  expiresAt?: string | null;
 };
 // Dashboard and tile extras are part of the classic contract. Keep the fetched document
 // intact and patch it; a narrower editor model must never become the PUT body.
@@ -486,7 +487,7 @@ export interface ParseableClient {
   setDefaultRole(name: string): Promise<void>;
   clearDefaultRole(): Promise<void>;
   listApiKeys(signal?: AbortSignal): Promise<ApiKey[]>;
-  createApiKey(name: string, roles: string[]): Promise<ApiKey>;
+  createApiKey(name: string, roles: string[], ttlSeconds?: number | null): Promise<ApiKey>;
   getApiKey(id: string, signal?: AbortSignal): Promise<ApiKey>;
   deleteApiKey(id: string): Promise<void>;
 }

@@ -250,11 +250,15 @@ impl Users {
     pub fn new_session(&self, user: &User, session: SessionKey, expires_in: TimeDelta) {
         let tenant_id = &user.tenant;
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+        let expiry = Utc::now() + expires_in;
+        let expiry = user
+            .as_api_key()
+            .map_or(expiry, |api_key| api_key.cap_session_expiry(expiry));
 
         mut_sessions().track_new(
             user.userid().to_owned(),
             session,
-            Utc::now() + expires_in,
+            expiry,
             roles_to_permission(user.roles(), tenant),
             tenant_id,
         );

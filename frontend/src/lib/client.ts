@@ -417,10 +417,14 @@ export function createClient({
       if (!Array.isArray(data) || !data.every(apiKey)) return malformed(keys);
       return data;
     },
-    async createApiKey(keyName, assigned) {
+    async createApiKey(keyName, assigned, ttlSeconds) {
       const data = await readJson(
         keys,
-        jsonBody('POST', { keyName, roles: assigned }),
+        jsonBody('POST', {
+          keyName,
+          roles: assigned,
+          ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+        }),
         onUnauthorized,
       );
       if (!apiKey(data)) return malformed(keys);

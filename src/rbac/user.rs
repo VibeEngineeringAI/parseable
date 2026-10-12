@@ -141,6 +141,7 @@ impl User {
                 created_by,
                 created_at: now,
                 modified_at: now,
+                expires_at: None,
             })),
             roles,
             user_groups: HashSet::new(),
@@ -348,6 +349,29 @@ pub struct ApiKeyUser {
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl ApiKeyUser {
+    /// The expiry instant itself is already expired.
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    }
+
+    pub fn matches_active_key(&self, value: &str, now: DateTime<Utc>) -> bool {
+        self.api_key == value && !self.is_expired_at(now)
+    }
+
+    /// Ephemeral sessions never outlive the credential that created them.
+    pub fn session_expires_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        self.cap_session_expiry(now + chrono::TimeDelta::minutes(5))
+    }
+
+    pub fn cap_session_expiry(&self, session_expiry: DateTime<Utc>) -> DateTime<Utc> {
+        self.expires_at
+            .map_or(session_expiry, |expiry| expiry.min(session_expiry))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -799,6 +823,92 @@ mod apikey_serde_tests {
         assert_eq!(ak.key_id, key_id);
         assert_eq!(ak.userid, key_id.to_string());
         assert_eq!(ak.api_key, "secret-token");
+    }
+
+    #[test]
+    fn api_key_expiration_roundtrip_and_legacy_missing_field() {
+        let mut user = User::new_api_key(
+            Ulid::new(),
+            "test-secret".into(),
+            "test".into(),
+            HashSet::new(),
+            "admin".into(),
+            None,
+        );
+        let UserType::ApiKey(key) = &mut user.ty else {
+            unreachable!()
+        };
+        let expiry = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        key.expires_at = Some(expiry);
+        let value = serde_json::to_value(&user).unwrap();
+        let back: User = serde_json::from_value(value).unwrap();
+        assert_eq!(back.as_api_key().unwrap().expires_at, Some(expiry));
+
+        let mut value = serde_json::to_value(user.as_api_key().unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("expiresAt");
+        let legacy: ApiKeyUser = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.expires_at, None);
+        assert!(serde_json::to_value(legacy).unwrap()["expiresAt"].is_null());
+    }
+
+    #[test]
+    fn expiration_boundary_and_session_deadline() {
+        let mut user = User::new_api_key(
+            Ulid::new(),
+            "test-secret".into(),
+            "test".into(),
+            HashSet::new(),
+            "admin".into(),
+            None,
+        );
+        let UserType::ApiKey(key) = &mut user.ty else {
+            unreachable!()
+        };
+        let now = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(!key.is_expired_at(now));
+        assert_eq!(
+            key.session_expires_at(now),
+            now + chrono::TimeDelta::minutes(5)
+        );
+        key.expires_at = Some(now);
+        assert!(!key.is_expired_at(now - chrono::TimeDelta::nanoseconds(1)));
+        assert!(key.is_expired_at(now));
+        assert!(key.is_expired_at(now + chrono::TimeDelta::nanoseconds(1)));
+        assert!(!key.matches_active_key("test-secret", now));
+        key.expires_at = Some(now + chrono::TimeDelta::seconds(1));
+        assert!(key.matches_active_key("test-secret", now));
+        assert!(!key.matches_active_key("wrong-secret", now));
+        assert_eq!(key.session_expires_at(now), key.expires_at.unwrap());
+        let later = now + chrono::TimeDelta::seconds(20);
+        assert_eq!(key.cap_session_expiry(later), key.expires_at.unwrap());
+        assert_eq!(key.cap_session_expiry(now), now);
+        key.expires_at = None;
+        assert_eq!(key.cap_session_expiry(later), later);
+    }
+
+    #[test]
+    fn api_key_rejects_malformed_stored_expiration() {
+        let user = User::new_api_key(
+            Ulid::new(),
+            "test-secret".into(),
+            "test".into(),
+            HashSet::new(),
+            "admin".into(),
+            None,
+        );
+        for invalid in [
+            serde_json::json!("not-a-timestamp"),
+            serde_json::json!("2026-99-99T00:00:00Z"),
+            serde_json::json!(123),
+        ] {
+            let mut value = serde_json::to_value(&user).unwrap();
+            value["expiresAt"] = invalid;
+            assert!(serde_json::from_value::<User>(value).is_err());
+        }
     }
 
     #[test]

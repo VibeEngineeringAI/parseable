@@ -128,6 +128,34 @@ describe('per-client Team demo', () => {
     await expect(client.getApiKey(key.keyId)).rejects.toMatchObject({ status: 404 });
     expect(await client.listApiKeys()).toHaveLength(2);
   });
+  it.each([1800, 7776000])(
+    'computes a TTL of %i seconds exactly and preserves native users',
+    async (ttlSeconds) => {
+      const client = createDemoClient();
+      const users = await client.listUsers();
+      const key = await client.createApiKey('finite-key', ['analysts'], ttlSeconds);
+      expect(Date.parse(key.expiresAt!) - Date.parse(key.createdAt)).toBe(ttlSeconds * 1000);
+      expect((await client.getApiKey(key.keyId)).expiresAt).toBe(key.expiresAt);
+      expect((await client.listApiKeys()).find((item) => item.keyId === key.keyId)?.expiresAt).toBe(
+        key.expiresAt,
+      );
+      expect(await client.listUsers()).toEqual(users);
+    },
+  );
+  it.each([undefined, null])('creates nonexpiring keys for TTL %s', async (ttlSeconds) => {
+    const key = await createDemoClient().createApiKey('permanent-key', ['analysts'], ttlSeconds);
+    expect(key.expiresAt).toBeNull();
+  });
+  it.each([0, 1799, 7776001, -1, 1800.5, NaN, Infinity])(
+    'rejects invalid TTL %s without creating a key',
+    async (ttlSeconds) => {
+      const client = createDemoClient();
+      await expect(
+        client.createApiKey('invalid-key', ['analysts'], ttlSeconds),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(await client.listApiKeys()).toHaveLength(2);
+    },
+  );
   it('honors read cancellation without sharing mutations with another client', async () => {
     const client = createDemoClient();
     const other = createDemoClient();
