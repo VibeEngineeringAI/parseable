@@ -185,6 +185,8 @@ function SqlWorkspace() {
       return;
     }
     const alreadyProcessed = url === previousUrl.current;
+    // Keep the handoff marked as processed until the router commits its removal.
+    // An edit can rerun this effect while params still contains the old query.
     previousUrl.current = url;
     const query = params.get('query') || '';
     const range = paramsRange(params);
@@ -200,7 +202,6 @@ function SqlWorkspace() {
     setRow(undefined);
     const consumed = new URLSearchParams(params);
     for (const key of ['query', 'start', 'end', 'range']) consumed.delete(key);
-    previousUrl.current = consumed.toString();
     setParams(consumed, { replace: true });
   }, [params, tabs, setParams]);
   useEffect(() => {

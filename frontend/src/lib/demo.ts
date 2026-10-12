@@ -19,6 +19,7 @@ import { createDemoDatasets } from './demoDatasets';
 import { createDemoLogMethods } from './demoLogs';
 import { createDemoTraceRecords, createDemoTraceMethods } from './demoTraces';
 import { handleApmDemoQuery } from './apmDemo';
+import { errorDemoQueryTarget, handleErrorDemoQuery } from './errorAnalyticsDemo';
 import { alertDuration } from '../features/alerts/helpers';
 import { validateName } from '../features/team/helpers';
 
@@ -722,6 +723,22 @@ export function createDemoClient(): ParseableClient {
         if (item.type !== 'traces') throw new ApiError('APM requires a traces dataset', 400);
         const result = handleApmDemoQuery(request, item.name === 'demo_traces' ? traceRows : []);
         if (result !== undefined) return result;
+      }
+      const errors = errorDemoQueryTarget(request);
+      if (errors) {
+        if (!current.some((dataset) => dataset.name === errors.dataset))
+          throw new ApiError(`Unknown demo dataset: ${errors.dataset}`, 404);
+        const fields = new Set(await datasets.schema(errors.dataset, signal));
+        const missing = errors.fields.filter((field) => !fields.has(field));
+        if (missing.length) throw new ApiError(`Unknown demo field: ${missing[0]}`, 400);
+        // Seeded datasets share the fixture records; created datasets start empty.
+        const rows =
+          errors.dataset === 'demo_traces'
+            ? traceRows
+            : demoDatasets.some((dataset) => dataset.name === errors.dataset)
+              ? records
+              : [];
+        return handleErrorDemoQuery(request, rows)!;
       }
       return executeDemoQuery(
         request,

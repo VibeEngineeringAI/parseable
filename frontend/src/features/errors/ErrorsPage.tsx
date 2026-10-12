@@ -1,24 +1,39 @@
-import { useCallback, useMemo, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { RefreshCw } from 'lucide-react';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
-import { Badge, Button, EmptyState, Select } from '../../components/ui';
-import { discoverTraceDatasets, TRACE_PAGE_SIZE } from '../traces/helpers';
+import { Badge, Button, EmptyState, Select, Tabs } from '../../components/ui';
+import { TRACE_PAGE_SIZE } from '../traces/helpers';
 import { TraceTable } from '../traces/TraceTable';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
-import { paramsRange, timeBounds } from '../../lib/query';
+import { apmBoundsFromParams, apmRangeFromParams, resolveApmRoute } from '../../lib/apm';
+import { ApiError } from '../../lib/apiError';
+import {
+  discoverErrorDatasets,
+  loadErrorSchema,
+  UnsupportedErrorSchema,
+  type ErrorBounds,
+  type ErrorSchema,
+} from '../../lib/errorAnalytics';
+import { timeBounds } from '../../lib/query';
 import type { TimeRange, TraceSortBy } from '../../lib/types';
+import { ErrorIssues } from './ErrorIssues';
 import '../traces/traces.css';
-export function ErrorsUnavailable({ dataset }: { dataset?: string }) {
+import './errors.css';
+
+const APPLIED_PARAMS = ['start', 'end', 'range', 'view'];
+
+export function ErrorsUnavailable({ dataset, reason }: { dataset?: string; reason?: string }) {
   return (
     <EmptyState
       title="No eligible error dataset"
       description={
         dataset
-          ? `${dataset} is not an accessible OTLP trace dataset. Explore its logs to investigate application errors.`
-          : 'Error spans require an accessible dataset ingested with the otel-traces source format.'
+          ? `Errors cannot be analyzed in ${dataset}.${reason ? ` ${reason}.` : ''} Explore its logs to investigate application errors.`
+          : 'Errors need a log dataset with a severity level field, or a trace dataset ingested with the otel-traces source format.'
       }
       action={
         <Link
@@ -31,43 +46,12 @@ export function ErrorsUnavailable({ dataset }: { dataset?: string }) {
     />
   );
 }
-function errorRange(params: URLSearchParams): TimeRange {
-  if (params.has('start') || params.has('end')) return paramsRange(params);
-  const preset = params.get('range');
-  if (preset) {
-    try {
-      timeBounds(preset as TimeRange);
-      return preset as TimeRange;
-    } catch {
-      /* Fall back to the default range. */
-    }
-  }
-  return '1h';
-}
-function ErrorSpans({ dataset }: { dataset: string }) {
+
+function ErrorSpans({ dataset, bounds }: { dataset: string; bounds: ErrorBounds }) {
   const { client } = useApp();
   const navigate = useNavigate();
-  const [params, setParams] = useSearchParams();
-  const rangeKey = JSON.stringify(errorRange(params));
-  const range = useMemo(() => JSON.parse(rangeKey) as TimeRange, [rangeKey]);
   const [page, setPage] = useState(0);
   const [sort, setSort] = useState<TraceSortBy>('mostRecent');
-  const [revision, setRevision] = useState(0);
-  const bounds = useMemo(() => timeBounds(range), [range, revision]);
-  function changeRange(value: TimeRange) {
-    const next = new URLSearchParams(params);
-    next.delete('start');
-    next.delete('end');
-    next.delete('range');
-    if (typeof value === 'string') next.set('range', value);
-    else {
-      next.set('start', value.startTime);
-      next.set('end', value.endTime);
-    }
-    setPage(0);
-    setSort('mostRecent');
-    setParams(next);
-  }
   const result = useAsync(
     useCallback(
       (signal) =>
@@ -87,18 +71,9 @@ function ErrorSpans({ dataset }: { dataset: string }) {
   );
   return (
     <>
-      <div className="inline">
-        <p>OTLP error spans · {TRACE_PAGE_SIZE} results per page</p>
-        <TimeRangePicker value={range} onChange={changeRange} />
-        <Button
-          onClick={() => {
-            setPage(0);
-            setRevision((v) => v + 1);
-          }}
-        >
-          Refresh
-        </Button>
-      </div>
+      <p className="errors-caption">
+        Individual error spans, {TRACE_PAGE_SIZE} per page. Open one to see its whole trace.
+      </p>
       <QueryState loading={result.loading} error={result.error} retry={result.reload} />
       {result.data &&
         (result.data.records.length ? (
@@ -126,76 +101,188 @@ function ErrorSpans({ dataset }: { dataset: string }) {
     </>
   );
 }
-export function ErrorsPage() {
-  const { dataset } = useParams();
-  const [params] = useSearchParams();
-  const { client, mode } = useApp();
-  const navigate = useNavigate();
-  const discovery = useAsync(
-    useCallback((signal) => discoverTraceDatasets(client, signal), [client]),
+
+/** Explains why a dataset outside the discovered list cannot be analyzed, without
+ * hiding permission or transport failures behind an "unsupported" message. */
+function DatasetUnavailable({ dataset }: { dataset: string }) {
+  const { client } = useApp();
+  const check = useAsync(
+    useCallback((signal) => loadErrorSchema(client, dataset, signal), [client, dataset]),
   );
-  const selected = dataset ?? discovery.data?.datasets[0]?.name;
-  const eligible = discovery.data?.datasets.some((entry) => entry.name === selected);
+  if (check.loading) return <QueryState loading />;
+  const unsupported = check.error instanceof UnsupportedErrorSchema;
+  const missing = check.error instanceof ApiError && check.error.status === 404;
+  if (check.error && !unsupported && !missing)
+    return <QueryState loading={false} error={check.error} retry={check.reload} />;
   return (
-    <div className="page">
-      <PageHeader title="Errors" description="Investigate error spans in OTLP trace datasets." />
-      {mode === 'demo' && <Badge>Sample data</Badge>}
-      <p className="notice">
-        This view lists individual error spans. Grouped error issues and frequency analysis are
-        unavailable on this server.
-      </p>
-      {[...params.keys()].some((key) => !['start', 'end', 'range'].includes(key)) && (
-        <p role="status">
-          This link includes options that are not applied here:{' '}
-          {[...new Set(params.keys())]
-            .filter((key) => !['start', 'end', 'range'].includes(key))
-            .join(', ')}
-          . Use the native time range and sort controls to refine these error spans.
+    <ErrorsUnavailable dataset={dataset} reason={unsupported ? check.error?.message : undefined} />
+  );
+}
+
+function ErrorDataset({
+  dataset,
+  schema,
+  bounds,
+  view,
+  onView,
+}: {
+  dataset: string;
+  schema: ErrorSchema;
+  bounds: ErrorBounds;
+  view: string;
+  onView: (view: string) => void;
+}) {
+  const issues = <ErrorIssues dataset={dataset} schema={schema} bounds={bounds} />;
+  if (schema.source !== 'traces') return issues;
+  return (
+    <Tabs
+      aria-label="Error views"
+      value={view === 'spans' ? 'spans' : 'issues'}
+      onValueChange={onView}
+      items={[
+        { value: 'issues', label: 'Issues', content: issues },
+        {
+          value: 'spans',
+          label: 'Error spans',
+          content: <ErrorSpans dataset={dataset} bounds={bounds} />,
+        },
+      ]}
+    />
+  );
+}
+
+export function ErrorsPage() {
+  const { client, mode } = useApp();
+  const location = useLocation();
+  // Router params decode %2F before matching; decode the raw segment exactly once.
+  const { dataset } = resolveApmRoute(location.pathname);
+  const [params, setParams] = useSearchParams();
+  const navigate = useNavigate();
+  const [refreshRevision, setRefreshRevision] = useState(0);
+  const searchString = params.toString();
+  const bounds = useMemo(
+    () => apmBoundsFromParams(new URLSearchParams(searchString)),
+    [searchString],
+  );
+  const range = useMemo(
+    () => apmRangeFromParams(new URLSearchParams(searchString)),
+    [searchString],
+  );
+  // Capture a relative range once so paging, sorting, details and handoffs share it.
+  useEffect(() => {
+    if (params.get('start') && params.get('end')) return;
+    const next = new URLSearchParams(params);
+    next.set('start', bounds.startTime);
+    next.set('end', bounds.endTime);
+    if (typeof range === 'string') next.set('range', range);
+    setParams(next, { replace: true });
+  }, [params, bounds, range, setParams]);
+  const discovery = useAsync(
+    useCallback((signal) => discoverErrorDatasets(client, signal), [client]),
+    { keepPreviousData: true },
+  );
+  const changeRange = (value: TimeRange) => {
+    const captured = timeBounds(value),
+      next = new URLSearchParams(params);
+    next.set('start', captured.startTime);
+    next.set('end', captured.endTime);
+    if (typeof value === 'string') next.set('range', value);
+    else next.delete('range');
+    setParams(next);
+  };
+  const refresh = () => {
+    changeRange(range);
+    setRefreshRevision((revision) => revision + 1);
+  };
+  const changeView = (view: string) => {
+    const next = new URLSearchParams(params);
+    if (view === 'issues') next.delete('view');
+    else next.set('view', view);
+    setParams(next, { replace: true });
+  };
+  const datasets = discovery.data?.datasets ?? [];
+  const selected = dataset ?? datasets[0]?.name;
+  const entry = datasets.find((candidate) => candidate.name === selected);
+  const unapplied = [
+    ...new Set(
+      [...params.keys()].filter(
+        (key) =>
+          !APPLIED_PARAMS.includes(key) ||
+          (key === 'view' &&
+            (entry?.source === 'logs'
+              ? params.get('view') !== 'issues'
+              : !['issues', 'spans'].includes(params.get('view') ?? ''))),
+      ),
+    ),
+  ];
+  return (
+    <div className="page errors-page">
+      <PageHeader
+        title="Errors"
+        description="Find the errors that happen most often and see when they occur."
+        actions={mode === 'demo' ? <Badge>Sample data</Badge> : undefined}
+      />
+      {unapplied.length > 0 && (
+        <p role="status" className="notice">
+          This link includes options that are not applied here: {unapplied.join(', ')}.
         </p>
       )}
+      <div className="errors-controls">
+        <Select
+          className="errors-dataset"
+          label="Dataset"
+          value={entry ? entry.name : ''}
+          disabled={!discovery.data}
+          onChange={(event) =>
+            navigate(
+              `/errors/${encodeURIComponent(event.target.value)}${params.size ? `?${params}` : ''}`,
+            )
+          }
+        >
+          <option value="" disabled>
+            Select dataset
+          </option>
+          {datasets.map((candidate) => (
+            <option key={candidate.name} value={candidate.name}>
+              {candidate.name} ({candidate.source === 'traces' ? 'traces' : 'logs'})
+            </option>
+          ))}
+        </Select>
+        <TimeRangePicker value={range} onChange={changeRange} />
+        <Button variant="secondary" onClick={refresh}>
+          <RefreshCw size={14} aria-hidden="true" /> Refresh
+        </Button>
+      </div>
       <QueryState loading={discovery.loading} error={discovery.error} retry={discovery.reload} />
       {discovery.data?.unchecked.length ? (
-        <p role="status">
+        <p role="status" className="notice">
           Could not check datasets: {discovery.data.unchecked.join(', ')}.{' '}
-          <Button onClick={discovery.reload}>Check again</Button>
+          <Button variant="ghost" onClick={discovery.reload}>
+            Check again
+          </Button>
         </p>
       ) : null}
-      {discovery.data && (
-        <>
-          <Select
-            label="Trace dataset"
-            value={eligible ? selected : ''}
-            onChange={(event) =>
-              navigate(
-                `/errors/${encodeURIComponent(event.target.value)}${params.size ? `?${params}` : ''}`,
-              )
-            }
-          >
-            <option value="" disabled>
-              Select dataset
-            </option>
-            {discovery.data.datasets.map((entry) => (
-              <option key={entry.name} value={entry.name}>
-                {entry.name}
-              </option>
-            ))}
-          </Select>
-          {eligible && selected ? (
-            <ErrorSpans
-              key={`${selected}:${JSON.stringify(errorRange(params))}`}
-              dataset={selected}
-            />
-          ) : selected && discovery.data.unchecked.includes(selected) ? (
-            <EmptyState
-              title="Could not verify dataset"
-              description={`Could not verify whether ${selected} supports OTLP error spans. Dataset metadata is temporarily unavailable.`}
-              action={<Button onClick={discovery.reload}>Retry dataset verification</Button>}
-            />
-          ) : (
-            <ErrorsUnavailable dataset={dataset} />
-          )}
-        </>
-      )}
+      {discovery.data &&
+        (entry ? (
+          <ErrorDataset
+            key={`${entry.name}:${bounds.startTime}:${bounds.endTime}:${refreshRevision}`}
+            dataset={entry.name}
+            schema={entry.schema}
+            bounds={bounds}
+            view={params.get('view') ?? 'issues'}
+            onView={changeView}
+          />
+        ) : selected && discovery.data.unchecked.includes(selected) ? (
+          <EmptyState
+            title="Could not verify dataset"
+            description={`Could not check whether ${selected} can be analyzed for errors. Dataset details are temporarily unavailable.`}
+            action={<Button onClick={discovery.reload}>Retry dataset verification</Button>}
+          />
+        ) : dataset ? (
+          <DatasetUnavailable key={dataset} dataset={dataset} />
+        ) : (
+          <ErrorsUnavailable />
+        ))}
     </div>
   );
 }
