@@ -27,7 +27,8 @@ use actix_web::dev::ServiceRequest;
 use actix_web::http::header::{HeaderName, HeaderValue};
 use chrono::{DateTime, Duration, TimeDelta, Utc};
 use itertools::Itertools;
-use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+use parking_lot::RwLockWriteGuard;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use url::Url;
 
@@ -46,7 +47,7 @@ use self::user::UserType;
 
 pub const EXPIRY_DURATION: Duration = Duration::hours(1);
 
-// A first Basic login re-verifies when the user changes mid-login; bound the
+// A Basic login re-verifies when the user changes mid-login; bound the
 // retries so a stream of password changes cannot spin it.
 const BASIC_LOGIN_ATTEMPTS: usize = 3;
 
@@ -83,8 +84,8 @@ impl Users {
 
     pub fn put_user(&self, user: User) {
         let tenant_id = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
-        // Holding SESSIONS across both steps keeps a concurrent first login from
-        // tracking a session for the user being replaced.
+        // Holding SESSIONS across both steps keeps a concurrent Basic login
+        // (`new_basic_session`) from tracking a session for the user being replaced.
         let mut sessions = mut_sessions();
         sessions.remove_user(user.userid(), tenant_id);
         mut_users().insert(user);
@@ -296,14 +297,38 @@ impl Users {
             get_tenant_id_from_key(&key)
         };
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        // Verify without holding SESSIONS, then re-read the user under it (lock
-        // order SESSIONS -> USERS, see `map`) so a password change, role change
-        // or deletion racing the verification cannot leave a stale session.
+        // add this user to auth map
+        let Some(sessions) = self.new_basic_session(
+            username,
+            password,
+            tenant,
+            key.clone(),
+            DateTime::<Utc>::MAX_UTC,
+        ) else {
+            return Response::UnAuthorized;
+        };
+        sessions
+            .check_auth(&key, action, context_stream, context_user)
+            .expect("entry for this key just added")
+    }
+
+    /// Verifies a native user's password and tracks `key` as their session.
+    ///
+    /// The slow verification runs without holding SESSIONS; the user is then
+    /// re-read under it (lock order SESSIONS -> USERS, see `map`), so a password
+    /// change, role change or deletion racing the verification cannot leave a
+    /// stale session. Returns the SESSIONS guard so the caller can use the new
+    /// session before any later write changes it.
+    pub fn new_basic_session(
+        &self,
+        username: &str,
+        password: &str,
+        tenant: &str,
+        key: SessionKey,
+        expiry: DateTime<Utc>,
+    ) -> Option<RwLockWriteGuard<'static, map::Sessions>> {
         for _ in 0..BASIC_LOGIN_ATTEMPTS {
-            let Some(verified_hash) = self.verified_password_hash(username, password, tenant)
-            else {
-                return Response::UnAuthorized;
-            };
+            let verified_hash = self.verified_password_hash(username, password, tenant)?;
             let mut sessions = mut_sessions();
             let current = users()
                 .get(tenant)
@@ -321,20 +346,11 @@ impl Users {
             let Some((permissions, user_tenant)) = current else {
                 continue;
             };
-            // add this user to auth map
-            sessions.track_new(
-                username.clone(),
-                key.clone(),
-                DateTime::<Utc>::MAX_UTC,
-                permissions,
-                &user_tenant,
-            );
-            return sessions
-                .check_auth(&key, action, context_stream, context_user)
-                .expect("entry for this key just added");
+            sessions.track_new(username.to_owned(), key, expiry, permissions, &user_tenant);
+            return Some(sessions);
         }
 
-        Response::UnAuthorized
+        None
     }
 
     /// Returns the stored hash if `password` matches the native user's. The
@@ -357,6 +373,28 @@ impl Users {
             .then_some(basic.password_hash)
     }
 
+    /// Copies out the native users named `username`, with the tenant each is
+    /// stored under, so callers can run the slow password check after dropping
+    /// USERS. Optionally limited to one tenant.
+    fn native_users_named(
+        &self,
+        username: &str,
+        tenant_id: Option<&str>,
+    ) -> Vec<(String, Option<String>, user::Basic)> {
+        users()
+            .iter()
+            .filter(|(tenant, _)| tenant_id.is_none_or(|tenant_id| tenant_id == tenant.as_str()))
+            .flat_map(|(tenant, usermap)| {
+                usermap.values().filter_map(move |user| match &user.ty {
+                    UserType::Native(basic) if basic.username.eq(username) => {
+                        Some((tenant.clone(), user.tenant.clone(), basic.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
     #[inline(always)]
     pub fn validate_basic_user_tenant_id(
         &self,
@@ -364,17 +402,9 @@ impl Users {
         password: &str,
         tenant_id: &str,
     ) -> bool {
-        users()
-            .get(tenant_id)
-            .is_some_and(|tenant_users| {
-                tenant_users
-                    .values()
-                    .par_bridge()
-                    .find_any(|user| {
-                        matches!(&user.ty, UserType::Native(basic) if basic.username.eq(username) && basic.verify_password(password))
-                    })
-                    .is_some()
-            })
+        self.native_users_named(username, Some(tenant_id))
+            .par_iter()
+            .any(|(_, _, basic)| basic.verify_password(password))
     }
 
     pub fn mutate_request_with_basic_user(
@@ -383,14 +413,9 @@ impl Users {
         password: &str,
         req: &mut ServiceRequest,
     ) {
-        if let Some((tenant, _)) = users().par_iter().find_any(|(_, usermap)| {
-            usermap
-                .par_iter()
-                .find_any(|(_, user)| {
-                    matches!(&user.ty, UserType::Native(basic) if basic.username.eq(username) && basic.verify_password(password)) && user.tenant.is_some()
-                })
-                .is_some()
-        }) {
+        if let Some((tenant, _, _)) = self.native_users_named(username, None).par_iter().find_any(
+            |(_, user_tenant, basic)| user_tenant.is_some() && basic.verify_password(password),
+        ) {
             req.headers_mut().insert(
                 HeaderName::from_static(TENANT_ID),
                 HeaderValue::from_bytes(tenant.as_bytes()).unwrap(),
@@ -403,18 +428,12 @@ impl Users {
     }
 
     pub fn get_user_tenant_from_basic(&self, username: &str, password: &str) -> Option<String> {
-        for usermap in users().values() {
-            for user in usermap.values() {
-                if let UserType::Native(basic) = &user.ty
-                    && basic.username.eq(username)
-                    && basic.verify_password(password)
-                    && let Some(tenant) = &user.tenant
-                {
-                    return Some(tenant.clone());
-                }
-            }
-        }
-        None
+        // A user without a tenant never matches, so skip its password check.
+        self.native_users_named(username, None)
+            .into_iter()
+            .find_map(|(_, user_tenant, basic)| {
+                user_tenant.filter(|_| basic.verify_password(password))
+            })
     }
 }
 
@@ -905,6 +924,120 @@ mod lock_order_tests {
 
         assert_eq!(finish(&login_rx, "login"), Response::UnAuthorized);
         assert!(!Users.session_exists(&login));
+    }
+
+    /// Runs the `/login` cookie exchange (`exchange_basic_for_cookie` in `oidc`)
+    /// for a Basic key. Returns the cookie session key and whether it was tracked.
+    fn cookie_login(key: &SessionKey, tenant: &str) -> (SessionKey, mpsc::Receiver<bool>) {
+        let cookie = SessionKey::SessionId(Ulid::new());
+        let rx = spawn({
+            let (key, cookie, tenant) = (key.clone(), cookie.clone(), tenant.to_owned());
+            move || {
+                let (username, password) = credentials(&key);
+                Users
+                    .new_basic_session(
+                        username,
+                        password,
+                        &tenant,
+                        cookie,
+                        Utc::now() + EXPIRY_DURATION,
+                    )
+                    .is_some()
+            }
+        });
+        (cookie, rx)
+    }
+
+    // `/login` verified the password and then tracked its cookie session from a
+    // copy of the user, so a password change in between left a session that
+    // outlived the reset.
+    #[test]
+    fn password_change_during_cookie_login_leaves_no_session() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (user, login) = native_user(&tenant, &[ROLE]);
+
+        let reader = sessions();
+        let (cookie, login_rx) = cookie_login(&login, &tenant);
+        wait_until("the cookie login to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        let new_hash = cheap_hash("changed");
+        let writer = queue_user_writer(move || {
+            if let Some(users) = mut_users().get_mut(user.tenant.as_deref().unwrap())
+                && let Some(User {
+                    ty: UserType::Native(basic),
+                    ..
+                }) = users.get_mut(user.userid())
+            {
+                basic.password_hash = new_hash;
+            }
+        });
+        finish(&writer, "password change");
+        drop(reader);
+
+        assert!(!finish(&login_rx, "cookie login"));
+        assert!(!Users.session_exists(&cookie));
+    }
+
+    #[test]
+    fn cookie_login_tracks_a_session_with_the_users_roles_and_tenant() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (_, login) = native_user(&tenant, &[ROLE]);
+        let (_, roleless) = native_user(&tenant, &[]);
+
+        let (cookie, tracked) = cookie_login(&login, &tenant);
+        assert!(finish(&tracked, "cookie login"));
+        assert_eq!(
+            Users.get_userid_from_session(&cookie),
+            Some((credentials(&login).0.to_owned(), tenant.clone()))
+        );
+        assert_eq!(
+            Users.authorize(cookie, Action::Query, None, None),
+            Response::Authorized
+        );
+        let (cookie, tracked) = cookie_login(&roleless, &tenant);
+        assert!(finish(&tracked, "cookie login"));
+        assert_eq!(
+            Users.authorize(cookie, Action::Query, None, None),
+            Response::UnAuthorized
+        );
+
+        let (username, _) = credentials(&login);
+        let wrong = SessionKey::BasicAuth {
+            username: username.to_owned(),
+            password: "wrong".into(),
+        };
+        let (cookie, tracked) = cookie_login(&wrong, &tenant);
+        assert!(!finish(&tracked, "cookie login"));
+        assert!(!Users.session_exists(&cookie));
+    }
+
+    // The Basic lookups verify passwords after dropping USERS; they must still
+    // pick the user's tenant and reject a wrong password or tenant.
+    #[test]
+    fn basic_tenant_lookups_match_the_users_tenant() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (_, login) = native_user(&tenant, &[ROLE]);
+        let (username, password) = credentials(&login);
+
+        assert_eq!(
+            Users.get_user_tenant_from_basic(username, password),
+            Some(tenant.clone())
+        );
+        assert_eq!(Users.get_user_tenant_from_basic(username, "wrong"), None);
+        assert!(Users.validate_basic_user_tenant_id(username, password, &tenant));
+        assert!(!Users.validate_basic_user_tenant_id(username, "wrong", &tenant));
+        assert!(!Users.validate_basic_user_tenant_id(username, password, "elsewhere"));
+
+        let mut req = actix_web::test::TestRequest::default().to_srv_request();
+        Users.mutate_request_with_basic_user(username, password, &mut req);
+        assert_eq!(req.headers().get(TENANT_ID).unwrap(), tenant.as_str());
+        let mut req = actix_web::test::TestRequest::default().to_srv_request();
+        Users.mutate_request_with_basic_user(username, "wrong", &mut req);
+        assert!(req.headers().get(TENANT_ID).is_none());
     }
 
     // A role change that lands while a first login is verifying must apply to

@@ -36,7 +36,7 @@ static COOKIE_REQUIRE_CROSS_SITE: AtomicBool = AtomicBool::new(false);
 pub fn set_cookie_cross_site(enabled: bool) {
     COOKIE_REQUIRE_CROSS_SITE.store(enabled, Ordering::Relaxed);
 }
-use chrono::TimeDelta;
+use chrono::{TimeDelta, Utc};
 use openid::Bearer;
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -124,29 +124,20 @@ pub async fn login(
     let tenant_id = get_tenant_id_from_key(&session_key);
     match session_key {
         // We can exchange basic auth for session cookie
-        SessionKey::BasicAuth { username, password } => match Users.get_user(&username, &tenant_id)
-        {
-            Some(
-                ref user @ User {
-                    ty: UserType::Native(ref basic),
-                    ..
-                },
-            ) if basic.verify_password(&password) => {
-                let user_cookie = cookie_username(&username);
-                let user_id_cookie = cookie_userid(&username);
-                let session_cookie = exchange_basic_for_cookie(
-                    user,
-                    SessionKey::BasicAuth { username, password },
-                    EXPIRY_DURATION,
-                );
+        SessionKey::BasicAuth { username, password } => {
+            match exchange_basic_for_cookie(&username, &password, &tenant_id, EXPIRY_DURATION) {
+                Some(session_cookie) => {
+                    let user_cookie = cookie_username(&username);
+                    let user_id_cookie = cookie_userid(&username);
 
-                Ok(redirect_to_client(
-                    query.redirect.as_str(),
-                    [user_cookie, user_id_cookie, session_cookie],
-                ))
+                    Ok(redirect_to_client(
+                        query.redirect.as_str(),
+                        [user_cookie, user_id_cookie, session_cookie],
+                    ))
+                }
+                None => Err(OIDCError::BadRequest("Bad Request".to_string())),
             }
-            _ => Err(OIDCError::BadRequest("Bad Request".to_string())),
-        },
+        }
         // if it's a valid active session, just redirect back
         key @ SessionKey::SessionId(_) => {
             let resp = if Users.session_exists(&key) {
@@ -510,15 +501,28 @@ fn callback_base_url(req: &HttpRequest) -> String {
     format!("{}://{host}/", PARSEABLE.options.get_scheme())
 }
 
+/// Re-verifies the Basic credentials and swaps their session for a cookie one.
+/// `new_basic_session` re-reads the user under SESSIONS, so an admin change
+/// racing the login cannot leave a cookie session with stale credentials.
 fn exchange_basic_for_cookie(
-    user: &User,
-    key: SessionKey,
+    username: &str,
+    password: &str,
+    tenant_id: &Option<String>,
     expires_in: TimeDelta,
-) -> Cookie<'static> {
+) -> Option<Cookie<'static>> {
     let id = Ulid::new();
-    Users.remove_session(&key);
-    Users.new_session(user, SessionKey::SessionId(id), expires_in);
-    cookie_session(id)
+    let mut sessions = Users.new_basic_session(
+        username,
+        password,
+        tenant_id.as_deref().unwrap_or(DEFAULT_TENANT),
+        SessionKey::SessionId(id),
+        Utc::now() + expires_in,
+    )?;
+    sessions.remove_session(&SessionKey::BasicAuth {
+        username: username.to_owned(),
+        password: password.to_owned(),
+    });
+    Some(cookie_session(id))
 }
 
 fn redirect_to_oidc_logout(mut logout_endpoint: Url, redirect: &Url) -> HttpResponse {
