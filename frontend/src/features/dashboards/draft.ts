@@ -5,6 +5,7 @@ import type { Dashboard, DashboardTile, DashboardVariable, TimeRange } from '../
 import { appendLayout, compactSection, sectionGroups } from './layout';
 import { record, tileTitle } from './tiles';
 import { classicTimeRange } from './timeRange';
+import { relocateTile } from './sections';
 
 export function loadDraft(original: Dashboard) {
   const seen = new Set<string>();
@@ -46,6 +47,18 @@ export function applyTile(draft: Dashboard, tile: DashboardTile): Dashboard {
   const tiles = original
     ? (draft.tiles ?? []).map((row) => (row.tile_id === tile.tile_id ? tile : row))
     : [...(draft.tiles ?? []), tile];
+  if (original && (original.sectionId || '') !== (tile.sectionId || '')) {
+    let moved = relocateTile({ ...draft, tiles }, tile.tile_id, tile.sectionId);
+    const neighbour = sectionGroups(draft.tiles ?? [], draft.sections)
+      .find((group) => group.tiles.some((row) => row.tile_id === tile.tile_id))
+      ?.tiles.find((row) => row.tile_id !== tile.tile_id);
+    if (neighbour)
+      moved = {
+        ...moved,
+        tiles: compactSection(moved.tiles ?? [], neighbour.tile_id, draft.sections),
+      };
+    return moved;
+  }
   const resized = original && JSON.stringify(original.layout) !== JSON.stringify(tile.layout);
   return {
     ...draft,

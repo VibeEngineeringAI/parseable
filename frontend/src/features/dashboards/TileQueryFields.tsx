@@ -1,3 +1,4 @@
+import { TileBuilderFields } from './TileBuilderFields';
 import { useState } from 'react';
 import { Button, Select } from '../../components/ui';
 import { PromqlEditor } from '../../components/promql/PromqlEditor';
@@ -6,14 +7,16 @@ import type { DashboardTile } from '../../lib/types';
 import { createId } from '../../lib/ids';
 import { SqlEditor } from '../sql/SqlEditor';
 import { addPromqlQuery, promqlRows, removePromqlQuery } from './tileEditing';
-import { promqlQueries, type QueryMode } from './tiles';
+import { promqlQueries, tileType, type QueryMode } from './tiles';
 export function TileQueryFields({
   draft,
   sql,
   change,
   metadata,
   runPreview,
+  fields = [],
 }: {
+  fields?: string[];
   draft: DashboardTile;
   sql: string;
   change: (edits: Partial<DashboardTile>) => void;
@@ -21,7 +24,7 @@ export function TileQueryFields({
   runPreview: () => void;
 }) {
   const queries = promqlQueries(draft),
-    isPromql = draft.tileType === 'promql';
+    isPromql = tileType(draft) === 'promql';
   const [queryIds, setQueryIds] = useState(() => queries.map(() => createId()));
   return (
     <>
@@ -84,6 +87,16 @@ export function TileQueryFields({
           >
             Add query
           </Button>
+        </div>
+      ) : tileType(draft) === 'builder' ? (
+        <div className="stack">
+          <TileBuilderFields draft={draft} fields={fields} change={change} />
+          {sql && (
+            <details>
+              <summary>Generated SQL</summary>
+              <pre className="wrap">{sql}</pre>
+            </details>
+          )}
         </div>
       ) : (
         <div className="stack">

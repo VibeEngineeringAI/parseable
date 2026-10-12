@@ -1,5 +1,13 @@
+import { newBuilderQuery } from './builder';
 import type { DashboardTile } from '../../lib/types';
-import { promqlQueries, sqlQuery, storedStep, tileDatasets, type QueryMode } from './tiles';
+import {
+  promqlQueries,
+  sqlQuery,
+  storedStep,
+  tileDatasets,
+  tileType,
+  type QueryMode,
+} from './tiles';
 
 export function convertBuilder(tile: DashboardTile): DashboardTile {
   const chartQuery = sqlQuery(tile);
@@ -7,17 +15,22 @@ export function convertBuilder(tile: DashboardTile): DashboardTile {
     throw new Error('This builder query cannot be converted faithfully to SQL.');
   return { ...tile, tileType: 'code', chartQuery, dbName: tileDatasets(tile) };
 }
-export function setQueryLanguage(tile: DashboardTile, language: 'code' | 'promql'): DashboardTile {
-  if (tile.tileType === language) return tile;
+export function setQueryLanguage(
+  tile: DashboardTile,
+  language: 'code' | 'promql' | 'builder',
+): DashboardTile {
+  if (tileType(tile) === language) return tile;
+  if (language === 'code' && tileType(tile) === 'builder') return convertBuilder(tile);
   const next = { ...tile };
-  if (tile.tileType === 'promql')
+  if (tileType(tile) === 'promql')
     for (const key of ['promqlQueryType', 'promqlStep', 'promqlQuery']) delete next[key];
   // These query/dataset fields are shared and are replaced with the new language's shapes.
   return {
     ...next,
     tileType: language,
-    chartQuery: language === 'promql' ? [''] : '',
-    dbName: language === 'promql' ? '' : [],
+    chartQuery:
+      language === 'promql' ? [''] : language === 'builder' ? newBuilderQuery(tile.chartType) : '',
+    dbName: language === 'promql' ? '' : tileType(tile) === 'promql' ? [] : tileDatasets(tile),
     ...(language === 'promql' ? { promqlQueryType: ['range'] } : {}),
   };
 }

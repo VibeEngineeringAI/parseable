@@ -33,9 +33,19 @@ export function resolvedLayouts(tiles: DashboardTile[], maxH = 24): Positioned[]
 
 /** Classic places absent and unknown section ids in the first grid. */
 export function sectionGroups(tiles: DashboardTile[], sections: unknown) {
+  const seen = new Set<string>();
   const groups = (Array.isArray(sections) ? sections : [])
     .filter(object)
-    .filter((section) => typeof section.sectionId === 'string')
+    .filter((section) => {
+      if (
+        typeof section.sectionId !== 'string' ||
+        !section.sectionId ||
+        seen.has(section.sectionId)
+      )
+        return false;
+      seen.add(section.sectionId);
+      return true;
+    })
     .map((section) => ({
       id: String(section.sectionId),
       title: typeof section.title === 'string' ? section.title : 'Untitled section',
@@ -50,7 +60,10 @@ export function sectionGroups(tiles: DashboardTile[], sections: unknown) {
 export function appendLayout(tiles: DashboardTile[], w = 6, h = 4): TileLayout {
   return {
     x: 0,
-    y: resolvedLayouts(tiles).reduce((end, row) => Math.max(end, row.layout.y + row.layout.h), 0),
+    y: resolvedLayouts(tiles, Infinity).reduce(
+      (end, row) => Math.max(end, row.layout.y + row.layout.h),
+      0,
+    ),
     w,
     h,
   };
@@ -146,4 +159,61 @@ export function moveTile(
   if (next.indexOf(first) > next.indexOf(second)) return swapped;
   const below = at(second);
   return place(new Map([[first, { ...below, y: below.y + below.h }]]));
+}
+
+/** Apply an explicit drag/resize inside one section. The edited tile takes priority
+ * at its destination; collisions move down, preserving every other tile's fields. */
+export function updateTileLayout(
+  tiles: DashboardTile[],
+  id: string,
+  edits: Partial<TileLayout>,
+): DashboardTile[] {
+  const rows = compactLayouts(tiles, Infinity);
+  const active = rows.find((row) => row.tile.tile_id === id);
+  if (!active) return tiles;
+  const w = integer(edits.w, active.layout.w, 1, 12);
+  const target = {
+    x: integer(edits.x, Math.min(active.layout.x, 12 - w), 0, 12 - w),
+    y: integer(edits.y, active.layout.y, 0, 100000),
+    w,
+    h: integer(edits.h, active.layout.h, 1, Infinity),
+  };
+  // A zero-distance gesture must not normalize an imported document.
+  if (
+    Object.keys(edits).every(
+      (key) => target[key as keyof TileLayout] === active.layout[key as keyof TileLayout],
+    )
+  )
+    return tiles;
+  const placed: Positioned[] = [{ tile: active.tile, layout: target }];
+  for (const row of compactLayouts(
+    tiles.filter((tile) => tile.tile_id !== id),
+    Infinity,
+  )) {
+    const layout = { ...row.layout };
+    let collision = placed.find((other) => overlaps(layout, other.layout));
+    while (collision) {
+      layout.y = collision.layout.y + collision.layout.h;
+      collision = placed.find((other) => overlaps(layout, other.layout));
+    }
+    placed.push({ tile: row.tile, layout });
+  }
+  // Vertical compaction closes the gap left by a moved tile.
+  const normalized = compactLayouts(
+    placed.map(({ tile, layout }) => ({ ...tile, layout })),
+    Infinity,
+  );
+  const positions = new Map(normalized.map(({ tile, layout }) => [tile.tile_id, layout]));
+  return tiles.map((tile) => {
+    const position = positions.get(tile.tile_id)!;
+    const stored = record(tile.layout);
+    if (tile.tile_id !== id)
+      return stored.y === position.y ? tile : { ...tile, layout: { ...stored, y: position.y } };
+    const patch: Record<string, number> = { y: position.y };
+    if (edits.x !== undefined || (edits.w !== undefined && target.x !== active.layout.x))
+      patch.x = position.x;
+    if (edits.w !== undefined) patch.w = position.w;
+    if (edits.h !== undefined) patch.h = position.h;
+    return { ...tile, layout: { ...stored, ...patch } };
+  });
 }

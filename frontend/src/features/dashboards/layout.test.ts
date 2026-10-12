@@ -1,5 +1,11 @@
 import { expect, it } from 'vitest';
-import { compactLayouts, compactSection, moveTile, sectionGroups } from './layout';
+import {
+  compactLayouts,
+  compactSection,
+  moveTile,
+  sectionGroups,
+  updateTileLayout,
+} from './layout';
 import { applyTile, removeTile } from './draft';
 import classic from './__fixtures__/classic.json';
 import type { DashboardTile } from '../../lib/types';
@@ -106,4 +112,61 @@ it('never writes display-clamped widths or heights to untouched tiles', () => {
   expect(compactSection(source, 'b')[0].layout).toMatchObject({ h: 30, w: 6, future: true });
   const oversized = { ...source[0], layout: { x: 99, y: 0, w: 30, h: 30, future: true } };
   expect(compactSection([oversized, ...source.slice(1)], 'b')[0]).toBe(oversized);
+});
+
+it('places a dragged tile before its destination and compacts the vacated space', () => {
+  const source = [tile('a', 0, 0, 12, 4), tile('b', 0, 4, 12, 4), tile('c', 0, 8, 12, 4)];
+  const down = updateTileLayout(source, 'a', { x: 0, y: 4 });
+  expect(compactLayouts(down).map(({ tile }) => tile.tile_id)).toEqual(['b', 'a', 'c']);
+  const up = updateTileLayout(source, 'c', { x: 0, y: 0 });
+  expect(compactLayouts(up).map(({ tile }) => tile.tile_id)).toEqual(['c', 'a', 'b']);
+  expect(source[0].layout).toEqual({ x: 0, y: 0, w: 12, h: 4, future: true });
+});
+it('clamps explicit resize dimensions and keeps opaque tile and layout metadata', () => {
+  const source = [
+    { ...tile('a', 8, 0, 4, 4), custom: { untouched: true } },
+    { ...tile('b', 0, 0, 8, 4), layout: { x: -7, y: 0, w: 8, h: 30, future: true } },
+  ];
+  const result = updateTileLayout(source, 'a', { w: 99, h: 6 });
+  expect(result[0]).toMatchObject({
+    custom: { untouched: true },
+    layout: { x: 0, y: 0, w: 12, h: 6, future: true },
+  });
+  expect(result[1].layout).toEqual({ x: -7, y: 6, w: 8, h: 30, future: true });
+  expect(updateTileLayout(source, 'missing', { x: 2 })).toBe(source);
+});
+it('does not normalize documents on a zero-distance gesture', () => {
+  const source = [{ ...tile('a', 0, 0, 6, 4), layout: { x: -2, y: 12, w: 6, h: 4, future: true } }];
+  expect(updateTileLayout(source, 'a', { x: 0, y: 0 })).toBe(source);
+  expect(updateTileLayout(source, 'a', {})).toBe(source);
+});
+it('drag and resize never overlap, including imported oversized heights', () => {
+  const source = [
+    tile('a', 0, 0, 6, 30),
+    tile('b', 6, 0, 6, 4),
+    tile('c', 6, 4, 6, 4),
+    tile('d', 0, 30, 12, 4),
+  ];
+  for (const edits of [
+    { x: 6, y: 0 },
+    { x: -3, y: -4 },
+    { w: 12, h: 8 },
+    { w: 1, h: 1 },
+  ]) {
+    const rows = compactLayouts(updateTileLayout(source, 'b', edits), Infinity);
+    for (const a of rows)
+      for (const b of rows)
+        if (a !== b)
+          expect(
+            a.layout.x < b.layout.x + b.layout.w &&
+              a.layout.x + a.layout.w > b.layout.x &&
+              a.layout.y < b.layout.y + b.layout.h &&
+              a.layout.y + a.layout.h > b.layout.y,
+          ).toBe(false);
+    expect(updateTileLayout(source, 'b', edits)[0].layout).toMatchObject({
+      w: 6,
+      h: 30,
+      future: true,
+    });
+  }
 });
