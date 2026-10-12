@@ -13,6 +13,7 @@ export function VariablesBar({
   values,
   params,
   bounds,
+  revision = 0,
   writable,
   promqlEnabled,
   resolutions,
@@ -25,6 +26,7 @@ export function VariablesBar({
   values: VariableValues;
   params: URLSearchParams;
   bounds: Omit<QueryRequest, 'sql'>;
+  revision?: number;
   writable: boolean;
   promqlEnabled?: boolean;
   resolutions: VariableResolutions;
@@ -53,6 +55,7 @@ export function VariablesBar({
           values={values}
           selected={params.get(`var-${variable.name}`)}
           bounds={bounds}
+          revision={revision}
           promqlEnabled={promqlEnabled}
           resolutions={resolutions}
           onSelect={onSelect}

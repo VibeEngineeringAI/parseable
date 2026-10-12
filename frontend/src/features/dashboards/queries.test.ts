@@ -26,12 +26,12 @@ it.each(tiles)('sends unknown dollar tokens unchanged in a $tileType tile', asyn
   if (tile.tileType === 'code')
     expect(client.query).toHaveBeenCalledWith(
       { sql: sql.replace('$host', 'node-a'), ...bounds },
-      signal,
+      expect.any(AbortSignal),
     );
   else
     expect(client.promqlQueryRange).toHaveBeenCalledWith(
       expect.objectContaining({ query: promql.replace('$host', 'node-a'), stream: 'metrics' }),
-      signal,
+      expect.any(AbortSignal),
     );
 });
 it.each(tiles)(
@@ -72,14 +72,14 @@ it.each(['instant', 'range', 'both'])(
         end: Date.parse(bounds.endTime) / 1000,
         step: '15s',
       },
-      signal,
+      expect.any(AbortSignal),
     );
     expect(client.promqlQuery).toHaveBeenCalledTimes(2);
     for (const [index, query] of ['up', 'process_cpu_seconds_total'].entries())
       expect(client.promqlQuery).toHaveBeenNthCalledWith(
         index + 1,
         { stream: 'metrics', query, time: Date.parse(bounds.endTime) / 1000 },
-        signal,
+        expect.any(AbortSignal),
       );
     expect(result.promql?.[0]).toMatchObject({
       id: 'A',
@@ -132,12 +132,45 @@ it.each(tiles)(
     if (tile.tileType === 'code')
       expect(client.query).toHaveBeenCalledWith(
         { sql: sql.replace('$host', '$host $other'), ...bounds },
-        signal,
+        expect.any(AbortSignal),
       );
     else
       expect(client.promqlQueryRange).toHaveBeenCalledWith(
         expect.objectContaining({ query: promql.replace('$host', '$host $other') }),
-        signal,
+        expect.any(AbortSignal),
       );
   },
 );
+
+it.each(tiles)('forwards cancellation to all dispatched $tileType requests', async (tile) => {
+  const controller = new AbortController();
+  const signals: AbortSignal[] = [];
+  const pending = vi.fn(
+    (_request: unknown, requestSignal: AbortSignal) =>
+      new Promise((_resolve, reject) => {
+        signals.push(requestSignal);
+        requestSignal.addEventListener('abort', () => reject(requestSignal.reason), { once: true });
+      }),
+  );
+  const client = {
+    ...mockClient(),
+    query: pending,
+    promqlQuery: pending,
+    promqlQueryRange: pending,
+  } as unknown as ParseableClient;
+  const operation = loadTile(
+    client,
+    tile,
+    variables,
+    { host: 'node-a' },
+    bounds,
+    createLimiter(4),
+    controller.signal,
+  );
+  const reason = new Error('Selection changed');
+  const rejected = expect(operation).rejects.toBe(reason);
+  await vi.waitFor(() => expect(signals.length).toBeGreaterThan(0));
+  controller.abort(reason);
+  await rejected;
+  expect(signals.every((signal) => signal.aborted && signal.reason === reason)).toBe(true);
+});

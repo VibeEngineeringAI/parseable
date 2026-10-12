@@ -12,7 +12,7 @@ import { clearSessionCookies } from '../lib/auth';
 import { demoEnabled } from '../lib/config';
 import type { SessionIdentity } from '../lib/types';
 export type Mode = 'demo' | 'live';
-const Context = createContext<ReturnType<typeof useAppState> | null>(null);
+export const AppContext = createContext<ReturnType<typeof useAppState> | null>(null);
 function useAppState() {
   const [mode, setModeState] = useState<Mode>(() => {
     if (demoEnabled && sessionStorage.getItem('parseable-mode') === 'demo') return 'demo';
@@ -64,10 +64,10 @@ function useAppState() {
   return { mode, setMode, client, session, identity, needsLogin, demoEnabled };
 }
 export function AppProvider({ children }: { children: ReactNode }) {
-  return <Context.Provider value={useAppState()}>{children}</Context.Provider>;
+  return <AppContext.Provider value={useAppState()}>{children}</AppContext.Provider>;
 }
 export function useApp() {
-  const ctx = useContext(Context);
+  const ctx = useContext(AppContext);
   if (!ctx) throw new Error('Missing AppProvider');
   return ctx;
 }

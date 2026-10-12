@@ -4,10 +4,15 @@ import { ActionsMenu, Button, Card, Dialog } from '../../components/ui';
 import { ExternalLink } from 'lucide-react';
 import { classicUiAvailable, classicUiPath } from '../../lib/classicUi';
 import { useApp } from '../../app/AppProvider';
-import { useAsync } from '../../hooks/useAsync';
+import { useDashboardQuery } from './DashboardRefresh';
 import { timeBounds } from '../../lib/query';
 import type { QueryLimiter } from '../../lib/concurrency';
-import type { DashboardTile as Tile, DashboardVariable, QueryRequest } from '../../lib/types';
+import type {
+  DashboardTile as Tile,
+  DashboardVariable,
+  QueryRequest,
+  TimeRange,
+} from '../../lib/types';
 import { TileChart } from './TileChart';
 import type { TimeSeriesChartProps } from '../../components/charts/TimeSeriesChart';
 import { loadTile, type TileResults } from './queries';
@@ -41,6 +46,7 @@ export function DashboardTile({
   variables,
   values,
   bounds,
+  range,
   anchor,
   revision,
   ready,
@@ -60,6 +66,7 @@ export function DashboardTile({
   variables: DashboardVariable[];
   values: VariableValues;
   bounds: Omit<QueryRequest, 'sql'>;
+  range: TimeRange;
   anchor: number;
   revision: number;
   ready: boolean;
@@ -90,7 +97,7 @@ export function DashboardTile({
   } catch (error) {
     query = error instanceof Error ? error.message : String(error);
   }
-  const inputKey = JSON.stringify({
+  const queryInputs = {
     query,
     datasets: tileDatasets(tile),
     values: [...names].map((name) => [name, values[name]]),
@@ -106,6 +113,13 @@ export function DashboardTile({
             record(tile.config).maxDataPoints ?? record(record(tile.config).layout).maxDataPoints,
         }
       : {}),
+  };
+  // Refreshing a rolling range may reuse a successful snapshot, but changing
+  // the query, selection, or range definition must never show unrelated data.
+  const resultKey = JSON.stringify({ ...queryInputs, range: tile.timeRange ?? range });
+  const inputKey = JSON.stringify({
+    ...queryInputs,
+    resultKey,
     start: effectiveBounds.startTime,
     end: effectiveBounds.endTime,
     revision,
@@ -114,20 +128,37 @@ export function DashboardTile({
     locked,
     ready,
   });
-  const results = useAsync(
+  const results = useDashboardQuery(
     useCallback(
       (signal) =>
         supported && !unavailable && !locked && ready
-          ? loadTile(client, tile, variables, values, effectiveBounds, limit, signal)
+          ? loadTile(client, tile, variables, values, effectiveBounds, limit, signal).then(
+              (result) => ({
+                result,
+                client,
+                key: resultKey,
+                bounds: effectiveBounds,
+                updated: Date.now(),
+              }),
+            )
           : Promise.resolve(undefined),
       [client, limit, inputKey],
     ),
+    { key: JSON.stringify([resultKey, supported, unavailable, locked]), scope: client },
   );
-  const [lastResult, setLastResult] = useState<TileResults>();
+  const [lastResult, setLastResult] = useState<{
+    result: TileResults;
+    client: typeof client;
+    key: string;
+    bounds: typeof effectiveBounds;
+    updated: number;
+  }>();
   useEffect(() => {
     if (results.data) setLastResult(results.data);
   }, [results.data]);
-  const result = results.data ?? lastResult;
+  const result =
+    results.data ??
+    (lastResult?.key === resultKey && lastResult.client === client ? lastResult : undefined);
   const handoff = tileHandoffs(tile, variables, values, effectiveBounds, promqlAlerts);
   const classic =
     classicUiAvailable && mode !== 'demo'
@@ -153,6 +184,17 @@ export function DashboardTile({
     >
       <div className="panel-heading dashboard-tile-heading">
         <h2>{tileTitle(tile)}</h2>
+        {result && (
+          <span className="muted dashboard-tile-updated">
+            Updated{' '}
+            <time
+              dateTime={new Date(result.updated).toISOString()}
+              title={new Date(result.updated).toLocaleString()}
+            >
+              {new Date(result.updated).toLocaleTimeString()}
+            </time>
+          </span>
+        )}
         <ActionsMenu
           label={`Actions for tile ${tileTitle(tile)}`}
           data-row-action={tile.tile_id}
@@ -248,7 +290,7 @@ export function DashboardTile({
               ? 'Loading server capabilities…'
               : 'PromQL dashboard tiles are unavailable on this server.'}
           </p>
-        ) : !ready && (!lastResult || variableError) ? (
+        ) : !ready && !result ? (
           <p className="muted">
             {variableError
               ? `A variable failed to load: ${variableError}`
@@ -256,12 +298,25 @@ export function DashboardTile({
           </p>
         ) : (
           <>
-            {results.loading && <p className="muted">Loading tile…</p>}
+            {!ready && (
+              <p className={variableError ? 'error-text' : 'muted'}>
+                {variableError
+                  ? `A variable failed to load: ${variableError}. Showing last successful data.`
+                  : 'Waiting for dashboard variables. Showing last successful data.'}
+              </p>
+            )}
+            {results.loading && (
+              <p className="muted">{result ? 'Refreshing tile…' : 'Loading tile…'}</p>
+            )}
             {results.error && (
               <div className="dashboard-tile-error">
-                <p className="error-text">Query failed: {results.error.message}</p>
+                <p className="error-text">
+                  {result ? 'Refresh failed' : 'Query failed'}:{' '}
+                  {results.error.message.trim().replace(/\.$/, '')}
+                  {result ? '. Showing last successful data.' : ''}
+                </p>
                 <div className="inline">
-                  <Button size="sm" onClick={results.reload}>
+                  <Button size="sm" disabled={results.loading} onClick={results.reload}>
                     Retry query
                   </Button>
                   <Button size="sm" onClick={() => setViewQuery(true)}>
@@ -270,12 +325,14 @@ export function DashboardTile({
                 </div>
               </div>
             )}
-            {result && !results.error && (
+            {/* Keep chart state (zoom announcements and keyboard focus) during
+                loading, but clear data from a different query or range. */}
+            {(result || (results.loading && lastResult?.client === client)) && (
               <TileChart
                 tile={tile}
-                result={result}
-                start={Date.parse(effectiveBounds.startTime) / 1000}
-                end={Date.parse(effectiveBounds.endTime) / 1000}
+                result={result?.result ?? {}}
+                start={Date.parse((result?.bounds ?? effectiveBounds).startTime) / 1000}
+                end={Date.parse((result?.bounds ?? effectiveBounds).endTime) / 1000}
                 height="fit"
                 onZoomRange={onZoomRange}
               />
