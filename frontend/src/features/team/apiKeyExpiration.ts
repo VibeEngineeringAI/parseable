@@ -13,6 +13,14 @@ export const expirationPresets = [
   { label: '90 days', seconds: API_KEY_MAX_TTL_SECONDS },
 ];
 
+/** Native input range for a custom duration; validation still requires whole seconds. */
+export function customDurationBounds(unit: DurationUnit): { min: number; max: number } {
+  return {
+    min: API_KEY_MIN_TTL_SECONDS / durationUnits[unit],
+    max: API_KEY_MAX_TTL_SECONDS / durationUnits[unit],
+  };
+}
+
 export function customTtlSeconds(duration: string, unit: DurationUnit): number | undefined {
   if (!duration.trim()) return undefined;
   const seconds = Number(duration) * durationUnits[unit];

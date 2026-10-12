@@ -133,6 +133,35 @@ test('custom duration rejects out-of-range and fractional-second values without 
   await expect(sheet.getByRole('button', { name: 'Create API key', exact: true })).toBeEnabled();
 });
 
+test('custom duration input range follows the selected unit', async ({ page }) => {
+  await live(page);
+  const sheet = await create(page, 'bounded-duration');
+  await sheet.getByLabel('Expiration', { exact: true }).selectOption('custom');
+  const duration = sheet.getByLabel('Duration', { exact: true });
+  for (const [unit, min, max] of [
+    ['minutes', '30', '129600'],
+    ['hours', '0.5', '2160'],
+    ['days', String(1 / 48), '90'],
+  ]) {
+    await sheet.getByLabel('Duration unit', { exact: true }).selectOption(unit);
+    await expect(duration).toHaveAttribute('min', min);
+    await expect(duration).toHaveAttribute('max', max);
+    await expect(duration).toHaveAttribute('step', 'any');
+    await duration.fill(min);
+    expect(await duration.evaluate((input: HTMLInputElement) => input.validity.valid)).toBe(true);
+    await expect(sheet.getByRole('button', { name: 'Create API key', exact: true })).toBeEnabled();
+  }
+  await sheet.getByLabel('Duration unit', { exact: true }).selectOption('minutes');
+  await duration.fill('29');
+  expect(await duration.evaluate((input: HTMLInputElement) => input.validity.rangeUnderflow)).toBe(
+    true,
+  );
+  await duration.fill('129601');
+  expect(await duration.evaluate((input: HTMLInputElement) => input.validity.rangeOverflow)).toBe(
+    true,
+  );
+});
+
 test('expiration updates at the deadline, disables copying and preserves deletion and legacy keys', async ({
   page,
 }) => {

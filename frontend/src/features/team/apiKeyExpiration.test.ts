@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { customTtlSeconds, isApiKeyExpired } from './apiKeyExpiration';
+import {
+  API_KEY_MAX_TTL_SECONDS,
+  API_KEY_MIN_TTL_SECONDS,
+  customDurationBounds,
+  customTtlSeconds,
+  durationUnits,
+  isApiKeyExpired,
+  type DurationUnit,
+} from './apiKeyExpiration';
 
 describe('API key expiration', () => {
   it('accepts both bounds and converts custom units to integer seconds', () => {
@@ -19,6 +27,23 @@ describe('API key expiration', () => {
     expect(customTtlSeconds('29.999999999', 'minutes')).toBeUndefined();
     expect(customTtlSeconds('90.000000001', 'days')).toBeUndefined();
   });
+  it.each([
+    ['minutes', 30, 129600],
+    ['hours', 0.5, 2160],
+    ['days', 1 / 48, 90],
+  ] as const)('bounds %s input to 30 minutes through 90 days', (unit, min, max) => {
+    expect(customDurationBounds(unit)).toEqual({ min, max });
+  });
+  it.each(Object.keys(durationUnits) as DurationUnit[])(
+    'accepts exactly the %s input bounds',
+    (unit) => {
+      const { min, max } = customDurationBounds(unit);
+      expect(customTtlSeconds(String(min), unit)).toBe(API_KEY_MIN_TTL_SECONDS);
+      expect(customTtlSeconds(String(max), unit)).toBe(API_KEY_MAX_TTL_SECONDS);
+      expect(customTtlSeconds(String(min * 0.999), unit)).toBeUndefined();
+      expect(customTtlSeconds(String(max * 1.001), unit)).toBeUndefined();
+    },
+  );
   it('expires at the exact timestamp and supports legacy keys', () => {
     const timestamp = '2026-01-01T00:00:00Z';
     const now = Date.parse(timestamp);

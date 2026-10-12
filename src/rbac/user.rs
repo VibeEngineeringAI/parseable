@@ -365,9 +365,12 @@ impl ApiKeyUser {
 
     /// Ephemeral sessions never outlive the credential that created them.
     pub fn session_expires_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
-        let session_limit = now + chrono::TimeDelta::minutes(5);
+        self.cap_session_expiry(now + chrono::TimeDelta::minutes(5))
+    }
+
+    pub fn cap_session_expiry(&self, session_expiry: DateTime<Utc>) -> DateTime<Utc> {
         self.expires_at
-            .map_or(session_limit, |expiry| expiry.min(session_limit))
+            .map_or(session_expiry, |expiry| expiry.min(session_expiry))
     }
 }
 
@@ -880,6 +883,11 @@ mod apikey_serde_tests {
         assert!(key.matches_active_key("test-secret", now));
         assert!(!key.matches_active_key("wrong-secret", now));
         assert_eq!(key.session_expires_at(now), key.expires_at.unwrap());
+        let later = now + chrono::TimeDelta::seconds(20);
+        assert_eq!(key.cap_session_expiry(later), key.expires_at.unwrap());
+        assert_eq!(key.cap_session_expiry(now), now);
+        key.expires_at = None;
+        assert_eq!(key.cap_session_expiry(later), later);
     }
 
     #[test]

@@ -8,6 +8,7 @@ import { RoleCheckboxes, SecretResult } from './shared';
 import { useMutation } from '../../hooks/useMutation';
 import {
   API_KEY_MAX_TTL_SECONDS,
+  customDurationBounds,
   customTtlSeconds,
   expirationPresets,
   type DurationUnit,
@@ -135,7 +136,7 @@ export function CredentialSheet({
                     value={duration}
                     onChange={(event) => setDuration(event.target.value)}
                     required
-                    min="0"
+                    {...customDurationBounds(durationUnit)}
                     step="any"
                     error={expirationError}
                     hint="From 30 minutes to 90 days."

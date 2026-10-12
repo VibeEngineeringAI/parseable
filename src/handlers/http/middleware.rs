@@ -196,11 +196,7 @@ where
                         permissions,
                         &user.tenant,
                     );
-                    insert_api_key_tenant_header(
-                        &mut req,
-                        &user,
-                        PARSEABLE.options.is_multi_tenant(),
-                    );
+                    insert_api_key_tenant_header(&mut req, &user, is_multi_tenant());
                     req.extensions_mut().insert(session_key);
                     Some(session_id)
                 }
@@ -388,13 +384,25 @@ fn insert_api_key_tenant_header(
     }
 }
 
+/// Unit tests cannot initialize `PARSEABLE`, which parses the process arguments,
+/// so they exercise the middleware in single-tenant mode.
+#[cfg(not(test))]
+fn is_multi_tenant() -> bool {
+    PARSEABLE.options.is_multi_tenant()
+}
+
+#[cfg(test)]
+fn is_multi_tenant() -> bool {
+    false
+}
+
 /// Resolve an incoming API key value to its backing `UserType::ApiKey` user.
 /// In multi-tenant deployments the `tenant_hint` is required and the lookup
 /// is scoped to that tenant; in single-tenant deployments we look in the
 /// default tenant. This prevents an API key from one tenant authenticating a
 /// request that is claiming another.
 fn find_api_key_user(api_key_value: &str, tenant_id: &Option<String>) -> Option<user::User> {
-    let tenant = if PARSEABLE.options.is_multi_tenant() {
+    let tenant = if is_multi_tenant() {
         tenant_id.as_deref()?
     } else {
         DEFAULT_TENANT
@@ -420,7 +428,7 @@ fn get_user_and_tenant(
     request: &mut ServiceRequest,
     header_error: &mut Option<Error>,
 ) -> Result<(Result<String, RBACError>, Option<String>), RBACError> {
-    if PARSEABLE.options.is_multi_tenant() {
+    if is_multi_tenant() {
         // if ingestion then tenant MUST be present and should not be DEFAULT_TENANT
         let tenant = if action.eq(&Action::Ingest) {
             if let Some(tenant) = request.headers().get(TENANT_ID)
@@ -779,7 +787,16 @@ where
                     } else {
                         Some(tenant.to_owned())
                     };
-                    let id = if let Some(user) = Users.get_user(userid, &tenant_id) {
+                    let user = Users.get_user(userid, &tenant_id);
+                    // Forwarded work must not outlive the API key that authorized it.
+                    if user
+                        .as_ref()
+                        .and_then(|user| user.as_api_key())
+                        .is_some_and(|api_key| api_key.is_expired_at(Utc::now()))
+                    {
+                        return Box::pin(async { Err(ErrorUnauthorized("Invalid API key")) });
+                    }
+                    let id = if let Some(user) = user {
                         let id = Ulid::new();
                         req.headers_mut().insert(
                             header::COOKIE,
@@ -1018,7 +1035,7 @@ mod api_key_header_tests {
     }
 
     #[test]
-    fn both_header_mechanisms_reject_at_expiry() {
+    fn extracted_header_values_follow_key_expiry() {
         let mut user = user::User::new_api_key(
             Ulid::new(),
             "test-secret".into(),
@@ -1063,5 +1080,275 @@ mod api_key_header_tests {
         insert_api_key_tenant_header(&mut req, &user, true);
 
         assert_eq!(req.headers().get(TENANT_ID).unwrap(), "acme");
+    }
+}
+
+#[cfg(test)]
+mod api_key_auth_tests {
+    use std::collections::{HashMap, HashSet};
+
+    use actix_web::{App, HttpResponse, http::StatusCode, test as actix_test, web};
+    use argon2::{PasswordHasher, password_hash::SaltString};
+    use base64::{Engine, prelude::BASE64_STANDARD};
+    use chrono::DateTime;
+    use parking_lot::RwLock;
+    use tokio::sync::{Mutex, MutexGuard};
+
+    use super::*;
+    use crate::rbac::{
+        map::{
+            ROLES, SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups, Users as UserMap, mut_users,
+        },
+        role::model::{DefaultPrivilege, Role},
+    };
+
+    const ROLE: &str = "api-key-expiry-admin";
+    const CLUSTER_TEST_SECRET: &str = "api-key-expiry-cluster-secret";
+
+    type AuthMethod = fn(&mut ServiceRequest, Action) -> Result<rbac::Response, Error>;
+
+    static SERIAL: Mutex<()> = Mutex::const_new(());
+
+    // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+    // Tests use their own users but run one at a time: concurrent first Basic
+    // logins and session checks take the user and session locks in opposite order.
+    async fn auth_state() -> MutexGuard<'static, ()> {
+        let serial = SERIAL.lock().await;
+        init_auth_maps();
+        serial
+    }
+
+    fn blocking_auth_state() -> MutexGuard<'static, ()> {
+        let serial = SERIAL.blocking_lock();
+        init_auth_maps();
+        serial
+    }
+
+    fn init_auth_maps() {
+        USERS.get_or_init(|| RwLock::new(UserMap::default()));
+        SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| {
+            let role = Role::create_internal_role(vec![DefaultPrivilege::Admin]);
+            let roles = HashMap::from([(ROLE.to_owned(), role)]);
+            RwLock::new(HashMap::from([(DEFAULT_TENANT.to_owned(), roles)]))
+        });
+        CLUSTER_SECRET.get_or_init(|| {
+            let salt = SaltString::encode_b64(b"api-key-expiry-salt").unwrap();
+            let hash = Argon2::default()
+                .hash_password(CLUSTER_TEST_SECRET.as_bytes(), &salt)
+                .unwrap()
+                .to_string();
+            (CLUSTER_TEST_SECRET.to_owned(), hash)
+        });
+    }
+
+    fn api_key_user(expires_at: Option<DateTime<Utc>>) -> (user::User, String) {
+        let secret = format!("api-key-expiry-{}", Ulid::new());
+        let mut user = user::User::new_api_key(
+            Ulid::new(),
+            secret.clone(),
+            "expiry-test".into(),
+            HashSet::from([ROLE.to_owned()]),
+            "admin".into(),
+            None,
+        );
+        let UserType::ApiKey(key) = &mut user.ty else {
+            unreachable!()
+        };
+        key.expires_at = expires_at;
+        mut_users().insert(user.clone());
+        (user, secret)
+    }
+
+    fn api_key_headers(secret: &str) -> [(&'static str, String); 2] {
+        [
+            ("x-api-key", secret.to_owned()),
+            ("authorization", format!("Bearer {secret}")),
+        ]
+    }
+
+    fn cluster_headers(user: &user::User) -> [(&'static str, String); 3] {
+        [
+            (
+                CLUSTER_SECRET_HEADER,
+                CLUSTER_SECRET.get().unwrap().1.clone(),
+            ),
+            ("intra-cluster-tenant", DEFAULT_TENANT.to_owned()),
+            ("intra-cluster-userid", user.userid().to_owned()),
+        ]
+    }
+
+    fn has_sessions(user: &user::User) -> bool {
+        sessions()
+            .get_active_sessions()
+            .iter()
+            .any(|(_, userid, _)| userid == user.userid())
+    }
+
+    async fn request(
+        method: AuthMethod,
+        intra_cluster: bool,
+        headers: &[(&'static str, String)],
+    ) -> StatusCode {
+        let route = web::get()
+            .to(|| async { HttpResponse::Ok().finish() })
+            .wrap(Auth {
+                action: Action::Query,
+                method,
+            });
+        let app = if intra_cluster {
+            actix_test::init_service(App::new().route("/", route.wrap(IntraClusterRequest))).await
+        } else {
+            actix_test::init_service(App::new().route("/", route)).await
+        };
+        let mut req = actix_test::TestRequest::get().uri("/");
+        for header in headers {
+            req = req.insert_header(header.clone());
+        }
+        match actix_test::try_call_service(&app, req.to_request()).await {
+            Ok(response) => response.status(),
+            Err(error) => error.as_response_error().status_code(),
+        }
+    }
+
+    /// Simulates the key's deadline passing after its session was registered.
+    fn expire_session_then_authorize(
+        req: &mut ServiceRequest,
+        action: Action,
+    ) -> Result<rbac::Response, Error> {
+        let key = req.extensions().get::<SessionKey>().cloned().unwrap();
+        if let Some((userid, tenant)) = Users.get_userid_from_session(&key) {
+            let permissions = sessions().get(&key).cloned().unwrap_or_default();
+            mut_sessions().track_new(
+                userid,
+                key,
+                Utc::now() - TimeDelta::seconds(1),
+                permissions,
+                &Some(tenant),
+            );
+        }
+        auth_no_context(req, action)
+    }
+
+    #[actix_web::test]
+    async fn active_api_key_authenticates_through_both_headers() {
+        let _state = auth_state().await;
+        let (user, secret) = api_key_user(Some(Utc::now() + TimeDelta::hours(1)));
+        for header in api_key_headers(&secret) {
+            assert_eq!(
+                request(auth_no_context, false, &[header]).await,
+                StatusCode::OK
+            );
+        }
+        assert!(!has_sessions(&user));
+    }
+
+    #[actix_web::test]
+    async fn nonexpiring_api_key_authenticates_through_both_headers() {
+        let _state = auth_state().await;
+        let (_, secret) = api_key_user(None);
+        for header in api_key_headers(&secret) {
+            assert_eq!(
+                request(auth_no_context, false, &[header]).await,
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn expired_api_key_is_rejected_through_both_headers() {
+        let _state = auth_state().await;
+        let (user, secret) = api_key_user(Some(Utc::now() - TimeDelta::seconds(1)));
+        for header in api_key_headers(&secret) {
+            assert_eq!(
+                request(auth_no_context, false, &[header]).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert!(!has_sessions(&user));
+    }
+
+    #[actix_web::test]
+    async fn api_key_expiring_after_session_registration_is_rejected() {
+        let _state = auth_state().await;
+        let (user, secret) = api_key_user(Some(Utc::now() + TimeDelta::hours(1)));
+        for header in api_key_headers(&secret) {
+            assert_eq!(
+                request(expire_session_then_authorize, false, &[header]).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert!(!has_sessions(&user));
+    }
+
+    #[actix_web::test]
+    async fn intra_cluster_request_accepts_active_api_key_user() {
+        let _state = auth_state().await;
+        for expires_at in [None, Some(Utc::now() + TimeDelta::hours(1))] {
+            let (user, _) = api_key_user(expires_at);
+            assert_eq!(
+                request(auth_no_context, true, &cluster_headers(&user)).await,
+                StatusCode::OK
+            );
+            assert!(!has_sessions(&user));
+        }
+    }
+
+    #[actix_web::test]
+    async fn intra_cluster_request_rejects_expired_api_key_user() {
+        let _state = auth_state().await;
+        let (user, _) = api_key_user(Some(Utc::now() - TimeDelta::seconds(1)));
+        assert_eq!(
+            request(auth_no_context, true, &cluster_headers(&user)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(!has_sessions(&user));
+    }
+
+    #[actix_web::test]
+    async fn intra_cluster_request_rejects_expired_api_key_despite_forwarded_basic_auth() {
+        let _state = auth_state().await;
+        // Distributed trace queries also forward the tenant's stored query credentials.
+        let username = format!("query-{}", Ulid::new()).to_lowercase();
+        let (mut basic, password) = user::User::new_basic(username.clone(), None, false);
+        basic.roles.insert(ROLE.to_owned());
+        mut_users().insert(basic);
+        let forwarded = (
+            "authorization",
+            format!(
+                "Basic {}",
+                BASE64_STANDARD.encode(format!("{username}:{password}"))
+            ),
+        );
+        assert_eq!(
+            request(auth_no_context, false, std::slice::from_ref(&forwarded)).await,
+            StatusCode::OK
+        );
+
+        let (user, _) = api_key_user(Some(Utc::now() - TimeDelta::seconds(1)));
+        let mut headers = cluster_headers(&user).to_vec();
+        headers.push(forwarded);
+        assert_eq!(
+            request(auth_no_context, true, &headers).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn new_sessions_never_outlive_the_api_key() {
+        let _state = blocking_auth_state();
+        let now = Utc::now();
+        for (expires_at, expired) in [
+            (None, false),
+            (Some(now + TimeDelta::hours(1)), false),
+            (Some(now - TimeDelta::seconds(1)), true),
+        ] {
+            let (user, _) = api_key_user(expires_at);
+            let session = SessionKey::SessionId(Ulid::new());
+            Users.new_session(&user, session.clone(), TimeDelta::seconds(20));
+            assert_eq!(sessions().is_session_expired(&session), expired);
+            mut_sessions().remove_session(&session);
+        }
     }
 }
