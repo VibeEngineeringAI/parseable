@@ -170,7 +170,7 @@ async function mocked(
   return { calls, writes };
 }
 
-test('Alerts is reachable after Metrics in Observe, with no Classic UI sidebar group', async ({
+test('Alerts is reachable with telemetry explorers in Observe, with no Classic UI sidebar group', async ({
   page,
 }) => {
   await demo(page, '/datasets');
@@ -180,7 +180,13 @@ test('Alerts is reachable after Metrics in Observe, with no Classic UI sidebar g
   const observe = page
     .locator('.sidebar-group')
     .filter({ has: page.getByText('Observe', { exact: true }) });
-  await expect(observe.getByRole('link')).toHaveText(['Logs', 'Metrics', 'Alerts']);
+  await expect(observe.getByRole('link')).toHaveText([
+    'Logs',
+    'Metrics',
+    'Traces',
+    'APM',
+    'Alerts',
+  ]);
   await expect(page.locator('.sidebar-group-label').filter({ hasText: 'Classic UI' })).toHaveCount(
     0,
   );

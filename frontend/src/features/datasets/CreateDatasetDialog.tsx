@@ -27,6 +27,7 @@ export function CreateDatasetDialog({
       try {
         await client.createDataset(name, {
           telemetryType,
+          logSource: telemetryType === 'logs' ? 'json' : `otel-${telemetryType}`,
           customPartition: customPartition || undefined,
         });
       } catch (error) {

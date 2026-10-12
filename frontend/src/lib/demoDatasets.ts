@@ -29,6 +29,7 @@ export function createDemoDatasets(
   fixtures: Dataset[],
   records: LogRecord[],
   now: number,
+  fixtureRecords: Record<string, LogRecord[]> = {},
 ): Pick<ParseableClient, Methods> {
   type Entry = {
     dataset: Dataset;
@@ -41,6 +42,7 @@ export function createDemoDatasets(
   const entries = new Map<string, Entry>();
   const clone = <T>(value: T): T => structuredClone(value);
   function entry(name: string, options: DatasetCreateOptions, seeded = false): Entry {
+    const source = fixtureRecords[name] ?? records;
     const size = seeded ? 102400 : 0;
     return {
       dataset: { name, type: options.telemetryType },
@@ -51,23 +53,26 @@ export function createDemoDatasets(
         latestEventAt: seeded
           ? options.telemetryType === 'metrics'
             ? new Date(Math.floor(now / 15000) * 15000).toISOString()
-            : String(records[0].p_timestamp)
+            : String(source[0].p_timestamp)
           : undefined,
-        logSourceFormats: [options.telemetryType === 'metrics' && seeded ? 'otel-metrics' : 'json'],
+        logSourceFormats: [
+          options.logSource ??
+            (seeded && options.telemetryType !== 'logs' ? `otel-${options.telemetryType}` : 'json'),
+        ],
         customPartition: options.customPartition || undefined,
         streamType: 'user',
         staticSchemaFlag: false,
         hotTierEnabled: false,
       },
-      schema: seeded ? Object.keys(records[0]) : [],
+      schema: seeded ? [...new Set(source.flatMap((row) => Object.keys(row)))] : [],
       stats: {
         stream: name,
         time: new Date(now).toISOString(),
         ingestion: {
-          count: seeded ? records.length : 0,
+          count: seeded ? source.length : 0,
           size,
           format: 'json',
-          lifetime_count: seeded ? records.length : 0,
+          lifetime_count: seeded ? source.length : 0,
           lifetime_size: size,
           deleted_count: 0,
           deleted_size: 0,

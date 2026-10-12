@@ -6,9 +6,12 @@ import { PageHeader } from '../components/explorer/PageHeader';
 import { QueryState } from '../components/explorer/QueryState';
 import { useAsync } from '../hooks/useAsync';
 import { useApp } from './AppProvider';
+import { datasetPath, listDatasetInventory } from '../lib/datasetPath';
 export function OverviewPage({ onConnect }: { onConnect: () => void }) {
   const { client, mode } = useApp();
-  const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
+  const datasets = useAsync(
+    useCallback((signal) => listDatasetInventory(client, signal), [client]),
+  );
   return (
     <div className="page overview-page">
       <PageHeader
@@ -63,26 +66,39 @@ export function OverviewPage({ onConnect }: { onConnect: () => void }) {
         </Link>
       </div>
       <div className="dataset-grid">
-        {datasets.data?.map((d) => (
-          <Link
-            key={d.name}
-            className="overview-dataset"
-            to={`/logs/explore/${encodeURIComponent(d.name)}`}
-          >
-            <div className="icon-tile">
-              <Logs size={20} />
+        {datasets.data?.map((d) =>
+          d.type ? (
+            <Link key={d.name} className="overview-dataset" to={datasetPath(d)}>
+              <div className="icon-tile">
+                <Logs size={20} />
+              </div>
+              <div>
+                <strong>{d.name}</strong>
+                <p>Explore {d.type} and inspect your data</p>
+              </div>
+              <ArrowUpRight size={17} />
+            </Link>
+          ) : (
+            <div key={d.name} className="overview-dataset">
+              <div className="icon-tile">
+                <Database size={20} />
+              </div>
+              <div>
+                <strong>{d.name}</strong>
+                <p>Telemetry type unavailable: {d.typeError}</p>
+              </div>
             </div>
-            <div>
-              <strong>{d.name}</strong>
-              <p>Explore events and inspect fields</p>
-            </div>
-            <ArrowUpRight size={17} />
-          </Link>
-        ))}
+          ),
+        )}
       </div>
+      {datasets.data?.some((d) => !d.type) && (
+        <Button variant="secondary" onClick={datasets.reload}>
+          Check dataset types again
+        </Button>
+      )}
       <div className="notice">
-        Explore logs, SQL, metrics, alerts, datasets, dashboards, and team settings. Traces and
-        other advanced views will follow in later iterations.
+        Explore logs, metrics, traces, and service performance. <Link to="/add-data">Add data</Link>{' '}
+        to connect your applications.
       </div>
     </div>
   );

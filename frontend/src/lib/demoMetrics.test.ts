@@ -52,7 +52,7 @@ describe('demo metric inventory and metadata', () => {
       expect(info).toMatchObject({
         name: dataset.name,
         telemetryType: dataset.type,
-        logSourceFormats: [dataset.type === 'metrics' ? 'otel-metrics' : 'json'],
+        logSourceFormats: [dataset.type === 'logs' ? 'json' : `otel-${dataset.type}`],
       });
       expect(Number.isFinite(Date.parse(info.latestEventAt!))).toBe(true);
     }

@@ -523,7 +523,9 @@ fn build_trace_list_sql(
     t."span_span_id",
     t."span_start_time_unix_nano",
     t."span_start_time_unix_nano_epoch",
-    t."p_timestamp",
+    MIN(t."p_timestamp") OVER (
+      PARTITION BY t."span_trace_id", t."span_span_id"
+    ) AS "p_timestamp",
     t."span_status_code",
     t."span_parent_span_id",
     COUNT(DISTINCT t."span_span_id") OVER (
@@ -830,6 +832,7 @@ fn escape_sql_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::prelude::SessionContext;
 
     fn context(service_name: Option<&str>) -> TraceSqlContext {
         let range =
@@ -862,6 +865,94 @@ mod tests {
 
         let errors = build_trace_count_sql(&context(None), &None, TraceListOption::ErrorSpans);
         assert!(errors.contains("t.\"span_status_code\" = 2"));
+    }
+
+    #[tokio::test]
+    async fn trace_list_deduplicates_retries_before_sort_and_pagination() {
+        let session = SessionContext::new();
+        // A retry changes only ingestion time. Event rows repeat span fields too.
+        // Neither should create extra list rows or consume a pagination slot.
+        let fixture = session
+            .sql(
+                r#"SELECT
+  service AS "service.name", name AS span_name, duration AS span_duration_ns,
+  trace_id AS span_trace_id, span_id AS span_span_id,
+  CAST(started AS TIMESTAMP) AS span_start_time_unix_nano,
+  epoch AS span_start_time_unix_nano_epoch,
+  CAST(ingested AS TIMESTAMP) AS p_timestamp,
+  status AS span_status_code, parent_id AS span_parent_span_id
+FROM (VALUES
+  ('checkout', 'root', 1000, 'trace-a', 'root-a', '2026-01-01T00:10:00Z', 100, '2026-01-01T00:10:01Z', 1, ''),
+  ('checkout', 'root', 1000, 'trace-a', 'root-a', '2026-01-01T00:10:00Z', 100, '2026-01-01T00:10:02Z', 1, ''),
+  ('inventory', 'child', 100, 'trace-a', 'child-a', '2026-01-01T00:10:00Z', 101, '2026-01-01T00:10:01Z', 2, 'root-a'),
+  ('inventory', 'child', 100, 'trace-a', 'child-a', '2026-01-01T00:10:00Z', 101, '2026-01-01T00:10:03Z', 2, 'root-a'),
+  ('checkout', 'second root', 2000, 'trace-b', 'root-b', '2026-01-01T00:20:00Z', 200, '2026-01-01T00:20:01Z', 1, '')
+) AS fixture(service, name, duration, trace_id, span_id, started, epoch, ingested, status, parent_id)"#,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(fixture.len(), 1);
+        session
+            .register_batch("traces", fixture[0].clone())
+            .unwrap();
+
+        for (option, expected_count) in [
+            (TraceListOption::Traces, 2),
+            (TraceListOption::Spans, 3),
+            (TraceListOption::ErrorSpans, 1),
+        ] {
+            let count_sql = build_trace_count_sql(&context(None), &None, option);
+            let count = session
+                .sql(&count_sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let count = record_batches_to_json(&count).unwrap();
+            assert_eq!(count[0]["count"].as_u64(), Some(expected_count));
+
+            for sort in [
+                TraceSortBy::MostRecent,
+                TraceSortBy::LeastRecent,
+                TraceSortBy::LongestFirst,
+                TraceSortBy::ShortestFirst,
+                TraceSortBy::MostSpans,
+                TraceSortBy::LeastSpans,
+            ] {
+                let sql = build_trace_list_sql(&context(None), &None, option, sort, 0, 500);
+                let records = session.sql(&sql).await.unwrap().collect().await.unwrap();
+                let records = record_batches_to_json(&records).unwrap();
+                assert_eq!(records.len() as u64, expected_count);
+                let mut pages = Vec::new();
+                for offset in 0..expected_count as usize {
+                    let page_sql =
+                        build_trace_list_sql(&context(None), &None, option, sort, offset, 1);
+                    let page = session
+                        .sql(&page_sql)
+                        .await
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    pages.extend(record_batches_to_json(&page).unwrap());
+                }
+                assert_eq!(pages, records);
+                if let Some(root) = records.iter().find(|row| row["span_span_id"] == "root-a") {
+                    assert_eq!(
+                        parse_timestamp(root["p_timestamp"].as_str().unwrap())
+                            .unwrap()
+                            .to_rfc3339(),
+                        "2026-01-01T00:10:01+00:00"
+                    );
+                    assert_eq!(root["total_span_count"].as_u64(), Some(2));
+                    assert_eq!(root["error_count"].as_u64(), Some(1));
+                }
+            }
+        }
     }
 
     #[test]

@@ -14,6 +14,9 @@ import {
   PanelLeftOpen,
   Search,
   UsersRound,
+  Workflow,
+  Network,
+  Import,
 } from 'lucide-react';
 import { Button, Badge } from '../components/ui';
 import { useApp } from './AppProvider';
@@ -31,12 +34,17 @@ const groups = [
     links: [
       { to: '/logs', label: 'Logs', id: 'logs', icon: Logs },
       { to: '/metrics', label: 'Metrics', id: 'metrics', icon: ChartLine },
+      { to: '/traces', label: 'Traces', id: 'traces', icon: Workflow },
+      { to: '/apm', label: 'APM', id: 'apm', icon: Network },
       { to: '/alerts', label: 'Alerts', id: 'alerts', icon: Bell },
     ],
   },
   {
     label: 'Data',
-    links: [{ to: '/datasets', label: 'Datasets', id: 'datasets', icon: Database }],
+    links: [
+      { to: '/datasets', label: 'Datasets', id: 'datasets', icon: Database },
+      { to: '/add-data', label: 'Add data', id: 'add-data', icon: Import },
+    ],
   },
   {
     label: 'Admin',

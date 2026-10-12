@@ -2,6 +2,7 @@ export type Dataset = { name: string; type: 'logs' | 'metrics' | 'traces' };
 export type DatasetCreateOptions = {
   telemetryType: Dataset['type'];
   customPartition?: string;
+  logSource?: 'json' | 'otel-logs' | 'otel-metrics' | 'otel-traces';
 };
 export type DatasetStats = {
   stream: string;
@@ -66,6 +67,56 @@ export type DatasetInfo = {
   hotTierEnabled?: boolean;
 };
 export type LogRecord = Record<string, unknown>;
+export type TraceSortBy =
+  'mostRecent' | 'leastRecent' | 'longestFirst' | 'shortestFirst' | 'mostSpans' | 'leastSpans';
+export type TraceListOption = 'traces' | 'errorSpans' | 'spans';
+export type TraceListRequest = {
+  dataset: string;
+  serviceName?: string;
+  startTime: string;
+  endTime: string;
+  sortBy?: TraceSortBy;
+  options?: TraceListOption;
+  limit?: number;
+  offset?: number;
+  conditions?: { conditions?: LogContextConditions; groupBy?: string[]; topK?: number };
+};
+export type TraceSpanRecord = Record<string, unknown> & {
+  'service.name': string;
+  span_name: string;
+  span_duration_ns: number;
+  span_trace_id: string;
+  span_span_id: string;
+  /** Timestamp text in UTC; the field name is inherited from the OTLP schema. */
+  span_start_time_unix_nano: string;
+  /** Numeric nanoseconds can exceed JS integer precision; use the timestamp text for dates. */
+  span_start_time_unix_nano_epoch: number;
+  total_span_count: number;
+};
+export type TraceListRecord = TraceSpanRecord & { p_timestamp: string; error_count: number };
+export type TraceListResponse = {
+  count: number;
+  offset: number;
+  limit: number;
+  records: TraceListRecord[];
+};
+export type TraceDetailRequest = {
+  dataset: string;
+  traceId: string;
+  startTime: string;
+  endTime: string;
+};
+export type TraceDetailRecord = TraceSpanRecord & {
+  span_parent_span_id: string;
+  has_error: boolean;
+  level: number;
+  event_count: number;
+};
+export type TraceDetailResponse = {
+  startTime: string;
+  endTime: string;
+  records: TraceDetailRecord[];
+};
 export type SavedLogViewRule = { id: string; field: string; value: string; operator: string };
 export type SavedLogViewBuilder = {
   id: string;
@@ -375,6 +426,8 @@ export interface ParseableClient {
   ): Promise<PromqlMetadataResult>;
   schema(dataset: string, signal?: AbortSignal): Promise<string[]>;
   query(request: QueryRequest, signal?: AbortSignal): Promise<LogRecord[]>;
+  listTraces(request: TraceListRequest, signal?: AbortSignal): Promise<TraceListResponse>;
+  traceDetail(request: TraceDetailRequest, signal?: AbortSignal): Promise<TraceDetailResponse>;
   listLogViews(signal?: AbortSignal): Promise<SavedLogView[]>;
   createLogView(body: SavedLogView): Promise<SavedLogView>;
   updateLogView(id: string, body: SavedLogView): Promise<SavedLogView>;

@@ -8,6 +8,7 @@ import { useAsync } from '../../hooks/useAsync';
 import { useMutation } from '../../hooks/useMutation';
 import { ApiError } from '../../lib/client';
 import type { DatasetRetention } from '../../lib/types';
+import { confirmedDatasetType, datasetPath } from '../../lib/datasetPath';
 import { formatAlertDate } from '../alerts/helpers';
 import {
   datasetError,
@@ -138,6 +139,10 @@ function Overview({ dataset }: { dataset: string }) {
 
 function Schema({ dataset }: { dataset: string }) {
   const { client } = useApp();
+  const info = useAsync(
+    useCallback((signal) => client.datasetInfo(dataset, signal), [client, dataset]),
+  );
+  const explorerType = info.data ? confirmedDatasetType(info.data) : undefined;
   const schema = useAsync(
     useCallback((signal) => client.schema(dataset, signal), [client, dataset]),
   );
@@ -155,9 +160,17 @@ function Schema({ dataset }: { dataset: string }) {
       {schema.data?.length === 0 && (
         <p className="muted">No fields yet. Ingest data to infer a schema.</p>
       )}
-      <Link className="text-link" to={`/logs/explore/${encodeURIComponent(dataset)}`}>
-        Explore dataset <ArrowUpRight size={14} aria-hidden="true" />
-      </Link>
+      <LoadState {...info} action="determine the dataset explorer" />
+      {info.data && !explorerType && (
+        <p className="muted">
+          Explore unavailable: dataset metadata does not identify a supported telemetry source.
+        </p>
+      )}
+      {explorerType && (
+        <Link className="text-link" to={datasetPath({ name: dataset, type: explorerType })}>
+          Explore dataset <ArrowUpRight size={14} aria-hidden="true" />
+        </Link>
+      )}
     </Section>
   );
 }

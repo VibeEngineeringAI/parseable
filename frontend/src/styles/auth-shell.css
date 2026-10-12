@@ -14,6 +14,13 @@ body .app-sidebar {
 }
 .app-sidebar nav {
   gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+.app-sidebar .sidebar-search,
+.app-sidebar .sidebar-footer {
+  flex-shrink: 0;
 }
 .app-sidebar .nav-item {
   min-height: 28px;

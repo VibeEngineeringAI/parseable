@@ -162,7 +162,7 @@ test('classic paths that moved open their page here', async ({ page }) => {
     await expect(page.getByRole('alert')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
   }
-  await page.goto('/apm/app/checkout.api');
+  await page.goto('/keystone/example');
   await expect(page.getByText('This page is only available in the classic UI.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
 });
