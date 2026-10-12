@@ -1,15 +1,22 @@
 import { useState } from 'react';
 import { Copy, Filter, FilterX } from 'lucide-react';
 import { Button, Sheet, Input, Tabs } from '../ui';
+import { formatTimestamp } from './timezone';
 import { formatValue } from './DataTable';
 import type { LogRecord } from '../../lib/types';
 export function RecordSheet({
   row,
   onClose,
   onFilter,
+  onContext,
+  timezone = 'UTC',
+  timestampField = 'p_timestamp',
 }: {
   row?: LogRecord;
   onClose: () => void;
+  onContext?: () => void;
+  timezone?: string;
+  timestampField?: string;
   onFilter?: (field: string, value: string, operator?: '=' | '!=') => void;
 }) {
   const [search, setSearch] = useState('');
@@ -38,6 +45,11 @@ export function RecordSheet({
       description="Inspect fields and values for this event."
     >
       <div className="stack">
+        {onContext && (
+          <Button variant="secondary" onClick={onContext}>
+            Surrounding logs
+          </Button>
+        )}
         <Button
           variant="secondary"
           onClick={async () => {
@@ -77,9 +89,16 @@ export function RecordSheet({
                       )
                       .map(([key, value]) => (
                         <div key={key}>
-                          <dt>{key}</dt>
+                          <dt>
+                            {key}
+                            {(key === 'p_timestamp' || key === timestampField) && ` (${timezone})`}
+                          </dt>
                           <dd>
-                            <code>{formatValue(value)}</code>
+                            <code>
+                              {key === 'p_timestamp' || key === timestampField
+                                ? formatTimestamp(value, timezone)
+                                : formatValue(value)}
+                            </code>
                             <div className="inline field-actions">
                               {onFilter && typeof value === 'string' && (
                                 <>

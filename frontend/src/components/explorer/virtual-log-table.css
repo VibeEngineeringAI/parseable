@@ -1,0 +1,59 @@
+.virtual-log-viewport {
+  height: 480px;
+  max-height: 60vh;
+  overflow: auto;
+  position: relative;
+}
+.virtual-log-viewport:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -2px;
+}
+.virtual-log-canvas {
+  position: relative;
+  font-size: 11px;
+}
+.virtual-log-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--color-bg);
+  color: var(--color-muted);
+  font-size: 10px;
+}
+.virtual-log-row {
+  position: absolute;
+  border-bottom: 1px solid var(--color-border);
+}
+.virtual-log-row:hover {
+  background: var(--color-surface-hover);
+}
+.virtual-log-cell {
+  position: absolute;
+  top: 0;
+  padding: 10px 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+.virtual-log-details {
+  position: sticky;
+  left: 0;
+  width: 40px;
+  height: 100%;
+  z-index: 2;
+  background: var(--color-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.virtual-log-wrap {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 19px;
+  padding-top: 8px;
+  padding-bottom: 12px;
+}
+.virtual-log-table .table-footer {
+  flex-wrap: wrap;
+}

@@ -9,10 +9,12 @@ import type {
   UserRoleSources,
 } from './types';
 import { ApiError } from './client';
+import { parseEventTimestamp } from '../components/explorer/timestamp';
 import { createDemoMetrics } from './demoMetrics';
 import { createDemoAlerts } from './demoAlerts';
 import { createDemoDashboards } from './demoDashboards';
 import { createDemoDatasets } from './demoDatasets';
+import { createDemoLogMethods } from './logsContract';
 import { alertDuration } from '../features/alerts/helpers';
 import { validateName } from '../features/team/helpers';
 
@@ -61,13 +63,13 @@ export const demoLogs = createDemoRecords();
 type Token = { kind: 'identifier' | 'string' | 'word' | 'number' | 'symbol'; value: string };
 const unsupported = () =>
   new Error(
-    'Demo SQL supports SELECT * FROM a sample dataset, AND filters (= or !=), message ILIKE search, ORDER BY and LIMIT. Connect to a server for other SQL.',
+    'Demo SQL supports SELECT * FROM a sample dataset, grouped AND/OR filters (= or !=), message ILIKE search, ORDER BY and LIMIT. Connect to a server for other SQL.',
   );
 
 function tokenize(sql: string): Token[] {
   const tokens: Token[] = [];
   const expression =
-    /\s+|"(?:[^"]|"")*"|'(?:[^']|'')*'|!=|<>|[=*,();]|[A-Za-z_][A-Za-z_0-9]*|\d+/gy;
+    /\s+|"(?:[^"]|"")*"|'(?:[^']|'')*'|>=|<=|!=|<>|[<>=*,();]|[A-Za-z_][A-Za-z_0-9]*|\d+/gy;
   let offset = 0;
   while (offset < sql.length) {
     expression.lastIndex = offset;
@@ -111,6 +113,35 @@ export function executeDemoQuery(
   records: LogRecord[],
   datasets: Dataset[] = demoDatasets,
 ): LogRecord[] {
+  const histogram =
+    /^SELECT DATE_BIN\(INTERVAL '(\d+) milliseconds', ("(?:[^"]|"")*"), TIMESTAMP '([^']+)'\) AS "bucket_start", COUNT\(\*\) AS "count" FROM ([\s\S]+) GROUP BY "bucket_start" ORDER BY "bucket_start" ASC$/i.exec(
+      request.sql,
+    );
+  if (histogram) {
+    const interval = Number(histogram[1]),
+      origin = Date.parse(histogram[3]);
+    if (!Number.isSafeInteger(interval) || interval < 1 || !Number.isFinite(origin))
+      throw unsupported();
+    const rows = executeDemoQuery(
+      { ...request, sql: `SELECT * FROM ${histogram[4]}` },
+      records,
+      datasets,
+    );
+    const buckets = new Map<number, number>();
+    for (const row of rows) {
+      const bucket =
+        origin +
+        Math.floor(
+          (parseEventTimestamp(row[histogram[2].slice(1, -1).replaceAll('""', '"')]) - origin) /
+            interval,
+        ) *
+          interval;
+      buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
+    }
+    return [...buckets]
+      .sort(([a], [b]) => a - b)
+      .map(([start, count]) => ({ bucket_start: new Date(start).toISOString(), count }));
+  }
   const aggregate =
     /^\s*SELECT\s+(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(\*|[a-zA-Z_][\w]*|"[^"]+")\s*\)\s*(?:AS\s+([\w]+|"[^"]+"))?\s+FROM\s+([\s\S]+)$/i.exec(
       request.sql,
@@ -172,42 +203,72 @@ export function executeDemoQuery(
   if (!datasets.some((item) => item.name === dataset))
     throw new Error(`Unknown demo dataset: ${dataset}`);
   if (!demoDatasets.some((item) => item.name === dataset)) records = [];
-  const predicates: ((row: LogRecord) => boolean)[] = [];
+  type Predicate = (row: LogRecord) => boolean;
+  function atom(): Predicate {
+    if (peek('AND') || peek('OR') || peek(')')) throw unsupported();
+    if (peek('(')) {
+      position++;
+      const predicate = expression();
+      expect(')');
+      return predicate;
+    }
+    if (peek('CAST')) {
+      position++;
+      expect('(');
+      const name = field();
+      expect('AS');
+      expect('VARCHAR');
+      expect(')');
+      expect('ILIKE');
+      const pattern = literal();
+      expect('ESCAPE');
+      const escape = literal();
+      if (escape.length !== 1) throw unsupported();
+      const matcher = likeRegex(pattern, escape);
+      return (row) => row[name] != null && matcher.test(String(row[name]));
+    }
+    const name = field();
+    const operation = tokens[position++]?.value;
+    if (['>=', '<'].includes(operation) && peek('TIMESTAMP')) {
+      position++;
+      const value = Date.parse(literal());
+      if (!Number.isFinite(value)) throw unsupported();
+      return (row) =>
+        operation === '>='
+          ? parseEventTimestamp(row[name]) >= value
+          : parseEventTimestamp(row[name]) < value;
+    }
+    if (!['=', '!=', '<>'].includes(operation)) throw unsupported();
+    const token = tokens[position++];
+    if (!token || !['string', 'number'].includes(token.kind)) throw unsupported();
+    return (row) =>
+      row[name] != null &&
+      (operation === '=' ? String(row[name]) === token.value : String(row[name]) !== token.value);
+  }
+  function conjunction(): Predicate {
+    let predicate = atom();
+    while (peek('AND')) {
+      position++;
+      const left = predicate,
+        right = atom();
+      predicate = (row) => left(row) && right(row);
+    }
+    return predicate;
+  }
+  function expression(): Predicate {
+    let predicate = conjunction();
+    while (peek('OR')) {
+      position++;
+      const left = predicate,
+        right = conjunction();
+      predicate = (row) => left(row) || right(row);
+    }
+    return predicate;
+  }
+  let predicate: Predicate = () => true;
   if (peek('WHERE')) {
     position++;
-    let firstCondition = true;
-    do {
-      if (!firstCondition) expect('AND');
-      firstCondition = false;
-      if (peek('AND')) throw unsupported();
-      if (peek('CAST')) {
-        position++;
-        expect('(');
-        const name = field();
-        expect('AS');
-        expect('VARCHAR');
-        expect(')');
-        expect('ILIKE');
-        const pattern = literal();
-        expect('ESCAPE');
-        const escape = literal();
-        if (escape.length !== 1) throw unsupported();
-        const matcher = likeRegex(pattern, escape);
-        predicates.push((row) => row[name] != null && matcher.test(String(row[name])));
-      } else {
-        const name = field();
-        const operation = tokens[position++]?.value;
-        if (!['=', '!=', '<>'].includes(operation)) throw unsupported();
-        const token = tokens[position++];
-        if (!token || !['string', 'number'].includes(token.kind)) throw unsupported();
-        const value = token.value;
-        predicates.push(
-          (row) =>
-            row[name] != null &&
-            (operation === '=' ? String(row[name]) === value : String(row[name]) !== value),
-        );
-      }
-    } while (peek('AND'));
+    predicate = expression();
   }
   let orderField: string | undefined;
   let descending = false;
@@ -220,7 +281,7 @@ export function executeDemoQuery(
       position++;
     } else if (peek('ASC')) position++;
   }
-  let limit = 100;
+  let limit = Infinity;
   if (peek('LIMIT')) {
     position++;
     const token = tokens[position++];
@@ -242,8 +303,8 @@ export function executeDemoQuery(
   if (!Number.isFinite(start) || !Number.isFinite(end) || start > end)
     throw new Error('Invalid query time range');
   const result = records.filter((row) => {
-    const timestamp = Date.parse(String(row.p_timestamp));
-    return timestamp >= start && timestamp < end && predicates.every((predicate) => predicate(row));
+    const timestamp = parseEventTimestamp(row.p_timestamp);
+    return timestamp >= start && timestamp < end && predicate(row);
   });
   if (orderField) {
     const key = orderField;
@@ -428,6 +489,7 @@ export function createDemoClient(): ParseableClient {
   }
   return {
     ...datasets,
+    ...createDemoLogMethods(records, datasets.listDatasets),
     ...metrics,
     ...alerts,
     ...dashboards,

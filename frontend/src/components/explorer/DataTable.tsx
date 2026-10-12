@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Badge, Button, EmptyState } from '../ui';
 import type { LogRecord } from '../../lib/types';
+import { VirtualLogTable } from './VirtualLogTable';
+import { formatTimestamp } from './timezone';
 export function formatValue(value: unknown): string {
   if (value == null) return '—';
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
@@ -39,6 +41,9 @@ export function DataTable({
   caption = 'Query results',
   wrap = false,
   summary = false,
+  virtualized = false,
+  timezone = 'UTC',
+  timestampField = 'p_timestamp',
 }: {
   rows: LogRecord[];
   columns?: string[];
@@ -46,9 +51,25 @@ export function DataTable({
   caption?: string;
   wrap?: boolean;
   summary?: boolean;
+  virtualized?: boolean;
+  timezone?: string;
+  timestampField?: string;
 }) {
   const [page, setPage] = useState(0);
   const [sort, setSort] = useState<{ field: string; descending: boolean }>();
+  if (virtualized)
+    return (
+      <VirtualLogTable
+        rows={rows}
+        columns={columns}
+        onSelect={onSelect}
+        caption={caption}
+        wrap={wrap}
+        summary={summary}
+        timezone={timezone}
+        timestampField={timestampField}
+      />
+    );
   const pageSize = 25;
   const effectivePage = Math.min(page, Math.max(0, Math.ceil(rows.length / pageSize) - 1));
   const fields = columns || [...new Set(rows.flatMap(Object.keys))];
@@ -87,10 +108,10 @@ export function DataTable({
                   scope="col"
                   key={field}
                   aria-label={
-                    field === 'p_timestamp'
-                      ? summary
-                        ? 'Ingestion Time (UTC)'
-                        : 'Timestamp (UTC)'
+                    field === timestampField
+                      ? summary && timestampField === 'p_timestamp'
+                        ? `Ingestion Time (${timezone})`
+                        : `Timestamp (${timezone})`
                       : field
                   }
                   aria-sort={
@@ -108,10 +129,10 @@ export function DataTable({
                       setPage(0);
                     }}
                   >
-                    {field === 'p_timestamp'
-                      ? summary
-                        ? 'Ingestion Time (UTC)'
-                        : 'Timestamp (UTC)'
+                    {field === timestampField
+                      ? summary && timestampField === 'p_timestamp'
+                        ? `Ingestion Time (${timezone})`
+                        : `Timestamp (${timezone})`
                       : field}
                     {sort?.field === field ? (
                       sort.descending ? (
@@ -166,8 +187,8 @@ export function DataTable({
                         >
                           {formatValue(row[field])}
                         </Badge>
-                      ) : field === 'p_timestamp' ? (
-                        formatValue(row[field]).replace('T', ' ').replace('Z', '')
+                      ) : field === timestampField ? (
+                        formatTimestamp(row[field], timezone)
                       ) : (
                         formatValue(row[field])
                       )}

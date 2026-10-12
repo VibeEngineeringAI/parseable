@@ -66,6 +66,82 @@ export type DatasetInfo = {
   hotTierEnabled?: boolean;
 };
 export type LogRecord = Record<string, unknown>;
+export type SavedLogViewRule = { id: string; field: string; value: string; operator: string };
+export type SavedLogViewBuilder = {
+  id: string;
+  combinator: string;
+  rules: Array<{ id: string; combinator: string; rules: SavedLogViewRule[] }>;
+};
+/** Full /filters document: retain flattened metadata when updating a saved view. */
+export type SavedLogView = {
+  filter_id?: string | null;
+  filter_name: string;
+  stream_name: string;
+  query: {
+    filter_type: 'filter' | 'sql' | 'search';
+    filter_query?: string | null;
+    filter_builder?: SavedLogViewBuilder | null;
+  };
+  time_filter?: { from: string; to: string } | null;
+  [key: string]: unknown;
+};
+export type LogContextConditions = {
+  operator?: 'and' | 'or' | null;
+  conditionConfig?: Array<{
+    column: string;
+    operator:
+      | '='
+      | '!='
+      | '<'
+      | '>'
+      | '<='
+      | '>='
+      | 'is null'
+      | 'is not null'
+      | 'ilike'
+      | 'contains'
+      | 'begins with'
+      | 'ends with'
+      | 'does not contain'
+      | 'does not begin with'
+      | 'does not end with';
+    value?: string | null;
+    type?: string | null;
+  }>;
+  groups?: LogContextConditions[] | null;
+};
+export type LogContextRequest = {
+  dataset: string;
+  pTimestamp: string;
+  contextWindow?: string;
+  contextStartTime?: string;
+  contextEndTime?: string;
+  log?: string;
+  body?: string;
+  message?: string;
+  conditions?: LogContextConditions;
+  pageSize?: number;
+};
+/** Wire payload for POST /query; reverseRecords is applied by the caller. */
+export type LogContextQueryPayload = {
+  query: string;
+  startTime: string;
+  endTime: string;
+  sendNull: boolean;
+  reverseRecords: boolean;
+};
+export type LogContextResponse = {
+  scope: 'contextWindow';
+  contextStartTime: string;
+  contextEndTime: string;
+  limit: number;
+  anchorIndex: number;
+  duplicateAnchorCount: number;
+  anchoredDuplicate: 'first';
+  records: LogRecord[];
+  queries: { previous: LogContextQueryPayload | null; next: LogContextQueryPayload | null };
+};
+
 export type TimeRange =
   | '10m'
   | '15m'
@@ -298,6 +374,11 @@ export interface ParseableClient {
   ): Promise<PromqlMetadataResult>;
   schema(dataset: string, signal?: AbortSignal): Promise<string[]>;
   query(request: QueryRequest, signal?: AbortSignal): Promise<LogRecord[]>;
+  listLogViews(signal?: AbortSignal): Promise<SavedLogView[]>;
+  createLogView(body: SavedLogView): Promise<SavedLogView>;
+  updateLogView(id: string, body: SavedLogView): Promise<SavedLogView>;
+  deleteLogView(id: string): Promise<void>;
+  logContext(request: LogContextRequest, signal?: AbortSignal): Promise<LogContextResponse>;
   login(username: string, password: string, returnPath?: string): Promise<void>;
   logout(): Promise<void>;
   about(signal?: AbortSignal): Promise<About>;

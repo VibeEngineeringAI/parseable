@@ -2,6 +2,22 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Logs explorer depth (2026-10-12, completed)
+
+Implemented on `feat/logs-explorer-depth` from `origin/main` `ee740826`. The [Mayfly plan](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=534c288c-5c54-430d-ad15-d742c972c579#J63UryiLZKvb1G5vnY7RVQhXPDhXy-GpIhjXiCB_TzM) was published before implementation; [completion evidence](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=d7edadf0-77c8-4546-9df6-de946f9b0932#J63UryiLZKvb1G5vnY7RVQhXPDhXy-GpIhjXiCB_TzM) is recorded in the same shared wiki. Six Sol 6.1 workstreams and three Opus 5.5 reviews covered implementation and integration. The final Opus review found no actionable findings or remaining blockers.
+
+Histogram totals aggregate every match through `/query` with the rows' captured bounds/predicates. Server `/filters` saved views and versioned fixed-bound `logView` copy links round-trip explorer settings. Two AND/OR levels allow 12 groups/50 rules, using `=`/`!=` and SQL NULL semantics. `/query/context` requests are bounded to 101 events, require `p_timestamp` plus a string anchor and report duplicates. The result limit defaults to 100 and extends to 10,000; large/wide tables virtualize rows/columns. Wrapped virtual rows use a fixed 96px preview, with full details available; sorting/export cover loaded rows. UTC/local/IANA editing preserves UTC instants and handles DST gaps/folds. Histogram buckets are 48 fixed elapsed intervals, not calendar buckets.
+
+Review corrections were verified: owner-only saved-view mutations, guarding include/exclude actions when OR groups could otherwise broaden results, custom timestamp-partition rendering in tables/details and saved SQL, keyboard focus during virtualization, stable captured bounds for equivalent filter criteria, and a distinct consumed `logView` parameter preserving classic `view` semantics. Offset-only timezone identifiers are rejected; local selection resolves to a concrete IANA zone. Opening saved views refetches the server list, and closing context restores the original record details.
+
+- Host formatting, TypeScript and production build pass; **2,011 unit tests in 75 files** pass.
+- Application suite: **418 passed, 2 optional screenshot-capture cases skipped** (420 cases). A prior focused run passed **64 browser tests**. New regressions cover matching predicates/bounds/context, aggregate failure isolation, timezone/share/server-saved reload, owner-only mutations/list refresh, keyboard behavior and 10,000 rows × 123 columns virtualization.
+- Production-build browser suite: **16 passed**.
+- Storybook: the host passed 81 cases but failed 22 visual comparisons because host fonts/browser rendering differ from the pinned environment. The **same unchanged built Storybook passed all 103 tests**, including all 22 visual comparisons, in `mcr.microsoft.com/playwright:v1.63.0-noble`. No snapshot baselines were updated. Required checks were verified across these environments; the monolithic host `npm run check` did not exit successfully.
+- Read-only queries against disposable live server `:8400` confirmed **24,001 histogram matches versus 100 returned rows**. A separate **257-event fixture** confirmed histogram total equals independent COUNT while rows remain capped at 100. Message/body context, duplicate anchors, bounded windows, executable cursors and server `/filters` CRUD/metadata preservation passed. Fixture dataset/view cleanup completed.
+
+Browser suites use mocked API responses; the disposable live checks separately validate server query/context/persistence contracts. No deployed service was modified. This record does not imply exhaustive production-volume or cross-browser performance testing.
+
 ## SQL editor workspace (2026-10-11)
 
 Implemented on `feat/sql-editor-workspace` from `origin/main`, using four Sol 6.1 agents for implementation, Storybook and regression coverage, followed by Opus 5.5 review.

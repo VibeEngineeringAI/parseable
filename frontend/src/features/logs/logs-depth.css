@@ -1,0 +1,35 @@
+.logs-view-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 16px 8px;
+}
+.logs-view-controls .ui-select {
+  max-width: 240px;
+}
+.context-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.context-events > li {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.context-events > li[aria-current='true'] {
+  border: 2px solid var(--color-primary);
+  border-radius: 4px;
+}
+.context-events summary {
+  cursor: pointer;
+  font-size: 12px;
+}
+.context-events pre {
+  max-height: 320px;
+  overflow: auto;
+}
+.logs-share-url {
+  width: 100%;
+}
