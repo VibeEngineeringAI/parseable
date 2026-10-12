@@ -32,9 +32,8 @@ async function press(page: Page, name: string) {
   return (dx: number, dy = 0) => page.mouse.move(x + dx, y + dy, { steps: 6 });
 }
 async function drag(page: Page, name: string, dx: number, cancel = false) {
-  await (
-    await press(page, name)
-  )(dx);
+  const move = await press(page, name);
+  await move(dx);
   if (cancel) await page.keyboard.press('Escape');
   await page.mouse.up();
 }
@@ -151,9 +150,8 @@ test('stacked tiles keep a vertical drag alive while it crosses a sibling', asyn
   const cells = grid.locator('.dashboard-layout-cell');
   await expect(cells.first()).toContainText('Requests');
   // Three rows down puts Requests below Latency, which swaps their reading order.
-  await (
-    await press(page, 'Move tile Requests')
-  )(0, (await rowHeight(grid)) * 3);
+  const move = await press(page, 'Move tile Requests');
+  await move(0, (await rowHeight(grid)) * 3);
   await expect(cellFor(page, 'Requests')).toHaveCSS('grid-row-start', '4');
   await page.mouse.up();
   await expect(cellFor(page, 'Requests')).toHaveCSS('grid-row-start', '4');
@@ -175,9 +173,8 @@ test('Escape during a reordering drag restores the stacked order and leaves noth
   const grid = page
     .locator('.dashboard-layout-grid')
     .filter({ has: page.getByRole('button', { name: 'Move tile Requests', exact: true }) });
-  await (
-    await press(page, 'Move tile Requests')
-  )(0, (await rowHeight(grid)) * 3);
+  const move = await press(page, 'Move tile Requests');
+  await move(0, (await rowHeight(grid)) * 3);
   await page.keyboard.press('Escape');
   await expect(cellFor(page, 'Requests')).toHaveCSS('grid-row-start', '1');
   await page.mouse.up();

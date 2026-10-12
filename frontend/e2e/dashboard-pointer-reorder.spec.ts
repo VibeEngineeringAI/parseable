@@ -93,9 +93,8 @@ test('a vertical drag past a sibling keeps its gesture when the grid reorders mi
   const row = await rowHeight(grid);
   await expect(page.locator('.dashboard-layout-cell').first()).toContainText('First');
   // Three rows down puts First below Second, so compaction swaps their reading order.
-  await (
-    await press(page, 'Move tile First')
-  )(row * 3);
+  const move = await press(page, 'Move tile First');
+  await move(row * 3);
   // The preview must still be live after the reorder: First has moved off the top row.
   await expect(cellFor(page, 'First')).toHaveCSS('grid-row-start', '4');
   await page.mouse.up();
@@ -117,9 +116,8 @@ test('Escape during a reordering drag restores the original order and leaves no 
   const server = await serve(page);
   const grid = page.locator('.dashboard-layout-grid').first();
   const row = await rowHeight(grid);
-  await (
-    await press(page, 'Move tile Second')
-  )(-row * 3);
+  const move = await press(page, 'Move tile Second');
+  await move(-row * 3);
   await expect(cellFor(page, 'Second')).toHaveCSS('grid-row-start', '1');
   await page.keyboard.press('Escape');
   await expect(cellFor(page, 'Second')).toHaveCSS('grid-row-start', '4');
@@ -133,9 +131,8 @@ test('a committed drag leaves reading order matching the visible layout', async 
   const server = await serve(page);
   const grid = page.locator('.dashboard-layout-grid').first();
   const row = await rowHeight(grid);
-  await (
-    await press(page, 'Move tile First')
-  )(row * 3);
+  const move = await press(page, 'Move tile First');
+  await move(row * 3);
   await page.mouse.up();
   const cells = page.locator('.dashboard-layout-cell');
   await expect(cells.first()).toContainText('Second');
