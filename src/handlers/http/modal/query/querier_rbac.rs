@@ -143,6 +143,7 @@ pub async fn delete_user(
         }
     }
     put_metadata(&metadata, &tenant_id).await?;
+    apply_user_removal_to_groups(&userid, &tenant_id, &groups_to_update);
 
     if let Err(e) =
         sync_user_deletion_with_ingestors(&req, &userid, &tenant_id, &caller_userid).await
@@ -155,8 +156,8 @@ pub async fn delete_user(
     Ok(HttpResponse::Ok().json(format!("deleted user: {username}")))
 }
 
-/// Removes the user from every in-memory group it belongs to and returns the
-/// updated groups so the caller can persist them. Caller holds `UPDATE_LOCK`.
+/// Returns copies of the user's groups with the member removed, without storing
+/// them. Caller holds `UPDATE_LOCK` and persists them before applying the removal.
 pub(crate) fn remove_user_from_groups(
     userid: &str,
     tenant_id: &Option<String>,
@@ -176,7 +177,7 @@ pub(crate) fn remove_user_from_groups(
 
     for user_group in Users.get_user_groups(userid, tenant_id) {
         // Removing members refreshes sessions, which comes first in the lock
-        // order (see `rbac::map`): update a copy, then store it back.
+        // order (see `rbac::map`): update a copy without holding USER_GROUPS.
         let Some(mut ug) = read_user_groups()
             .get(tenant)
             .and_then(|groups| groups.get(&user_group))
@@ -185,14 +186,25 @@ pub(crate) fn remove_user_from_groups(
             continue;
         };
         ug.remove_users_by_user_ids(HashSet::from_iter([member_id.clone()]))?;
-        if let Some(groups) = write_user_groups().get_mut(tenant)
-            && let Some(stored) = groups.get_mut(&user_group)
-        {
-            stored.clone_from(&ug);
-        }
         groups_to_update.push(ug);
     }
     Ok(groups_to_update)
+}
+
+pub(crate) fn apply_user_removal_to_groups(
+    userid: &str,
+    tenant_id: &Option<String>,
+    groups_to_update: &[user::UserGroup],
+) {
+    let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+    if let Some(groups) = write_user_groups().get_mut(tenant) {
+        for updated_group in groups_to_update {
+            if let Some(stored) = groups.get_mut(&updated_group.name) {
+                // Preserve any other membership or role changes since the copy was made.
+                stored.users.retain(|member| member.userid() != userid);
+            }
+        }
+    }
 }
 
 // Handler PATCH /user/{userid}/role/add => Add roles to a user

@@ -836,7 +836,7 @@ mod lock_order_tests {
         let removal = spawn({
             let userid = leaving.userid().to_owned();
             let tenant = leaving.tenant.clone();
-            move || remove_user_from_groups(&userid, &tenant).map(|groups| groups.len())
+            move || remove_user_from_groups(&userid, &tenant)
         });
         wait_until("the group removal to queue for SESSIONS", || {
             writer_queued(sessions_lock())
@@ -844,7 +844,20 @@ mod lock_order_tests {
         go.send(()).unwrap();
 
         assert_eq!(finish(&check, "session check"), Some(Response::Authorized));
-        assert_eq!(finish(&removal, "group removal").unwrap(), 1);
+        let updated_groups = finish(&removal, "group removal").unwrap();
+        assert_eq!(updated_groups.len(), 1);
+        let leaving_member = GroupUser::from_user(&leaving);
+        assert!(!updated_groups[0].users.contains(&leaving_member));
+        assert!(
+            read_user_groups()[&tenant][&group_name]
+                .users
+                .contains(&leaving_member)
+        );
+        crate::handlers::http::modal::query::querier_rbac::apply_user_removal_to_groups(
+            leaving.userid(),
+            &leaving.tenant,
+            &updated_groups,
+        );
         let groups = read_user_groups();
         let users = &groups[&tenant][&group_name].users;
         assert!(!users.contains(&GroupUser::from_user(&leaving)));
