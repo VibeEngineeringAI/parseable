@@ -144,12 +144,21 @@ describe.skipIf(!origin)('Errors analytics on a real Parseable server', () => {
           scopeLogs: [
             {
               scope: { name: 'errors-live-regression' },
-              logRecords: Array.from({ length: 9 }, (_, index) => ({
-                timeUnixNano: String(nanos),
-                severityNumber: 16 + index,
-                severityText: index ? 'ERROR' : 'WARN',
-                body: { stringValue: `OTLP severity ${16 + index}` },
-              })),
+              logRecords: [
+                ...Array.from({ length: 9 }, (_, index) => ({
+                  timeUnixNano: String(nanos),
+                  severityNumber: 16 + index,
+                  severityText: index ? 'ERROR' : 'WARN',
+                  body: { stringValue: `OTLP severity ${16 + index}` },
+                })),
+                // The server derives ERROR/FATAL categories from these bodies,
+                // but unspecified severity must not qualify them as errors.
+                ...['0 errors found', 'no fatal failures'].map((body) => ({
+                  timeUnixNano: String(nanos),
+                  severityNumber: 0,
+                  body: { stringValue: body },
+                })),
+              ],
             },
           ],
         },
@@ -351,6 +360,33 @@ describe.skipIf(!origin)('Errors analytics on a real Parseable server', () => {
     expect(issues.rows.map((issue) => issue.message).sort()).toEqual(
       Array.from({ length: 8 }, (_, index) => `OTLP severity ${17 + index}`),
     );
+  });
+
+  it('excludes OTLP body-inferred categories from counts, frequency and SQL investigation', async () => {
+    const target = options(numericDataset);
+    // Verify the actual ingestion fallback, so this test cannot pass merely
+    // because the misleading records were not ingested.
+    const stored = await query({
+      ...apmTransportBounds(bounds),
+      sql: `SELECT body, p_log_category FROM "${numericDataset}" WHERE severity_number = 0 ORDER BY body`,
+    });
+    expect(stored).toEqual([
+      { body: '0 errors found', p_log_category: 'ERROR' },
+      { body: 'no fatal failures', p_log_category: 'FATAL' },
+    ]);
+    expect(await loadErrorSummary(client, target)).toMatchObject({ occurrences: 8, issues: 8 });
+    const series = await loadErrorSeries(client, target);
+    expect(series.reduce((sum, bucket) => sum + bucket.occurrences, 0)).toBe(8);
+    for (const { body } of stored) {
+      const issue = { service: 'severity-numbers', errorType: null, message: String(body) };
+      expect((await loadErrorOccurrences(client, { ...target, issue })).rows).toEqual([]);
+      expect(
+        await query({
+          sql: buildErrorExplorerSql({ ...target, issue }),
+          ...apmTransportBounds(bounds),
+        }),
+      ).toEqual([]);
+    }
   });
 
   it('keeps a span exception type and message paired across several exception events and a retry', async () => {

@@ -109,7 +109,9 @@ export const ERROR_LEVEL_NUMBER_FIELD = 'level';
 export const ERROR_EXPLORE_LIMIT = { default: 100, max: 10_000 } as const;
 
 const ALIASES = {
-  severityText: ['p_log_category', 'level', 'log_level', 'severity', 'severity_text'],
+  // p_log_category can be inferred from body text when OTLP severity is unset
+  // (src/otel/logs.rs). Only explicit severity fields may classify an error.
+  severityText: ['level', 'log_level', 'severity', 'severity_text'],
   severityNumber: ['severity_number'],
   logService: ['service.name', 'service', 'service_name'],
   logErrorType: ['exception.type', 'error.type', 'error.kind', 'exception_type', 'error_type'],

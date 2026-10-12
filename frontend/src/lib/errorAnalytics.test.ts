@@ -107,6 +107,11 @@ describe('error schema discovery', () => {
         .timeColumn,
     ).toBe('event_time');
   });
+  it('does not treat a derived log category as an explicit severity field', () => {
+    expect(() => inspectErrorSchema(['p_timestamp', 'p_log_category', 'body'], logInfo)).toThrow(
+      /no severity field/,
+    );
+  });
 });
 
 describe('error SQL contract', () => {
@@ -176,6 +181,26 @@ describe('error SQL contract', () => {
     expect(build('occurrences', { limit: 10 }).sql).toContain(
       'ORDER BY at DESC, trace_id ASC NULLS LAST, span_id ASC NULLS LAST, operation ASC NULLS LAST LIMIT 11 OFFSET 0',
     );
+  });
+  it('excludes body-inferred categories from every log query, including SQL investigation', () => {
+    const schema = inspectErrorSchema(
+      ['p_timestamp', 'p_log_category', 'severity_number', 'severity_text', 'body'],
+      { name: 'logs', logSourceFormats: ['otel-logs'] },
+    );
+    for (const kind of ['summary', 'series', 'issues', 'occurrences', 'explore'] as const) {
+      const { sql } = buildErrorQuery({
+        dataset: 'logs',
+        schema,
+        bounds,
+        kind,
+        ...(['occurrences', 'explore'].includes(kind) ? { issue: key } : {}),
+      });
+      expect(sql).not.toContain('p_log_category');
+      expect(sql).toContain(
+        'TRY_CAST("severity_number" AS DOUBLE) IN (17, 18, 19, 20, 21, 22, 23, 24)',
+      );
+      expect(sql).toContain('UPPER(TRIM(CAST("severity_text" AS VARCHAR)))');
+    }
   });
   it('uses at most 48 full-range buckets', () => {
     expect(build('series').sql).toContain(
@@ -579,6 +604,53 @@ describe('demo error analytics', () => {
         spans,
       ),
     ).toEqual([expect.objectContaining({ occurrences: 3, issues: 1 })]);
+  });
+  it('ignores body-inferred error and fatal categories but preserves explicit severities', () => {
+    // OTLP ingestion infers p_log_category from body substrings when severity is
+    // unspecified. These rows model the stored output, not the raw OTLP input.
+    const logs: LogRecord[] = [
+      {
+        body: '0 errors found',
+        severity_number: 0,
+        severity_text: 'UNSPECIFIED',
+        p_log_category: 'ERROR',
+      },
+      {
+        body: 'no fatal failures',
+        severity_number: 0,
+        severity_text: 'UNSPECIFIED',
+        p_log_category: 'FATAL',
+      },
+      { body: 'numeric error', severity_number: 17, p_log_category: 'ERROR' },
+      { body: 'numeric fatal', severity_number: 24, p_log_category: 'FATAL' },
+      { body: 'text error', severity_text: 'ERROR' },
+      { body: 'pino error', level: 50 },
+    ].map((row) => ({ ...row, p_timestamp: '2026-10-12T15:30:00.000Z' }));
+    const schema = inspectErrorSchema(
+      ['p_timestamp', 'p_log_category', 'severity_number', 'severity_text', 'level', 'body'],
+      { name: 'logs', logSourceFormats: ['otel-logs'] },
+    );
+    const target = { dataset: 'logs', schema, bounds };
+    expect(handleErrorDemoQuery(buildErrorQuery({ ...target, kind: 'summary' }), logs)).toEqual([
+      expect.objectContaining({ occurrences: 4, issues: 4 }),
+    ]);
+    const issues = handleErrorDemoQuery(buildErrorQuery({ ...target, kind: 'issues' }), logs)!;
+    expect(issues.map((row) => row.message).sort()).toEqual([
+      'numeric error',
+      'numeric fatal',
+      'pino error',
+      'text error',
+    ]);
+    expect(
+      handleErrorDemoQuery(
+        buildErrorQuery({
+          ...target,
+          kind: 'explore',
+          issue: { service: null, errorType: null, message: '0 errors found' },
+        }),
+        logs,
+      ),
+    ).toEqual([]);
   });
   it('counts pino/bunyan numeric error and fatal levels exactly, alongside text levels', () => {
     const at = '2026-10-12T15:30:00.000Z';
