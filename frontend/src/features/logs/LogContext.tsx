@@ -8,11 +8,11 @@ import { parseEventTimestamp } from '../../components/explorer/timestamp';
 import type { LogRecord } from '../../lib/types';
 import './logs-depth.css';
 
+export function contextField(row: LogRecord): 'message' | 'body' | 'log' | undefined {
+  return (['message', 'body', 'log'] as const).find((field) => typeof row[field] === 'string');
+}
 export function canShowContext(row: LogRecord): boolean {
-  return (
-    Number.isFinite(parseEventTimestamp(row.p_timestamp)) &&
-    ['message', 'body', 'log'].some((field) => typeof row[field] === 'string')
-  );
+  return Number.isFinite(parseEventTimestamp(row.p_timestamp)) && contextField(row) !== undefined;
 }
 
 export function LogContext({
@@ -27,7 +27,8 @@ export function LogContext({
   onClose: () => void;
 }) {
   const { client } = useApp();
-  const [window, setWindow] = useState('5m');
+  const [contextWindow, setContextWindow] = useState('5m');
+  const field = contextField(row);
   const result = useAsync(
     useCallback(
       (signal) =>
@@ -35,18 +36,13 @@ export function LogContext({
           {
             dataset,
             pTimestamp: String(row.p_timestamp),
-            contextWindow: window,
+            contextWindow,
             pageSize: 101,
-            ...Object.fromEntries(
-              ['message', 'body', 'log']
-                .filter((key) => typeof row[key] === 'string')
-                .slice(0, 1)
-                .map((key) => [key, row[key]]),
-            ),
+            ...(field ? { [field]: row[field] } : {}),
           },
           signal,
         ),
-      [client, dataset, row, window],
+      [client, dataset, row, contextWindow, field],
     ),
   );
   return (
@@ -59,7 +55,11 @@ export function LogContext({
       description="Nearby events in this dataset. Search and filters are excluded from this context window."
     >
       <div className="stack">
-        <Select label="Context window" value={window} onChange={(e) => setWindow(e.target.value)}>
+        <Select
+          label="Context window"
+          value={contextWindow}
+          onChange={(e) => setContextWindow(e.target.value)}
+        >
           <option value="1m">1 minute</option>
           <option value="5m">5 minutes</option>
           <option value="1h">1 hour</option>
@@ -87,7 +87,7 @@ export function LogContext({
                     <summary>
                       {index === result.data!.anchorIndex && <strong>Selected event · </strong>}
                       {formatTimestamp(record.p_timestamp, timezone)} ·{' '}
-                      {String(record.message ?? record.body ?? record.log ?? 'Event')}
+                      {String(record[contextField(record) ?? ''] ?? 'Event')}
                     </summary>
                     <pre className="event-json">{JSON.stringify(record, null, 2)}</pre>
                   </details>

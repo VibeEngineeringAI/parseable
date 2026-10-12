@@ -1,23 +1,35 @@
 import { quoteIdentifier, quoteLiteral, timeBounds } from './query';
 import { parseEventTimestamp } from '../components/explorer/timestamp';
-import type { LogFilter, LogRecord } from './types';
-export type LogFilterGroup = { id: string; combinator: 'and' | 'or'; rules: LogFilter[] };
-export type LogFilterExpression = { combinator: 'and' | 'or'; groups: LogFilterGroup[] };
+import type { LogRecord } from './types';
+import {
+  MAX_FILTER_GROUPS,
+  MAX_FILTER_RULES,
+  MAX_LOG_ROWS,
+  ruleCount,
+  type LogFilterExpression,
+} from './logFilters';
+export type { LogFilterGroup, LogFilterExpression } from './logFilters';
+export const HISTOGRAM_BUCKETS = 48;
+export type LogCriteria = Readonly<{ source: string; predicate: string; timestamp: string }>;
+export type HistogramAggregate = {
+  bins: number[];
+  total: number;
+  start: number;
+  end: number;
+  interval: number;
+};
 type Bounds = { startTime: string; endTime: string };
 function join(parts: string[], combinator: 'and' | 'or'): string {
   if (combinator !== 'and' && combinator !== 'or') throw new Error('Unsupported filter combinator');
   return parts.length ? `(${parts.join(` ${combinator.toUpperCase()} `)})` : '';
 }
-function where(
+export function compileLogCriteria(
+  dataset: string,
   search: string,
   expression: LogFilterExpression,
-  bounds?: Bounds,
   timestampField = 'p_timestamp',
-): string {
-  if (
-    expression.groups.length > 12 ||
-    expression.groups.reduce((n, group) => n + group.rules.length, 0) > 50
-  )
+): LogCriteria {
+  if (expression.groups.length > MAX_FILTER_GROUPS || ruleCount(expression) > MAX_FILTER_RULES)
     throw new Error('Too many filter groups or rules');
   const grouped = join(
     expression.groups
@@ -39,15 +51,31 @@ function where(
     const pattern = `%${search.trim().replaceAll('!', '!!').replaceAll('%', '!%').replaceAll('_', '!_')}%`;
     conditions.push(`CAST("message" AS VARCHAR) ILIKE ${quoteLiteral(pattern)} ESCAPE '!'`);
   }
+  return {
+    source: quoteIdentifier(dataset),
+    predicate: conditions.join(' AND '),
+    timestamp: quoteIdentifier(timestampField),
+  };
+}
+function where(criteria: LogCriteria, bounds?: Bounds): string {
+  const conditions = criteria.predicate ? [criteria.predicate] : [];
   if (bounds) {
-    const normalized = timeBounds(bounds),
-      field = quoteIdentifier(timestampField);
+    const normalized = timeBounds(bounds);
     conditions.push(
-      `${field} >= TIMESTAMP ${quoteLiteral(normalized.startTime)}`,
-      `${field} < TIMESTAMP ${quoteLiteral(normalized.endTime)}`,
+      `${criteria.timestamp} >= TIMESTAMP ${quoteLiteral(normalized.startTime)}`,
+      `${criteria.timestamp} < TIMESTAMP ${quoteLiteral(normalized.endTime)}`,
     );
   }
   return conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+}
+export function buildRowsFromCriteria(
+  criteria: LogCriteria,
+  limit: number,
+  bounds?: Bounds,
+): string {
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LOG_ROWS)
+    throw new Error(`Limit must be between 1 and ${MAX_LOG_ROWS}`);
+  return `SELECT * FROM ${criteria.source}${where(criteria, bounds)} ORDER BY ${criteria.timestamp} DESC LIMIT ${limit}`;
 }
 export function buildExplorerQuery(
   dataset: string,
@@ -57,15 +85,18 @@ export function buildExplorerQuery(
   timestampField = 'p_timestamp',
   bounds?: Bounds,
 ): string {
-  if (!Number.isInteger(limit) || limit < 1 || limit > 10000)
-    throw new Error('Limit must be between 1 and 10000');
-  return `SELECT * FROM ${quoteIdentifier(dataset)}${where(search, expression, bounds, timestampField)} ORDER BY ${quoteIdentifier(timestampField)} DESC LIMIT ${limit}`;
+  return buildRowsFromCriteria(
+    compileLogCriteria(dataset, search, expression, timestampField),
+    limit,
+    bounds,
+  );
 }
+
 function histogramGeometry(bounds: Bounds) {
   const normalized = timeBounds(bounds);
   const start = Date.parse(normalized.startTime),
     end = Date.parse(normalized.endTime);
-  return { ...normalized, start, end, interval: Math.ceil((end - start) / 48) };
+  return { ...normalized, start, end, interval: Math.ceil((end - start) / HISTOGRAM_BUCKETS) };
 }
 export function buildHistogramQuery(
   dataset: string,
@@ -74,15 +105,19 @@ export function buildHistogramQuery(
   bounds: Bounds,
   timestampField = 'p_timestamp',
 ): string {
-  const geometry = histogramGeometry(bounds);
-  return `SELECT DATE_BIN(INTERVAL '${geometry.interval} milliseconds', ${quoteIdentifier(timestampField)}, TIMESTAMP '${geometry.startTime}') AS "bucket_start", COUNT(*) AS "count" FROM ${quoteIdentifier(dataset)}${where(search, expression, bounds, timestampField)} GROUP BY "bucket_start" ORDER BY "bucket_start" ASC`;
+  return buildHistogramFromCriteria(
+    compileLogCriteria(dataset, search, expression, timestampField),
+    bounds,
+  );
 }
-export function histogramBuckets(
-  rows: LogRecord[],
-  bounds: Bounds,
-): { bins: number[]; total: number } {
+export function buildHistogramFromCriteria(criteria: LogCriteria, bounds: Bounds): string {
+  const geometry = histogramGeometry(bounds);
+  return `SELECT DATE_BIN(INTERVAL '${geometry.interval} milliseconds', ${criteria.timestamp}, TIMESTAMP '${geometry.startTime}') AS "bucket_start", COUNT(*) AS "count" FROM ${criteria.source}${where(criteria, bounds)} GROUP BY "bucket_start" ORDER BY "bucket_start" ASC`;
+}
+
+export function histogramBuckets(rows: LogRecord[], bounds: Bounds): HistogramAggregate {
   const { start, end, interval } = histogramGeometry(bounds);
-  const bins = Array<number>(48).fill(0);
+  const bins = Array<number>(HISTOGRAM_BUCKETS).fill(0);
   for (const row of rows) {
     const timestamp = parseEventTimestamp(row.bucket_start);
     const count = row.count;
@@ -92,7 +127,7 @@ export function histogramBuckets(
       timestamp < start ||
       timestamp >= end ||
       (timestamp - start) % interval !== 0 ||
-      index >= 48 ||
+      index >= HISTOGRAM_BUCKETS ||
       typeof count !== 'number' ||
       !Number.isSafeInteger(count) ||
       count < 0
@@ -103,5 +138,5 @@ export function histogramBuckets(
   }
   const total = bins.reduce((sum, count) => sum + count, 0);
   if (!Number.isSafeInteger(total)) throw new Error('Invalid histogram response');
-  return { bins, total };
+  return { bins, total, start, end, interval };
 }

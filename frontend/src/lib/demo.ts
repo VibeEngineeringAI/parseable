@@ -8,13 +8,13 @@ import type {
   TeamUser,
   UserRoleSources,
 } from './types';
-import { ApiError } from './client';
+import { ApiError } from './apiError';
 import { parseEventTimestamp } from '../components/explorer/timestamp';
 import { createDemoMetrics } from './demoMetrics';
 import { createDemoAlerts } from './demoAlerts';
 import { createDemoDashboards } from './demoDashboards';
 import { createDemoDatasets } from './demoDatasets';
-import { createDemoLogMethods } from './logsContract';
+import { createDemoLogMethods } from './demoLogs';
 import { alertDuration } from '../features/alerts/helpers';
 import { validateName } from '../features/team/helpers';
 
@@ -113,6 +113,16 @@ export function executeDemoQuery(
   records: LogRecord[],
   datasets: Dataset[] = demoDatasets,
 ): LogRecord[] {
+  return evaluateDemoQuery(request, records, datasets, 100);
+}
+
+/** Aggregate inputs must scan all matching demo rows, independent of display limits. */
+function evaluateDemoQuery(
+  request: QueryRequest,
+  records: LogRecord[],
+  datasets: Dataset[],
+  defaultLimit: number,
+): LogRecord[] {
   const histogram =
     /^SELECT DATE_BIN\(INTERVAL '(\d+) milliseconds', ("(?:[^"]|"")*"), TIMESTAMP '([^']+)'\) AS "bucket_start", COUNT\(\*\) AS "count" FROM ([\s\S]+) GROUP BY "bucket_start" ORDER BY "bucket_start" ASC$/i.exec(
       request.sql,
@@ -122,10 +132,11 @@ export function executeDemoQuery(
       origin = Date.parse(histogram[3]);
     if (!Number.isSafeInteger(interval) || interval < 1 || !Number.isFinite(origin))
       throw unsupported();
-    const rows = executeDemoQuery(
+    const rows = evaluateDemoQuery(
       { ...request, sql: `SELECT * FROM ${histogram[4]}` },
       records,
       datasets,
+      Infinity,
     );
     const buckets = new Map<number, number>();
     for (const row of rows) {
@@ -153,7 +164,12 @@ export function executeDemoQuery(
     if (field !== '*' && records.length && !Object.hasOwn(records[0], field))
       throw new Error(`Unknown demo field: ${field}`);
     if (field === '*' && fn.toUpperCase() !== 'COUNT') throw unsupported();
-    const rows = executeDemoQuery({ ...request, sql: `SELECT * FROM ${tail}` }, records, datasets);
+    const rows = evaluateDemoQuery(
+      { ...request, sql: `SELECT * FROM ${tail}` },
+      records,
+      datasets,
+      Infinity,
+    );
     const values = rows
       .map((row) => row[field])
       .filter((value): value is number => typeof value === 'number');
@@ -281,7 +297,7 @@ export function executeDemoQuery(
       position++;
     } else if (peek('ASC')) position++;
   }
-  let limit = Infinity;
+  let limit = defaultLimit;
   if (peek('LIMIT')) {
     position++;
     const token = tokens[position++];

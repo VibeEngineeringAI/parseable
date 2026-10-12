@@ -1,6 +1,11 @@
 import { isValidTimezone } from '../../components/explorer/timezone';
 import type { LogFilter, TimeRange } from '../../lib/types';
-import type { LogFilterExpression } from '../../lib/logQuery';
+import {
+  MAX_FILTER_GROUPS,
+  MAX_FILTER_RULES,
+  MAX_LOG_ROWS,
+  type LogFilterExpression,
+} from '../../lib/logFilters';
 
 export type LogViewState = {
   version: 1;
@@ -36,7 +41,7 @@ function validInstant(value: string): boolean {
     (!offsetHour || (Number(offsetHour) < 24 && Number(offsetMinute) < 60))
   );
 }
-function object(value: unknown): Record<string, unknown> {
+function requireObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new Error('Invalid log view: expected an object.');
   return value as Record<string, unknown>;
@@ -56,13 +61,13 @@ function combinator(value: unknown): 'and' | 'or' {
   return value;
 }
 export function validateLogView(value: unknown): LogViewState {
-  const raw = object(value);
+  const raw = requireObject(value);
   if (raw.version !== 1) throw new Error('Unsupported log view version.');
   const dataset = text(raw.dataset, 'dataset', 512, true);
   let range: TimeRange;
   if (typeof raw.range === 'string' && presets.has(raw.range)) range = raw.range as TimeRange;
   else {
-    const bounds = object(raw.range);
+    const bounds = requireObject(raw.range);
     const startTime = text(bounds.startTime, 'start time', 64, true);
     const endTime = text(bounds.endTime, 'end time', 64, true);
     if (
@@ -76,28 +81,32 @@ export function validateLogView(value: unknown): LogViewState {
   const timezone = text(raw.timezone, 'timezone', 128, true);
   if (timezone === 'local' || !isValidTimezone(timezone))
     throw new Error('Invalid log view: timezone.');
-  if (!Number.isInteger(raw.limit) || (raw.limit as number) < 1 || (raw.limit as number) > 10000)
-    throw new Error('Invalid log view: result limit must be between 1 and 10000.');
+  if (
+    !Number.isInteger(raw.limit) ||
+    (raw.limit as number) < 1 ||
+    (raw.limit as number) > MAX_LOG_ROWS
+  )
+    throw new Error(`Invalid log view: result limit must be between 1 and ${MAX_LOG_ROWS}.`);
   if (typeof raw.wrap !== 'boolean' || typeof raw.showHistogram !== 'boolean')
     throw new Error('Invalid log view: display settings.');
-  const expressionRaw = object(raw.expression);
-  if (!Array.isArray(expressionRaw.groups) || expressionRaw.groups.length > 12)
+  const expressionRaw = requireObject(raw.expression);
+  if (!Array.isArray(expressionRaw.groups) || expressionRaw.groups.length > MAX_FILTER_GROUPS)
     throw new Error('Invalid log view: filter groups.');
   let ruleCount = 0;
   const groupIds = new Set<string>();
   const ruleIds = new Set<string>();
   const groups = expressionRaw.groups.map((value) => {
-    const group = object(value);
+    const group = requireObject(value);
     const id = text(group.id, 'group identifier', 128, true);
     if (groupIds.has(id)) throw new Error('Invalid log view: duplicate group identifier.');
     groupIds.add(id);
-    if (!Array.isArray(group.rules) || (ruleCount += group.rules.length) > 50)
+    if (!Array.isArray(group.rules) || (ruleCount += group.rules.length) > MAX_FILTER_RULES)
       throw new Error('Invalid log view: too many filter rules.');
     return {
       id,
       combinator: combinator(group.combinator),
       rules: group.rules.map((value): LogFilter => {
-        const rule = object(value);
+        const rule = requireObject(value);
         const id = text(rule.id, 'rule identifier', 128, true);
         if (ruleIds.has(id)) throw new Error('Invalid log view: duplicate rule identifier.');
         ruleIds.add(id);

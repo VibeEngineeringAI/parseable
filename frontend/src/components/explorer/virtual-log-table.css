@@ -57,3 +57,7 @@
 .virtual-log-table .table-footer {
   flex-wrap: wrap;
 }
+/* Keep message presentation within the fixed virtual grid width. */
+.virtual-log-cell.message-cell {
+  min-width: 0;
+}

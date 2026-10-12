@@ -1,6 +1,6 @@
 import { createPortal } from 'react-dom';
 import { createId } from '../../lib/ids';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { PanelLeft, RefreshCw, Terminal, WrapText, Download } from 'lucide-react';
 import { Button, EmptyState, Select, Dialog, Input } from '../../components/ui';
@@ -15,13 +15,16 @@ import { FieldSidebar } from './FieldSidebar';
 import { GroupedFilterBar } from './GroupedFilterBar';
 import { SavedViews } from './SavedViews';
 import { decodeLogView, encodeLogView, type LogViewState } from './logViewState';
+import { initialLogView, logViewReducer } from './logViewReducer';
 import { resolveTimezone } from '../../components/explorer/timezone';
 import { TimezoneSelect } from '../../components/explorer/TimezoneSelect';
 import { LogContext, canShowContext } from './LogContext';
 import { appPath } from '../../lib/config';
+import { emptyExpression, narrowLogExpression, MAX_LOG_ROWS } from '../../lib/logFilters';
 import {
-  buildExplorerQuery,
-  buildHistogramQuery,
+  compileLogCriteria,
+  buildRowsFromCriteria,
+  buildHistogramFromCriteria,
   histogramBuckets,
   type LogFilterExpression,
 } from '../../lib/logQuery';
@@ -30,7 +33,7 @@ import { ApiError } from '../../lib/client';
 import { useAsync } from '../../hooks/useAsync';
 import { timeBounds } from '../../lib/query';
 import { classicLogsParams, classicLogsState } from '../../lib/classicUi';
-import type { LogRecord, TimeRange, LogFilter } from '../../lib/types';
+import type { LogRecord, LogFilter } from '../../lib/types';
 export function LogsPage() {
   const { client } = useApp();
   const { currentDataset } = useParams();
@@ -40,25 +43,30 @@ export function LogsPage() {
   const location = useLocation();
   const [params] = useSearchParams();
   const [dropped, setDropped] = useState<string[]>([]);
-  const [range, setRange] = useState<TimeRange>('1h');
-  const [search, setSearch] = useState('');
+  const [view, dispatchView] = useReducer(logViewReducer, dataset, initialLogView);
+  const { range, search, expression, timezone, limit, columns, wrap, showHistogram } = view;
+  const editView = (patch: Partial<Omit<LogViewState, 'version' | 'dataset'>>) =>
+    dispatchView({ type: 'edit', patch });
+  const setRange = (range: LogViewState['range']) => editView({ range });
+  const setSearch = (search: string) => editView({ search });
+  const setExpression = (expression: LogFilterExpression) => {
+    setFilterNotice('');
+    editView({ expression });
+  };
+  const setTimezone = (timezone: string) => editView({ timezone });
+  const setLimit = (limit: number) => editView({ limit });
+  const setColumns = (columns: string[]) => editView({ columns });
+  const setWrap = (wrap: boolean) => editView({ wrap });
+  const setShowHistogram = (showHistogram: boolean) => editView({ showHistogram });
   // Tagged with its dataset so a timer left over from the previous dataset is ignored.
   const [debounced, setDebounced] = useState({ dataset, search: '' });
-  const [expression, setExpression] = useState<LogFilterExpression>({
-    combinator: 'and',
-    groups: [],
-  });
-  const [timezone, setTimezone] = useState('UTC');
-  const [limit, setLimit] = useState(100);
+  const [filterNotice, setFilterNotice] = useState('');
   const [revision, setRevision] = useState(0);
   const [contextRow, setContextRow] = useState<LogRecord>();
   const [shareUrl, setShareUrl] = useState('');
   const [shareStatus, setShareStatus] = useState('');
   const [linkError, setLinkError] = useState('');
-  const [columns, setColumns] = useState<string[]>();
   const [showFields, setShowFields] = useState(true);
-  const [wrap, setWrap] = useState(false);
-  const [showHistogram, setShowHistogram] = useState(true);
   const [row, setRow] = useState<LogRecord>();
   // Fields seen in the latest returned rows, kept while the next results load
   // or if they fail, so the field list does not empty out. Reset with the dataset.
@@ -71,16 +79,12 @@ export function LogsPage() {
   }, [dataset, search]);
   // Reset during render, not in an effect, so the query never runs with the
   // previous dataset's filters against the new one.
-  const [stateDataset, setStateDataset] = useState(dataset);
-  if (stateDataset !== dataset) {
-    setStateDataset(dataset);
-    setExpression({ combinator: 'and', groups: [] });
-    setColumns(undefined);
-    setSearch('');
+  if (view.dataset !== dataset) {
+    dispatchView({ type: 'resetDataset', dataset });
+    setFilterNotice('');
     setDebounced({ dataset, search: '' });
     setRow(undefined);
     setContextRow(undefined);
-    setLimit(100);
     setShareUrl('');
     setLinkError('');
     setRowFields({ fields: [] });
@@ -93,36 +97,32 @@ export function LogsPage() {
   if (link && dataset && appliedLink !== link) {
     const linked = classicLogsState(params);
     setAppliedLink(link);
-    setRange(linked.range ?? '1h');
-    setTimezone('UTC');
+    setFilterNotice('');
     setRow(undefined);
     setContextRow(undefined);
     setLinkError('');
-    setExpression({
-      combinator: 'and',
-      groups: [
-        {
-          id: createId(),
-          combinator: 'and',
-          rules: linked.filters.map((filter) => ({ ...filter, id: createId() })),
-        },
-      ],
+    dispatchView({
+      type: 'applyClassic',
+      range: linked.range ?? '1h',
+      expression: {
+        combinator: 'and',
+        groups: [
+          {
+            id: createId(),
+            combinator: 'and',
+            rules: linked.filters.map((filter) => ({ ...filter, id: createId() })),
+          },
+        ],
+      },
     });
     // A search typed before the link would narrow its results without showing why.
-    setSearch('');
     setDebounced({ dataset, search: '' });
     setDropped(linked.dropped);
   }
   const applyView = (view: LogViewState) => {
-    setRange(view.range);
-    setSearch(view.search);
+    dispatchView({ type: 'applyView', view });
     setDebounced({ dataset: view.dataset, search: view.search });
-    setExpression(view.expression);
-    setColumns(view.columns);
-    setTimezone(view.timezone);
-    setLimit(view.limit);
-    setWrap(view.wrap);
-    setShowHistogram(view.showHistogram);
+    setFilterNotice('');
     setRow(undefined);
     setContextRow(undefined);
     setDropped([]);
@@ -167,107 +167,67 @@ export function LogsPage() {
     ),
   );
   const timestampField = info.data?.timePartition || 'p_timestamp';
-  // Canonical SQL ignores empty groups and client-only IDs. Only effective query changes advance now.
-  const criteria = useMemo(() => {
+  const compiled = useMemo(() => {
     try {
       return {
-        sql: dataset
-          ? buildExplorerQuery(dataset, debouncedSearch, expression, 100, timestampField)
-          : '',
+        criteria: dataset
+          ? compileLogCriteria(dataset, debouncedSearch, expression, timestampField)
+          : undefined,
         error: '',
       };
     } catch (error) {
-      return { sql: '', error: error instanceof Error ? error.message : 'Invalid log query' };
+      return {
+        criteria: undefined,
+        error: error instanceof Error ? error.message : 'Invalid log query',
+      };
     }
   }, [dataset, debouncedSearch, expression, timestampField]);
-  const bounds = useMemo(() => timeBounds(range), [range, criteria.sql, revision]);
-  const queryPlan = useMemo(
-    () => ({
-      ...criteria,
-      sql: criteria.sql
-        ? buildExplorerQuery(dataset, debouncedSearch, expression, limit, timestampField, bounds)
-        : '',
-    }),
-    [criteria.sql, criteria.error, limit, bounds],
+  const { source, predicate, timestamp } = compiled.criteria ?? {};
+  // Stabilize by semantic SQL values: client IDs and empty groups do not trigger queries.
+  const criteria = useMemo(
+    () =>
+      source && timestamp && predicate !== undefined ? { source, predicate, timestamp } : undefined,
+    [source, predicate, timestamp],
   );
-  const sql = queryPlan.sql;
-  const ready = !!dataset && !info.loading && !linkError && !queryPlan.error;
+  // Capture now again only for a changed range, effective criteria, or explicit refresh.
+  const bounds = useMemo(() => timeBounds(range), [range, criteria, revision]);
+  const sql = useMemo(
+    () => (criteria ? buildRowsFromCriteria(criteria, limit, bounds) : ''),
+    [criteria, limit, bounds],
+  );
+  const ready = !!criteria && !info.loading && !linkError && !compiled.error;
   const results = useAsync(
     useCallback(
-      (signal) => (ready ? client.query({ sql, ...bounds }, signal) : Promise.resolve([])),
+      (signal) => (ready ? client.query({ sql, ...bounds }, signal) : Promise.resolve(undefined)),
       [client, sql, bounds, ready],
     ),
   );
   const histogram = useAsync(
     useCallback(
       async (signal) => {
-        if (!ready) return undefined;
+        if (!ready || !criteria) return undefined;
         const rows = await client.query(
           {
-            sql: buildHistogramQuery(dataset, debouncedSearch, expression, bounds, timestampField),
+            sql: buildHistogramFromCriteria(criteria, bounds),
             ...bounds,
           },
           signal,
         );
         return histogramBuckets(rows, bounds);
       },
-      [client, ready, criteria.sql, bounds],
+      [client, ready, criteria, bounds],
     ),
   );
   if (results.data && rowFields.rows !== results.data)
     setRowFields({ rows: results.data, fields: [...new Set(results.data.flatMap(Object.keys))] });
   const fields = schema.data?.length ? schema.data : rowFields.fields;
   const visibleColumns = columns ?? [timestampField].filter((f) => fields.includes(f));
-  const [filterNotice, setFilterNotice] = useState('');
   const addFilter = (filter: LogFilter) => {
-    if (
-      expression.combinator === 'or' &&
-      expression.groups.filter((g) => g.rules.length).length > 1
-    ) {
-      setFilterNotice(
-        'To narrow these OR groups, add the filter within each group, or change Match groups to All groups (AND).',
-      );
-      return;
+    try {
+      setExpression(narrowLogExpression(expression, filter, createId()));
+    } catch (error) {
+      setFilterNotice(error instanceof Error ? error.message : 'Could not add this filter.');
     }
-    if (
-      expression.combinator === 'and' &&
-      expression.groups.some(
-        (g) =>
-          (g.combinator === 'and' || g.rules.length === 1) &&
-          g.rules.some(
-            (f) =>
-              f.field === filter.field &&
-              f.operator === filter.operator &&
-              f.value === filter.value,
-          ),
-      )
-    )
-      return;
-    if (
-      expression.groups.length >= 12 ||
-      expression.groups.reduce((n, g) => n + g.rules.length, 0) >= 50
-    ) {
-      setFilterNotice('Filter limit reached. Remove a group or filter before adding another.');
-      return;
-    }
-    setFilterNotice('');
-    setExpression((current) => ({
-      ...current,
-      combinator: 'and',
-      groups: [...current.groups, { id: createId(), combinator: 'and', rules: [filter] }],
-    }));
-  };
-  const view: LogViewState = {
-    version: 1,
-    dataset,
-    range,
-    search,
-    expression,
-    columns,
-    timezone,
-    limit,
-    wrap,
-    showHistogram,
   };
   const refresh = () => setRevision((value) => value + 1);
   const share = () => {
@@ -373,7 +333,7 @@ export function LogsPage() {
                 expression={expression}
                 onChange={setExpression}
                 onClear={() => {
-                  setExpression({ combinator: 'and', groups: [] });
+                  setExpression(emptyExpression());
                   setSearch('');
                 }}
               />
@@ -411,7 +371,7 @@ export function LogsPage() {
                 value={limit}
                 onChange={(e) => setLimit(Number(e.target.value))}
               >
-                {[...new Set([100, 1000, 5000, 10000, limit])]
+                {[...new Set([100, 1000, 5000, MAX_LOG_ROWS, limit])]
                   .sort((a, b) => a - b)
                   .map((count) => (
                     <option key={count} value={count}>
@@ -438,7 +398,7 @@ export function LogsPage() {
                 </Button>
               </div>
             )}
-            {queryPlan.error && <p role="alert">{queryPlan.error}</p>}
+            {compiled.error && <p role="alert">{compiled.error}</p>}
             {filterNotice && <p role="status">{filterNotice}</p>}
             {info.error && (
               <p className="notice" role="status">
@@ -459,25 +419,22 @@ export function LogsPage() {
                 </p>
               )}
             </>
-            {showHistogram && (
+            {ready && showHistogram && (
               <section aria-label="Histogram totals">
                 <QueryState
                   loading={histogram.loading}
                   error={histogram.error}
                   retry={histogram.reload}
                 />
-                {histogram.data && (
-                  <LogHistogram
-                    rows={[]}
-                    bounds={bounds}
-                    aggregate={histogram.data}
-                    timezone={timezone}
-                  />
-                )}
+                {histogram.data && <LogHistogram aggregate={histogram.data} timezone={timezone} />}
               </section>
             )}
-            <QueryState loading={results.loading} error={results.error} retry={refresh} />
-            {!results.loading && !results.error && (
+            <QueryState
+              loading={ready && results.loading}
+              error={ready ? results.error : undefined}
+              retry={refresh}
+            />
+            {ready && !results.loading && !results.error && results.data && (
               <>
                 <div className="panel-heading result-heading">
                   <h2>

@@ -1,13 +1,17 @@
 import { useState } from 'react';
 import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight } from 'lucide-react';
-import { Badge, Button, EmptyState } from '../ui';
+import { Button, EmptyState } from '../ui';
 import type { LogRecord } from '../../lib/types';
 import { VirtualLogTable } from './VirtualLogTable';
-import { formatTimestamp } from './timezone';
-export function formatValue(value: unknown): string {
-  if (value == null) return '—';
-  return typeof value === 'object' ? JSON.stringify(value) : String(value);
-}
+import {
+  formatValue,
+  orderLogRows,
+  columnLabel,
+  cellClassName,
+  LogCellContent,
+  type LogTableSort,
+} from './logTable';
+export { formatValue } from './logTable';
 export function exportRecords(rows: LogRecord[], format: 'json' | 'csv') {
   const fields = [...new Set(rows.flatMap(Object.keys))];
   // Prefix spreadsheet formulas in CSV so exported log text remains data.
@@ -56,7 +60,7 @@ export function DataTable({
   timestampField?: string;
 }) {
   const [page, setPage] = useState(0);
-  const [sort, setSort] = useState<{ field: string; descending: boolean }>();
+  const [sort, setSort] = useState<LogTableSort>();
   if (virtualized)
     return (
       <VirtualLogTable
@@ -73,17 +77,7 @@ export function DataTable({
   const pageSize = 25;
   const effectivePage = Math.min(page, Math.max(0, Math.ceil(rows.length / pageSize) - 1));
   const fields = columns || [...new Set(rows.flatMap(Object.keys))];
-  const ordered = sort
-    ? [...rows].sort((a, b) => {
-        const left = a[sort.field],
-          right = b[sort.field];
-        const result =
-          typeof left === 'number' && typeof right === 'number'
-            ? left - right
-            : formatValue(left).localeCompare(formatValue(right), undefined, { numeric: true });
-        return sort.descending ? -result : result;
-      })
-    : rows;
+  const ordered = orderLogRows(rows, sort);
   if (!rows.length)
     return (
       <EmptyState
@@ -107,13 +101,7 @@ export function DataTable({
                 <th
                   scope="col"
                   key={field}
-                  aria-label={
-                    field === timestampField
-                      ? summary && timestampField === 'p_timestamp'
-                        ? `Ingestion Time (${timezone})`
-                        : `Timestamp (${timezone})`
-                      : field
-                  }
+                  aria-label={columnLabel(field, timestampField, timezone, summary)}
                   aria-sort={
                     sort?.field === field ? (sort.descending ? 'descending' : 'ascending') : 'none'
                   }
@@ -129,11 +117,7 @@ export function DataTable({
                       setPage(0);
                     }}
                   >
-                    {field === timestampField
-                      ? summary && timestampField === 'p_timestamp'
-                        ? `Ingestion Time (${timezone})`
-                        : `Timestamp (${timezone})`
-                      : field}
+                    {columnLabel(field, timestampField, timezone, summary)}
                     {sort?.field === field ? (
                       sort.descending ? (
                         <ArrowDown size={12} />
@@ -172,38 +156,27 @@ export function DataTable({
                   {fields.map((field) => (
                     <td
                       key={field}
-                      className={field === 'message' ? 'message-cell' : 'mono'}
+                      className={cellClassName(field)}
                       title={formatValue(row[field])}
                     >
-                      {field === 'level' ? (
-                        <Badge
-                          tone={
-                            String(row[field]).toLowerCase() === 'error'
-                              ? 'danger'
-                              : String(row[field]).toLowerCase() === 'warn'
-                                ? 'warning'
-                                : 'success'
-                          }
-                        >
-                          {formatValue(row[field])}
-                        </Badge>
-                      ) : field === timestampField ? (
-                        formatTimestamp(row[field], timezone)
-                      ) : (
-                        formatValue(row[field])
-                      )}
+                      <LogCellContent
+                        row={row}
+                        field={field}
+                        fields={fields}
+                        timestampField={timestampField}
+                        timezone={timezone}
+                      />
                     </td>
                   ))}
                   {summary && (
                     <td className="mono log-data-cell">
-                      {Object.entries(row)
-                        .filter(([key]) => !fields.includes(key))
-                        .map(([key, value]) => (
-                          <span className="log-data-pair" key={key}>
-                            <span className="log-data-key">{key}</span>=
-                            <span>{formatValue(value)}</span>{' '}
-                          </span>
-                        ))}
+                      <LogCellContent
+                        row={row}
+                        field={null}
+                        fields={fields}
+                        timestampField={timestampField}
+                        timezone={timezone}
+                      />
                     </td>
                   )}
                 </tr>

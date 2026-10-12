@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, createClient } from './client';
 import { createDemoClient, createDemoRecords } from './demo';
-import { demoLogContext, logContextResponse, savedLogView } from './logsContract';
+import { logContextResponse, savedLogView } from './logsContract';
+import { demoLogContext } from './demoLogs';
 import type { LogContextRequest, SavedLogView } from './logsContract';
 
 afterEach(() => {
@@ -90,6 +91,14 @@ describe('saved view HTTP contract', () => {
     await expect(
       method === 'create' ? client.createLogView(body) : client.updateLogView('id', body),
     ).rejects.toBeInstanceOf(ApiError);
+  });
+  it('validates optional explorer state while retaining classic metadata', () => {
+    for (const explorer_state of [undefined, null, 'encoded'])
+      expect(savedLogView({ ...body, explorer_state, classic_metadata: { anything: true } })).toBe(
+        true,
+      );
+    for (const explorer_state of [false, 1, {}, []])
+      expect(savedLogView({ ...body, explorer_state })).toBe(false);
   });
   it('validates nested builder rules without losing opaque metadata', () => {
     const builder = {

@@ -82,6 +82,7 @@ export type SavedLogView = {
     filter_query?: string | null;
     filter_builder?: SavedLogViewBuilder | null;
   };
+  explorer_state?: string | null;
   time_filter?: { from: string; to: string } | null;
   [key: string]: unknown;
 };

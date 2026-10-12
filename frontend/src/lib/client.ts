@@ -15,16 +15,8 @@ import type {
   PromqlMetadataRequest,
 } from './types';
 
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    public readonly status: number,
-    public readonly detail?: unknown,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
-}
+export { ApiError } from './apiError';
+import { ApiError } from './apiError';
 
 export function promqlErrorType(error: unknown): string | undefined {
   return error instanceof ApiError &&

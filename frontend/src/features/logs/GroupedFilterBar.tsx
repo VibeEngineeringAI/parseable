@@ -2,12 +2,18 @@ import { useState, type FormEvent } from 'react';
 import { Plus, Search, X } from 'lucide-react';
 import { Button, Dialog, Input, Select } from '../../components/ui';
 import { createId } from '../../lib/ids';
-import type { LogFilterExpression, LogFilterGroup } from '../../lib/logQuery';
+import {
+  MAX_FILTER_GROUPS,
+  MAX_FILTER_RULES,
+  ruleCount,
+  sameRule,
+  addGroupRule,
+  type LogFilterExpression,
+  type LogFilterGroup,
+} from '../../lib/logFilters';
 import type { LogFilter } from '../../lib/types';
 import './grouped-filter-bar.css';
 
-const MAX_GROUPS = 12;
-const MAX_RULES = 50;
 type Draft = { groupId?: string; rule?: LogFilter };
 
 export function GroupedFilterBar({
@@ -30,9 +36,9 @@ export function GroupedFilterBar({
   const [operator, setOperator] = useState<LogFilter['operator']>('=');
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
-  const ruleCount = expression.groups.reduce((count, group) => count + group.rules.length, 0);
-  const groupLimit = expression.groups.length >= MAX_GROUPS;
-  const ruleLimit = ruleCount >= MAX_RULES;
+  const count = ruleCount(expression);
+  const groupLimit = expression.groups.length >= MAX_FILTER_GROUPS;
+  const ruleLimit = count >= MAX_FILTER_RULES;
   // Retain a saved field even when it is absent from the currently returned schema.
   const availableFields = [...new Set([...fields, ...(draft?.rule ? [draft.rule.field] : [])])];
   const selected = availableFields.includes(field) ? field : availableFields[0] || '';
@@ -66,34 +72,31 @@ export function GroupedFilterBar({
     }
     if (
       !draft.rule &&
-      group?.rules.some(
-        (rule) => rule.field === selected && rule.operator === operator && rule.value === value,
-      )
+      group?.rules.some((rule) => sameRule(rule, { field: selected, operator, value }))
     ) {
       setDraft(undefined);
       return;
     }
     if (!draft.rule && ruleLimit) {
-      setError('You can use up to 50 filters. Remove a filter before adding another.');
+      setError(
+        `You can use up to ${MAX_FILTER_RULES} filters. Remove a filter before adding another.`,
+      );
       return;
     }
     if (!group && groupLimit) {
-      setError('You can use up to 12 groups. Remove a group before adding another.');
+      setError(
+        `You can use up to ${MAX_FILTER_GROUPS} groups. Remove a group before adding another.`,
+      );
       return;
     }
     const rule: LogFilter = { id: draft.rule?.id || createId(), field: selected, operator, value };
-    if (group) {
+    if (group && draft.rule) {
       updateGroup(group.id, (current) => ({
         ...current,
-        rules: draft.rule
-          ? current.rules.map((item) => (item.id === rule.id ? rule : item))
-          : [...current.rules, rule],
+        rules: current.rules.map((item) => (item.id === rule.id ? rule : item)),
       }));
     } else {
-      onChange({
-        ...expression,
-        groups: [...expression.groups, { id: createId(), combinator: 'and', rules: [rule] }],
-      });
+      onChange(addGroupRule(expression, rule, group?.id ?? createId()));
     }
     setDraft(undefined);
   }
@@ -233,8 +236,10 @@ export function GroupedFilterBar({
       )}
       {(groupLimit || ruleLimit || !fields.length) && (
         <p className="grouped-filter-hint" role="status">
-          {groupLimit && 'Group limit reached (12). Remove a group to add another. '}
-          {ruleLimit && 'Filter limit reached (50). Remove a filter to add another. '}
+          {groupLimit &&
+            `Group limit reached (${MAX_FILTER_GROUPS}). Remove a group to add another. `}
+          {ruleLimit &&
+            `Filter limit reached (${MAX_FILTER_RULES}). Remove a filter to add another. `}
           {!fields.length && 'Fields are not available yet. Load a dataset to add filters.'}
         </p>
       )}

@@ -2,8 +2,14 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { Button, EmptyState } from '../ui';
 import type { LogRecord } from '../../lib/types';
-import { formatValue } from './DataTable';
-import { formatTimestamp } from './timezone';
+import {
+  orderLogRows,
+  columnLabel,
+  cellText,
+  cellClassName,
+  LogCellContent,
+  type LogTableSort,
+} from './logTable';
 import { virtualWindow } from './virtualWindow';
 import './virtual-log-table.css';
 
@@ -31,26 +37,12 @@ export function VirtualLogTable({
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({ top: 0, left: 0, width: 960, height: 480 });
-  const [sort, setSort] = useState<{ field: string; descending: boolean }>();
+  const [sort, setSort] = useState<LogTableSort>();
   const [focusedRow, setFocusedRow] = useState<number>();
   const pendingFocus = useRef<number | undefined>(undefined);
   const fields = useMemo(() => columns ?? [...new Set(rows.flatMap(Object.keys))], [columns, rows]);
   const displayFields = useMemo(() => (summary ? [...fields, null] : fields), [fields, summary]);
-  const ordered = useMemo(
-    () =>
-      sort
-        ? [...rows].sort((a, b) => {
-            const left = a[sort.field],
-              right = b[sort.field];
-            const result =
-              typeof left === 'number' && typeof right === 'number'
-                ? left - right
-                : formatValue(left).localeCompare(formatValue(right), undefined, { numeric: true });
-            return sort.descending ? -result : result;
-          })
-        : rows,
-    [rows, sort],
-  );
+  const ordered = useMemo(() => orderLogRows(rows, sort), [rows, sort]);
   useEffect(() => {
     const node = viewport.current;
     if (!node) return;
@@ -105,12 +97,7 @@ export function VirtualLogTable({
   if (focusedRow !== undefined && focusedRow < rows.length && !rowIndices.includes(focusedRow))
     rowIndices.push(focusedRow);
   const width = Math.max(position.width, detailWidth + displayFields.length * COLUMN_WIDTH);
-  const label = (field: string | null) =>
-    field === null
-      ? 'Data'
-      : field === timestampField
-        ? `${summary && timestampField === 'p_timestamp' ? 'Ingestion Time' : 'Timestamp'} (${timezone})`
-        : field;
+  const label = (field: string | null) => columnLabel(field, timestampField, timezone, summary);
   if (!rows.length)
     return (
       <EmptyState
@@ -255,29 +242,27 @@ export function VirtualLogTable({
                   </div>
                 )}
                 {visibleFields.map((field, columnIndex) => {
-                  const value =
-                    field === null
-                      ? Object.entries(row)
-                          .filter(([key]) => !fields.includes(key))
-                          .map(([key, value]) => `${key}=${formatValue(value)}`)
-                          .join(' ')
-                      : field === timestampField
-                        ? formatTimestamp(row[field], timezone)
-                        : formatValue(row[field]);
+                  const value = cellText(row, field, fields, timestampField, timezone);
                   return (
                     <div
                       role="cell"
                       aria-colindex={columnWindow.start + columnIndex + 1 + (onSelect ? 1 : 0)}
                       key={columnWindow.start + columnIndex}
                       title={value}
-                      className={`virtual-log-cell mono ${wrap ? 'virtual-log-wrap' : ''}`}
+                      className={`virtual-log-cell ${cellClassName(field)} ${wrap ? 'virtual-log-wrap' : ''}`}
                       style={{
                         left: detailWidth + (columnWindow.start + columnIndex) * COLUMN_WIDTH,
                         width: COLUMN_WIDTH,
                         height: rowHeight,
                       }}
                     >
-                      {value}
+                      <LogCellContent
+                        row={row}
+                        field={field}
+                        fields={fields}
+                        timestampField={timestampField}
+                        timezone={timezone}
+                      />
                     </div>
                   );
                 })}

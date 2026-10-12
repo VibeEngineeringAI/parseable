@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bookmark } from 'lucide-react';
 import { Button, Dialog, Input, Select } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
@@ -97,8 +97,21 @@ export function SavedViews({
       [client, open],
     ),
   );
-  const available = (views.data ?? []).filter((view) => view.stream_name === state.dataset);
-  const view = available.find((item) => item.filter_id === selected);
+  const available = useMemo(
+    () =>
+      (views.data ?? [])
+        .filter((view) => view.stream_name === state.dataset)
+        .map((view) => {
+          try {
+            return { view, decoded: savedLogViewState(view) };
+          } catch {
+            return { view, decoded: undefined };
+          }
+        }),
+    [views.data, state.dataset],
+  );
+  const selectedView = available.find((item) => item.view.filter_id === selected);
+  const view = selectedView?.view;
   const owned = ownsSavedLogView(view, ownerHash.data, mode === 'demo');
   async function mutate(action: 'create' | 'update' | 'delete') {
     const requestGeneration = generation.current;
@@ -121,7 +134,8 @@ export function SavedViews({
           );
         if (action === 'update') {
           // Classic views remain readable in the list but are never overwritten.
-          savedLogViewState(view);
+          if (!selectedView?.decoded)
+            throw new Error('This saved view cannot be overwritten here.');
           await client.updateLogView(
             view.filter_id,
             savedLogViewBody(state, name, view, timestampField),
@@ -142,13 +156,7 @@ export function SavedViews({
       if (requestGeneration === generation.current) setBusy(false);
     }
   }
-  const compatible = (() => {
-    try {
-      return !!view && !!savedLogViewState(view);
-    } catch {
-      return false;
-    }
-  })();
+  const compatible = !!selectedView?.decoded;
   return (
     <>
       <Button variant="secondary" onClick={() => setOpen(true)}>
@@ -178,31 +186,23 @@ export function SavedViews({
               onChange={(event) => {
                 const id = event.target.value;
                 setSelected(id);
-                setName(available.find((item) => item.filter_id === id)?.filter_name ?? '');
+                setName(
+                  available.find((item) => item.view.filter_id === id)?.view.filter_name ?? '',
+                );
                 setError('');
                 setNotice('');
               }}
             >
               <option value="">New view</option>
               {available
-                .filter((item) => item.filter_id)
-                .map((item) => {
-                  let legacy = false;
-                  try {
-                    savedLogViewState(item);
-                  } catch {
-                    legacy = true;
-                  }
-                  return (
-                    <option key={item.filter_id} value={item.filter_id ?? ''}>
-                      {item.filter_name}
-                      {legacy ? ' (classic or incompatible)' : ''}
-                      {!ownsSavedLogView(item, ownerHash.data, mode === 'demo')
-                        ? ' (read only)'
-                        : ''}
-                    </option>
-                  );
-                })}
+                .filter(({ view }) => view.filter_id)
+                .map(({ view: item, decoded }) => (
+                  <option key={item.filter_id} value={item.filter_id ?? ''}>
+                    {item.filter_name}
+                    {!decoded ? ' (classic or incompatible)' : ''}
+                    {!ownsSavedLogView(item, ownerHash.data, mode === 'demo') ? ' (read only)' : ''}
+                  </option>
+                ))}
             </Select>
           </label>
           {view && !compatible && (
@@ -235,7 +235,8 @@ export function SavedViews({
               onClick={() => {
                 if (!view) return;
                 try {
-                  onApply(savedLogViewState(view));
+                  if (!selectedView?.decoded) return;
+                  onApply(selectedView.decoded);
                   setOpen(false);
                 } catch (cause) {
                   setError(cause instanceof Error ? cause.message : String(cause));

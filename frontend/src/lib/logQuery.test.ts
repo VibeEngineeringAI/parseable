@@ -86,3 +86,22 @@ it('ignores empty groups and validates aggregate data and expression limits', ()
     }),
   ).toThrow('Too many');
 });
+it('keeps ordinary demo query limits while aggregate inputs scan all rows', () => {
+  const rows = Array.from({ length: 257 }, () => ({
+    p_timestamp: bounds.startTime,
+    message: 'ok',
+  }));
+  expect(executeDemoQuery({ sql: 'SELECT * FROM application_logs', ...bounds }, rows)).toHaveLength(
+    100,
+  );
+  expect(
+    executeDemoQuery({ sql: 'SELECT COUNT(*) AS total FROM application_logs', ...bounds }, rows),
+  ).toEqual([{ total: 257 }]);
+});
+it('returns the exact bounds and rounded interval for histogram rendering', () => {
+  const uneven = { startTime: bounds.startTime, endTime: '2026-10-06T00:00:01.001Z' };
+  const aggregate = histogramBuckets([], uneven);
+  expect(aggregate.start).toBe(Date.parse(uneven.startTime));
+  expect(aggregate.end).toBe(Date.parse(uneven.endTime));
+  expect(aggregate.interval).toBe(21);
+});

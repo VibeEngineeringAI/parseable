@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ownsSavedLogView, savedLogViewBody, savedLogViewState } from './SavedViews';
+import { canShowContext, contextField } from './LogContext';
 import type { LogViewState } from './logViewState';
 
 const state: LogViewState = {
@@ -57,5 +58,21 @@ describe('server saved views', () => {
       from: range.startTime,
       to: range.endTime,
     });
+  });
+});
+
+describe('context anchor fields', () => {
+  it('uses the first string field and skips nonstring values', () => {
+    const row = {
+      p_timestamp: '2026-10-12T10:00:00Z',
+      message: { nested: true },
+      body: 'body',
+      log: 'log',
+    };
+    expect(contextField(row)).toBe('body');
+    expect(canShowContext(row)).toBe(true);
+    expect(contextField({ ...row, message: '' })).toBe('message');
+    expect(contextField({ ...row, body: 1, log: null })).toBeUndefined();
+    expect(canShowContext({ ...row, p_timestamp: 'invalid' })).toBe(false);
   });
 });

@@ -2,6 +2,14 @@
 
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
+## Logs explorer quality follow-up (2026-10-12)
+
+Opus 5.5's quality review identified false empty results when queries were blocked and stale filter notices. Both are fixed. The follow-up centralizes persisted explorer state in a reducer and shares compiled criteria between row and histogram queries while preserving captured bounds. Shared filter helpers keep group additions distinct from whole-expression narrowing. Both table modes now share sorting, labels, summary formatting and severity badges; histogram rendering consumes the aggregate's exact geometry. Demo implementations are separated from transport guards, saved-view metadata is typed and decoded once per response, and context-field selection is consistent. Ordinary demo SQL retains its 100-row default; aggregate inputs remain unlimited.
+
+Final Opus 5.5 review approved the changes with no blockers and confirmed all prior findings were addressed. Its optional observations were a metadata-loading indicator, defensive handling of the filter helper, minor Apply-handler simplification and additional direct time-window tests. These are not required for the reviewed fixes; existing guards and browser regression tests cover the affected behavior. Server timestamp, shared-view instant and timezone wall-clock validators remain distinct because they accept different contracts.
+
+Verification: formatting, TypeScript and production build pass; **2,026 unit tests across 78 files**, **424 application tests** (2 optional screenshot tests skipped), and **16 production tests** pass. All **103 Storybook tests** pass in `mcr.microsoft.com/playwright:v1.63.0-noble`, including unchanged visual baselines. Six new application regressions cover blocked queries and clearing notices after AND, clear, apply and dataset transitions. Earlier live-server evidence below belongs to the original feature validation; the follow-up reused the query contracts and did not repeat live-server mutation checks.
+
 ## Logs explorer depth (2026-10-12, completed)
 
 Implemented on `feat/logs-explorer-depth` from `origin/main` `ee740826`. The [Mayfly plan](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=534c288c-5c54-430d-ad15-d742c972c579#J63UryiLZKvb1G5vnY7RVQhXPDhXy-GpIhjXiCB_TzM) was published before implementation; [completion evidence](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=d7edadf0-77c8-4546-9df6-de946f9b0932#J63UryiLZKvb1G5vnY7RVQhXPDhXy-GpIhjXiCB_TzM) is recorded in the same shared wiki. Six Sol 6.1 workstreams and three Opus 5.5 reviews covered implementation and integration. The final Opus review found no actionable findings or remaining blockers.
