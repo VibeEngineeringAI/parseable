@@ -1,0 +1,64 @@
+.agents-page {
+  min-width: 0;
+}
+.agents-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0;
+}
+.agents-controls .input {
+  max-width: 320px;
+}
+.agents-note {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.agents-panel {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 16px;
+  min-width: 0;
+}
+.agents-table-scroll {
+  overflow-x: auto;
+}
+.agents-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.agents-table th,
+.agents-table td {
+  padding: 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  max-width: 240px;
+  overflow-wrap: anywhere;
+}
+.agents-table th {
+  color: var(--muted);
+  font-weight: 500;
+}
+.agents-record {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.6;
+}
+@media (max-width: 600px) {
+  .agents-controls > .select,
+  .agents-controls > .input {
+    width: 100%;
+    max-width: none;
+  }
+  .agents-table {
+    min-width: 720px;
+  }
+  .agents-panel {
+    padding: 12px;
+  }
+}

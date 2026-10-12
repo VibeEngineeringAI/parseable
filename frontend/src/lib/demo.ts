@@ -1,3 +1,5 @@
+import { decodeAlertTargetPolicy, emptyAlertTargetPolicy } from './networkPolicy';
+import { demoClusterNodes, demoClusterMetrics } from './clusterDemo';
 import type {
   ApiKey,
   Dataset,
@@ -341,6 +343,7 @@ function evaluateDemoQuery(
 }
 
 export function createDemoClient(): ParseableClient {
+  let networkPolicy = emptyAlertTargetPolicy();
   const fixtureTime = Date.now();
   const records = createDemoRecords(fixtureTime - 1_000);
   const traceRows = createDemoTraceRecords(fixtureTime);
@@ -516,6 +519,23 @@ export function createDemoClient(): ParseableClient {
     ...metrics,
     ...alerts,
     ...dashboards,
+    async getAlertTargetPolicy(signal) {
+      await ready(signal);
+      return structuredClone(networkPolicy);
+    },
+    async putAlertTargetPolicy(policy) {
+      await ready();
+      networkPolicy = decodeAlertTargetPolicy(policy);
+      return structuredClone(networkPolicy);
+    },
+    async clusterNodes(signal) {
+      await ready(signal);
+      return structuredClone(demoClusterNodes);
+    },
+    async clusterMetrics(signal) {
+      await ready(signal);
+      return structuredClone(demoClusterMetrics);
+    },
     async about(signal) {
       await ready(signal);
       return {

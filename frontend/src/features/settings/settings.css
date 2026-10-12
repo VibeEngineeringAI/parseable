@@ -1,0 +1,62 @@
+.settings-capability-page {
+  max-width: 1120px;
+}
+.settings-demo-notice {
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+}
+.settings-scope-note {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  line-height: 1.6;
+}
+.settings-related {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  padding: 16px 0;
+}
+.settings-related a {
+  font-size: 13px;
+}
+.network-policy-fields {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  display: grid;
+  gap: 12px;
+}
+.network-policy-fields legend {
+  padding: 0 8px;
+  font-weight: 600;
+}
+.network-policy-list {
+  display: grid;
+  gap: 8px;
+}
+.network-policy-list textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 96px;
+  padding: 10px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+}
+.network-policy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+}
+.network-policy-error {
+  border: 1px solid var(--border);
+  padding: 16px;
+  border-radius: 8px;
+  margin: 16px 0;
+}

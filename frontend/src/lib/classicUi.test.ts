@@ -49,19 +49,19 @@ describe('classic routes opened here', () => {
     ['/traces/explore/spans', 'same', '/traces/explore/spans'],
     ['/apm/otel', 'same', '/apm/otel'],
     ['/apm/otel/checkout.api', 'same', '/apm/otel/checkout.api'],
-    ['/agents', 'classic-only', '/agents'],
-    ['/agents/app', 'classic-only', '/agents/app'],
-    ['/keystone', 'classic-only', '/keystone'],
-    ['/keystone/k1', 'classic-only', '/keystone/k1'],
-    ['/settings/llm-key', 'classic-only', '/settings/llm-key'],
+    ['/agents', 'limited', '/agents'],
+    ['/agents/app', 'limited', '/agents/app'],
+    ['/keystone', 'limited', '/keystone'],
+    ['/keystone/k1', 'limited', '/keystone/k1'],
+    ['/settings/llm-key', 'limited', '/settings/llm-key'],
     ['/settings/billing', 'classic-only', '/settings/billing'],
-    ['/settings/network-access', 'classic-only', '/settings/network-access'],
+    ['/settings/network-access', 'limited', '/settings/network-access'],
     ['/add-data', 'same', '/add-data'],
-    ['/cluster', 'classic-only', '/cluster'],
-    ['/onboarding', 'classic-only', '/onboarding'],
-    ['/new', 'classic-only', '/new'],
-    ['/errors', 'classic-only', '/errors'],
-    ['/errors/app', 'classic-only', '/errors/app'],
+    ['/cluster', 'limited', '/cluster'],
+    ['/onboarding', 'limited', '/onboarding'],
+    ['/new', 'limited', '/new'],
+    ['/errors', 'limited', '/errors'],
+    ['/errors/app', 'limited', '/errors/app'],
     ['/no-access', 'classic-only', '/no-access'],
     ['/post-auth', 'classic-only', '/post-auth'],
     ['/sso-callback', 'classic-only', '/sso-callback'],
@@ -118,6 +118,11 @@ describe('classic routes opened here', () => {
   it('is not a classic page when the classic router has no such route', () => {
     for (const path of ['/logs', '/metrics', '/components', '/oidc-not-configured', '/device'])
       expect(classicRoute(path)).toBeUndefined();
+  });
+
+  it('preserves limited-route query bytes without an unnecessary redirect', () => {
+    const path = '/agents/my%20dataset?query=hello%20world&flag#details';
+    expect(nativePath(path)).toBe(path);
   });
 
   it('keeps the query and hash of a redirected link', () => {

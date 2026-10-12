@@ -17,6 +17,11 @@ import {
   Workflow,
   Network,
   Import,
+  Bot,
+  CircleAlert,
+  Server,
+  Shield,
+  ListChecks,
 } from 'lucide-react';
 import { Button, Badge } from '../components/ui';
 import { useApp } from './AppProvider';
@@ -36,6 +41,8 @@ const groups = [
       { to: '/metrics', label: 'Metrics', id: 'metrics', icon: ChartLine },
       { to: '/traces', label: 'Traces', id: 'traces', icon: Workflow },
       { to: '/apm', label: 'APM', id: 'apm', icon: Network },
+      { to: '/agents', label: 'Agents', id: 'agents', icon: Bot },
+      { to: '/errors', label: 'Errors', id: 'errors', icon: CircleAlert },
       { to: '/alerts', label: 'Alerts', id: 'alerts', icon: Bell },
     ],
   },
@@ -43,12 +50,22 @@ const groups = [
     label: 'Data',
     links: [
       { to: '/datasets', label: 'Datasets', id: 'datasets', icon: Database },
+      { to: '/onboarding', label: 'Get started', id: 'onboarding', icon: ListChecks },
       { to: '/add-data', label: 'Add data', id: 'add-data', icon: Import },
     ],
   },
   {
     label: 'Admin',
-    links: [{ to: '/team', label: 'Team', id: 'team', icon: UsersRound }],
+    links: [
+      { to: '/team', label: 'Team', id: 'team', icon: UsersRound },
+      { to: '/cluster', label: 'Cluster', id: 'cluster', icon: Server },
+      {
+        to: '/settings/network-access',
+        label: 'Network access',
+        id: 'network-access',
+        icon: Shield,
+      },
+    ],
   },
   {
     label: 'Develop',

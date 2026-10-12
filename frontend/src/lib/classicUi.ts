@@ -10,9 +10,10 @@ export const classicUiAvailable = basePath !== '';
  * How a classic URL opens here:
  * - `same`: the same path shows the equivalent page.
  * - `redirect`: the page lives at another path.
+ * - `limited`: a native page exposes a subset or explains unavailable capabilities.
  * - `classic-only`: this frontend has no such page.
  */
-export type ClassicRouteKind = 'same' | 'redirect' | 'classic-only';
+export type ClassicRouteKind = 'same' | 'redirect' | 'limited' | 'classic-only';
 
 export type ClassicRoute = {
   /** Classic path; `:name` matches one segment. */
@@ -74,19 +75,19 @@ export const classicRoutes: readonly ClassicRoute[] = [
   { classic: '/traces/explore/:dataset', native: '/traces/explore/:dataset', kind: 'same' },
   { classic: '/apm/:dataset', native: '/apm/:dataset', kind: 'same' },
   { classic: '/apm/:dataset/:service', native: '/apm/:dataset/:service', kind: 'same' },
-  { classic: '/agents', kind: 'classic-only' },
-  { classic: '/agents/:dataset', kind: 'classic-only' },
-  { classic: '/keystone', kind: 'classic-only' },
-  { classic: '/keystone/:id', kind: 'classic-only' },
-  { classic: '/settings/llm-key', kind: 'classic-only' },
+  { classic: '/agents', native: '/agents', kind: 'limited' },
+  { classic: '/agents/:dataset', native: '/agents/:dataset', kind: 'limited' },
+  { classic: '/keystone', native: '/keystone', kind: 'limited' },
+  { classic: '/keystone/:id', native: '/keystone/:id', kind: 'limited' },
+  { classic: '/settings/llm-key', native: '/settings/llm-key', kind: 'limited' },
   { classic: '/settings/billing', kind: 'classic-only' },
-  { classic: '/settings/network-access', kind: 'classic-only' },
+  { classic: '/settings/network-access', native: '/settings/network-access', kind: 'limited' },
   { classic: '/add-data', native: '/add-data', kind: 'same' },
-  { classic: '/cluster', kind: 'classic-only' },
-  { classic: '/onboarding', kind: 'classic-only' },
-  { classic: '/new', kind: 'classic-only' },
-  { classic: '/errors', kind: 'classic-only' },
-  { classic: '/errors/:dataset', kind: 'classic-only' },
+  { classic: '/cluster', native: '/cluster', kind: 'limited' },
+  { classic: '/onboarding', native: '/onboarding', kind: 'limited' },
+  { classic: '/new', native: '/new', kind: 'limited' },
+  { classic: '/errors', native: '/errors', kind: 'limited' },
+  { classic: '/errors/:dataset', native: '/errors/:dataset', kind: 'limited' },
   { classic: '/no-access', kind: 'classic-only' },
   { classic: '/post-auth', kind: 'classic-only' },
   { classic: '/sso-callback', kind: 'classic-only' },
@@ -142,7 +143,7 @@ export function classicRoute(pathname: string): ClassicRoute | undefined {
 export function nativePath(path: string): string {
   const { pathname, search, hash } = splitPath(path);
   const found = bestMatch('classic', pathname);
-  if (!found?.route.native || found.route.kind === 'same') return path;
+  if (!found?.route.native || found.route.native === found.route.classic) return path;
   if (found.route.params) {
     const decoded: Record<string, string> = {};
     for (const [name, value] of Object.entries(found.captures)) {

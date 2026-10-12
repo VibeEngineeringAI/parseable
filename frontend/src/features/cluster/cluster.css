@@ -1,0 +1,30 @@
+.cluster-nodes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  gap: 16px;
+}
+.cluster-node {
+  padding: 20px;
+  min-width: 0;
+}
+.cluster-node h2 {
+  margin: 0;
+  text-transform: capitalize;
+  font-size: 16px;
+}
+.cluster-address,
+.cluster-node dd {
+  overflow-wrap: anywhere;
+}
+.cluster-node dl {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(0, 2fr);
+  gap: 12px;
+  font-size: 13px;
+}
+.cluster-node dt {
+  color: var(--color-muted);
+}
+.cluster-node dd {
+  margin: 0;
+}

@@ -1,0 +1,59 @@
+.onboarding-page {
+  max-width: 1080px;
+}
+.setup-guide {
+  display: grid;
+  gap: 18px;
+}
+.setup-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+  padding: 24px;
+}
+.setup-step > svg {
+  flex-shrink: 0;
+  color: var(--color-primary);
+  margin-top: 4px;
+}
+.setup-step > div {
+  min-width: 0;
+  flex: 1;
+}
+.setup-step h2 {
+  font-size: 18px;
+  margin: 0 0 10px;
+}
+.setup-step p {
+  line-height: 1.6;
+  margin: 0 0 16px;
+}
+.setup-step .inline {
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.setup-step .inline + p {
+  margin-top: 18px;
+}
+.setup-datasets {
+  list-style: none;
+  margin: 0 0 20px;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.setup-datasets li {
+  overflow-wrap: anywhere;
+}
+.setup-datasets a {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+@media (max-width: 600px) {
+  .setup-step {
+    padding: 18px;
+    gap: 12px;
+  }
+}
