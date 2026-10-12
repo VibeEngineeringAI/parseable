@@ -1,12 +1,14 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Clock, CalendarDays } from 'lucide-react';
 import { Button, Dialog, Input, Select } from '../ui';
 import { timeBounds } from '../../lib/query';
 import type { TimeRange } from '../../lib/types';
+import { formatWallTime, isValidTimezone, resolveTimezone, resolveWallTime } from './timezone';
 export function TimeRangePicker({
   value,
   onChange,
   disabled = false,
+  timezone = 'UTC',
   presets = [
     { value: '15m', label: 'Last 15 minutes' },
     { value: '1h', label: 'Last 1 hour' },
@@ -18,6 +20,7 @@ export function TimeRangePicker({
   value: TimeRange;
   onChange: (value: TimeRange) => void;
   disabled?: boolean;
+  timezone?: string;
   presets?: ReadonlyArray<{ value: Extract<TimeRange, string>; label: string }>;
 }) {
   // A preset outside the list, such as one from a classic link, is still shown.
@@ -29,10 +32,31 @@ export function TimeRangePicker({
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [error, setError] = useState('');
+  const [dialogTimezone, setDialogTimezone] = useState('UTC');
+  const [original, setOriginal] = useState({ startTime: '', endTime: '' });
+  const [fromEdited, setFromEdited] = useState(false);
+  const [toEdited, setToEdited] = useState(false);
+  const [fromOccurrence, setFromOccurrence] = useState('');
+  const [toOccurrence, setToOccurrence] = useState('');
+  const fromResult = useMemo(
+    () => resolveWallTime(from, dialogTimezone, fromEdited ? undefined : original.startTime),
+    [from, dialogTimezone, original.startTime, fromEdited],
+  );
+  const toResult = useMemo(
+    () => resolveWallTime(to, dialogTimezone, toEdited ? undefined : original.endTime),
+    [to, dialogTimezone, original.endTime, toEdited],
+  );
   const begin = () => {
     const bounds = timeBounds(value);
-    setFrom(bounds.startTime.slice(0, 19));
-    setTo(bounds.endTime.slice(0, 19));
+    const zone = isValidTimezone(timezone) ? resolveTimezone(timezone) : 'UTC';
+    setDialogTimezone(zone);
+    setOriginal(typeof value === 'string' ? bounds : value);
+    setFromEdited(false);
+    setToEdited(false);
+    setFrom(formatWallTime(bounds.startTime, zone));
+    setTo(formatWallTime(bounds.endTime, zone));
+    setFromOccurrence('');
+    setToOccurrence('');
     setError('');
     setOpen(true);
   };
@@ -67,21 +91,37 @@ export function TimeRangePicker({
         open={open}
         onOpenChange={setOpen}
         title="Time range"
-        description="Choose a start and end time in UTC."
+        description={`Choose a start and end time in ${dialogTimezone}.`}
       >
         <form
           className="stack"
           onSubmit={(e) => {
             e.preventDefault();
-            const start = Date.parse(`${from}Z`),
-              end = Date.parse(`${to}Z`);
-            if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) {
+            if (fromResult.status === 'invalid' || toResult.status === 'invalid') {
+              setError('Enter a valid start and end time.');
+              return;
+            }
+            if (fromResult.status === 'nonexistent' || toResult.status === 'nonexistent') {
+              setError(
+                `This time does not exist in ${dialogTimezone} because the clocks move forward. Choose another time.`,
+              );
+              return;
+            }
+            const start = fromResult.status === 'valid' ? fromResult.instant : fromOccurrence;
+            const end = toResult.status === 'valid' ? toResult.instant : toOccurrence;
+            if (!start || !end) {
+              setError(
+                'This time occurs twice because the clocks move back. Choose the earlier or later occurrence.',
+              );
+              return;
+            }
+            if (Date.parse(start) >= Date.parse(end)) {
               setError('From must be before To.');
               return;
             }
             onChange({
-              startTime: new Date(start).toISOString(),
-              endTime: new Date(end).toISOString(),
+              startTime: start,
+              endTime: end,
             });
             setOpen(false);
           }}
@@ -90,25 +130,74 @@ export function TimeRangePicker({
             autoFocus
             label="From"
             type="datetime-local"
-            step="1"
+            step="0.001"
             required
             value={from}
-            onChange={(e) => setFrom(e.target.value)}
+            onChange={(e) => {
+              setFrom(e.target.value);
+              setFromEdited(true);
+              setFromOccurrence('');
+              setError('');
+            }}
           />
+          {fromResult.status === 'ambiguous' && (
+            <Select
+              label="From occurrence"
+              hint="Clocks move back: this time occurs twice."
+              required
+              value={fromOccurrence}
+              onChange={(e) => setFromOccurrence(e.target.value)}
+            >
+              <option value="">Choose an occurrence</option>
+              {fromResult.instants.map((instant, index) => (
+                <option key={instant} value={instant}>
+                  {index === 0 ? 'Earlier' : 'Later'} ({instant})
+                </option>
+              ))}
+            </Select>
+          )}
           <Input
             label="To"
             type="datetime-local"
-            step="1"
+            step="0.001"
             required
             value={to}
-            onChange={(e) => setTo(e.target.value)}
+            onChange={(e) => {
+              setTo(e.target.value);
+              setToEdited(true);
+              setToOccurrence('');
+              setError('');
+            }}
           />
+          {toResult.status === 'ambiguous' && (
+            <Select
+              label="To occurrence"
+              hint="Clocks move back: this time occurs twice."
+              required
+              value={toOccurrence}
+              onChange={(e) => setToOccurrence(e.target.value)}
+            >
+              <option value="">Choose an occurrence</option>
+              {toResult.instants.map((instant, index) => (
+                <option key={instant} value={instant}>
+                  {index === 0 ? 'Earlier' : 'Later'} ({instant})
+                </option>
+              ))}
+            </Select>
+          )}
           <div className="inline">
-            <span className="muted">Timezone: UTC</span>
+            <span className="muted">Timezone: {dialogTimezone}</span>
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => setTo(new Date().toISOString().slice(0, 19))}
+              onClick={() => {
+                const now = new Date().toISOString();
+                setTo(formatWallTime(now, dialogTimezone));
+                setOriginal((previous) => ({ ...previous, endTime: now }));
+                setToEdited(false);
+                setToOccurrence('');
+                setError('');
+              }}
             >
               Now
             </Button>

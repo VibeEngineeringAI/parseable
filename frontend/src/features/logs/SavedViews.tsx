@@ -1,0 +1,270 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Bookmark } from 'lucide-react';
+import { Button, Dialog, Input, Select } from '../../components/ui';
+import { useApp } from '../../app/AppProvider';
+import { useAsync } from '../../hooks/useAsync';
+import { sha256 } from '../../lib/sha256';
+import { buildExplorerQuery } from '../../lib/logQuery';
+import type { SavedLogView } from '../../lib/types';
+import { decodeLogView, encodeLogView, type LogViewState } from './logViewState';
+
+export function savedLogViewState(view: SavedLogView): LogViewState {
+  if (typeof view.explorer_state !== 'string')
+    throw new Error('This saved view uses a classic format and cannot be opened in this explorer.');
+  const state = decodeLogView(view.explorer_state);
+  if (state.dataset !== view.stream_name)
+    throw new Error('This saved view has inconsistent dataset metadata.');
+  return state;
+}
+/** Ownership is a display constraint; backend authorization remains authoritative. */
+export function ownsSavedLogView(
+  view: SavedLogView | undefined,
+  hash: string | undefined,
+  demo = false,
+): boolean {
+  return !!view && (demo ? view.user_id === 'demo' : !!hash && view.user_id === hash);
+}
+export function savedLogViewBody(
+  state: LogViewState,
+  name: string,
+  previous?: SavedLogView,
+  timestampField = 'p_timestamp',
+): SavedLogView {
+  const filter_name = name.trim();
+  if (!filter_name || filter_name.length > 200)
+    throw new Error('Enter a view name of 1 to 200 characters.');
+  return {
+    ...previous,
+    filter_name,
+    stream_name: state.dataset,
+    query: {
+      ...(previous?.query ?? {}),
+      filter_type: 'sql',
+      filter_query: buildExplorerQuery(
+        state.dataset,
+        state.search,
+        state.expression,
+        state.limit,
+        timestampField,
+      ),
+      filter_builder: null,
+    },
+    explorer_state: encodeLogView(state),
+    time_filter:
+      typeof state.range === 'object'
+        ? { from: state.range.startTime, to: state.range.endTime }
+        : null,
+  };
+}
+
+export function SavedViews({
+  state,
+  onApply,
+  timestampField = 'p_timestamp',
+}: {
+  state: LogViewState;
+  timestampField?: string;
+  onApply: (state: LogViewState) => void;
+}) {
+  const { client, identity, mode } = useApp();
+  const ownerHash = useAsync(
+    useCallback(
+      async () => (identity?.source === 'server' ? sha256(identity.id) : undefined),
+      [identity?.id, identity?.source],
+    ),
+  );
+  const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState('');
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const generation = useRef(0);
+  useEffect(() => {
+    generation.current += 1;
+    setSelected('');
+    setName('');
+    setError('');
+    setNotice('');
+    setBusy(false);
+    return () => {
+      generation.current += 1;
+    };
+  }, [client, state.dataset]);
+  const views = useAsync(
+    useCallback(
+      (signal) => (open ? client.listLogViews(signal) : Promise.resolve([])),
+      [client, open],
+    ),
+  );
+  const available = useMemo(
+    () =>
+      (views.data ?? [])
+        .filter((view) => view.stream_name === state.dataset)
+        .map((view) => {
+          try {
+            return { view, decoded: savedLogViewState(view) };
+          } catch {
+            return { view, decoded: undefined };
+          }
+        }),
+    [views.data, state.dataset],
+  );
+  const selectedView = available.find((item) => item.view.filter_id === selected);
+  const view = selectedView?.view;
+  const owned = ownsSavedLogView(view, ownerHash.data, mode === 'demo');
+  async function mutate(action: 'create' | 'update' | 'delete') {
+    const requestGeneration = generation.current;
+    setError('');
+    setNotice('');
+    setBusy(true);
+    try {
+      if (action === 'create') {
+        const created = await client.createLogView(
+          savedLogViewBody(state, name, undefined, timestampField),
+        );
+        if (requestGeneration !== generation.current) return;
+        setSelected(created.filter_id ?? '');
+        setName(created.filter_name);
+      } else {
+        if (!view?.filter_id) throw new Error('Select a saved view first.');
+        if (!owned)
+          throw new Error(
+            'Only the owner can update or delete this saved view. Apply it or save a new copy instead.',
+          );
+        if (action === 'update') {
+          // Classic views remain readable in the list but are never overwritten.
+          if (!selectedView?.decoded)
+            throw new Error('This saved view cannot be overwritten here.');
+          await client.updateLogView(
+            view.filter_id,
+            savedLogViewBody(state, name, view, timestampField),
+          );
+        } else await client.deleteLogView(view.filter_id);
+        if (requestGeneration !== generation.current) return;
+        if (action === 'delete') {
+          setSelected('');
+          setName('');
+        }
+      }
+      views.reload();
+      setNotice(action === 'delete' ? 'View deleted.' : 'View saved on the server.');
+    } catch (cause) {
+      if (requestGeneration === generation.current)
+        setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (requestGeneration === generation.current) setBusy(false);
+    }
+  }
+  const compatible = !!selectedView?.decoded;
+  return (
+    <>
+      <Button variant="secondary" onClick={() => setOpen(true)}>
+        <Bookmark size={15} />
+        Saved views
+      </Button>
+      <Dialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Saved log views"
+        description="Views are saved on your Parseable server for this dataset."
+      >
+        <div className="stack">
+          {views.loading && <p role="status">Loading saved views…</p>}
+          {views.error && (
+            <div role="alert">
+              <p>{views.error.message}</p>
+              <Button onClick={views.reload}>Retry saved views</Button>
+            </div>
+          )}
+          <label>
+            Saved view
+            <Select
+              aria-label="Saved log view"
+              value={selected}
+              disabled={busy}
+              onChange={(event) => {
+                const id = event.target.value;
+                setSelected(id);
+                setName(
+                  available.find((item) => item.view.filter_id === id)?.view.filter_name ?? '',
+                );
+                setError('');
+                setNotice('');
+              }}
+            >
+              <option value="">New view</option>
+              {available
+                .filter(({ view }) => view.filter_id)
+                .map(({ view: item, decoded }) => (
+                  <option key={item.filter_id} value={item.filter_id ?? ''}>
+                    {item.filter_name}
+                    {!decoded ? ' (classic or incompatible)' : ''}
+                    {!ownsSavedLogView(item, ownerHash.data, mode === 'demo') ? ' (read only)' : ''}
+                  </option>
+                ))}
+            </Select>
+          </label>
+          {view && !compatible && (
+            <p>
+              This classic or incompatible view cannot be applied or overwritten here. Save a new
+              view instead.
+            </p>
+          )}
+          {view && !owned && (
+            <p>
+              This view is read only because its ownership could not be verified as yours. You can
+              apply it or save a new copy.
+            </p>
+          )}
+          <label>
+            View name
+            <Input
+              aria-label="Log view name"
+              value={name}
+              maxLength={200}
+              disabled={busy}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+          {error && <p role="alert">{error}</p>}
+          {notice && <p role="status">{notice}</p>}
+          <div className="inline">
+            <Button
+              disabled={busy || !compatible}
+              onClick={() => {
+                if (!view) return;
+                try {
+                  if (!selectedView?.decoded) return;
+                  onApply(selectedView.decoded);
+                  setOpen(false);
+                } catch (cause) {
+                  setError(cause instanceof Error ? cause.message : String(cause));
+                }
+              }}
+            >
+              Apply view
+            </Button>
+            <Button disabled={busy || !name.trim()} onClick={() => void mutate('create')}>
+              Save new view
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={busy || !owned || !compatible || !name.trim()}
+              onClick={() => void mutate('update')}
+            >
+              Update selected
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={busy || !owned || !view?.filter_id}
+              onClick={() => void mutate('delete')}
+            >
+              Delete selected
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+    </>
+  );
+}

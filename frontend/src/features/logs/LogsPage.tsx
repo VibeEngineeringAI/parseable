@@ -1,9 +1,9 @@
 import { createPortal } from 'react-dom';
 import { createId } from '../../lib/ids';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { PanelLeft, RefreshCw, Terminal, WrapText, Download } from 'lucide-react';
-import { Button, EmptyState, Select } from '../../components/ui';
+import { Button, EmptyState, Select, Dialog, Input } from '../../components/ui';
 import { LinkNotice } from '../../components/explorer/LinkNotice';
 import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
@@ -12,13 +12,28 @@ import { DataTable, exportRecords } from '../../components/explorer/DataTable';
 import { LogHistogram } from '../../components/explorer/LogHistogram';
 import { RecordSheet } from '../../components/explorer/RecordSheet';
 import { FieldSidebar } from './FieldSidebar';
-import { FilterBar, type LogFilter } from './FilterBar';
+import { GroupedFilterBar } from './GroupedFilterBar';
+import { SavedViews } from './SavedViews';
+import { decodeLogView, encodeLogView, type LogViewState } from './logViewState';
+import { initialLogView, logViewReducer } from './logViewReducer';
+import { resolveTimezone } from '../../components/explorer/timezone';
+import { TimezoneSelect } from '../../components/explorer/TimezoneSelect';
+import { LogContext, canShowContext } from './LogContext';
+import { appPath } from '../../lib/config';
+import { emptyExpression, narrowLogExpression, MAX_LOG_ROWS } from '../../lib/logFilters';
+import {
+  compileLogCriteria,
+  buildRowsFromCriteria,
+  buildHistogramFromCriteria,
+  histogramBuckets,
+  type LogFilterExpression,
+} from '../../lib/logQuery';
 import { useApp } from '../../app/AppProvider';
 import { ApiError } from '../../lib/client';
 import { useAsync } from '../../hooks/useAsync';
-import { buildLogQuery, timeBounds } from '../../lib/query';
+import { timeBounds } from '../../lib/query';
 import { classicLogsParams, classicLogsState } from '../../lib/classicUi';
-import type { LogRecord, TimeRange } from '../../lib/types';
+import type { LogRecord, LogFilter } from '../../lib/types';
 export function LogsPage() {
   const { client } = useApp();
   const { currentDataset } = useParams();
@@ -28,15 +43,30 @@ export function LogsPage() {
   const location = useLocation();
   const [params] = useSearchParams();
   const [dropped, setDropped] = useState<string[]>([]);
-  const [range, setRange] = useState<TimeRange>('1h');
-  const [search, setSearch] = useState('');
+  const [view, dispatchView] = useReducer(logViewReducer, dataset, initialLogView);
+  const { range, search, expression, timezone, limit, columns, wrap, showHistogram } = view;
+  const editView = (patch: Partial<Omit<LogViewState, 'version' | 'dataset'>>) =>
+    dispatchView({ type: 'edit', patch });
+  const setRange = (range: LogViewState['range']) => editView({ range });
+  const setSearch = (search: string) => editView({ search });
+  const setExpression = (expression: LogFilterExpression) => {
+    setFilterNotice('');
+    editView({ expression });
+  };
+  const setTimezone = (timezone: string) => editView({ timezone });
+  const setLimit = (limit: number) => editView({ limit });
+  const setColumns = (columns: string[]) => editView({ columns });
+  const setWrap = (wrap: boolean) => editView({ wrap });
+  const setShowHistogram = (showHistogram: boolean) => editView({ showHistogram });
   // Tagged with its dataset so a timer left over from the previous dataset is ignored.
   const [debounced, setDebounced] = useState({ dataset, search: '' });
-  const [filters, setFilters] = useState<LogFilter[]>([]);
-  const [columns, setColumns] = useState<string[]>();
+  const [filterNotice, setFilterNotice] = useState('');
+  const [revision, setRevision] = useState(0);
+  const [contextRow, setContextRow] = useState<LogRecord>();
+  const [shareUrl, setShareUrl] = useState('');
+  const [shareStatus, setShareStatus] = useState('');
+  const [linkError, setLinkError] = useState('');
   const [showFields, setShowFields] = useState(true);
-  const [wrap, setWrap] = useState(false);
-  const [showHistogram, setShowHistogram] = useState(true);
   const [row, setRow] = useState<LogRecord>();
   // Fields seen in the latest returned rows, kept while the next results load
   // or if they fail, so the field list does not empty out. Reset with the dataset.
@@ -49,14 +79,14 @@ export function LogsPage() {
   }, [dataset, search]);
   // Reset during render, not in an effect, so the query never runs with the
   // previous dataset's filters against the new one.
-  const [stateDataset, setStateDataset] = useState(dataset);
-  if (stateDataset !== dataset) {
-    setStateDataset(dataset);
-    setFilters([]);
-    setColumns(undefined);
-    setSearch('');
+  if (view.dataset !== dataset) {
+    dispatchView({ type: 'resetDataset', dataset });
+    setFilterNotice('');
     setDebounced({ dataset, search: '' });
     setRow(undefined);
+    setContextRow(undefined);
+    setShareUrl('');
+    setLinkError('');
     setRowFields({ fields: [] });
   }
   // A classic Logs link carries its range and filters in the query string. Each
@@ -67,25 +97,62 @@ export function LogsPage() {
   if (link && dataset && appliedLink !== link) {
     const linked = classicLogsState(params);
     setAppliedLink(link);
-    setRange(linked.range ?? '1h');
-    setFilters(linked.filters.map((filter) => ({ ...filter, id: createId() })));
+    setFilterNotice('');
+    setRow(undefined);
+    setContextRow(undefined);
+    setLinkError('');
+    dispatchView({
+      type: 'applyClassic',
+      range: linked.range ?? '1h',
+      expression: {
+        combinator: 'and',
+        groups: [
+          {
+            id: createId(),
+            combinator: 'and',
+            rules: linked.filters.map((filter) => ({ ...filter, id: createId() })),
+          },
+        ],
+      },
+    });
     // A search typed before the link would narrow its results without showing why.
-    setSearch('');
     setDebounced({ dataset, search: '' });
     setDropped(linked.dropped);
   }
-  // Once applied, they come out of the address so they cannot disagree with the
-  // page. The replacement has none of them, so it is not read as another link.
+  const applyView = (view: LogViewState) => {
+    dispatchView({ type: 'applyView', view });
+    setDebounced({ dataset: view.dataset, search: view.search });
+    setFilterNotice('');
+    setRow(undefined);
+    setContextRow(undefined);
+    setDropped([]);
+    setLinkError('');
+  };
+  const [appliedView, setAppliedView] = useState<string>();
+  if (params.has('logView') && appliedView !== location.key && dataset) {
+    setAppliedView(location.key);
+    try {
+      const view = decodeLogView(params.get('logView')!);
+      if (view.dataset !== dataset)
+        throw new Error('The shared view dataset does not match this page.');
+      applyView(view);
+    } catch (error) {
+      setLinkError(error instanceof Error ? error.message : 'Invalid shared view');
+    }
+  }
+  // Consume handoffs once so subsequent edits are not overwritten by navigation.
   useEffect(() => {
-    if (!link || appliedLink !== link) return;
+    const classicApplied = !!link && appliedLink === link;
+    const nativeApplied = params.has('logView') && appliedView === location.key && !linkError;
+    if (!classicApplied && !nativeApplied) return;
     const rest = new URLSearchParams(location.search);
-    for (const name of classicLogsParams) rest.delete(name);
-    const query = rest.toString();
+    if (classicApplied) for (const name of classicLogsParams) rest.delete(name);
+    if (nativeApplied) rest.delete('logView');
     navigate(
-      { pathname: location.pathname, search: query ? `?${query}` : '', hash: location.hash },
+      { pathname: location.pathname, search: rest.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [link, appliedLink, location, navigate]);
+  }, [link, appliedLink, appliedView, linkError, location, navigate, params]);
   const schema = useAsync(
     useCallback(
       (signal) => (dataset ? client.schema(dataset, signal) : Promise.resolve([])),
@@ -93,30 +160,93 @@ export function LogsPage() {
     ),
   );
   const debouncedSearch = debounced.dataset === dataset ? debounced.search : '';
-  const sql = useMemo(
-    () => (dataset ? buildLogQuery(dataset, debouncedSearch, filters, 100) : ''),
-    [dataset, debouncedSearch, filters],
+  const info = useAsync(
+    useCallback(
+      (signal) => (dataset ? client.datasetInfo(dataset, signal) : Promise.resolve(undefined)),
+      [client, dataset],
+    ),
   );
+  const timestampField = info.data?.timePartition || 'p_timestamp';
+  const compiled = useMemo(() => {
+    try {
+      return {
+        criteria: dataset
+          ? compileLogCriteria(dataset, debouncedSearch, expression, timestampField)
+          : undefined,
+        error: '',
+      };
+    } catch (error) {
+      return {
+        criteria: undefined,
+        error: error instanceof Error ? error.message : 'Invalid log query',
+      };
+    }
+  }, [dataset, debouncedSearch, expression, timestampField]);
+  const { source, predicate, timestamp } = compiled.criteria ?? {};
+  // Stabilize by semantic SQL values: client IDs and empty groups do not trigger queries.
+  const criteria = useMemo(
+    () =>
+      source && timestamp && predicate !== undefined ? { source, predicate, timestamp } : undefined,
+    [source, predicate, timestamp],
+  );
+  // Capture now again only for a changed range, effective criteria, or explicit refresh.
+  const bounds = useMemo(() => timeBounds(range), [range, criteria, revision]);
+  const sql = useMemo(
+    () => (criteria ? buildRowsFromCriteria(criteria, limit, bounds) : ''),
+    [criteria, limit, bounds],
+  );
+  const ready = !!criteria && !info.loading && !linkError && !compiled.error;
   const results = useAsync(
     useCallback(
-      (signal) => (sql ? client.query({ sql, ...timeBounds(range) }, signal) : Promise.resolve([])),
-      [client, sql, range],
+      (signal) => (ready ? client.query({ sql, ...bounds }, signal) : Promise.resolve(undefined)),
+      [client, sql, bounds, ready],
+    ),
+  );
+  const histogram = useAsync(
+    useCallback(
+      async (signal) => {
+        if (!ready || !criteria) return undefined;
+        const rows = await client.query(
+          {
+            sql: buildHistogramFromCriteria(criteria, bounds),
+            ...bounds,
+          },
+          signal,
+        );
+        return histogramBuckets(rows, bounds);
+      },
+      [client, ready, criteria, bounds],
     ),
   );
   if (results.data && rowFields.rows !== results.data)
     setRowFields({ rows: results.data, fields: [...new Set(results.data.flatMap(Object.keys))] });
   const fields = schema.data?.length ? schema.data : rowFields.fields;
-  const visibleColumns = columns ?? ['p_timestamp'].filter((f) => fields.includes(f));
-  // An identical filter changes nothing, so it is not added twice.
-  const addFilter = (filter: LogFilter) =>
-    setFilters((items) =>
-      items.some(
-        (f) =>
-          f.field === filter.field && f.operator === filter.operator && f.value === filter.value,
-      )
-        ? items
-        : [...items, filter],
-    );
+  const visibleColumns = columns ?? [timestampField].filter((f) => fields.includes(f));
+  const addFilter = (filter: LogFilter) => {
+    try {
+      setExpression(narrowLogExpression(expression, filter, createId()));
+    } catch (error) {
+      setFilterNotice(error instanceof Error ? error.message : 'Could not add this filter.');
+    }
+  };
+  const refresh = () => setRevision((value) => value + 1);
+  const share = () => {
+    try {
+      const encoded = encodeLogView({ ...view, range: bounds });
+      setShareUrl(
+        new URL(
+          appPath(
+            `/logs/explore/${encodeURIComponent(dataset)}?${new URLSearchParams({ logView: encoded })}`,
+          ),
+          window.location.origin,
+        ).href,
+      );
+      setShareStatus('');
+      setFilterNotice('');
+    } catch (error) {
+      setFilterNotice(error instanceof Error ? error.message : 'Could not create the view link.');
+    }
+  };
   return (
     <div className="page logs-page">
       <h1 className="sr-only">Logs</h1>
@@ -178,12 +308,16 @@ export function LogsPage() {
                 <PanelLeft size={16} />
               </Button>
               <div className="inline explorer-time-controls">
-                <TimeRangePicker value={range} onChange={setRange} />
+                <TimeRangePicker value={range} onChange={setRange} timezone={timezone} />
+                <TimezoneSelect
+                  value={timezone}
+                  onChange={(value) => setTimezone(resolveTimezone(value))}
+                />
                 <Button
                   variant="secondary"
                   size="icon"
                   aria-label="Refresh logs"
-                  onClick={results.reload}
+                  onClick={refresh}
                   disabled={results.loading}
                 >
                   <RefreshCw size={15} />
@@ -191,19 +325,15 @@ export function LogsPage() {
               </div>
             </div>
             <div className="explorer-filters">
-              <FilterBar
+              <GroupedFilterBar
                 key={dataset}
                 search={search}
                 onSearch={setSearch}
                 fields={fields}
-                filters={filters}
-                onAdd={addFilter}
-                onRemove={(id) => setFilters(filters.filter((f) => f.id !== id))}
-                onUpdate={(filter) =>
-                  setFilters(filters.map((f) => (f.id === filter.id ? filter : f)))
-                }
+                expression={expression}
+                onChange={setExpression}
                 onClear={() => {
-                  setFilters([]);
+                  setExpression(emptyExpression());
                   setSearch('');
                 }}
               />
@@ -211,11 +341,70 @@ export function LogsPage() {
                 className="text-link sql-handoff"
                 aria-label="Open in SQL editor"
                 title="Open in SQL editor"
-                to={`/sql-editor?query=${encodeURIComponent(sql)}`}
+                to={`/sql-editor?${new URLSearchParams({ query: sql, start: bounds.startTime, end: bounds.endTime })}`}
               >
                 <Terminal size={15} />
               </Link>
             </div>
+            <div className="logs-view-controls">
+              <SavedViews
+                timestampField={timestampField}
+                state={view}
+                onApply={(next) => {
+                  if (next.dataset !== dataset)
+                    navigate(
+                      `/logs/explore/${encodeURIComponent(next.dataset)}?${new URLSearchParams({ logView: encodeLogView(next) })}`,
+                    );
+                  else applyView(next);
+                }}
+              />
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={share}
+                disabled={search !== debouncedSearch || !ready}
+              >
+                Share / copy link
+              </Button>
+              <Select
+                aria-label="Result limit"
+                value={limit}
+                onChange={(e) => setLimit(Number(e.target.value))}
+              >
+                {[...new Set([100, 1000, 5000, MAX_LOG_ROWS, limit])]
+                  .sort((a, b) => a - b)
+                  .map((count) => (
+                    <option key={count} value={count}>
+                      Load up to {count.toLocaleString()} rows
+                    </option>
+                  ))}
+              </Select>
+            </div>
+            {linkError && (
+              <div role="alert">
+                <p>{linkError}</p>
+                <Button
+                  onClick={() => {
+                    const rest = new URLSearchParams(location.search);
+                    rest.delete('logView');
+                    setLinkError('');
+                    navigate(
+                      { pathname: location.pathname, search: rest.toString() },
+                      { replace: true },
+                    );
+                  }}
+                >
+                  Clear invalid shared view
+                </Button>
+              </div>
+            )}
+            {compiled.error && <p role="alert">{compiled.error}</p>}
+            {filterNotice && <p role="status">{filterNotice}</p>}
+            {info.error && (
+              <p className="notice" role="status">
+                Dataset time partition unavailable. Using ingestion time.
+              </p>
+            )}
             <LinkNotice dropped={dropped} onDismiss={() => setDropped([])} />
             <>
               {schema.error && (
@@ -230,14 +419,33 @@ export function LogsPage() {
                 </p>
               )}
             </>
-            <QueryState loading={results.loading} error={results.error} retry={results.reload} />
-            {!results.loading && !results.error && (
+            {ready && showHistogram && (
+              <section aria-label="Histogram totals">
+                <QueryState
+                  loading={histogram.loading}
+                  error={histogram.error}
+                  retry={histogram.reload}
+                />
+                {histogram.data && <LogHistogram aggregate={histogram.data} timezone={timezone} />}
+              </section>
+            )}
+            <QueryState
+              loading={ready && results.loading}
+              error={ready ? results.error : undefined}
+              retry={refresh}
+            />
+            {ready && !results.loading && !results.error && results.data && (
               <>
-                {showHistogram && (
-                  <LogHistogram rows={results.data || []} bounds={timeBounds(range)} />
-                )}
                 <div className="panel-heading result-heading">
-                  <h2>{results.data?.length || 0} records</h2>
+                  <h2>
+                    {results.data?.length || 0} records{' '}
+                    <span className="muted">
+                      loaded
+                      {histogram.data
+                        ? ` of ${histogram.data.total.toLocaleString()} matching`
+                        : ''}
+                    </span>
+                  </h2>
                   <div className="inline wrap results-actions">
                     <Button
                       size="sm"
@@ -261,6 +469,7 @@ export function LogsPage() {
                       size="sm"
                       variant="ghost"
                       disabled={!results.data?.length}
+                      title="Export loaded rows"
                       onClick={() => exportRecords(results.data || [], 'json')}
                     >
                       <Download size={14} />
@@ -270,6 +479,7 @@ export function LogsPage() {
                       size="sm"
                       variant="ghost"
                       disabled={!results.data?.length}
+                      title="Export loaded rows"
                       onClick={() => exportRecords(results.data || [], 'csv')}
                     >
                       Export CSV
@@ -282,6 +492,9 @@ export function LogsPage() {
                   onSelect={setRow}
                   wrap={wrap}
                   summary
+                  timestampField={timestampField}
+                  virtualized={limit > 100 || visibleColumns.length > 20}
+                  timezone={timezone}
                 />
               </>
             )}
@@ -290,11 +503,58 @@ export function LogsPage() {
       )}
       <RecordSheet
         row={row}
+        timezone={timezone}
+        timestampField={timestampField}
+        onContext={
+          row && canShowContext(row)
+            ? () => {
+                setContextRow(row);
+                setRow(undefined);
+              }
+            : undefined
+        }
         onClose={() => setRow(undefined)}
         onFilter={(field, value, operator = '=') =>
           addFilter({ id: createId(), field, operator, value })
         }
       />
+      {contextRow && (
+        <LogContext
+          key={dataset}
+          dataset={dataset}
+          row={contextRow}
+          timezone={timezone}
+          onClose={() => {
+            setRow(contextRow);
+            setContextRow(undefined);
+          }}
+        />
+      )}
+      <Dialog
+        open={!!shareUrl}
+        onOpenChange={(open) => {
+          if (!open) setShareUrl('');
+        }}
+        title="Share log view"
+        description="This link includes filters and the captured time range. Anyone opening it needs dataset access."
+      >
+        <div className="stack">
+          <Input label="View link" readOnly value={shareUrl} onFocus={(e) => e.target.select()} />
+          <Button
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(shareUrl);
+                setShareStatus('Link copied');
+              } catch {
+                setShareStatus('Clipboard unavailable. Select and copy the link above.');
+              }
+            }}
+          >
+            Copy link
+          </Button>
+          <span role="status">{shareStatus}</span>
+        </div>
+      </Dialog>
     </div>
   );
 }

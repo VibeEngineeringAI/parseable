@@ -5,6 +5,7 @@ import { apiKey, groupRoles, object, roles, roleSources, strings, userRoles } fr
 import { instantResult, rangeResult, successEnvelope } from './promqlContract';
 import { alert, alertSummary, alertTarget, alertTargetStatus } from './alertsContract';
 import { dashboard, dashboardSummary } from './dashboardsContract';
+import { savedLogView, logContextResponse } from './logsContract';
 import { datasetHotTier, datasetRetention, datasetStats } from './datasetsContract';
 import type {
   AlertSeverity,
@@ -14,16 +15,8 @@ import type {
   PromqlMetadataRequest,
 } from './types';
 
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    public readonly status: number,
-    public readonly detail?: unknown,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
-}
+export { ApiError } from './apiError';
+import { ApiError } from './apiError';
 
 export function promqlErrorType(error: unknown): string | undefined {
   return error instanceof ApiError &&
@@ -194,7 +187,28 @@ export function createClient({
     if (!dashboard(data)) return malformed(endpoint);
     return data;
   };
+  const readLogView = async (endpoint: string, init: RequestInit) => {
+    const data = await readJson(endpoint, init, onUnauthorized);
+    if (!savedLogView(data)) return malformed(endpoint);
+    return data;
+  };
+  const logViewPath = (id: string) => `${base}/filters/${encodeURIComponent(id)}`;
   return {
+    async listLogViews(signal) {
+      const endpoint = `${base}/filters`;
+      const data = await readJson(endpoint, { signal }, onUnauthorized);
+      if (!Array.isArray(data) || !data.every(savedLogView)) return malformed(endpoint);
+      return data;
+    },
+    createLogView: (body) => readLogView(`${base}/filters`, jsonBody('POST', body)),
+    updateLogView: (id, body) => readLogView(logViewPath(id), jsonBody('PUT', body)),
+    deleteLogView: (id) => mutate(logViewPath(id), { method: 'DELETE' }),
+    async logContext(body, signal) {
+      const endpoint = `${base}/query/context`;
+      const data = await readJson(endpoint, { ...jsonBody('POST', body), signal }, onUnauthorized);
+      if (!logContextResponse(data)) return malformed(endpoint);
+      return data;
+    },
     async listDashboards(signal) {
       const endpoint = `${base}/dashboards?limit=0`;
       const data = await readJson(endpoint, { signal }, onUnauthorized);

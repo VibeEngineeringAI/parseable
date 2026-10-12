@@ -31,6 +31,7 @@ test('a classic Logs bookmark opens with its range and filters', async ({ page }
     /time zone Asia\/Kolkata \(times are shown in UTC\), 1 filter\./,
   );
   await expect(page).toHaveURL('/logs/explore/app?keep=1');
+  await expect.poll(() => queries.length).toBeGreaterThan(0);
   expect(queries[0]).toMatchObject({
     startTime: '2026-10-09T08:00:00.000Z',
     endTime: '2026-10-09T09:30:00.000Z',
