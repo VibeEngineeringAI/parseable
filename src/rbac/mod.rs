@@ -584,12 +584,17 @@ mod lock_order_tests {
     }
 
     // A deadlocked thread holds the process-wide maps forever and would hang
-    // every later test, so abort the run instead of panicking.
+    // every later test, so abort the run instead of panicking. The abort may
+    // also write a core dump, which can add several seconds to the failure.
     fn deadlock(what: &str) -> ! {
-        // Bypass libtest's output capture, which an abort would discard.
+        // Bypass libtest's output capture, which an abort would discard. libtest
+        // prints no result after an abort, so name the test; every caller runs
+        // on the test's own thread, which libtest names after it.
+        let current = thread::current();
+        let test = current.name().unwrap_or("?");
         let _ = writeln!(
             std::io::stderr(),
-            "{what} within {DEADLINE:?}: lock-order deadlock, aborting"
+            "{test}: {what} within {DEADLINE:?}: lock-order deadlock, aborting"
         );
         std::process::abort()
     }
@@ -714,7 +719,7 @@ mod lock_order_tests {
         finish(&writer, "user write");
     }
 
-    // Reproduction: administrative writes took USERS(write) and then
+    // Reproduction: role and password changes took USERS(write) and then
     // SESSIONS(write), the reverse of `check_auth`.
     fn assert_admin_write_survives_session_check(write: fn(&User)) {
         let _serial = auth_state();
@@ -763,9 +768,44 @@ mod lock_order_tests {
         });
     }
 
+    // Not a reproduction: `put_user` used to release SESSIONS before writing
+    // USERS. This guards the lock order now that it holds both.
     #[test]
     fn replacing_a_user_does_not_deadlock_with_a_session_check() {
         assert_admin_write_survives_session_check(|user| Users.put_user(user.clone()));
+    }
+
+    // If `put_user` released SESSIONS between removing the user's sessions and
+    // storing the replacement, a first login that had verified the old password
+    // could track a session in that gap, and nothing would remove it. The gap
+    // has no lock acquisition a test could stop a thread at, so this checks
+    // that SESSIONS stays held across it, then that a racing login gets nothing.
+    #[test]
+    fn replacing_a_user_during_first_login_leaves_no_stale_session() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (user, login) = native_user(&tenant, &[ROLE]);
+        let mut replacement = user;
+        if let UserType::Native(basic) = &mut replacement.ty {
+            basic.password_hash = cheap_hash("changed");
+        }
+
+        // Stops `put_user` after it removed the sessions, before it stores the user.
+        let reader = users();
+        let writer = spawn(move || Users.put_user(replacement));
+        wait_until("the replacement to queue for USERS", || {
+            writer_queued(users_lock())
+        });
+        assert!(
+            sessions_lock().is_locked_exclusive(),
+            "put_user released SESSIONS before storing the replacement"
+        );
+        let login_rx = first_login(&login);
+        drop(reader);
+
+        finish(&writer, "user replacement");
+        assert_eq!(finish(&login_rx, "login"), Response::UnAuthorized);
+        assert!(!Users.session_exists(&login));
     }
 
     // Reproduction: deleting a user on the querier held USER_GROUPS(write) (and
