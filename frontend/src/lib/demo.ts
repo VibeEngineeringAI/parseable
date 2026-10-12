@@ -15,6 +15,8 @@ import { createDemoAlerts } from './demoAlerts';
 import { createDemoDashboards } from './demoDashboards';
 import { createDemoDatasets } from './demoDatasets';
 import { createDemoLogMethods } from './demoLogs';
+import { createDemoTraceRecords, createDemoTraceMethods } from './demoTraces';
+import { handleApmDemoQuery } from './apmDemo';
 import { alertDuration } from '../features/alerts/helpers';
 import { validateName } from '../features/team/helpers';
 
@@ -23,6 +25,7 @@ export const demoDatasets: Dataset[] = [
   { name: 'api_logs', type: 'logs' },
   { name: 'infrastructure_logs', type: 'logs' },
   { name: 'demo_metrics', type: 'metrics' },
+  { name: 'demo_traces', type: 'traces' },
 ];
 
 /** Fixed sequences anchored to now keep the initial relative time range useful. */
@@ -340,7 +343,10 @@ function evaluateDemoQuery(
 export function createDemoClient(): ParseableClient {
   const fixtureTime = Date.now();
   const records = createDemoRecords(fixtureTime - 1_000);
-  const datasets = createDemoDatasets(demoDatasets, records, fixtureTime);
+  const traceRows = createDemoTraceRecords(fixtureTime);
+  const datasets = createDemoDatasets(demoDatasets, records, fixtureTime, {
+    demo_traces: traceRows,
+  });
   const metrics = createDemoMetrics(fixtureTime);
   const alerts = createDemoAlerts(fixtureTime);
   const dashboards = createDemoDashboards(fixtureTime);
@@ -506,6 +512,7 @@ export function createDemoClient(): ParseableClient {
   return {
     ...datasets,
     ...createDemoLogMethods(records, datasets.listDatasets),
+    ...createDemoTraceMethods(traceRows, datasets.listDatasets, datasets.datasetInfo),
     ...metrics,
     ...alerts,
     ...dashboards,
@@ -676,7 +683,19 @@ export function createDemoClient(): ParseableClient {
     async query(request, signal) {
       await ready(signal);
       const current = await datasets.listDatasets(signal);
-      return executeDemoQuery(request, records, current);
+      if (request.sql.startsWith('/* parseable-apm:')) {
+        const table = /FROM\s+"((?:[^"]|"")*)"/i.exec(request.sql)?.[1].replaceAll('""', '"');
+        const item = current.find((dataset) => dataset.name === table);
+        if (!item) throw new ApiError(`Unknown demo dataset: ${table}`, 404);
+        if (item.type !== 'traces') throw new ApiError('APM requires a traces dataset', 400);
+        const result = handleApmDemoQuery(request, item.name === 'demo_traces' ? traceRows : []);
+        if (result !== undefined) return result;
+      }
+      return executeDemoQuery(
+        request,
+        /FROM\s+(?:"demo_traces"|demo_traces\b)/i.test(request.sql) ? traceRows : records,
+        current,
+      );
     },
     async identity(signal) {
       await ready(signal);

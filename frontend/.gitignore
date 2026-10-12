@@ -12,5 +12,6 @@ test-results/
 !src/features/datasets/**
 !src/lib/datasetsContract.ts
 !src/lib/datasetsClient.test.ts
+!src/lib/datasetPath.ts
 !e2e/datasets.spec.ts
 !e2e-live/datasets.spec.ts

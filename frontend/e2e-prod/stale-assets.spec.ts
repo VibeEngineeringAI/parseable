@@ -36,6 +36,9 @@ for (const mount of ['', '/next']) {
       ['/dashboards', /\/dashboards-[\w-]+\.css$/],
       // Logs has no stylesheet of its own, so its module is what goes missing.
       ['/logs/explore/app', /\/LogsPage-[\w-]+\.js$/],
+      ['/traces/explore/app', /\/TracesPage-[\w-]+\.js$/],
+      ['/apm/app/checkout', /\/ApmPage-[\w-]+\.js$/],
+      ['/add-data', /\/IngestionPage-[\w-]+\.js$/],
     ] as const) {
       test(`${path} offers a reload`, async ({ page }) => {
         await server(page);

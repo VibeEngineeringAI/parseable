@@ -273,6 +273,13 @@ test('server 403 errors explain each action inline without blocking other sectio
   page,
 }) => {
   await liveMock(page);
+  const unavailable = page.getByRole('row').filter({ hasText: 'web_logs' });
+  await expect(unavailable).toContainText('Type unavailable');
+  await expect(unavailable).toContainText('Permission denied');
+  await expect(unavailable.getByRole('link')).toHaveCount(0);
+  await expect(
+    unavailable.getByRole('button', { name: 'Manage web_logs', exact: true }),
+  ).toBeVisible();
   const sheet = await manage(page, 'web_logs');
   for (const [section, action] of [
     ['Overview', 'view dataset statistics'],

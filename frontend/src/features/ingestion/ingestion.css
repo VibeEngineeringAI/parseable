@@ -1,0 +1,362 @@
+.ingestion-page {
+  max-width: 1500px;
+}
+.ingestion-intro {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 22px 24px;
+  margin-bottom: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(110deg, var(--color-primary-soft), var(--color-surface));
+}
+.ingestion-intro-icon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-primary);
+}
+.ingestion-intro h2 {
+  font-size: 16px;
+  margin: 0 0 5px;
+}
+.ingestion-intro p {
+  color: var(--color-muted);
+  font-size: 12px;
+  margin: 0;
+  line-height: 1.6;
+}
+.ingestion-intro > .ui-badge {
+  margin-left: auto;
+}
+.ingestion-demo-notice {
+  padding: 12px 16px;
+  border: 1px solid var(--color-border);
+  background: var(--color-warning-soft);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 1.6;
+  margin-bottom: 20px;
+}
+.ingestion-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 248px;
+  gap: 24px;
+  align-items: start;
+}
+.ingestion-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+.ingestion-step-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 22px;
+  border-bottom: 1px solid var(--color-border);
+}
+.ingestion-step-number {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+  font: 600 12px var(--font-sans);
+}
+.ingestion-step-heading h2 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.ingestion-step-heading p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-muted);
+  line-height: 1.6;
+}
+.ingestion-step-icon {
+  margin-left: auto;
+  color: var(--color-muted);
+}
+.ingestion-step-body {
+  padding: 22px;
+}
+.ingestion-source-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.ingestion-source-card {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 18px 16px;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
+}
+.ingestion-source-card:hover {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-hover);
+}
+.ingestion-source-card[data-selected='true'] {
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+}
+.ingestion-source-card > svg {
+  color: var(--color-primary);
+}
+.ingestion-source-card > input {
+  position: absolute;
+  right: 14px;
+  top: 16px;
+  accent-color: var(--color-primary);
+}
+.ingestion-source-card:has(input:focus-visible) {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
+}
+.ingestion-source-card:has(input:disabled) {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+.ingestion-source-title {
+  font-size: 12px;
+  font-weight: 600;
+  padding-right: 8px;
+}
+.ingestion-source-description {
+  color: var(--color-muted);
+  font-size: 11px;
+  line-height: 1.65;
+  flex: 1;
+}
+.ingestion-signal-row {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 18px;
+  align-items: end;
+  margin-top: 20px;
+}
+.ingestion-signal-row p {
+  margin: 0 0 5px;
+  font-size: 11px;
+  color: var(--color-muted);
+  line-height: 1.65;
+}
+.ingestion-dataset-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.ingestion-dataset-row > .ui-field {
+  flex: 1;
+  min-width: 180px;
+}
+.ingestion-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+}
+.ingestion-dataset-detail {
+  font-size: 11px;
+  color: var(--color-muted);
+  line-height: 1.7;
+}
+.ingestion-config-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--color-muted);
+}
+.ingestion-code-block {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  min-width: 0;
+}
+.ingestion-code-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--color-surface-hover);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 11px;
+  font-weight: 550;
+}
+.ingestion-code-heading > button {
+  margin-left: auto;
+}
+.ingestion-code-language {
+  font-weight: 400;
+  color: var(--color-muted);
+}
+.ingestion-code-block pre {
+  padding: 18px;
+  margin: 0;
+  font: 11px/1.8 var(--font-mono);
+  white-space: pre;
+  overflow: auto;
+  color: var(--color-text);
+  background: var(--color-bg);
+  max-height: 520px;
+}
+.ingestion-code-block pre:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -3px;
+}
+.ingestion-code-block > .error-text {
+  padding: 0 14px;
+}
+.ingestion-instructions {
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--color-muted);
+}
+.ingestion-instructions p {
+  margin: 0 0 10px;
+}
+.ingestion-instructions p:last-child {
+  margin-bottom: 0;
+}
+.ingestion-instructions code {
+  color: var(--color-text);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.ingestion-instructions a {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ingestion-prompt,
+.ingestion-verification > p {
+  color: var(--color-muted);
+  font-size: 12px;
+  margin: 0;
+  line-height: 1.7;
+}
+.ingestion-check-result {
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  font-size: 12px;
+}
+.ingestion-check-result dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 22px;
+  margin: 18px 0;
+}
+.ingestion-check-result dt {
+  font-size: 11px;
+  color: var(--color-muted);
+  margin-bottom: 6px;
+}
+.ingestion-check-result dd {
+  margin: 0;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+.ingestion-check-result p {
+  color: var(--color-muted);
+  line-height: 1.7;
+}
+.ingestion-guide {
+  padding: 20px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.ingestion-guide h2 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.ingestion-guide h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+}
+.ingestion-guide p,
+.ingestion-guide li {
+  font-size: 11px;
+  line-height: 1.8;
+  color: var(--color-muted);
+}
+.ingestion-guide ul {
+  padding-left: 16px;
+  margin: 0;
+}
+.ingestion-guide-divider {
+  height: 1px;
+  background: var(--color-border);
+  margin: 20px 0;
+}
+.ingestion-guide .text-link {
+  font-size: 11px;
+  line-height: 1.7;
+}
+@media (max-width: 1100px) {
+  .ingestion-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ingestion-guide {
+    display: none;
+  }
+}
+@media (max-width: 650px) {
+  .ingestion-source-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ingestion-source-card {
+    gap: 10px;
+  }
+  .ingestion-step-body,
+  .ingestion-step-heading {
+    padding: 16px;
+  }
+  .ingestion-intro {
+    padding: 16px;
+    align-items: flex-start;
+  }
+  .ingestion-intro > .ui-badge {
+    display: none;
+  }
+  .ingestion-signal-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ingestion-source-card {
+    transition: none;
+  }
+}

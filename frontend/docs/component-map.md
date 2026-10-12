@@ -76,3 +76,13 @@ Dashboard controls compose existing primitives; no new shared primitive or paral
 SQL saved queries use persistent browser local storage; draft workspaces use session storage independent per browser tab and retained across reload/navigation. Both remain user/server scoped and use no new server API. Draft persistence excludes result rows. Generated multi-dataset SQL uses `UNION ALL BY NAME`, fills missing columns with NULL and requires compatible types for common columns; demo supports only single-dataset SQL. Chart previews use captured execution bounds. Existing dashboards retain their own range when a SQL tile is added, while new dashboards use the executed range.
 
 URL query handoffs restore existing drafts before adding or focusing the incoming query, then consume the handoff parameters. Opening a saved query that already has a tab focuses its existing draft and preserves edits. Initial identity loading preserves anonymous edits until scoped storage is available; session changes clear result data.
+
+## Observability screens
+
+| Surface                           | Components and contracts                                                                                                              | Stable selectors                                                                             |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Trace explorer                    | `features/traces/TracesPage`, `TraceTable`, `TraceDetailSheet`, `SpanWaterfall`, `SpanDetail`; `lib/tracesContract`, `lib/demoTraces` | `sidebar-traces`, `traces-page`, `trace-table`, `span-waterfall`, `span-detail`              |
+| APM inventory and service details | `features/apm/ApmPage`, `ServiceInventory`, `ServiceInsights`, `ServiceTopology`, `ServiceMap`; `lib/apm`, `lib/apmDemo`              | `sidebar-apm`, named Services/Dependencies tabs, named service links and map region          |
+| Ingestion setup                   | `features/ingestion/IngestionPage`, `SourcePicker`, `DatasetStep`, `ConnectionConfig`, `IngestionVerification`; `lib/ingestion`       | `sidebar-add-data`, named source radios, Destination dataset, Check ingestion, copy controls |
+
+See [observability validation](observability-validation.md) for exact story IDs, interaction coverage and reviewed visual baselines.

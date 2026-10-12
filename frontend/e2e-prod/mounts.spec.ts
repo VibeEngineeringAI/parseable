@@ -30,6 +30,19 @@ for (const mount of ['', '/next']) {
       await expect(page).toHaveURL(new RegExp(`^[^?]*${mount}/metrics(\\?|$)`));
       await expect(page.getByRole('heading').first()).toBeVisible();
 
+      await page.goto(`${mount}/traces/explore/demo_traces`);
+      await expect(page.getByRole('heading', { name: 'Traces', exact: true })).toBeVisible();
+      await expect(page.getByRole('button', { name: /Open trace/ }).first()).toBeVisible();
+      await page.goto(`${mount}/apm/demo_traces/checkout`);
+      await expect(page.getByRole('heading', { name: 'checkout', exact: true })).toBeVisible();
+      await expect(page.getByRole('link', { name: 'Explore service traces' })).toHaveAttribute(
+        'href',
+        new RegExp(`^${mount}/traces/explore/demo_traces\\?`),
+      );
+      await page.getByTestId('sidebar-add-data').click();
+      await expect(page).toHaveURL(`${mount}/add-data`);
+      await expect(page.getByRole('heading', { name: 'Add data', exact: true })).toBeVisible();
+
       expect(failed).toEqual([]);
       expect(paths.filter((path) => !path.startsWith(`${mount}/`))).toEqual([]);
       // Lazy chunks import the entry module that is already running.

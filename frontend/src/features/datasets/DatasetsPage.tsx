@@ -9,9 +9,10 @@ import { useAsync } from '../../hooks/useAsync';
 import { CreateDatasetDialog } from './CreateDatasetDialog';
 import { ManageDatasetSheet } from './ManageDatasetSheet';
 import './datasets.css';
+import { datasetPath, listDatasetInventory } from '../../lib/datasetPath';
 export function DatasetsPage() {
   const { client } = useApp();
-  const data = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
+  const data = useAsync(useCallback((signal) => listDatasetInventory(client, signal), [client]));
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<string>();
   const [creating, setCreating] = useState(false);
@@ -64,16 +65,18 @@ export function DatasetsPage() {
               {datasets.map((d) => (
                 <tr key={d.name}>
                   <td>
-                    <Link
-                      className="dataset-name"
-                      to={`/logs/explore/${encodeURIComponent(d.name)}`}
-                    >
-                      <Database size={15} />
-                      {d.name}
-                    </Link>
+                    {d.type ? (
+                      <Link className="dataset-name" to={datasetPath(d)}>
+                        <Database size={15} />
+                        {d.name}
+                      </Link>
+                    ) : (
+                      <strong className="dataset-name">{d.name}</strong>
+                    )}
                   </td>
                   <td>
-                    <Badge>{d.type}</Badge>
+                    <Badge>{d.type ?? 'Type unavailable'}</Badge>
+                    {d.typeError && <p className="muted">{d.typeError}</p>}
                   </td>
                   <td>
                     <div className="inline">
@@ -85,12 +88,13 @@ export function DatasetsPage() {
                       >
                         Manage
                       </Button>
-                      <Link
-                        className="text-link"
-                        to={`/logs/explore/${encodeURIComponent(d.name)}`}
-                      >
-                        Explore <ArrowUpRight size={14} />
-                      </Link>
+                      {d.type ? (
+                        <Link className="text-link" to={datasetPath(d)}>
+                          Explore <ArrowUpRight size={14} />
+                        </Link>
+                      ) : (
+                        <span className="muted">Explore unavailable</span>
+                      )}
                     </div>
                   </td>
                 </tr>

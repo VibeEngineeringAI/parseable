@@ -35,6 +35,13 @@ const MetricsPage = lazy(() =>
 const AlertsPage = lazy(() =>
   import('../features/alerts/AlertsPage').then((m) => ({ default: m.AlertsPage })),
 );
+const TracesPage = lazy(() =>
+  import('../features/traces/TracesPage').then((m) => ({ default: m.TracesPage })),
+);
+const ApmPage = lazy(() => import('../features/apm/ApmPage').then((m) => ({ default: m.ApmPage })));
+const IngestionPage = lazy(() =>
+  import('../features/ingestion/IngestionPage').then((m) => ({ default: m.IngestionPage })),
+);
 import { OverviewPage } from './OverviewPage';
 export function App() {
   const { mode, session, identity, needsLogin, client } = useApp();
@@ -51,6 +58,9 @@ export function App() {
       {
         logs: 'Logs',
         metrics: 'Metrics',
+        traces: 'Traces',
+        apm: 'APM',
+        'add-data': 'Add data',
         alerts: 'Alerts',
         'sql-editor': 'SQL editor',
         datasets: 'Datasets',
@@ -175,6 +185,12 @@ export function App() {
                 <Route path="/logs/:view/:currentDataset" element={<LogsPage />} />
                 <Route path="/metrics" element={<MetricsPage />} />
                 <Route path="/metrics/explore/:dataset" element={<MetricsPage />} />
+                <Route path="/traces" element={<TracesPage />} />
+                <Route path="/traces/explore/:dataset" element={<TracesPage />} />
+                <Route path="/apm" element={<ApmPage />} />
+                <Route path="/apm/:dataset" element={<ApmPage />} />
+                <Route path="/apm/:dataset/:service" element={<ApmPage />} />
+                <Route path="/add-data" element={<IngestionPage />} />
                 <Route path="/sql-editor" element={<SqlPage />} />
                 <Route path="/datasets" element={<DatasetsPage />} />
                 <Route path="/dashboards" element={<DashboardsPage />} />

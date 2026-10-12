@@ -7,6 +7,7 @@ import { alert, alertSummary, alertTarget, alertTargetStatus } from './alertsCon
 import { dashboard, dashboardSummary } from './dashboardsContract';
 import { savedLogView, logContextResponse } from './logsContract';
 import { datasetHotTier, datasetRetention, datasetStats } from './datasetsContract';
+import { traceListResponse, decodeTraceDetail } from './tracesContract';
 import type {
   AlertSeverity,
   Dataset,
@@ -93,7 +94,23 @@ async function request(endpoint: string, init: RequestInit, onUnauthorized?: () 
       throw error;
     }
   }
-  return checked(response);
+  try {
+    return await checked(response);
+  } catch (error) {
+    if (error instanceof ApiError) {
+      // These handlers wrap a dataset authorization failure in QueryError.
+      // Match the known wrapper and status without treating it as session expiry.
+      const trace = /^\/api\/prism\/v1\/services\/traces\/(list|detail)$/.test(endpoint);
+      const denied =
+        trace && error.status === 500
+          ? /^Query error: Error: (User does not have access to stream- .+)$/.exec(error.message)
+          : endpoint === '/api/v1/query' && error.status === 400
+            ? /^Error: (User does not have access to stream- .+)$/.exec(error.message)
+            : null;
+      if (denied) throw new ApiError(`Permission denied: ${denied[1]}`, 403, error.detail);
+    }
+    throw error;
+  }
 }
 
 async function readText(endpoint: string, init: RequestInit, onUnauthorized?: () => void) {
@@ -400,6 +417,7 @@ export function createClient({
     createDataset: (name, options) => {
       const headers: Record<string, string> = { 'X-P-Telemetry-Type': options.telemetryType };
       if (options.customPartition) headers['X-P-Custom-Partition'] = options.customPartition;
+      if (options.logSource) headers['X-P-Log-Source'] = options.logSource;
       return mutate(datasetPath(name), { method: 'PUT', headers });
     },
     deleteDataset: (name) => mutate(datasetPath(name), { method: 'DELETE' }),
@@ -529,6 +547,19 @@ export function createClient({
         `${prometheus}/label/${encodeURIComponent(label)}/values?${metadataParams(params)}`,
         signal,
       ),
+    async listTraces(body, signal) {
+      const endpoint = '/api/prism/v1/services/traces/list';
+      const data = await readJson(endpoint, { ...jsonBody('POST', body), signal }, onUnauthorized);
+      if (!traceListResponse(data)) return malformed(endpoint);
+      return data;
+    },
+    async traceDetail(body, signal) {
+      const endpoint = '/api/prism/v1/services/traces/detail';
+      const data = await readJson(endpoint, { ...jsonBody('POST', body), signal }, onUnauthorized);
+      const detail = decodeTraceDetail(data);
+      if (!detail) return malformed(endpoint);
+      return detail;
+    },
     async schema(dataset, signal) {
       const endpoint = `${base}/logstream/${encodeURIComponent(dataset)}/schema`;
       const data = await readJson(endpoint, { signal }, onUnauthorized);

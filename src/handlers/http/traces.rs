@@ -34,8 +34,10 @@ use crate::{
     rbac::map::SessionKey,
     tenants::TENANT_METADATA,
     utils::{
-        actix::extract_session_key_from_req, arrow::record_batches_to_json,
-        get_tenant_id_from_request, get_user_from_request, time::TimeRange,
+        actix::extract_session_key_from_req,
+        arrow::record_batches_to_json,
+        get_tenant_id_from_request, get_user_from_request,
+        time::{TimeRange, parse_start_time_expression, parse_time_expression, truncate_to_minute},
     },
 };
 
@@ -237,8 +239,9 @@ async fn list_traces_with_target(
     let conditions = build_conditions_filter(body.conditions.as_ref())?;
     let option = body.options.unwrap_or_default();
     let sort_by = body.sort_by.unwrap_or_default();
-    let start_time = time_range.start.to_rfc3339();
-    let end_time = time_range.end.to_rfc3339();
+    let query_range = trace_query_envelope(&time_range)?;
+    let start_time = query_range.start.to_rfc3339();
+    let end_time = query_range.end.to_rfc3339();
 
     let (records, count_records) = tokio::try_join!(
         execute_trace_query(
@@ -310,12 +313,18 @@ async fn get_trace_detail_with_target(
     let dataset_info =
         validate_trace_dataset(&body.dataset, tenant_id, TRACE_DETAIL_REQUIRED_FIELDS)?;
 
+    let query_range = trace_query_envelope(&discovery_range)?;
     let bounds = execute_trace_query(
         "traces/detail/bounds",
         target.clone(),
-        build_trace_bounds_sql(&body.dataset, trace_id, &dataset_info.time_column),
-        &discovery_range.start.to_rfc3339(),
-        &discovery_range.end.to_rfc3339(),
+        build_trace_bounds_sql(
+            &body.dataset,
+            trace_id,
+            &dataset_info.time_column,
+            &discovery_range,
+        ),
+        &query_range.start.to_rfc3339(),
+        &query_range.end.to_rfc3339(),
         tenant_id,
     )
     .await?;
@@ -364,9 +373,39 @@ async fn get_trace_detail_with_target(
     .expect("trace detail response is serializable"))
 }
 
+// Keep the requested bounds exact. The generic query API intentionally rounds its
+// transport range to minutes; SQL predicates must not inherit that rounding.
 fn parse_time_range(start_time: &str, end_time: &str) -> Result<TimeRange, TraceError> {
-    TimeRange::parse_human_time(start_time, end_time)
-        .map_err(|error| TraceError::TimeParse(error.to_string()))
+    parse_time_range_at(start_time, end_time, Utc::now())
+}
+
+fn parse_time_range_at(
+    start_time: &str,
+    end_time: &str,
+    now: DateTime<Utc>,
+) -> Result<TimeRange, TraceError> {
+    let start = parse_start_time_expression(start_time, now)
+        .map_err(|error| TraceError::TimeParse(format!("Invalid start time: {error}")))?;
+    let end = parse_time_expression(end_time, now)
+        .map_err(|error| TraceError::TimeParse(format!("Invalid end time: {error}")))?;
+    if start >= end {
+        return Err(TraceError::TimeParse(
+            "Start time must be before end time".to_string(),
+        ));
+    }
+    Ok(TimeRange { start, end })
+}
+
+fn trace_query_envelope(range: &TimeRange) -> Result<TimeRange, TraceError> {
+    let end = truncate_to_minute(range.end)
+        .checked_add_signed(Duration::minutes(1))
+        .ok_or_else(|| {
+            TraceError::TimeParse("Query end time is outside the supported range".to_string())
+        })?;
+    Ok(TimeRange {
+        start: truncate_to_minute(range.start),
+        end,
+    })
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, TraceError> {
@@ -476,7 +515,7 @@ impl TraceSqlContext {
             format!("{alias}.")
         };
         let mut filter = format!(
-            "{prefix}{} >= TIMESTAMP '{}' AND {prefix}{} <= TIMESTAMP '{}'",
+            "{prefix}{} >= TIMESTAMP '{}' AND {prefix}{} < TIMESTAMP '{}'",
             self.time_column, self.start_time, self.time_column, self.end_time
         );
         if let Some(service_name) = &self.service_name {
@@ -523,7 +562,9 @@ fn build_trace_list_sql(
     t."span_span_id",
     t."span_start_time_unix_nano",
     t."span_start_time_unix_nano_epoch",
-    t."p_timestamp",
+    MIN(t."p_timestamp") OVER (
+      PARTITION BY t."span_trace_id", t."span_span_id"
+    ) AS "p_timestamp",
     t."span_status_code",
     t."span_parent_span_id",
     COUNT(DISTINCT t."span_span_id") OVER (
@@ -569,7 +610,13 @@ WHERE {source_filter} AND {option_filter}"#
     )
 }
 
-fn build_trace_bounds_sql(dataset: &str, trace_id: &str, time_column: &str) -> String {
+fn build_trace_bounds_sql(
+    dataset: &str,
+    trace_id: &str,
+    time_column: &str,
+    time_range: &TimeRange,
+) -> String {
+    let filter = TraceSqlContext::new(dataset, time_column, time_range, None).filter("");
     let table = quote_identifier(dataset);
     let trace_id = escape_sql_string_literal(trace_id);
     let time_column = quote_identifier(time_column);
@@ -578,7 +625,7 @@ fn build_trace_bounds_sql(dataset: &str, trace_id: &str, time_column: &str) -> S
   MIN({time_column}) AS start_time,
   MAX({time_column}) AS end_time
 FROM {table}
-WHERE "span_trace_id" = '{trace_id}'"#
+WHERE "span_trace_id" = '{trace_id}' AND {filter}"#
     )
 }
 
@@ -830,11 +877,117 @@ fn escape_sql_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::prelude::SessionContext;
 
     fn context(service_name: Option<&str>) -> TraceSqlContext {
         let range =
             TimeRange::parse_human_time("2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z").unwrap();
         TraceSqlContext::new("traces", "p_timestamp", &range, service_name)
+    }
+
+    #[test]
+    fn exact_trace_window_preserves_fractional_bounds() {
+        let range =
+            parse_time_range("2026-01-01T00:00:15.125Z", "2026-01-01T00:01:45.875Z").unwrap();
+        assert_eq!(
+            range.start,
+            parse_timestamp("2026-01-01T00:00:15.125Z").unwrap()
+        );
+        assert_eq!(
+            range.end,
+            parse_timestamp("2026-01-01T00:01:45.875Z").unwrap()
+        );
+        assert!(parse_time_range("2026-01-01T00:00:45Z", "2026-01-01T00:00:15Z").is_err());
+    }
+
+    #[test]
+    fn exact_trace_window_relative_bounds_share_now_and_envelope_covers_end_minute() {
+        let now = parse_timestamp("2026-01-01T00:01:45.875Z").unwrap();
+        for start in ["now-90s", "90s"] {
+            let range = parse_time_range_at(start, "now", now).unwrap();
+            assert_eq!(range.start, now - Duration::seconds(90));
+            assert_eq!(range.end, now);
+            let envelope = trace_query_envelope(&range).unwrap();
+            assert_eq!(
+                envelope.start,
+                parse_timestamp("2026-01-01T00:00:00Z").unwrap()
+            );
+            assert_eq!(
+                envelope.end,
+                parse_timestamp("2026-01-01T00:02:00Z").unwrap()
+            );
+            // Existing generic query behavior remains minute-rounded.
+            let generic =
+                TimeRange::parse_human_time(&range.start.to_rfc3339(), &range.end.to_rfc3339())
+                    .unwrap();
+            assert_eq!(
+                generic.end,
+                parse_timestamp("2026-01-01T00:01:00Z").unwrap()
+            );
+        }
+        assert!(parse_time_range_at("now", "now", now).is_err());
+        assert!(parse_time_range_at("now", "now-1s", now).is_err());
+        let aligned = parse_time_range("2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z").unwrap();
+        assert_eq!(
+            trace_query_envelope(&aligned).unwrap().end,
+            parse_timestamp("2026-01-01T00:02:00Z").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_trace_window_list_and_count_execute_with_custom_time_column() {
+        let session = SessionContext::new();
+        let fixture = session
+            .sql(
+                r#"SELECT
+            'checkout' AS "service.name", 'root' AS span_name, 1000 AS span_duration_ns,
+            span_id AS span_trace_id, span_id AS span_span_id,
+            CAST(observed AS TIMESTAMP) AS span_start_time_unix_nano,
+            100 AS span_start_time_unix_nano_epoch,
+            TIMESTAMP '2025-01-01' AS p_timestamp,
+            CAST(observed AS TIMESTAMP) AS observed_at,
+            1 AS span_status_code, '' AS span_parent_span_id
+            FROM (VALUES
+                ('before', '2026-01-01T00:00:15.124Z'),
+                ('start', '2026-01-01T00:00:15.125Z'),
+                ('ending-minute', '2026-01-01T00:01:30Z'),
+                ('last', '2026-01-01T00:01:45.874Z'),
+                ('end', '2026-01-01T00:01:45.875Z'),
+                ('after', '2026-01-01T00:01:50Z')
+            ) AS fixture(span_id, observed)"#,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        session
+            .register_batch("traces", fixture[0].clone())
+            .unwrap();
+        let range =
+            parse_time_range("2026-01-01T00:00:15.125Z", "2026-01-01T00:01:45.875Z").unwrap();
+        let context = TraceSqlContext::new("traces", "observed_at", &range, None);
+        let sql = build_trace_list_sql(
+            &context,
+            &None,
+            TraceListOption::Spans,
+            TraceSortBy::MostRecent,
+            0,
+            500,
+        );
+        let batches = session.sql(&sql).await.unwrap().collect().await.unwrap();
+        let rows = record_batches_to_json(&batches).unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| row["span_span_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["ending-minute", "last", "start"]);
+        let sql = build_trace_count_sql(&context, &None, TraceListOption::Spans);
+        let batches = session.sql(&sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(
+            record_batches_to_json(&batches).unwrap()[0]["count"].as_u64(),
+            Some(3)
+        );
     }
 
     #[test]
@@ -864,9 +1017,191 @@ mod tests {
         assert!(errors.contains("t.\"span_status_code\" = 2"));
     }
 
+    #[tokio::test]
+    async fn trace_list_deduplicates_retries_before_sort_and_pagination() {
+        let session = SessionContext::new();
+        // A retry changes only ingestion time. Event rows repeat span fields too.
+        // Neither should create extra list rows or consume a pagination slot.
+        let fixture = session
+            .sql(
+                r#"SELECT
+  service AS "service.name", name AS span_name, duration AS span_duration_ns,
+  trace_id AS span_trace_id, span_id AS span_span_id,
+  CAST(started AS TIMESTAMP) AS span_start_time_unix_nano,
+  epoch AS span_start_time_unix_nano_epoch,
+  CAST(ingested AS TIMESTAMP) AS p_timestamp,
+  status AS span_status_code, parent_id AS span_parent_span_id
+FROM (VALUES
+  ('checkout', 'root', 1000, 'trace-a', 'root-a', '2026-01-01T00:10:00Z', 100, '2026-01-01T00:10:01Z', 1, ''),
+  ('checkout', 'root', 1000, 'trace-a', 'root-a', '2026-01-01T00:10:00Z', 100, '2026-01-01T00:10:02Z', 1, ''),
+  ('inventory', 'child', 100, 'trace-a', 'child-a', '2026-01-01T00:10:00Z', 101, '2026-01-01T00:10:01Z', 2, 'root-a'),
+  ('inventory', 'child', 100, 'trace-a', 'child-a', '2026-01-01T00:10:00Z', 101, '2026-01-01T00:10:03Z', 2, 'root-a'),
+  ('checkout', 'second root', 2000, 'trace-b', 'root-b', '2026-01-01T00:20:00Z', 200, '2026-01-01T00:20:01Z', 1, '')
+) AS fixture(service, name, duration, trace_id, span_id, started, epoch, ingested, status, parent_id)"#,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(fixture.len(), 1);
+        session
+            .register_batch("traces", fixture[0].clone())
+            .unwrap();
+
+        for (option, expected_count) in [
+            (TraceListOption::Traces, 2),
+            (TraceListOption::Spans, 3),
+            (TraceListOption::ErrorSpans, 1),
+        ] {
+            let count_sql = build_trace_count_sql(&context(None), &None, option);
+            let count = session
+                .sql(&count_sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let count = record_batches_to_json(&count).unwrap();
+            assert_eq!(count[0]["count"].as_u64(), Some(expected_count));
+
+            for sort in [
+                TraceSortBy::MostRecent,
+                TraceSortBy::LeastRecent,
+                TraceSortBy::LongestFirst,
+                TraceSortBy::ShortestFirst,
+                TraceSortBy::MostSpans,
+                TraceSortBy::LeastSpans,
+            ] {
+                let sql = build_trace_list_sql(&context(None), &None, option, sort, 0, 500);
+                let records = session.sql(&sql).await.unwrap().collect().await.unwrap();
+                let records = record_batches_to_json(&records).unwrap();
+                assert_eq!(records.len() as u64, expected_count);
+                let mut pages = Vec::new();
+                for offset in 0..expected_count as usize {
+                    let page_sql =
+                        build_trace_list_sql(&context(None), &None, option, sort, offset, 1);
+                    let page = session
+                        .sql(&page_sql)
+                        .await
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    pages.extend(record_batches_to_json(&page).unwrap());
+                }
+                assert_eq!(pages, records);
+                if let Some(root) = records.iter().find(|row| row["span_span_id"] == "root-a") {
+                    assert_eq!(
+                        parse_timestamp(root["p_timestamp"].as_str().unwrap())
+                            .unwrap()
+                            .to_rfc3339(),
+                        "2026-01-01T00:10:01+00:00"
+                    );
+                    assert_eq!(root["total_span_count"].as_u64(), Some(2));
+                    assert_eq!(root["error_count"].as_u64(), Some(1));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_trace_window_discovery_excludes_spans_outside_window() {
+        let session = SessionContext::new();
+        let fixture = session
+            .sql(
+                r#"SELECT span_id AS span_trace_id, CAST(observed AS TIMESTAMP) AS observed_at
+            FROM (VALUES
+                ('inside', '2026-01-01T00:01:30Z'),
+                ('before', '2026-01-01T00:00:15.124Z'),
+                ('end', '2026-01-01T00:01:45.875Z')
+            ) AS fixture(span_id, observed)"#,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        session
+            .register_batch("traces", fixture[0].clone())
+            .unwrap();
+        for (id, expected) in [("inside", true), ("before", false), ("end", false)] {
+            let range =
+                parse_time_range("2026-01-01T00:00:15.125Z", "2026-01-01T00:01:45.875Z").unwrap();
+            let sql = build_trace_bounds_sql("traces", id, "observed_at", &range);
+            let batches = session.sql(&sql).await.unwrap().collect().await.unwrap();
+            let rows = record_batches_to_json(&batches).unwrap();
+            assert_eq!(
+                rows[0].get("start_time").is_some_and(Value::is_string),
+                expected,
+                "trace {id}: {rows:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_detail_preserves_expansion_around_exact_discovery() {
+        let session = SessionContext::new();
+        let fixture = session
+            .sql(
+                r#"SELECT
+            'checkout' AS "service.name", 'root' AS span_name, 1000 AS span_duration_ns,
+            'whole-trace' AS span_trace_id, span_id AS span_span_id,
+            CAST(observed AS TIMESTAMP) AS span_start_time_unix_nano,
+            100 AS span_start_time_unix_nano_epoch,
+            CAST(observed AS TIMESTAMP) AS observed_at,
+            1 AS span_status_code, '' AS span_parent_span_id
+            FROM (VALUES
+                ('before', '2026-01-01T00:01:14.999Z'),
+                ('inside', '2026-01-01T00:01:30Z'),
+                ('after', '2026-01-01T00:01:50Z')
+            ) AS fixture(span_id, observed)"#,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        session
+            .register_batch("traces", fixture[0].clone())
+            .unwrap();
+        let range = parse_time_range("2026-01-01T00:01:15Z", "2026-01-01T00:01:45Z").unwrap();
+        let sql = build_trace_bounds_sql("traces", "whole-trace", "observed_at", &range);
+        let batches = session.sql(&sql).await.unwrap().collect().await.unwrap();
+        let bounds = record_batches_to_json(&batches).unwrap();
+        let start = parse_timestamp(bounds[0]["start_time"].as_str().unwrap()).unwrap();
+        let end = parse_timestamp(bounds[0]["end_time"].as_str().unwrap()).unwrap();
+        assert_eq!(start, parse_timestamp("2026-01-01T00:01:30Z").unwrap());
+        assert_eq!(end, start);
+        // Detail keeps the existing full minute expansion around discovered bounds.
+        let expanded = TimeRange::parse_human_time(
+            &start.to_rfc3339(),
+            &(end + Duration::minutes(1)).to_rfc3339(),
+        )
+        .unwrap();
+        let sql = format!(
+            "SELECT * FROM traces WHERE observed_at >= TIMESTAMP '{}' AND observed_at < TIMESTAMP '{}'",
+            expanded.start.to_rfc3339(),
+            expanded.end.to_rfc3339()
+        );
+        let expanded_batches = session.sql(&sql).await.unwrap().collect().await.unwrap();
+        session.deregister_table("traces").unwrap();
+        session
+            .register_batch("traces", expanded_batches[0].clone())
+            .unwrap();
+        let sql = build_trace_detail_sql("traces", "whole-trace", "observed_at", false);
+        let batches = session.sql(&sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(record_batches_to_json(&batches).unwrap().len(), 3);
+    }
+
     #[test]
     fn trace_detail_sql_escapes_id_and_builds_hierarchy() {
-        let bounds = build_trace_bounds_sql("traces", "abc' OR 1=1 --", "observed_at");
+        let bounds = build_trace_bounds_sql(
+            "traces",
+            "abc' OR 1=1 --",
+            "observed_at",
+            &parse_time_range("1h", "now").unwrap(),
+        );
         assert!(bounds.contains("\"span_trace_id\" = 'abc'' OR 1=1 --'"));
         assert!(bounds.contains("MIN(\"observed_at\") AS start_time"));
 

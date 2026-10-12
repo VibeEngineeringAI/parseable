@@ -102,7 +102,7 @@ describe('per-client dataset demo', () => {
         customPartition: 'nested.field',
       }),
     ).rejects.toThrow("must not contain '.'");
-    expect(await client.listDatasets()).toHaveLength(4);
+    expect(await client.listDatasets()).toHaveLength(5);
   });
   it('keeps dataset state isolated and returns copies of metadata, inventory, schema and stats', async () => {
     const first = createDemoClient(),
@@ -120,7 +120,7 @@ describe('per-client dataset demo', () => {
     expect((await first.datasetInfo('application_logs')).logSourceFormats).toEqual(['json']);
     expect(await first.schema('application_logs')).toContain('message');
     expect((await first.datasetStats('application_logs')).ingestion.count).toBe(100);
-    expect(await second.listDatasets()).toHaveLength(4);
+    expect(await second.listDatasets()).toHaveLength(5);
   });
   const reads = [
     (c: ParseableClient, s?: AbortSignal) => c.datasetInfo('missing', s),
