@@ -32,7 +32,7 @@ use crate::{
     parseable::{DEFAULT_TENANT, PARSEABLE},
     rbac::{
         Users,
-        map::{roles, users, write_user_groups},
+        map::{read_user_groups, roles, users, write_user_groups},
         user::{self, UserType},
     },
     tenants::TENANT_METADATA,
@@ -128,27 +128,7 @@ pub async fn delete_user(
     metadata.users.retain(|user| user.userid() != userid);
 
     // also delete from user groups
-    let user_groups = Users.get_user_groups(&userid, &tenant_id);
-    let mut groups_to_update = Vec::new();
-
-    for user_group in user_groups {
-        if let Some(groups) = write_user_groups().get_mut(tenant)
-            && let Some(ug) = groups.get_mut(&user_group)
-            && let Some(users) = users().get(tenant)
-            && let Some(user) = users.get(&userid)
-        {
-            let userid = match &user.ty {
-                UserType::Native(basic) => basic.username.clone(),
-                UserType::OAuth(oauth) => oauth.userid.clone(),
-                UserType::ApiKey(api_key) => api_key.userid.clone(),
-            };
-            ug.remove_users_by_user_ids(HashSet::from_iter([userid]))?;
-            groups_to_update.push(ug.clone());
-        } else {
-            // User not found, skip or log as needed
-            continue;
-        }
-    }
+    let groups_to_update = remove_user_from_groups(&userid, &tenant_id)?;
 
     // For each updated group, replace in place if found; otherwise push
     for updated_group in &groups_to_update {
@@ -173,6 +153,46 @@ pub async fn delete_user(
     // update in mem table
     Users.delete_user(&userid, &tenant_id);
     Ok(HttpResponse::Ok().json(format!("deleted user: {username}")))
+}
+
+/// Removes the user from every in-memory group it belongs to and returns the
+/// updated groups so the caller can persist them. Caller holds `UPDATE_LOCK`.
+pub(crate) fn remove_user_from_groups(
+    userid: &str,
+    tenant_id: &Option<String>,
+) -> Result<Vec<user::UserGroup>, RBACError> {
+    let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+    let Some(member_id) = Users
+        .get_user(userid, tenant_id)
+        .map(|user| match &user.ty {
+            UserType::Native(basic) => basic.username.clone(),
+            UserType::OAuth(oauth) => oauth.userid.clone(),
+            UserType::ApiKey(api_key) => api_key.userid.clone(),
+        })
+    else {
+        return Ok(Vec::new());
+    };
+    let mut groups_to_update = Vec::new();
+
+    for user_group in Users.get_user_groups(userid, tenant_id) {
+        // Removing members refreshes sessions, which comes first in the lock
+        // order (see `rbac::map`): update a copy, then store it back.
+        let Some(mut ug) = read_user_groups()
+            .get(tenant)
+            .and_then(|groups| groups.get(&user_group))
+            .cloned()
+        else {
+            continue;
+        };
+        ug.remove_users_by_user_ids(HashSet::from_iter([member_id.clone()]))?;
+        if let Some(groups) = write_user_groups().get_mut(tenant)
+            && let Some(stored) = groups.get_mut(&user_group)
+        {
+            stored.clone_from(&ug);
+        }
+        groups_to_update.push(ug);
+    }
+    Ok(groups_to_update)
 }
 
 // Handler PATCH /user/{userid}/role/add => Add roles to a user

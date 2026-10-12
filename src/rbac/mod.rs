@@ -46,6 +46,10 @@ use self::user::UserType;
 
 pub const EXPIRY_DURATION: Duration = Duration::hours(1);
 
+// A first Basic login re-verifies when the user changes mid-login; bound the
+// retries so a stream of password changes cannot spin it.
+const BASIC_LOGIN_ATTEMPTS: usize = 3;
+
 #[derive(PartialEq, Debug)]
 pub enum Response {
     Authorized,
@@ -79,7 +83,10 @@ impl Users {
 
     pub fn put_user(&self, user: User) {
         let tenant_id = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
-        mut_sessions().remove_user(user.userid(), tenant_id);
+        // Holding SESSIONS across both steps keeps a concurrent first login from
+        // tracking a session for the user being replaced.
+        let mut sessions = mut_sessions();
+        sessions.remove_user(user.userid(), tenant_id);
         mut_users().insert(user);
     }
 
@@ -168,6 +175,8 @@ impl Users {
     // caller ensures that this operation is valid for the user
     pub fn change_password_hash(&self, userid: &str, hash: &String, tenant_id: &Option<String>) {
         let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+        // SESSIONS before USERS; see the lock order in `map`.
+        let mut sessions = mut_sessions();
         if let Some(users) = mut_users().get_mut(tenant_id)
             && let Some(User {
                 ty: UserType::Native(user),
@@ -175,12 +184,14 @@ impl Users {
             }) = users.get_mut(userid)
         {
             user.password_hash.clone_from(hash);
-            mut_sessions().remove_user(userid, tenant_id);
+            sessions.remove_user(userid, tenant_id);
         };
     }
 
     pub fn add_roles(&self, userid: &str, roles: HashSet<String>, tenant_id: &Option<String>) {
         let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+        // SESSIONS before USERS; see the lock order in `map`.
+        let mut sessions = mut_sessions();
         if let Some(users) = mut_users().get_mut(tenant_id)
             && let Some(user) = users.get_mut(userid)
         {
@@ -188,19 +199,21 @@ impl Users {
             manual.extend(roles);
             user.set_manual_roles(manual);
             let new_perms = roles_to_permission(user.roles(), tenant_id);
-            mut_sessions().refresh_user_permissions(userid, tenant_id, &new_perms);
+            sessions.refresh_user_permissions(userid, tenant_id, &new_perms);
         };
     }
 
     pub fn remove_roles(&self, userid: &str, roles: HashSet<String>, tenant_id: &Option<String>) {
         let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+        // SESSIONS before USERS; see the lock order in `map`.
+        let mut sessions = mut_sessions();
         if let Some(users) = mut_users().get_mut(tenant_id)
             && let Some(user) = users.get_mut(userid)
         {
             let manual = user.manual_roles();
             user.set_manual_roles(HashSet::from_iter(manual.difference(&roles).cloned()));
             let new_perms = roles_to_permission(user.roles(), tenant_id);
-            mut_sessions().refresh_user_permissions(userid, tenant_id, &new_perms);
+            sessions.refresh_user_permissions(userid, tenant_id, &new_perms);
         };
     }
 
@@ -283,32 +296,65 @@ impl Users {
             get_tenant_id_from_key(&key)
         };
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        if let Some(users) = users().get(tenant)
-            && let Some(
-                user @ User {
-                    ty: UserType::Native(basic_user),
-                    ..
-                },
-            ) = users.get(username)
-        {
-            // if user exists and password matches
+        // Verify without holding SESSIONS, then re-read the user under it (lock
+        // order SESSIONS -> USERS, see `map`) so a password change, role change
+        // or deletion racing the verification cannot leave a stale session.
+        for _ in 0..BASIC_LOGIN_ATTEMPTS {
+            let Some(verified_hash) = self.verified_password_hash(username, password, tenant)
+            else {
+                return Response::UnAuthorized;
+            };
+            let mut sessions = mut_sessions();
+            let current = users()
+                .get(tenant)
+                .and_then(|users| users.get(username))
+                .filter(|user| {
+                    matches!(&user.ty, UserType::Native(basic) if basic.password_hash == verified_hash)
+                })
+                .map(|user| {
+                    (
+                        roles_to_permission(user.roles(), tenant),
+                        user.tenant.clone(),
+                    )
+                });
+            // The user changed after verification; verify against the new state.
+            let Some((permissions, user_tenant)) = current else {
+                continue;
+            };
             // add this user to auth map
-            if basic_user.verify_password(password) {
-                let mut sessions = mut_sessions();
-                sessions.track_new(
-                    username.clone(),
-                    key.clone(),
-                    DateTime::<Utc>::MAX_UTC,
-                    roles_to_permission(user.roles(), tenant),
-                    &user.tenant,
-                );
-                return sessions
-                    .check_auth(&key, action, context_stream, context_user)
-                    .expect("entry for this key just added");
-            }
+            sessions.track_new(
+                username.clone(),
+                key.clone(),
+                DateTime::<Utc>::MAX_UTC,
+                permissions,
+                &user_tenant,
+            );
+            return sessions
+                .check_auth(&key, action, context_stream, context_user)
+                .expect("entry for this key just added");
         }
 
         Response::UnAuthorized
+    }
+
+    /// Returns the stored hash if `password` matches the native user's. The
+    /// slow hash check runs without holding any RBAC lock.
+    fn verified_password_hash(
+        &self,
+        username: &str,
+        password: &str,
+        tenant: &str,
+    ) -> Option<String> {
+        let basic = match users().get(tenant).and_then(|users| users.get(username)) {
+            Some(User {
+                ty: UserType::Native(basic),
+                ..
+            }) => basic.clone(),
+            _ => return None,
+        };
+        basic
+            .verify_password(password)
+            .then_some(basic.password_hash)
     }
 
     #[inline(always)]
@@ -411,4 +457,532 @@ pub fn roles_to_permission(roles: Vec<String>, tenant_id: &str) -> Vec<Permissio
         };
     }
     perms.into_iter().collect()
+}
+
+#[cfg(test)]
+mod lock_order_tests {
+    //! Deadlock regressions for the process-wide RBAC maps. Each test forces an
+    //! interleaving at the lock boundaries and bounds every wait, so a lock-order
+    //! cycle fails the test instead of hanging the run.
+
+    use std::sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version, password_hash::SaltString};
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::handlers::http::modal::query::querier_rbac::remove_user_from_groups;
+    use crate::rbac::map::{
+        ROLES, SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups, mut_roles, write_user_groups,
+    };
+    use crate::rbac::role::model::{DefaultPrivilege, Role};
+    use crate::rbac::user::{Basic, GroupUser, UserGroup};
+
+    const ROLE: &str = "lock-order-admin";
+    // Generous for debug builds; a deadlocked thread never finishes.
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    // `map::init` needs `PARSEABLE`, so tests create the maps directly. They hold
+    // the shared locks on purpose, so they run one at a time.
+    fn auth_state() -> MutexGuard<'static, ()> {
+        let serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        USERS.get_or_init(|| RwLock::new(map::Users::default()));
+        SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+        serial
+    }
+
+    /// A fresh tenant with an admin role, so tests never see each other's users.
+    fn tenant() -> String {
+        let tenant = format!("lock-order-{}", Ulid::new());
+        mut_roles().entry(tenant.clone()).or_default().insert(
+            ROLE.to_owned(),
+            Role::create_internal_role(vec![DefaultPrivilege::Admin]),
+        );
+        tenant
+    }
+
+    // Default Argon2 parameters take seconds per hash in debug builds.
+    fn cheap_hash(password: &str) -> String {
+        let salt = SaltString::encode_b64(&Ulid::new().to_bytes()).unwrap();
+        let params = Params::new(Params::MIN_M_COST, 1, 1, None).unwrap();
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    /// A native user (not yet stored) and its Basic-auth key.
+    fn basic_user(tenant: &str, roles: &[&str]) -> (User, SessionKey) {
+        let username = format!("user-{}", Ulid::new());
+        let password = format!("password-{}", Ulid::new());
+        let user = User {
+            ty: UserType::Native(Basic {
+                username: username.clone(),
+                password_hash: cheap_hash(&password),
+                email: None,
+            }),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+            user_groups: HashSet::new(),
+            tenant: Some(tenant.to_owned()),
+            protected: false,
+        };
+        (user, SessionKey::BasicAuth { username, password })
+    }
+
+    fn native_user(tenant: &str, roles: &[&str]) -> (User, SessionKey) {
+        let (user, key) = basic_user(tenant, roles);
+        mut_users().insert(user.clone());
+        (user, key)
+    }
+
+    /// Tracks a browser-style session for `user`; its permissions come from roles.
+    fn session_for(user: &User) -> SessionKey {
+        let key = SessionKey::SessionId(Ulid::new());
+        Users.new_session(user, key.clone(), TimeDelta::minutes(5));
+        key
+    }
+
+    fn spawn<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> mpsc::Receiver<T> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx
+    }
+
+    fn finish<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
+        rx.recv_timeout(DEADLINE)
+            .unwrap_or_else(|_| panic!("{what} did not finish within {DEADLINE:?}: deadlock"))
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < DEADLINE, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // parking_lot's RwLock is task-fair: a queued writer sets the exclusive bit
+    // and blocks every new reader until it has run.
+    fn writer_queued<T>(lock: &RwLock<T>) -> bool {
+        lock.is_locked_exclusive()
+    }
+
+    fn users_lock() -> &'static RwLock<map::Users> {
+        USERS.get().unwrap()
+    }
+
+    fn sessions_lock() -> &'static RwLock<Sessions> {
+        SESSIONS.get().unwrap()
+    }
+
+    /// Spawns `write` and waits until it has finished or is queued for USERS.
+    fn queue_user_writer(write: impl FnOnce() + Send + 'static) -> mpsc::Receiver<()> {
+        let done = Arc::new(AtomicBool::new(false));
+        let rx = spawn({
+            let done = done.clone();
+            move || {
+                write();
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+        wait_until("the user writer to queue or finish", || {
+            done.load(Ordering::SeqCst) || writer_queued(users_lock())
+        });
+        rx
+    }
+
+    /// Stands in for a session-authorized request inside `Sessions::check_auth`:
+    /// it takes SESSIONS(read), then waits for `go` before it reads the user maps.
+    fn paused_session_check(
+        key: SessionKey,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<Option<Response>>) {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let result = spawn(move || {
+            let sessions = sessions();
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            sessions.check_auth(&key, Action::Query, None, None)
+        });
+        finish(&held_rx, "the session check to take SESSIONS");
+        (go_tx, result)
+    }
+
+    fn first_login(key: &SessionKey) -> mpsc::Receiver<Response> {
+        let key = key.clone();
+        spawn(move || Users.authorize(key, Action::Query, None, None))
+    }
+
+    // Reproduction: a first Basic login kept its USERS read guard while it took
+    // SESSIONS(write) and then re-read USERS inside `check_auth`. A user write
+    // queued in between waited for the outer guard and blocked the inner read.
+    #[test]
+    fn first_basic_login_survives_a_queued_user_write() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (_, login) = native_user(&tenant, &[ROLE]);
+        let (newcomer, _) = basic_user(&tenant, &[ROLE]);
+
+        // Another request reading sessions holds the login back at SESSIONS.
+        let reader = sessions();
+        let login_rx = first_login(&login);
+        wait_until("the login to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        // For example an OIDC login storing its user.
+        let writer = queue_user_writer(move || mut_users().insert(newcomer));
+        drop(reader);
+
+        assert_eq!(finish(&login_rx, "first Basic login"), Response::Authorized);
+        finish(&writer, "user write");
+        assert!(Users.session_exists(&login));
+    }
+
+    // Reproduction of the reported three-way cycle: login holds USERS and waits
+    // for SESSIONS, a session check holds SESSIONS and waits for USERS, and a
+    // queued user write blocks that read.
+    #[test]
+    fn first_login_session_check_and_user_write_do_not_cycle() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (_, login) = native_user(&tenant, &[ROLE]);
+        let (member, _) = native_user(&tenant, &[ROLE]);
+        let member_session = session_for(&member);
+        let (newcomer, _) = basic_user(&tenant, &[ROLE]);
+
+        let (go, check) = paused_session_check(member_session);
+        let login_rx = first_login(&login);
+        wait_until("the login to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        let writer = queue_user_writer(move || mut_users().insert(newcomer));
+        go.send(()).unwrap();
+
+        assert_eq!(finish(&check, "session check"), Some(Response::Authorized));
+        assert_eq!(finish(&login_rx, "first Basic login"), Response::Authorized);
+        finish(&writer, "user write");
+    }
+
+    // Reproduction: administrative writes took USERS(write) and then
+    // SESSIONS(write), the reverse of `check_auth`.
+    fn assert_admin_write_survives_session_check(write: fn(&User)) {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (target, _) = native_user(&tenant, &[]);
+        let (member, _) = native_user(&tenant, &[ROLE]);
+        let member_session = session_for(&member);
+
+        let (go, check) = paused_session_check(member_session);
+        let writer = spawn(move || write(&target));
+        wait_until("the admin write to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        go.send(()).unwrap();
+
+        assert_eq!(finish(&check, "session check"), Some(Response::Authorized));
+        finish(&writer, "admin write");
+    }
+
+    #[test]
+    fn adding_roles_does_not_deadlock_with_a_session_check() {
+        assert_admin_write_survives_session_check(|user| {
+            Users.add_roles(
+                user.userid(),
+                HashSet::from([ROLE.to_owned()]),
+                &user.tenant,
+            )
+        });
+    }
+
+    #[test]
+    fn removing_roles_does_not_deadlock_with_a_session_check() {
+        assert_admin_write_survives_session_check(|user| {
+            Users.remove_roles(
+                user.userid(),
+                HashSet::from([ROLE.to_owned()]),
+                &user.tenant,
+            )
+        });
+    }
+
+    #[test]
+    fn password_change_does_not_deadlock_with_a_session_check() {
+        assert_admin_write_survives_session_check(|user| {
+            Users.change_password_hash(user.userid(), &cheap_hash("changed"), &user.tenant)
+        });
+    }
+
+    #[test]
+    fn replacing_a_user_does_not_deadlock_with_a_session_check() {
+        assert_admin_write_survives_session_check(|user| Users.put_user(user.clone()));
+    }
+
+    // Reproduction: deleting a user on the querier held USER_GROUPS(write) (and
+    // USERS) while refreshing sessions, the reverse of `check_auth`.
+    #[test]
+    fn group_removal_does_not_deadlock_with_a_session_check() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let group_name = format!("group-{}", Ulid::new());
+        let (mut leaving, _) = basic_user(&tenant, &[]);
+        let (mut member, _) = basic_user(&tenant, &[ROLE]);
+        for user in [&mut leaving, &mut member] {
+            user.user_groups.insert(group_name.clone());
+            mut_users().insert(user.clone());
+        }
+        let group = UserGroup::new(
+            group_name.clone(),
+            HashSet::from([ROLE.to_owned()]),
+            HashSet::from([
+                GroupUser::from_user(&leaving),
+                GroupUser::from_user(&member),
+            ]),
+        );
+        write_user_groups().insert(group, &tenant);
+        let member_session = session_for(&member);
+
+        let (go, check) = paused_session_check(member_session);
+        let removal = spawn({
+            let userid = leaving.userid().to_owned();
+            let tenant = leaving.tenant.clone();
+            move || remove_user_from_groups(&userid, &tenant).map(|groups| groups.len())
+        });
+        wait_until("the group removal to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        go.send(()).unwrap();
+
+        assert_eq!(finish(&check, "session check"), Some(Response::Authorized));
+        assert_eq!(finish(&removal, "group removal").unwrap(), 1);
+        let groups = read_user_groups();
+        let users = &groups[&tenant][&group_name].users;
+        assert!(!users.contains(&GroupUser::from_user(&leaving)));
+        assert!(users.contains(&GroupUser::from_user(&member)));
+    }
+
+    #[test]
+    fn basic_login_authorizes_once_then_reuses_the_session() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (_, login) = native_user(&tenant, &[ROLE]);
+
+        assert_eq!(finish(&first_login(&login), "login"), Response::Authorized);
+        assert!(Users.session_exists(&login));
+        assert_eq!(finish(&first_login(&login), "login"), Response::Authorized);
+
+        let SessionKey::BasicAuth { username, .. } = &login else {
+            unreachable!()
+        };
+        let wrong = SessionKey::BasicAuth {
+            username: username.clone(),
+            password: "wrong".into(),
+        };
+        assert_eq!(
+            finish(&first_login(&wrong), "login"),
+            Response::UnAuthorized
+        );
+        assert!(!Users.session_exists(&wrong));
+        let unknown = SessionKey::BasicAuth {
+            username: format!("missing-{}", Ulid::new()),
+            password: "whatever".into(),
+        };
+        assert_eq!(
+            finish(&first_login(&unknown), "login"),
+            Response::UnAuthorized
+        );
+        assert_eq!(
+            Users.authorize(
+                SessionKey::SessionId(Ulid::new()),
+                Action::Query,
+                None,
+                None
+            ),
+            Response::ReloadRequired
+        );
+    }
+
+    #[test]
+    fn basic_login_without_roles_is_tracked_but_unauthorized() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (_, login) = native_user(&tenant, &[]);
+
+        assert_eq!(
+            finish(&first_login(&login), "login"),
+            Response::UnAuthorized
+        );
+        assert!(Users.session_exists(&login));
+    }
+
+    #[test]
+    fn session_check_includes_group_permissions() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let group_name = format!("group-{}", Ulid::new());
+        let (mut grouped, _) = basic_user(&tenant, &[]);
+        grouped.user_groups.insert(group_name.clone());
+        mut_users().insert(grouped.clone());
+        let (outsider, _) = native_user(&tenant, &[]);
+        write_user_groups().insert(
+            UserGroup::new(
+                group_name,
+                HashSet::from([ROLE.to_owned()]),
+                HashSet::from([GroupUser::from_user(&grouped)]),
+            ),
+            &tenant,
+        );
+
+        let grouped_session = session_for(&grouped);
+        let outsider_session = session_for(&outsider);
+        assert_eq!(
+            Users.authorize(grouped_session, Action::Query, None, None),
+            Response::Authorized
+        );
+        assert_eq!(
+            Users.authorize(outsider_session, Action::Query, None, None),
+            Response::UnAuthorized
+        );
+    }
+
+    // A password change that lands while a first login is verifying the old
+    // password must not leave a session keyed by the old password.
+    #[test]
+    fn password_change_during_first_login_leaves_no_stale_session() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (user, login) = native_user(&tenant, &[ROLE]);
+
+        let reader = sessions();
+        let login_rx = first_login(&login);
+        wait_until("the login to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        let new_hash = cheap_hash("changed");
+        let writer = queue_user_writer(move || {
+            if let Some(users) = mut_users().get_mut(user.tenant.as_deref().unwrap())
+                && let Some(User {
+                    ty: UserType::Native(basic),
+                    ..
+                }) = users.get_mut(user.userid())
+            {
+                basic.password_hash = new_hash;
+            }
+        });
+        finish(&writer, "password change");
+        drop(reader);
+
+        assert_eq!(finish(&login_rx, "login"), Response::UnAuthorized);
+        assert!(!Users.session_exists(&login));
+    }
+
+    #[test]
+    fn deletion_during_first_login_leaves_no_session() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (user, login) = native_user(&tenant, &[ROLE]);
+
+        let reader = sessions();
+        let login_rx = first_login(&login);
+        wait_until("the login to queue for SESSIONS", || {
+            writer_queued(sessions_lock())
+        });
+        let deletion = spawn(move || {
+            let mut users = Users;
+            users.delete_user(user.userid(), &user.tenant)
+        });
+        wait_until("the user to be removed", || {
+            !users_lock()
+                .try_read()
+                .is_some_and(|users| users[&tenant].contains_key(user_id(&login)))
+        });
+        drop(reader);
+
+        assert_eq!(finish(&login_rx, "login"), Response::UnAuthorized);
+        finish(&deletion, "deletion");
+        assert!(!Users.session_exists(&login));
+    }
+
+    fn user_id(key: &SessionKey) -> &str {
+        match key {
+            SessionKey::BasicAuth { username, .. } => username,
+            SessionKey::SessionId(_) => unreachable!(),
+        }
+    }
+
+    // Logins, session checks and user writes racing freely must all finish.
+    #[test]
+    fn concurrent_logins_session_checks_and_user_writes_finish() {
+        const ROUNDS: usize = 40;
+        let _serial = auth_state();
+        let tenant = tenant();
+        // Set everything up first: a deadlocked worker would block the test thread.
+        let logins: Vec<_> = (0..4).map(|_| native_user(&tenant, &[ROLE]).1).collect();
+        let sessions: Vec<_> = (0..4)
+            .map(|_| session_for(&native_user(&tenant, &[ROLE]).0))
+            .collect();
+        let targets: Vec<_> = (0..2).map(|_| native_user(&tenant, &[]).0).collect();
+        let newcomers: Vec<Vec<_>> = (0..2)
+            .map(|_| {
+                (0..ROUNDS)
+                    .map(|_| basic_user(&tenant, &[ROLE]).0)
+                    .collect()
+            })
+            .collect();
+        let new_hash = cheap_hash("changed");
+
+        let mut workers = Vec::new();
+        for login in logins {
+            workers.push(spawn(move || {
+                for _ in 0..ROUNDS {
+                    // Forget the session so every round is a first login.
+                    Users.remove_session(&login);
+                    assert_eq!(
+                        Users.authorize(login.clone(), Action::Query, None, None),
+                        Response::Authorized
+                    );
+                }
+            }));
+        }
+        for session in sessions {
+            workers.push(spawn(move || {
+                for _ in 0..ROUNDS {
+                    assert_eq!(
+                        Users.authorize(session.clone(), Action::Query, None, None),
+                        Response::Authorized
+                    );
+                }
+            }));
+        }
+        for (target, newcomers) in targets.into_iter().zip(newcomers) {
+            let new_hash = new_hash.clone();
+            workers.push(spawn(move || {
+                let roles = HashSet::from([ROLE.to_owned()]);
+                for newcomer in newcomers {
+                    Users.add_roles(target.userid(), roles.clone(), &target.tenant);
+                    Users.remove_roles(target.userid(), roles.clone(), &target.tenant);
+                    Users.change_password_hash(target.userid(), &new_hash, &target.tenant);
+                    mut_users().insert(newcomer);
+                    Users.put_user(target.clone());
+                }
+            }));
+        }
+        for (index, worker) in workers.iter().enumerate() {
+            finish(worker, &format!("worker {index}"));
+        }
+    }
 }
