@@ -642,7 +642,7 @@ ingestion or cross-browser coverage.
 
 ## Native missing screens (2026-10-12)
 
-[Shared Mayfly completion record](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=d665474a-2bc8-445f-a8e7-4949ea6e32e3#J63UryiLZKvb1G5vnY7RVQhXPDhXy-GpIhjXiCB_TzM) documents implementation commit `83503697`, scope limits, review findings and validation caveats, and is linked from the earlier Traces/APM/ingestion wiki page. This implementation is committed locally; it has not been pushed or deployed.
+[Shared Mayfly completion record](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=d665474a-2bc8-445f-a8e7-4949ea6e32e3#J63UryiLZKvb1G5vnY7RVQhXPDhXy-GpIhjXiCB_TzM) documents implementation commit `83503697`, scope limits, review findings and validation caveats, and is linked from the earlier Traces/APM/ingestion wiki page. At the initial wiki publication, this implementation was committed locally and had not been pushed or deployed.
 
 Implemented on `feat/native-missing-screens` from `origin/main` (`81d1e0c9`), with five Sol 6.1 agents covering implementation, independent regressions and Storybook QA, plus four Opus 5.5 review rounds. See [scope and deliberate limits](prism-parity.md#native-missing-screen-scope-2026-10-12). Network access is the real outbound alert-target policy editor; Keystone/LLM management and hosted workspace provisioning remain explicitly unavailable.
 
