@@ -127,6 +127,30 @@ const cases: Case[] = [
     reply: { ...key, apiKey: 'full-test-key' },
   },
   {
+    name: 'create API key with TTL 1800',
+    run: (c) => c.createApiKey('ingestion', ['analysts'], 1800),
+    url: '/api/prism/v1/apikeys',
+    method: 'POST',
+    body: { keyName: 'ingestion', roles: ['analysts'], ttlSeconds: 1800 },
+    reply: { ...key, expiresAt: '2026-10-08T12:30:00Z' },
+  },
+  {
+    name: 'create API key with TTL null',
+    run: (c) => c.createApiKey('ingestion', ['analysts'], null),
+    url: '/api/prism/v1/apikeys',
+    method: 'POST',
+    body: { keyName: 'ingestion', roles: ['analysts'], ttlSeconds: null },
+    reply: { ...key, expiresAt: null },
+  },
+  {
+    name: 'create API key with TTL 7776000',
+    run: (c) => c.createApiKey('ingestion', ['analysts'], 7776000),
+    url: '/api/prism/v1/apikeys',
+    method: 'POST',
+    body: { keyName: 'ingestion', roles: ['analysts'], ttlSeconds: 7776000 },
+    reply: { ...key, expiresAt: '2027-01-06T12:00:00Z' },
+  },
+  {
     name: 'get API key',
     run: (c, s) => c.getApiKey('key/id', s),
     url: '/api/prism/v1/apikeys/key%2Fid',
@@ -324,6 +348,10 @@ describe('Team HTTP contracts', () => {
     { run: (c) => c.listApiKeys(), reply: [{ ...key, roles: 'analysts' }] },
     { run: (c) => c.createApiKey('key', []), reply: { ...key, createdAt: 'invalid' } },
     { run: (c) => c.getApiKey('key'), reply: { keyId: 'key' } },
+    ...[42, 'invalid', '', '2026-10-08', '2026-10-08T12:00:00+02:00'].map((expiresAt) => ({
+      run: (c: ParseableClient) => c.listApiKeys(),
+      reply: [{ ...key, expiresAt }],
+    })),
   ];
   it.each(malformedCases)(
     'rejects malformed successful Team payload %#',

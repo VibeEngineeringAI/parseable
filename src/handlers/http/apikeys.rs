@@ -51,6 +51,7 @@ struct ApiKeyResponse<'a> {
     created_by: &'a str,
     created_at: DateTime<Utc>,
     modified_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 impl<'a> TryFrom<&'a User> for ApiKeyResponse<'a> {
@@ -68,6 +69,7 @@ impl<'a> TryFrom<&'a User> for ApiKeyResponse<'a> {
             created_by: &api_key.created_by,
             created_at: api_key.created_at,
             modified_at: api_key.modified_at,
+            expires_at: api_key.expires_at,
         })
     }
 }
@@ -83,6 +85,7 @@ struct ApiKeyListEntry {
     created_by: String,
     created_at: DateTime<Utc>,
     modified_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +117,7 @@ impl ApiKeyListEntry {
             created_by: api_key.created_by.clone(),
             created_at: api_key.created_at,
             modified_at: api_key.modified_at,
+            expires_at: api_key.expires_at,
         })
     }
 }
@@ -188,7 +192,7 @@ pub async fn create_api_key(
 
     let key_id = Ulid::new();
     let api_key_value = generate_api_key_value();
-    let user = User::new_api_key(
+    let mut user = User::new_api_key(
         key_id,
         api_key_value,
         body.key_name,
@@ -196,6 +200,12 @@ pub async fn create_api_key(
         created_by,
         tenant_id.clone(),
     );
+
+    if let UserType::ApiKey(key) = &mut user.ty {
+        key.expires_at = body
+            .ttl_seconds
+            .map(|seconds| key.created_at + chrono::TimeDelta::seconds(seconds));
+    }
 
     // Persist the new user in parseable.json and push into memory on this node.
     let mut metadata = get_metadata(&tenant_id).await?;
@@ -304,10 +314,11 @@ pub async fn validate_api_key(
 ) -> Result<impl Responder, ApiKeyError> {
     let (_, tenant_id) = get_user_and_tenant_from_request(&req)
         .map_err(|_| ApiKeyError::Unauthorized("Missing user identity".into()))?;
+    let now = Utc::now();
     let valid = collect_tenant_api_keys(&tenant_id)
         .iter()
         .filter_map(|u| u.as_api_key())
-        .any(|k| k.api_key == body.api_key);
+        .any(|k| k.matches_active_key(&body.api_key, now));
 
     Ok(HttpResponse::Ok().json(ValidateApiKeyResponse { valid }))
 }
@@ -331,4 +342,51 @@ pub async fn get_api_key(
 
     let response = ApiKeyResponse::try_from(&user)?;
     Ok(HttpResponse::Ok().json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_key_remains_visible_with_expiry_in_detail_and_list() {
+        let mut user = User::new_api_key(
+            Ulid::new(),
+            "test-secret".into(),
+            "test".into(),
+            HashSet::new(),
+            "admin".into(),
+            None,
+        );
+        let expiry = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let UserType::ApiKey(key) = &mut user.ty else {
+            unreachable!()
+        };
+        key.expires_at = Some(expiry);
+        assert!(!key.matches_active_key("test-secret", expiry));
+        let detail = serde_json::to_value(ApiKeyResponse::try_from(&user).unwrap()).unwrap();
+        let entry = serde_json::to_value(ApiKeyListEntry::from_user(&user).unwrap()).unwrap();
+        assert_eq!(detail["expiresAt"], serde_json::to_value(expiry).unwrap());
+        assert_eq!(entry["expiresAt"], detail["expiresAt"]);
+        assert_eq!(entry["apiKey"], "****cret");
+        assert_eq!(detail["apiKey"], "test-secret");
+    }
+
+    #[test]
+    fn non_expiring_responses_include_null_expiry() {
+        let user = User::new_api_key(
+            Ulid::new(),
+            "test-secret".into(),
+            "test".into(),
+            HashSet::new(),
+            "admin".into(),
+            None,
+        );
+        let detail = serde_json::to_value(ApiKeyResponse::try_from(&user).unwrap()).unwrap();
+        let entry = serde_json::to_value(ApiKeyListEntry::from_user(&user).unwrap()).unwrap();
+        assert!(detail.get("expiresAt").unwrap().is_null());
+        assert!(entry.get("expiresAt").unwrap().is_null());
+    }
 }

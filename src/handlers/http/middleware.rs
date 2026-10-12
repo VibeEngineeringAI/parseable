@@ -182,6 +182,9 @@ where
             let tenant_id: Option<String> = tenant_id.clone();
             match find_api_key_user(&api_key, &tenant_id) {
                 Some(user) => {
+                    let Some(api_key) = user.as_api_key() else {
+                        return Box::pin(async { Err(ErrorUnauthorized("Invalid API key")) });
+                    };
                     let tenant = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
                     let permissions = roles_to_permission(user.roles(), tenant);
                     let session_id = Ulid::new();
@@ -189,7 +192,7 @@ where
                     mut_sessions().track_new(
                         user.userid().to_owned(),
                         session_key.clone(),
-                        Utc::now() + TimeDelta::minutes(5),
+                        api_key.session_expires_at(Utc::now()),
                         permissions,
                         &user.tenant,
                     );
@@ -280,10 +283,22 @@ where
                 return Err(err);
             }
 
-            // if session is expired, refresh token
             auth_result?;
-            if sessions().is_session_expired(&key) {
+            let api_key_session = api_key_session_id.map(SessionKey::SessionId);
+            // Basic auth retains its existing precedence when both mechanisms
+            // are supplied. Only the selected non-API session may be refreshed.
+            if api_key_session.as_ref() != Some(&key) && sessions().is_session_expired(&key) {
                 refresh_token(user_and_tenant_id, &key, headers).await?;
+            }
+            if let Some(api_key_session) = &api_key_session {
+                // This per-request session is capped by the credential's expiry.
+                // Check it after any Basic refresh without scanning users again.
+                let sessions = sessions();
+                if sessions.get(api_key_session).is_none()
+                    || sessions.is_session_expired(api_key_session)
+                {
+                    return Err(ErrorUnauthorized("Invalid API key"));
+                }
             }
             // Recheck after any async refresh or administrative grant change.
             match auth_method(&mut req, action)? {
@@ -387,9 +402,10 @@ fn find_api_key_user(api_key_value: &str, tenant_id: &Option<String>) -> Option<
 
     let users_guard = users();
     let tenant_users = users_guard.get(tenant)?;
+    let now = Utc::now();
     tenant_users.values().find_map(|user| {
         if let UserType::ApiKey(api_key) = &user.ty
-            && api_key.api_key == api_key_value
+            && api_key.matches_active_key(api_key_value, now)
         {
             Some(user.clone())
         } else {
@@ -999,6 +1015,37 @@ mod api_key_header_tests {
             .to_srv_request();
 
         assert_eq!(extract_api_key(&req).as_deref(), Some("x-api-key-value"));
+    }
+
+    #[test]
+    fn both_header_mechanisms_reject_at_expiry() {
+        let mut user = user::User::new_api_key(
+            Ulid::new(),
+            "test-secret".into(),
+            "test".into(),
+            HashSet::new(),
+            "admin".into(),
+            None,
+        );
+        let UserType::ApiKey(key) = &mut user.ty else {
+            unreachable!()
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        key.expires_at = Some(now);
+        for (header_name, header_value) in [
+            ("x-api-key", "test-secret"),
+            ("authorization", "Bearer test-secret"),
+        ] {
+            let request = actix_test::TestRequest::default()
+                .insert_header((header_name, header_value))
+                .to_srv_request();
+            let value = extract_api_key(&request).unwrap();
+            assert!(key.matches_active_key(&value, now - TimeDelta::nanoseconds(1)));
+            assert!(!key.matches_active_key(&value, now));
+            assert!(!key.matches_active_key(&value, now + TimeDelta::nanoseconds(1)));
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@ import { CredentialSheet } from './CredentialSheet';
 import { TeamSearch, useTeamSearch } from './shared';
 import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
+import { isApiKeyExpired } from './apiKeyExpiration';
 
 export async function copyApiKey(key: Promise<ApiKey>, active: { current: boolean }) {
   try {
@@ -39,7 +40,7 @@ export async function copyApiKey(key: Promise<ApiKey>, active: { current: boolea
   }
 }
 
-function CopyKey({ apiKey }: { apiKey: ApiKey }) {
+function CopyKey({ apiKey, expired }: { apiKey: ApiKey; expired: boolean }) {
   const { client } = useApp();
   const [status, setStatus] = useState('');
   const mutation = useMutation();
@@ -64,7 +65,7 @@ function CopyKey({ apiKey }: { apiKey: ApiKey }) {
         size="sm"
         aria-label={`Copy API key for ${apiKey.keyName}`}
         onClick={copy}
-        disabled={mutation.pending}
+        disabled={mutation.pending || expired}
       >
         <Copy size={14} aria-hidden="true" /> Copy API key
       </Button>
@@ -118,6 +119,19 @@ export function ApiKeysTab({
   const { client } = useApp();
   const keys = useCollection(useCallback((signal) => client.listApiKeys(signal), [client]));
   const [deleting, setDeleting] = useState<ApiKey>();
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const current = Date.now();
+    const upcoming = (keys.data ?? [])
+      .map((key) => Date.parse(key.expiresAt ?? ''))
+      .filter((time) => time > current);
+    if (!upcoming.length) return;
+    const timer = window.setTimeout(
+      () => setNow(Date.now()),
+      Math.min(Math.min(...upcoming) - current, 2_147_483_647),
+    );
+    return () => window.clearTimeout(timer);
+  }, [keys.data, now]);
   const list = useTeamSearch(
     [...(keys.data ?? [])].sort((a, b) => a.keyName.localeCompare(b.keyName)),
     (key, search) => key.keyName.toLowerCase().includes(search),
@@ -147,6 +161,7 @@ export function ApiKeysTab({
                   <th scope="col">Roles</th>
                   <th scope="col">Created by</th>
                   <th scope="col">Created at</th>
+                  <th scope="col">Expiration</th>
                   <th scope="col">Actions</th>
                 </tr>
               </thead>
@@ -173,8 +188,25 @@ export function ApiKeysTab({
                       </time>
                     </td>
                     <td>
+                      {key.expiresAt ? (
+                        <div className="stack">
+                          <time dateTime={key.expiresAt}>
+                            {new Date(key.expiresAt).toLocaleString()}
+                          </time>
+                          {isApiKeyExpired(key.expiresAt, Math.max(now, Date.now())) && (
+                            <Badge>Expired</Badge>
+                          )}
+                        </div>
+                      ) : (
+                        'No expiration'
+                      )}
+                    </td>
+                    <td>
                       <div className="team-actions">
-                        <CopyKey apiKey={key} />
+                        <CopyKey
+                          apiKey={key}
+                          expired={isApiKeyExpired(key.expiresAt, Math.max(now, Date.now()))}
+                        />
                         <Button
                           variant="ghost"
                           size="sm"

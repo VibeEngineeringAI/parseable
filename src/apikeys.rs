@@ -36,6 +36,22 @@ pub struct CreateApiKeyRequest {
     pub key_name: String,
     #[serde(default)]
     pub roles: HashSet<String>,
+    #[serde(default, deserialize_with = "deserialize_ttl_seconds")]
+    pub ttl_seconds: Option<i64>,
+}
+
+/// Validate at JSON extraction so malformed or out-of-range durations return 400.
+fn deserialize_ttl_seconds<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let ttl = Option::<i64>::deserialize(deserializer)?;
+    if ttl.is_some_and(|seconds| !(1800..=7_776_000).contains(&seconds)) {
+        return Err(serde::de::Error::custom(
+            "ttlSeconds must be an integer between 1800 and 7776000",
+        ));
+    }
+    Ok(ttl)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +91,75 @@ impl actix_web::ResponseError for ApiKeyError {
             ApiKeyError::Storage(_) | ApiKeyError::Anyhow(_) => {
                 actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ttl_accepts_inclusive_boundaries_and_no_expiration() {
+        for ttl in [json!(null), json!(1800), json!(7_776_000)] {
+            let request: CreateApiKeyRequest = serde_json::from_value(json!({
+                "keyName": "test", "ttlSeconds": ttl
+            }))
+            .unwrap();
+            assert_eq!(request.ttl_seconds, ttl.as_i64());
+        }
+        let request: CreateApiKeyRequest =
+            serde_json::from_value(json!({"keyName": "legacy"})).unwrap();
+        assert_eq!(request.ttl_seconds, None);
+    }
+
+    #[test]
+    fn ttl_rejects_out_of_range_and_non_integer_input() {
+        for ttl in [
+            json!(1799),
+            json!(7_776_001),
+            json!(-1),
+            json!(0),
+            json!(1800.5),
+            json!("1800"),
+            json!(true),
+            json!([]),
+            json!({}),
+            json!(u64::MAX),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateApiKeyRequest>(json!({
+                    "keyName": "test", "ttlSeconds": ttl
+                }))
+                .is_err(),
+                "accepted {ttl}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn invalid_ttl_json_extraction_returns_bad_request() {
+        use actix_web::{App, HttpResponse, test, web};
+        let app = test::init_service(
+            App::new().route(
+                "/",
+                web::post()
+                    .to(|_: web::Json<CreateApiKeyRequest>| async { HttpResponse::Ok().finish() }),
+            ),
+        )
+        .await;
+        for ttl in [json!(1799), json!(7_776_001), json!(1800.5), json!("1800")] {
+            let req = test::TestRequest::post()
+                .uri("/")
+                .set_json(json!({
+                    "keyName": "test", "ttlSeconds": ttl
+                }))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                actix_web::http::StatusCode::BAD_REQUEST
+            );
         }
     }
 }

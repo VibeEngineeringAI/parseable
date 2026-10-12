@@ -431,6 +431,7 @@ export function createDemoClient(): ParseableClient {
       createdBy: 'admin',
       createdAt: now,
       modifiedAt: now,
+      expiresAt: null,
     },
     {
       keyId: apiKeyId(),
@@ -440,6 +441,7 @@ export function createDemoClient(): ParseableClient {
       createdBy: 'admin',
       createdAt: now,
       modifiedAt: now,
+      expiresAt: null,
     },
   ];
   const clone = <T>(value: T): T => structuredClone(value);
@@ -673,9 +675,15 @@ export function createDemoClient(): ParseableClient {
       await ready(signal);
       return keys.map((key) => ({ ...clone(key), apiKey: `****${key.apiKey.slice(-4)}` }));
     },
-    async createApiKey(keyName, assigned) {
+    async createApiKey(keyName, assigned, ttlSeconds) {
       await ready();
       knownRoles(assigned);
+      if (
+        ttlSeconds != null &&
+        (!Number.isInteger(ttlSeconds) || ttlSeconds < 1800 || ttlSeconds > 7776000)
+      ) {
+        fail('ttlSeconds must be an integer between 1800 and 7776000.');
+      }
       if (!keyName.trim()) fail('Enter a name for the API key.');
       if (keys.some((key) => key.keyName === keyName)) fail(`Duplicate key name: ${keyName}`, 409);
       const timestamp = new Date().toISOString();
@@ -687,6 +695,10 @@ export function createDemoClient(): ParseableClient {
         createdBy: 'admin',
         createdAt: timestamp,
         modifiedAt: timestamp,
+        expiresAt:
+          ttlSeconds == null
+            ? null
+            : new Date(Date.parse(timestamp) + ttlSeconds * 1000).toISOString(),
       };
       keys.push(key);
       return clone(key);
