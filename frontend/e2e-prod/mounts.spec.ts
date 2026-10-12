@@ -43,6 +43,21 @@ for (const mount of ['', '/next']) {
       await expect(page).toHaveURL(`${mount}/add-data`);
       await expect(page.getByRole('heading', { name: 'Add data', exact: true })).toBeVisible();
 
+      for (const [path, title] of [
+        ['/agents/agent_telemetry', 'Agents'],
+        ['/cluster', 'Cluster'],
+        ['/errors/demo_traces', 'Errors'],
+        ['/onboarding', 'Get started'],
+        ['/new', 'Set up a workspace'],
+        ['/keystone/example', 'Keystone'],
+        ['/settings/llm-key', 'LLM settings'],
+        ['/settings/network-access', 'Network access'],
+      ]) {
+        await page.goto(`${mount}${path}`);
+        await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+      }
+      await expect(page.getByLabel('Allowed domains', { exact: true })).toBeVisible();
+
       expect(failed).toEqual([]);
       expect(paths.filter((path) => !path.startsWith(`${mount}/`))).toEqual([]);
       // Lazy chunks import the entry module that is already running.

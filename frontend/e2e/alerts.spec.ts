@@ -185,6 +185,8 @@ test('Alerts is reachable with telemetry explorers in Observe, with no Classic U
     'Metrics',
     'Traces',
     'APM',
+    'Agents',
+    'Errors',
     'Alerts',
   ]);
   await expect(page.locator('.sidebar-group-label').filter({ hasText: 'Classic UI' })).toHaveCount(

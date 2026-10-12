@@ -42,6 +42,30 @@ const ApmPage = lazy(() => import('../features/apm/ApmPage').then((m) => ({ defa
 const IngestionPage = lazy(() =>
   import('../features/ingestion/IngestionPage').then((m) => ({ default: m.IngestionPage })),
 );
+const OnboardingPage = lazy(() =>
+  import('../features/onboarding/OnboardingPage').then((m) => ({ default: m.OnboardingPage })),
+);
+const NewWorkspacePage = lazy(() =>
+  import('../features/onboarding/OnboardingPage').then((m) => ({ default: m.NewWorkspacePage })),
+);
+const AgentsPage = lazy(() =>
+  import('../features/agents/AgentsPage').then((m) => ({ default: m.AgentsPage })),
+);
+const KeystonePage = lazy(() =>
+  import('../features/keystone/KeystonePage').then((m) => ({ default: m.KeystonePage })),
+);
+const LlmSettingsPage = lazy(() =>
+  import('../features/settings/SettingsPages').then((m) => ({ default: m.LlmSettingsPage })),
+);
+const NetworkAccessPage = lazy(() =>
+  import('../features/settings/SettingsPages').then((m) => ({ default: m.NetworkAccessPage })),
+);
+const ClusterPage = lazy(() =>
+  import('../features/cluster/ClusterPage').then((m) => ({ default: m.ClusterPage })),
+);
+const ErrorsPage = lazy(() =>
+  import('../features/errors/ErrorsPage').then((m) => ({ default: m.ErrorsPage })),
+);
 import { OverviewPage } from './OverviewPage';
 export function App() {
   const { mode, session, identity, needsLogin, client } = useApp();
@@ -67,6 +91,13 @@ export function App() {
         dashboards: 'Dashboards',
         team: 'Team',
         components: 'Component library',
+        onboarding: 'Get started',
+        new: 'Workspace setup',
+        agents: 'Agents',
+        cluster: 'Cluster',
+        errors: 'Errors',
+        keystone: 'Keystone',
+        settings: 'Settings',
       } as Record<string, string>
     )[location.pathname.split('/')[1]] || 'Overview';
   const path = `${location.pathname}${location.search}${location.hash}`;
@@ -190,6 +221,20 @@ export function App() {
                 <Route path="/apm" element={<ApmPage />} />
                 <Route path="/apm/:dataset" element={<ApmPage />} />
                 <Route path="/apm/:dataset/:service" element={<ApmPage />} />
+                <Route path="/cluster" element={<ClusterPage />} />
+                <Route path="/errors" element={<ErrorsPage />} />
+                <Route path="/errors/:dataset" element={<ErrorsPage />} />
+                <Route path="/agents" element={<AgentsPage />} />
+                <Route path="/agents/:dataset" element={<AgentsPage />} />
+                <Route path="/keystone" element={<KeystonePage />} />
+                <Route path="/keystone/:id" element={<KeystonePage />} />
+                <Route path="/settings/llm-key" element={<LlmSettingsPage />} />
+                <Route path="/settings/network-access" element={<NetworkAccessPage />} />
+                <Route path="/onboarding" element={<OnboardingPage />} />
+                <Route
+                  path="/new"
+                  element={<NewWorkspacePage onConnect={() => setConnect(true)} />}
+                />
                 <Route path="/add-data" element={<IngestionPage />} />
                 <Route path="/sql-editor" element={<SqlPage />} />
                 <Route path="/datasets" element={<DatasetsPage />} />

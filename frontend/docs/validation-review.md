@@ -639,3 +639,17 @@ The browser tests use deterministic transports. They check generated SQL and
 limited-result tooltip values, chart rendering, save/reload, explicit legacy
 bindings, and opaque metadata preservation. They do not establish live backend
 ingestion or cross-browser coverage.
+
+## Native missing screens (2026-10-12)
+
+Implemented on `feat/native-missing-screens` from `origin/main` (`81d1e0c9`), with five Sol 6.1 agents covering implementation, independent regressions and Storybook QA, plus four Opus 5.5 review rounds. See [scope and deliberate limits](prism-parity.md#native-missing-screen-scope-2026-10-12). Network access is the real outbound alert-target policy editor; Keystone/LLM management and hosted workspace provisioning remain explicitly unavailable.
+
+Validation of the final implementation:
+
+- Production build and TypeScript pass. All **2,166 unit tests pass**, with one pre-existing skipped test.
+- All **30 focused browser tests pass** in one serial run against a fresh production bundle: Agents, operations, onboarding, settings, outbound policy, stale dataset/session behavior and `/next` navigation. Server calls are mocked; these results do not claim a live distributed-cluster or policy-propagation check.
+- **22 production mount/stale-asset tests pass**, including hard loads of every added screen at both `/` and `/next`. The **26 classic-link/onboarding tests** also passed during integration.
+- All **49 native Storybook checks pass** across a serial run and one immediate isolated retry of a transient empty iframe. Coverage includes loading/empty/permission/error states, keyboard inspection and focus restoration, time-range request bodies, policy save/discard/validation, and narrow dark-theme accessibility.
+- Opus findings addressed include network API scope, full-policy payloads, domain rules that could never match the backend, authorization-header allowlist help, permission-safe discard, unique field descriptions, missing metric values, failed dataset verification, unnecessary discovery requests, duplicate refresh requests and native URL preservation. An independent regression caught and fixed synthetic demo data appearing under unknown dataset names.
+
+Broader suites are **not clean** on this host. The 493-test development-server run was stopped after repeated `net::ERR_INSUFFICIENT_RESOURCES`, blank lazy pages and Chromium failures: 238 passed, 45 failed, 3 interrupted, 1 skipped and 206 not run. The full 221-test Storybook run had 162 passes and 59 failures (38 existing screenshot assertions and 21 runtime/resource failures). A representative grouped-bars screenshot was rebuilt and tested from an isolated `origin/main` archive: it fails by the same 1,093 pixels, and its actual PNG is byte-identical to this branch (`c21e1b584291ac5ee37e020c75832fb14dbec1566610613dc06c792f9249b06d`). No baselines were updated. The obsolete sidebar expectation was updated for Agents/Errors and passed on retry; the reported APM 24-hour test also passed independently. The final focused run used a production bundle to avoid the development server's large module graph.

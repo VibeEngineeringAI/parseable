@@ -1,3 +1,4 @@
+import type { ClusterNode, ClusterMetrics } from './operationsContract';
 export type Dataset = { name: string; type: 'logs' | 'metrics' | 'traces' };
 export type DatasetCreateOptions = {
   telemetryType: Dataset['type'];
@@ -404,7 +405,18 @@ export type DashboardVariable = {
   defaultValue?: string;
   [key: string]: unknown;
 };
+export interface AlertTargetPolicy {
+  allowPrivate: boolean;
+  allowedDomains: string[];
+  allowedCidrs: string[];
+  deniedDomains: string[];
+  deniedCidrs: string[];
+  allowInvalidTls: boolean;
+}
+
 export interface ParseableClient {
+  getAlertTargetPolicy(signal?: AbortSignal): Promise<AlertTargetPolicy>;
+  putAlertTargetPolicy(policy: AlertTargetPolicy): Promise<AlertTargetPolicy>;
   identity(signal?: AbortSignal): Promise<SessionIdentity | undefined>;
   listDatasets(signal?: AbortSignal): Promise<Dataset[]>;
   datasetInfo(name: string, signal?: AbortSignal): Promise<DatasetInfo>;
@@ -436,6 +448,8 @@ export interface ParseableClient {
   login(username: string, password: string, returnPath?: string): Promise<void>;
   logout(): Promise<void>;
   about(signal?: AbortSignal): Promise<About>;
+  clusterNodes(signal?: AbortSignal): Promise<ClusterNode[]>;
+  clusterMetrics(signal?: AbortSignal): Promise<ClusterMetrics[]>;
   listDashboards(signal?: AbortSignal): Promise<DashboardSummary[]>;
   getDashboard(id: string, signal?: AbortSignal): Promise<Dashboard>;
   createDashboard(body: DashboardRequest): Promise<Dashboard>;

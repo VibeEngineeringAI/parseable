@@ -1,3 +1,5 @@
+import { decodeAlertTargetPolicy } from './networkPolicy';
+import { clusterNodes, clusterMetrics } from './operationsContract';
 import { createDemoClient } from './demo';
 import { authEndpoint, cookieIdentity } from './auth';
 import { demoEnabled } from './config';
@@ -211,6 +213,17 @@ export function createClient({
   };
   const logViewPath = (id: string) => `${base}/filters/${encodeURIComponent(id)}`;
   return {
+    async getAlertTargetPolicy(signal) {
+      return decodeAlertTargetPolicy(
+        await readJson(`${base}/alert-target-policy`, { signal }, onUnauthorized),
+      );
+    },
+    async putAlertTargetPolicy(policy) {
+      const body = decodeAlertTargetPolicy(policy);
+      return decodeAlertTargetPolicy(
+        await readJson(`${base}/alert-target-policy`, jsonBody('PUT', body), onUnauthorized),
+      );
+    },
     async listLogViews(signal) {
       const endpoint = `${base}/filters`;
       const data = await readJson(endpoint, { signal }, onUnauthorized);
@@ -286,6 +299,12 @@ export function createClient({
     createAlertTarget: (body) => readTarget(`${base}/targets`, jsonBody('POST', body)),
     updateAlertTarget: (id, body) => readTarget(targetPath(id), jsonBody('PUT', body)),
     deleteAlertTarget: (id) => readTarget(targetPath(id), { method: 'DELETE' }),
+    async clusterNodes(signal) {
+      return clusterNodes(await readJson(`${base}/cluster/info`, { signal }, onUnauthorized));
+    },
+    async clusterMetrics(signal) {
+      return clusterMetrics(await readJson(`${base}/cluster/metrics`, { signal }, onUnauthorized));
+    },
     async about(signal) {
       const endpoint = `${base}/about`;
       const data = await readJson(endpoint, { signal }, onUnauthorized);

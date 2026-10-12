@@ -163,7 +163,9 @@ test('classic paths that moved open their page here', async ({ page }) => {
     await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
   }
   await page.goto('/keystone/example');
-  await expect(page.getByText('This page is only available in the classic UI.')).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Keystone analysis is unavailable in this native UI' }),
+  ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
 });
 
