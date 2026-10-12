@@ -137,6 +137,28 @@ flock /home/ajs/.cache/parseable-playwright.lock bash -c '
 
 On shared machines, run every Playwright invocation (including `npm run check`, `test:ui`, `test:prod` and `test:stories`) under this lock, checking ports 5173, 4180 and 6006 inside the lock before running. Do not reuse another worktree's server.
 
+### Dashboard refresh
+
+Dashboard views offer **Off / 15s / 30s / 1m / 5m** auto refresh, with Off as the
+initial setting. This is a view preference; it does not change the saved dashboard.
+The next interval starts after tile and variable queries finish. Manual refresh is
+disabled during requests. Hidden tabs pause the timer and resume with a full
+interval, without replaying missed ticks.
+
+Rolling dashboard and tile ranges share a fresh time anchor for each refresh;
+absolute ranges stay fixed. A failed refresh keeps each tile's last successful
+data, chart time bounds, and timestamp visible, with an error and retry action.
+The toolbar reports the most recent successful tile update; individual tile
+timestamps show when their own data last succeeded. Failed queries are reported
+separately, including when other tiles succeed. Changing query inputs clears
+unrelated retained data. Queries time out after two minutes and can retry on the
+next interval. Automatic updates announce failure and recovery transitions only.
+
+`e2e/dashboard-refresh.spec.ts` covers timers, slow requests, failure/recovery,
+visibility, variable queries, range overrides, and concurrent PromQL branches.
+`Dashboards/Refresh` provides interactive slow-response, failure, recovery, and
+timer stories, covered by `story-tests/dashboard-refresh.spec.ts`.
+
 ### Storybook chart regression tests
 
 `story-tests/tile-chart.spec.ts` exercises real binding controls and `TileChart`: inherited

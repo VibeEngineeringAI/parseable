@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Button, Input, Select } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
-import { useAsync } from '../../hooks/useAsync';
+import { useDashboardQuery } from './DashboardRefresh';
 import type { DashboardVariable, QueryRequest } from '../../lib/types';
 import {
   allValue,
@@ -68,6 +68,7 @@ export function VariableControl({
   values,
   selected,
   bounds,
+  revision = 0,
   promqlEnabled,
   resolutions,
   onSelect,
@@ -79,6 +80,7 @@ export function VariableControl({
   values: VariableValues;
   selected: string | null;
   bounds: Omit<QueryRequest, 'sql'>;
+  revision?: number;
   promqlEnabled?: boolean;
   resolutions: VariableResolutions;
   onSelect: (name: string, value: string) => void;
@@ -103,11 +105,16 @@ export function VariableControl({
       .filter((row) => dependencies.includes(row.name) && row.type === 'dataset')
       .map((row) => row.name),
     bounds: dynamic ? bounds : undefined,
+    revision,
     locked,
     pendingDependencies,
   });
+  const definitionKey = JSON.stringify({
+    definition: { ...definition, includeAll: undefined },
+    inputs: variableInputs(variable, values),
+  });
   // Loader identity follows content used by the request, never the document's identity.
-  const options = useAsync(
+  const options = useDashboardQuery(
     useCallback(
       (signal) =>
         locked || pendingDependencies
@@ -122,12 +129,9 @@ export function VariableControl({
             ),
       [client, sourceKey],
     ),
+    { kind: 'variable', key: JSON.stringify([definitionKey, locked]), scope: client },
   );
   const [previous, setPrevious] = useState<{ key: string; options: string[] }>();
-  const definitionKey = JSON.stringify({
-    definition: { ...definition, includeAll: undefined },
-    inputs: variableInputs(variable, values),
-  });
   useEffect(() => {
     if (options.data) setPrevious({ key: definitionKey, options: options.data });
   }, [options.data, definitionKey]);
@@ -204,7 +208,7 @@ export function VariableControl({
       {options.error && (
         <p id={errorId} className="error-text dashboard-variable-error">
           Could not load values for {variable.label}: {options.error.message}{' '}
-          <Button size="sm" onClick={options.reload}>
+          <Button size="sm" disabled={options.loading} onClick={options.reload}>
             Retry {variable.label}
           </Button>
         </p>

@@ -57,6 +57,7 @@ export function useDashboardUrl(draft: Dashboard) {
     [updateParams],
   );
   const setRange = (value: TimeRange) => updateParams((current) => rangeParams(current, value));
+  const refresh = useCallback(() => setRevision((value) => value + 1), []);
   return {
     params,
     range,
@@ -67,6 +68,6 @@ export function useDashboardUrl(draft: Dashboard) {
     bounds,
     anchor,
     revision,
-    refresh: () => setRevision((value) => value + 1),
+    refresh,
   };
 }

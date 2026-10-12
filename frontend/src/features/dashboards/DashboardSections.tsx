@@ -65,6 +65,7 @@ export function DashboardSections({
                     variables={url.variables}
                     values={url.values}
                     bounds={url.bounds}
+                    range={url.range}
                     anchor={url.anchor}
                     revision={url.revision}
                     ready={ready}
