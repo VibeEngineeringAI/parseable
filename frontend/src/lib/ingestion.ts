@@ -154,6 +154,13 @@ export function ingestionCompatibility(
     formats.some((item) => ['otel-metrics', 'otel-traces'].includes(item))
   )
     return 'This dataset uses a different OTLP signal. Select a logs dataset.';
+  if (info.customPartition) {
+    const fields = info.customPartition
+      .split(',')
+      .map((field) => field.trim())
+      .join(', ');
+    return `This dataset requires custom partition fields: ${fields}. Guided setup does not support custom partitions. Select or create a dataset without custom partitions, or configure your sender manually with values for every required field.`;
+  }
   return undefined;
 }
 

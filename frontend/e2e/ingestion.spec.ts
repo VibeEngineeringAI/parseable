@@ -1,7 +1,11 @@
 import { test, expect, type Page, type Route } from '@playwright/test';
 
 type Call = { path: string; method: string; headers: Record<string, string> };
-type FixtureInfo = { telemetryType: string; logSource: Array<{ log_source_format: string }> };
+type FixtureInfo = {
+  customPartition?: string;
+  telemetryType: string;
+  logSource: Array<{ log_source_format: string }>;
+};
 const info = (signal: string, source: string): FixtureInfo => ({
   telemetryType: signal,
   logSource: [{ log_source_format: source }],
@@ -409,3 +413,40 @@ for (const change of ['source', 'signal', 'dataset', 'endpoint'] as const)
       await expect(page.locator('.ingestion-check-result')).not.toContainText('999');
     },
   );
+
+test('custom partition datasets block guided senders and creating an unpartitioned dataset restores setup', async ({
+  page,
+}) => {
+  const calls = await mockLive(page, {
+    override: (route, call) =>
+      call.path.endsWith('/web_logs/info')
+        ? route.fulfill({ json: { ...info('logs', 'json'), customPartition: 'tenant, region' } })
+        : undefined,
+  });
+  await open(page);
+  await page.getByLabel('Destination dataset', { exact: true }).selectOption('web_logs');
+  const error = page
+    .getByRole('alert')
+    .filter({ hasText: 'custom partition fields: tenant, region' });
+  const check = page.getByRole('button', { name: 'Check ingestion', exact: true });
+  for (const source of [/^JSON HTTP/, /^OTLP HTTP/, /^OpenTelemetry Collector/]) {
+    await page.getByRole('radio', { name: source }).check();
+    await expect(error).toContainText('Select or create a dataset without custom partitions');
+    await expect(page.locator('.ingestion-code-block')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Copy / })).toHaveCount(0);
+    await expect(check).toBeDisabled();
+  }
+  expect(calls.filter((call) => call.path.endsWith('/stats'))).toHaveLength(0);
+  await page.getByRole('button', { name: 'Create new dataset', exact: true }).click();
+  await page.getByLabel('New dataset name').fill('unpartitioned_logs');
+  await page.getByRole('button', { name: 'Create dataset', exact: true }).click();
+  await expect(page.getByLabel('Destination dataset', { exact: true })).toHaveValue(
+    'unpartitioned_logs',
+  );
+  await expect(error).toHaveCount(0);
+  await expect(page.getByLabel('collector.yaml', { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Copy collector.yaml', exact: true }),
+  ).toBeVisible();
+  await expect(check).toBeEnabled();
+});

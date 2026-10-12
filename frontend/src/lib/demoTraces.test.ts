@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDemoClient } from './demo';
-import { createDemoTraceRecords, demoTraceList } from './demoTraces';
+import { createDemoTraceMethods, createDemoTraceRecords, demoTraceList } from './demoTraces';
 import { traceDetailResponse, traceListResponse } from './tracesContract';
 import { parseEventTimestamp } from '../components/explorer/timestamp';
 
@@ -20,6 +20,35 @@ afterEach(() => {
 });
 
 describe('demo traces', () => {
+  it('uses exact half-open bounds for lists and trace discovery like the native API', async () => {
+    const startTime = '2026-10-12T11:00:15.125Z';
+    const endTime = '2026-10-12T11:01:45.875Z';
+    const template = createDemoTraceRecords(now)[0];
+    const rows = [
+      ['before', '2026-10-12T11:00:15.124Z'],
+      ['start', startTime],
+      ['inside', '2026-10-12T11:01:45.874Z'],
+      ['end', endTime],
+    ].map(([id, time]) => ({
+      ...template,
+      span_trace_id: id,
+      span_span_id: id,
+      p_timestamp: time,
+    }));
+    const client = createDemoTraceMethods(rows, async () => [
+      { name: 'demo_traces', type: 'traces' },
+    ]);
+    const bounds = { dataset: 'demo_traces', startTime, endTime };
+    const list = await client.listTraces(bounds);
+    expect(list.count).toBe(2);
+    expect(list.records.map((row) => row.span_trace_id).sort()).toEqual(['inside', 'start']);
+    await expect(client.traceDetail({ ...bounds, traceId: 'inside' })).resolves.toMatchObject({
+      records: [expect.objectContaining({ span_trace_id: 'inside' })],
+    });
+    await expect(client.traceDetail({ ...bounds, traceId: 'end' })).rejects.toMatchObject({
+      status: 404,
+    });
+  });
   it('exposes OTLP schema and matches native deduplicated list, roots and errors', async () => {
     const fetch = vi.fn();
     vi.stubGlobal('fetch', fetch);

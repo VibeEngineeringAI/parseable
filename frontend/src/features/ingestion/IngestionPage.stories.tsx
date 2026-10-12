@@ -8,7 +8,14 @@ import { IngestionPage } from './IngestionPage';
 
 type Args = {
   state:
-    'live' | 'empty' | 'permission' | 'verification-error' | 'demo' | 'loading' | 'new-arrivals';
+    | 'live'
+    | 'empty'
+    | 'permission'
+    | 'verification-error'
+    | 'demo'
+    | 'loading'
+    | 'new-arrivals'
+    | 'custom-partitions';
 };
 const seed: DatasetInfo[] = [
   { name: 'application_logs', telemetryType: 'logs', logSourceFormats: ['json'] },
@@ -18,7 +25,19 @@ const seed: DatasetInfo[] = [
 ];
 
 function Example({ state }: Args) {
-  const [items, setItems] = useState(seed);
+  const [items, setItems] = useState(() =>
+    state === 'custom-partitions'
+      ? [
+          ...seed,
+          {
+            name: 'partitioned_logs',
+            telemetryType: 'logs',
+            logSourceFormats: ['json'],
+            customPartition: 'tenant, region',
+          },
+        ]
+      : seed,
+  );
   const checks = useRef(0);
   const client = useMemo(
     () =>
@@ -108,3 +127,5 @@ export const VerificationError: Story = { args: { state: 'verification-error' } 
 export const DemoMode: Story = { args: { state: 'demo' } };
 export const Loading: Story = { args: { state: 'loading' } };
 export const NewArrivals: Story = { args: { state: 'new-arrivals' } };
+
+export const CustomPartitions: Story = { args: { state: 'custom-partitions' } };

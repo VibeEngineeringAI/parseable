@@ -83,7 +83,7 @@ export function demoTraceRows(
   return structuredClone(
     rows.filter((row) => {
       const at = parseEventTimestamp(row.p_timestamp);
-      return at >= start && at <= end;
+      return at >= start && at < end;
     }),
   );
 }

@@ -22,7 +22,7 @@ Lookup uses `POST /api/prism/v1/services/traces/detail` with dataset, trace ID a
 
 Stored fields and event payloads come from a bounded `/api/v1/query` request for the selected trace/span identity. The native summary's event count does not supply an event payload. The UI deduplicates repeated stored records/events, exposes multiple distinct records, and retains the summary when reading stored fields is forbidden. At most 100 stored records are requested, with a visible limit notice when reached. Unknown service labels in child detail records are normalized for display; other malformed response fields remain errors.
 
-Trace lookup searches the selected ingestion-time window. Native trace transport behavior rounds time bounds to minutes, and the backend stores OTLP timestamps without an explicit UTC suffix. A trace whose root or spans fall outside the searched bounds may be incomplete or unavailable. Empty, missing required fields, permission errors and not-found responses are explicit; the UI does not infer missing span/event data.
+Trace lists, counts and lookup discovery use the exact half-open selected window (`start <= time < end`), including fractional seconds. Native trace queries widen only the planner's transport envelope to whole minutes; SQL retains the requested bounds. Once discovered, detail retains its existing expansion to the minutes containing the trace's observed minimum/maximum timestamps, so nearby spans of that trace remain visible. The backend stores OTLP timestamps without an explicit UTC suffix. A trace whose root or spans fall outside the discovered bounds may be incomplete or unavailable. Empty or reversed request windows, missing required fields, permission errors and not-found responses are explicit; the UI does not infer missing span/event data.
 
 ## APM contract and limits
 
@@ -36,7 +36,7 @@ Dependencies require a child span and its parent in the same dataset/time window
 
 ## Ingestion contract and limits
 
-JSON HTTP targets `/api/v1/ingest`; OTLP HTTP targets `/v1/logs`, `/v1/metrics` or `/v1/traces`. Dataset creation supplies the matching telemetry type and source (`json`, `otel-logs`, `otel-metrics`, `otel-traces`). Existing metadata must match the selected source/signal before configuration becomes available. JSON input uses logs; other sources choose one signal per dataset.
+JSON HTTP targets `/api/v1/ingest`; OTLP HTTP targets `/v1/logs`, `/v1/metrics` or `/v1/traces`. Dataset creation supplies the matching telemetry type and source (`json`, `otel-logs`, `otel-metrics`, `otel-traces`). Existing metadata must match the selected source/signal before configuration becomes available. Destinations with custom partitions show the required field names and instructions to select/create an unpartitioned dataset or configure a sender manually. Generated configuration, copying and guided verification stay unavailable for those destinations because setup cannot infer valid partition values. JSON input uses logs; other sources choose one signal per dataset.
 
 Generated collector configuration uses `otlp_http/parseable`, HTTP JSON encoding, `compression: none`, `X-P-Stream`, and an environment variable for the ingest API key. Receivers bind to localhost on ports 4317/4318 and must be adjusted for other deployment arrangements. The native OSS server accepts JSON OTLP HTTP rather than protobuf; its content type is `application/json`. Collector configuration converts compatible sender traffic. Setup does not deploy or start a sender.
 
@@ -84,7 +84,25 @@ Use an appropriate shared lock path on other machines. Serialize suites using sh
 
 Application suites in `e2e/traces.spec.ts`, `e2e/apm.spec.ts`, `e2e/ingestion.spec.ts` and `e2e/observability-navigation.spec.ts` cover routes and mocked server behavior. Opt-in live suites require a disposable server and are separate evidence from Storybook or mocked browser checks; use the existing [live validation runbook](validation-review.md) and suite-specific environment variables. Final results are recorded below. The optional fixture SQL test requires the captured reference dataset; it is skipped in the default unit run.
 
-## Final validation — 2026-10-12
+## PR #27 regression fixes — 2026-10-12
+
+The review follow-up used test-driven development for exact trace windows and custom-partition setup. Three compiled Rust regressions initially failed on fractional bounds, list/count filtering and detail discovery. Eight new ingestion unit cases initially failed because partitioned destinations were accepted. The new app and Storybook cases also failed against an isolated copy of the original implementation, then passed with the compatibility guard. A demo boundary test failed before aligning demo discovery with the native half-open interval.
+
+The new opt-in `e2e-live/apm-traces.spec.ts` creates an OTLP fixture, derives fractional bounds from its persisted ingestion timestamp, follows the actual APM investigation link, and checks native list/detail responses and the rendered waterfall without API mocks. It failed against the previous backend because the native list omitted the span, then passed against the freshly compiled fixed backend. Fixture datasets are removed on completion or failure.
+
+Verified results for the fixes:
+
+- 13 compiled Rust trace tests passed, including custom time-column boundaries and existing retry deduplication.
+- 2,144 frontend unit tests passed; one optional fixture test skipped.
+- 39 focused app browser cases passed across traces, APM, ingestion and observability navigation.
+- 9 ingestion Storybook cases passed, including the new partitioned-destination story and existing accessibility checks.
+- 5 live browser cases passed: the new APM handoff regression and all four existing JSON/OTLP ingestion cases.
+- 18 compiled native trace-handler cases passed against a fixture with 11 raw rows and 9 unique spans.
+- TypeScript, production frontend build, server build, Rust formatting, affected frontend formatting and whitespace checks passed.
+
+GPT-6.1 Sol workstreams covered backend TDD, ingestion TDD and browser integration. Opus 5.5 supplied implementation direction and independently reviewed the resulting changes, finding no blocking defects. Full browser/Storybook suites and visual baselines were not rerun for these scoped fixes. The temporary test server and datasets were cleaned up.
+
+## Original feature validation — 2026-10-12
 
 Branch: `feat/missing-observability-screens`. Eight Sol 6.1 workstreams and six Opus 5.5 review/research rounds covered contracts, implementation, integration, visual quality and original runtime comparison. The closing Opus review found no high- or medium-severity defects. Its remaining discovery-error and unknown-type explanations were also addressed. Local chart tabs, operation search and column sorting can reset when their data panels reload; page-level APM search, latency metric and Services/Dependencies selection persist.
 

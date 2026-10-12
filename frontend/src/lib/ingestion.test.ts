@@ -293,4 +293,35 @@ describe('dataset compatibility', () => {
       'different OTLP signal',
     );
   });
+  it.each([
+    ['json', 'logs', 'json', 'tenant'],
+    ['json', 'logs', 'json', 'tenant, region'],
+    ['otlp', 'logs', 'otel-logs', 'tenant'],
+    ['otlp', 'metrics', 'otel-metrics', 'tenant, region'],
+    ['otlp', 'traces', 'otel-traces', 'tenant'],
+    ['collector', 'logs', 'otel-logs', 'tenant'],
+    ['collector', 'metrics', 'otel-metrics', 'tenant, region'],
+    ['collector', 'traces', 'otel-traces', 'tenant'],
+  ] as const)(
+    'rejects custom partitions for %s %s setup (%s, %s)',
+    (source, signal, format, customPartition) => {
+      const error = ingestionCompatibility(
+        { ...info(signal, [format]), customPartition },
+        source,
+        signal,
+      );
+      expect(error).toContain('custom partition');
+      for (const field of customPartition.split(',').map((field) => field.trim()))
+        expect(error).toContain(field);
+      expect(error).toContain('create');
+    },
+  );
+  it.each([undefined, ''])(
+    'permits destinations without custom partitions (%s)',
+    (customPartition) => {
+      expect(
+        ingestionCompatibility({ ...info('logs', ['json']), customPartition }, 'json', 'logs'),
+      ).toBeUndefined();
+    },
+  );
 });

@@ -685,3 +685,28 @@ for (const theme of ['light', 'dark'] as const) {
     });
   }
 }
+
+test('ingestion custom partition guard survives source changes and selecting an unpartitioned dataset restores setup', async ({
+  page,
+}) => {
+  await story(page, 'ingestion-setup--custom-partitions');
+  await page.getByLabel('Destination dataset', { exact: true }).selectOption('partitioned_logs');
+  const error = page
+    .getByRole('alert')
+    .filter({ hasText: 'custom partition fields: tenant, region' });
+  const check = page.getByRole('button', { name: 'Check ingestion', exact: true });
+  for (const source of [/^JSON HTTP/, /^OTLP HTTP/, /^OpenTelemetry Collector/]) {
+    await page.getByRole('radio', { name: source }).check();
+    await expect(error).toContainText('Select or create a dataset without custom partitions');
+    await expect(page.locator('.ingestion-code-block')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Copy / })).toHaveCount(0);
+    await expect(check).toBeDisabled();
+  }
+  await page.getByLabel('Destination dataset', { exact: true }).selectOption('application_logs');
+  await expect(error).toHaveCount(0);
+  await expect(page.getByLabel('collector.yaml', { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Copy collector.yaml', exact: true }),
+  ).toBeVisible();
+  await expect(check).toBeEnabled();
+});
