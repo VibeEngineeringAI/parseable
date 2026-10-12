@@ -1,0 +1,166 @@
+.errors-page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+.errors-page .notice {
+  margin: 0;
+}
+.errors-controls {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 18px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface);
+}
+.errors-controls .ui-field:first-child {
+  min-width: 220px;
+  margin-right: auto;
+}
+.errors-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.errors-caption,
+.errors-note {
+  color: var(--color-muted);
+  font-size: 12px;
+  margin: 0;
+}
+.errors-note summary {
+  cursor: pointer;
+  color: var(--color-text);
+  font-size: 13px;
+}
+.errors-note p {
+  margin: 8px 0 0;
+  max-width: 80ch;
+}
+.errors-fields,
+.errors-detail-fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 8px 0 0;
+}
+.errors-fields dt,
+.errors-detail-fields dt {
+  color: var(--color-muted);
+}
+.errors-fields dd,
+.errors-detail-fields dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.errors-detail-fields {
+  margin: 0 0 16px;
+  font-size: 13px;
+}
+.errors-detail-message {
+  white-space: pre-wrap;
+}
+.errors-stat-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+.errors-stat {
+  padding: 18px 20px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  min-width: 0;
+}
+.errors-stat dt {
+  color: var(--color-muted);
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+.errors-stat dd {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.errors-stat dd.errors-stat-note {
+  color: var(--color-muted);
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 400;
+}
+.errors-panel {
+  min-width: 0;
+  padding: 16px 18px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface);
+}
+.errors-panel h2 {
+  font-size: 15px;
+  margin: 0 0 12px;
+}
+.errors-sheet section {
+  margin-top: 20px;
+}
+.errors-sheet h3 {
+  font-size: 14px;
+  margin: 0 0 10px;
+}
+.errors-issue-button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  max-width: 60ch;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.errors-issue-button:hover .errors-issue-message {
+  text-decoration: underline;
+}
+.errors-issue-button:focus-visible {
+  outline: 2px solid var(--color-focus, currentColor);
+  outline-offset: 2px;
+}
+.errors-issue-message {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.errors-issue-type {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.errors-missing {
+  color: var(--color-muted);
+  font-style: italic;
+}
+.errors-number {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+@media (max-width: 1000px) {
+  .errors-stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 600px) {
+  .errors-stat-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .errors-controls .ui-field:first-child {
+    min-width: 0;
+    width: 100%;
+  }
+}

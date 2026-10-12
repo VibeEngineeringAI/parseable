@@ -655,3 +655,22 @@ Validation of the final implementation:
 - Opus findings addressed include network API scope, full-policy payloads, domain rules that could never match the backend, authorization-header allowlist help, permission-safe discard, unique field descriptions, missing metric values, failed dataset verification, unnecessary discovery requests, duplicate refresh requests and native URL preservation. An independent regression caught and fixed synthetic demo data appearing under unknown dataset names.
 
 Broader suites are **not clean** on this host. The 493-test development-server run was stopped after repeated `net::ERR_INSUFFICIENT_RESOURCES`, blank lazy pages and Chromium failures: 238 passed, 45 failed, 3 interrupted, 1 skipped and 206 not run. The full 221-test Storybook run had 162 passes and 59 failures (38 existing screenshot assertions and 21 runtime/resource failures). A representative grouped-bars screenshot was rebuilt and tested from an isolated `origin/main` archive: it fails by the same 1,093 pixels, and its actual PNG is byte-identical to this branch (`c21e1b584291ac5ee37e020c75832fb14dbec1566610613dc06c792f9249b06d`). No baselines were updated. The obsolete sidebar expectation was updated for Agents/Errors and passed on retry; the reported APM 24-hour test also passed independently. The final focused run used a production bundle to avoid the development server's large module graph.
+
+## Grouped Errors analytics (2026-10-12)
+
+Implemented on `feat/error-issue-analytics` from `origin/main` (`bd882956`) in an isolated worktree. Two Sol 6.1 agents covered wiki research and real-server validation; Opus 5.5 agents covered architecture, SQL/demo implementation, UI, and independent review. The [implementation runbook](error-analytics.md) explains grouping, counting and reproducible test commands. The [Mayfly record](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=1983eae1-fba9-4616-9643-1de4e746162c) records completion evidence.
+
+The default Errors view now groups exact service/type/message values, shows full-range counts and frequency, and opens paginated occurrences. General log severity schemas and OTLP traces are supported. The original paginated, sortable error-span view and trace links remain available. Live SQL investigation returns complete stored log records with exact issue predicates; the same handoff also executes in sample mode.
+
+Review regressions cover coherent exception pairs when a span has multiple different exception events, numeric Pino/Bunyan levels, exact numeric status/severity comparisons, direct versus event exception fields, permission versus unsupported-schema states, and readable live SQL handoffs. Frequency and summary counts remain independent of table pagination. No fuzzy grouping or persisted assignment/resolution state is claimed.
+
+The final independent Opus review confirmed the earlier findings resolved and reported no required fixes. Optional follow-ups include measuring large-range trace window-query cost and improving errors for hand-edited malformed demo markers.
+
+Validation passed:
+
+- Production build and TypeScript; all **2,193 frontend unit tests**, with ten opt-in live tests skipped in that default run.
+- **27 Errors unit tests and nine real-server tests** against the disposable Parseable server at `127.0.0.1:8450`. Fixtures cover JSON/OTLP logs and traces, severity aliases and numeric levels, exact grouping, differing exception events, retries, SQL quoting, raw log handoff, pagination, fractional bounds, and frequency totals. Created datasets are removed afterward.
+- **12 application browser tests** (`errors.spec.ts` and `operations.spec.ts`) and **12 Errors Storybook checks**, including axe, occurrence paging, keyboard dismissal/focus restoration, and a narrow dark viewport. Final browser runs held the shared Playwright lock and used this worktree's isolated ports 5191/6191 instead of other checkouts' servers on the defaults.
+- Formatting and `git diff --check`.
+
+The browser transport fixtures establish UI behavior; the opt-in live suite separately establishes generated SQL compatibility. Large-production-dataset performance, cross-browser coverage, and deployment are outside this validation. The full unrelated browser and screenshot suites were not rerun; the earlier baseline limitations above still apply.

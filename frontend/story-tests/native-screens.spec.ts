@@ -19,6 +19,33 @@ async function accessible(page: Page) {
   ).toEqual([]);
 }
 
+for (const [id, source, expectedRows] of [
+  ['operations-errors--trace-issue-detail', 'trace', 8],
+  ['operations-errors--log-issue-detail', 'log', 25],
+] as const) {
+  test(`${id} exposes accessible occurrence details and restores focus on close`, async ({
+    page,
+  }) => {
+    await story(page, id);
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByTestId('error-occurrence-table').locator('tbody tr')).toHaveCount(
+      expectedRows,
+    );
+    if (source === 'trace') {
+      await expect(dialog.getByRole('link', { name: /Open trace/ })).toHaveCount(expectedRows);
+    } else {
+      await expect(dialog.getByRole('link', { name: /SQL editor/ })).toBeVisible();
+      await dialog.getByRole('button', { name: 'Next page', exact: true }).click();
+      await expect(dialog.getByTestId('error-occurrence-table').locator('tbody tr')).toHaveCount(6);
+    }
+    await accessible(page);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(page.locator('.errors-issue-button:focus')).toHaveCount(1);
+  });
+}
+
 const states = [
   ['agents-telemetry--default', 'Agents'],
   ['agents-telemetry--empty', 'No agent telemetry in this range'],
@@ -47,7 +74,10 @@ const states = [
   ['operations-errors--loading', 'Errors'],
   ['operations-errors--error', 'Could not load data'],
   ['operations-errors--permission', 'Permission denied'],
-  ['operations-errors--empty', 'No error spans'],
+  ['operations-errors--empty', 'No errors'],
+  ['operations-errors--logs', 'Errors'],
+  ['operations-errors--unsupported-schema', 'No eligible error dataset'],
+  ['operations-errors--metadata-unavailable', 'Could not verify dataset'],
   ['onboarding-setup-guide--empty', '1. Connect your data'],
   ['onboarding-setup-guide--available-datasets', '1. Connect your data'],
   ['onboarding-setup-guide--metadata-unavailable', '1. Connect your data'],
@@ -58,11 +88,14 @@ const states = [
 for (const [id, heading] of states) {
   test(`${id} renders its declared state and passes accessibility`, async ({ page }) => {
     await story(page, id);
-    await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
+    const title = page.getByRole('heading', { name: heading, exact: true });
+    // Errors has independent summary, frequency and issue requests. Several
+    // panels can correctly expose the same failure at the same time.
+    await expect(id.startsWith('operations-errors--') ? title.first() : title).toBeVisible();
     if (id.endsWith('--loading') && !id.startsWith('settings-network-access'))
-      await expect(page.getByRole('status').filter({ hasText: 'Loading data' })).toContainText(
-        'Loading data',
-      );
+      await expect(
+        page.getByRole('status').filter({ hasText: 'Loading data' }).first(),
+      ).toContainText('Loading data');
     if (
       id === 'agents-telemetry--permission-denied' ||
       id === 'agents-telemetry--error' ||

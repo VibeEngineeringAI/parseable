@@ -22,6 +22,18 @@ test('errors uses supported OTLP error span endpoint and opens trace detail', as
   const requests: unknown[] = [];
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith('/schema'))
+      return route.fulfill({
+        json: {
+          fields: [
+            'p_timestamp',
+            'service.name',
+            'span_trace_id',
+            'span_span_id',
+            'span_status_code',
+          ].map((name) => ({ name })),
+        },
+      });
     if (path === '/api/v1/logstream') return route.fulfill({ json: [{ name: 'orders_traces' }] });
     if (path.endsWith('/info'))
       return route.fulfill({
@@ -40,7 +52,7 @@ test('errors uses supported OTLP error span endpoint and opens trace detail', as
     }
     return route.fulfill({ json: {} });
   });
-  await page.goto('/errors/orders_traces');
+  await page.goto('/errors/orders_traces?view=spans');
   await expect(page.getByRole('heading', { name: 'Errors', exact: true })).toBeVisible();
   await expect(page.getByTestId('trace-table')).toBeVisible();
   expect(requests[0]).toMatchObject({
@@ -86,6 +98,18 @@ test('errors explains ineligible datasets without querying fabricated error APIs
   let unsupportedRequests = 0;
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith('/schema'))
+      return route.fulfill({
+        json: {
+          fields: [
+            'p_timestamp',
+            'service.name',
+            'span_trace_id',
+            'span_span_id',
+            'span_status_code',
+          ].map((name) => ({ name })),
+        },
+      });
     if (path.includes('/errors/')) unsupportedRequests++;
     if (path === '/api/v1/logstream') return route.fulfill({ json: [{ name: 'logs' }] });
     if (path.endsWith('/info'))
@@ -108,6 +132,18 @@ test('errors retries unverified dataset metadata instead of declaring it ineligi
   let metadataUnavailable = true;
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith('/schema'))
+      return route.fulfill({
+        json: {
+          fields: [
+            'p_timestamp',
+            'service.name',
+            'span_trace_id',
+            'span_span_id',
+            'span_status_code',
+          ].map((name) => ({ name })),
+        },
+      });
     if (path === '/api/v1/logstream') return route.fulfill({ json: [{ name: 'orders_traces' }] });
     if (path.endsWith('/info'))
       return metadataUnavailable
@@ -119,7 +155,7 @@ test('errors retries unverified dataset metadata instead of declaring it ineligi
       return route.fulfill({ json: { count: 0, offset: 0, limit: 25, records: [] } });
     return route.fulfill({ json: {} });
   });
-  await page.goto('/errors/orders_traces');
+  await page.goto('/errors/orders_traces?view=spans');
   await expect(page.getByText('Could not verify dataset', { exact: true })).toBeVisible();
   await expect(page.getByText('No eligible error dataset')).toHaveCount(0);
   metadataUnavailable = false;
