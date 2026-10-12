@@ -11,6 +11,44 @@ async function apply(page: Page) {
   return JSON.parse((await page.getByTestId('applied-tile').textContent())!);
 }
 
+test('default time-series builder previews a chart with automatic X binding', async ({ page }) => {
+  await open(page, 'default-timeseries');
+  await page.getByLabel('Query language', { exact: true }).selectOption('builder');
+  await expect(page.getByLabel('X axis (time or category)', { exact: true })).toHaveValue('');
+  await page.getByRole('button', { name: 'Run query', exact: true }).click();
+  await expect(page.locator('.dashboard-preview figure')).toBeVisible();
+  await expect(page.getByText(/x values are not timestamps/)).toHaveCount(0);
+  const result = await apply(page);
+  expect(result.config.axes.x.field).toBe('');
+  expect(result.chartQuery.x.fields).toEqual([{ name: 'p_timestamp' }]);
+  await expect(page.getByTestId('executed-queries')).toContainText('time_bucket');
+});
+
+test('explicit time-series and aggregate sort take precedence and default sort can be restored', async ({
+  page,
+}) => {
+  await open(page, 'visual-authoring');
+  await page.getByText('Generated SQL', { exact: true }).click();
+  const sql = page.locator('details pre');
+  await expect(sql).toContainText('ORDER BY "time_bucket" DESC LIMIT 100');
+  for (const field of ['time_bucket', 'COUNT_STAR']) {
+    await page.getByLabel('Order by', { exact: true }).selectOption(field);
+    for (const direction of ['ASC', 'DESC']) {
+      await page.getByLabel('Order direction', { exact: true }).selectOption(direction);
+      await expect(sql).toContainText(`ORDER BY "${field}" ${direction} LIMIT 100`);
+      await expect(sql).not.toContainText('DESC,');
+    }
+  }
+  await page.getByRole('button', { name: 'Run query', exact: true }).click();
+  await expect(page.locator('.dashboard-preview figure')).toBeVisible();
+  await page.getByLabel('Order by', { exact: true }).selectOption('');
+  await expect(sql).toContainText('ORDER BY "time_bucket" DESC LIMIT 100');
+  const result = await apply(page);
+  expect(result.chartQuery.y).not.toHaveProperty('sortBy');
+  await expect(page.getByTestId('executed-queries')).toContainText('ORDER BY');
+  await expect(page.getByTestId('executed-queries')).toContainText('COUNT_STAR');
+});
+
 test('visual authoring projects fields, executes generated SQL and emits the builder definition', async ({
   page,
 }) => {
@@ -59,9 +97,12 @@ test('legacy missing tileType remains a visual builder and preserves the missing
   await open(page, 'legacy-missing-type');
   await expect(page.getByLabel('Query language', { exact: true })).toHaveValue('builder');
   await expect(page.getByLabel('Dimension 1', { exact: true })).toHaveValue('p_timestamp');
+  await page.getByRole('button', { name: 'Run query', exact: true }).click();
+  await expect(page.locator('.dashboard-preview figure')).toBeVisible();
   await page.getByLabel('Tile title', { exact: true }).fill('Legacy preserved');
   const result = await apply(page);
   expect(result).not.toHaveProperty('tileType');
+  expect(result.config.axes.x.field).toBe('');
   expect(result.chartQuery.x.fields).toEqual([{ name: 'p_timestamp' }]);
 });
 

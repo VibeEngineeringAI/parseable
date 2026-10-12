@@ -7,7 +7,9 @@ import type { Dashboard, ParseableClient } from '../../lib/types';
 import { DashboardView } from './DashboardView';
 import classic from './__fixtures__/classic.json';
 
-function Playground({ readOnly = false }: { readOnly?: boolean }) {
+type Args = { readOnly?: boolean; stacked?: boolean };
+
+function Playground({ readOnly = false, stacked = false }: Args) {
   const [revision, setRevision] = useState(0);
   const [saved, setSaved] = useState<Dashboard>();
   const client = useMemo(() => {
@@ -27,7 +29,9 @@ function Playground({ readOnly = false }: { readOnly?: boolean }) {
         chartType: 'table',
         chartQuery: 'SELECT service, requests FROM "application_logs"',
         dbName: ['application_logs'],
-        layout: { x: index * 4, y: 0, w: 4, h: 3 },
+        // Stacking the tiles in one column makes a vertical drag cross a sibling,
+        // which is the case that changes reading order mid-gesture.
+        layout: stacked ? { x: 0, y: index * 3, w: 4, h: 3 } : { x: index * 4, y: 0, w: 4, h: 3 },
         config: { type: 'table' },
         sectionId: 'overview',
       })),
@@ -52,7 +56,7 @@ function Playground({ readOnly = false }: { readOnly?: boolean }) {
         return ['service', 'requests'];
       },
     } satisfies ParseableClient;
-  }, [readOnly]);
+  }, [readOnly, stacked]);
   return (
     <div>
       <AppContext.Provider
@@ -82,14 +86,19 @@ function Playground({ readOnly = false }: { readOnly?: boolean }) {
     </div>
   );
 }
-function Example({ readOnly = false }: { readOnly?: boolean }) {
+function Example({ readOnly = false, stacked = false }: Args) {
   const router = useMemo(
     () =>
       createMemoryRouter(
-        [{ path: '/dashboards/:id', element: <Playground readOnly={readOnly} /> }],
+        [
+          {
+            path: '/dashboards/:id',
+            element: <Playground readOnly={readOnly} stacked={stacked} />,
+          },
+        ],
         { initialEntries: [`/dashboards/${classic.dashboardId}`] },
       ),
-    [readOnly],
+    [readOnly, stacked],
   );
   return <RouterProvider router={router} />;
 }
@@ -102,3 +111,4 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 export const Editable: Story = {};
 export const ReadOnly: Story = { args: { readOnly: true } };
+export const StackedTiles: Story = { args: { stacked: true } };

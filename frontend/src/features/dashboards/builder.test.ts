@@ -46,6 +46,59 @@ it('permits unlimited queries and ignores hidden row limits for scalar charts', 
   }
 });
 describe('visual builder', () => {
+  it.each([
+    ['time_bucket', 'ASC', 'time_bucket'],
+    ['time_bucket', 'DESC', 'time_bucket'],
+    ['COUNT_STAR', 'ASC', 'COUNT_STAR'],
+    ['COUNT_STAR', 'DESC', 'COUNT_STAR'],
+    ['duration', 'ASC', 'AVG_duration'],
+    ['AVG_duration', 'DESC', 'AVG_duration'],
+  ])('makes explicit %s %s the primary and only time-series order', (field, direction, alias) => {
+    const query = newBuilderQuery('timeseries');
+    const draft = {
+      ...tile(),
+      chartType: 'timeseries',
+      chartQuery: {
+        ...query,
+        y: {
+          ...query.y,
+          fields: [...query.y.fields, { name: 'duration', aggregate: 'AVG' }],
+          sortBy: { field, direction },
+          limit: 2,
+        },
+      },
+    };
+    const before = structuredClone(draft);
+    expect(sqlQuery(draft).split(' ORDER BY ')[1]).toBe(`"${alias}" ${direction} LIMIT 2`);
+    expect(draft).toEqual(before);
+  });
+  it('uses legacy x-axis sorting and restores default descending buckets when sort is cleared', () => {
+    const query = newBuilderQuery('timeseries');
+    const draft = {
+      ...tile(),
+      chartType: 'timeseries',
+      chartQuery: {
+        ...query,
+        x: { ...query.x, sortBy: { field: 'time_bucket', direction: 'ASC' } },
+      },
+    };
+    expect(sqlQuery(draft).split(' ORDER BY ')[1]).toBe('"time_bucket" ASC LIMIT 100');
+    const both = {
+      ...draft,
+      chartQuery: {
+        ...draft.chartQuery,
+        y: { ...query.y, sortBy: { field: 'COUNT_STAR', direction: 'DESC' } },
+      },
+    };
+    expect(sqlQuery(both).split(' ORDER BY ')[1]).toBe('"COUNT_STAR" DESC LIMIT 100');
+    const overridden = {
+      ...draft,
+      ...builderSort(draft, { field: 'COUNT_STAR', direction: 'DESC' }),
+    };
+    expect(sqlQuery(overridden).split(' ORDER BY ')[1]).toBe('"COUNT_STAR" DESC LIMIT 100');
+    const cleared = { ...draft, ...builderSort(draft) };
+    expect(sqlQuery(cleared).split(' ORDER BY ')[1]).toBe('"time_bucket" DESC LIMIT 100');
+  });
   it('executes dimensions, aggregates, grouping and filters with quoted identifiers and values', () => {
     const draft = {
       ...tile(),

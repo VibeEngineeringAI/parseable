@@ -14,7 +14,7 @@ const variables: DashboardVariable[] = [];
 const values = {};
 const sections = [{ sectionId: 'overview', title: 'Overview', id: 'opaque-id' }];
 
-type Scenario = 'visual' | 'stored-sql' | 'legacy' | 'validation' | 'opaque';
+type Scenario = 'visual' | 'new-timeseries' | 'stored-sql' | 'legacy' | 'validation' | 'opaque';
 function fixture(scenario: Scenario): DashboardTile {
   const tile: DashboardTile = {
     ...newTile([]),
@@ -26,6 +26,10 @@ function fixture(scenario: Scenario): DashboardTile {
     chartQuery: newBuilderQuery('timeseries'),
     extensionMetadata: { owner: 'Observability', version: 7 },
   };
+  if (scenario === 'new-timeseries') {
+    tile.tileType = 'code';
+    tile.chartQuery = '';
+  }
   if (scenario === 'stored-sql')
     tile.chartQuery = {
       sql: 'SELECT COUNT(*) AS requests FROM "application_logs"',
@@ -138,6 +142,7 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 export const VisualAuthoring: Story = { args: { scenario: 'visual' } };
+export const DefaultTimeseries: Story = { args: { scenario: 'new-timeseries' } };
 export const StoredSqlPreserved: Story = { args: { scenario: 'stored-sql' } };
 export const LegacyMissingType: Story = { args: { scenario: 'legacy' } };
 export const TypedFiltersAndLimits: Story = { args: { scenario: 'validation' } };

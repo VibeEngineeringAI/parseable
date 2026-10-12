@@ -57,6 +57,17 @@ export function DashboardTileGrid({
   const help = useId();
   const displayed = preview && sameTiles(preview.source, tiles) && writable ? preview.tiles : tiles;
   const rows = compactLayouts(displayed);
+  const position = new Map(rows.map((row, index) => [row.tile.tile_id, index]));
+  // Cells are rendered in the committed reading order, never the previewed one. React
+  // moves a cell whose position among its siblings changes, and moving the subtree that
+  // holds the pointer capture releases it, which would cancel the drag the moment it
+  // crosses a sibling. Previews reposition cells through explicit grid areas instead, so
+  // the visible layout still tracks the pointer and the order keyboard users navigate
+  // only changes once the gesture commits.
+  const cells =
+    displayed === tiles
+      ? rows
+      : compactLayouts(tiles).map(({ tile }) => rows[position.get(tile.tile_id)!]);
   const enabled = writable && !!onLayoutChange;
   function layoutMessage(id: string, next: DashboardTile[]) {
     const row = compactLayouts(next).find(({ tile }) => tile.tile_id === id);
@@ -148,7 +159,7 @@ export function DashboardTileGrid({
         tiles. Escape cancels dragging.
       </p>
       <div ref={grid} className="dashboard-server-grid dashboard-layout-grid">
-        {rows.map(({ tile, layout }, index) => (
+        {cells.map(({ tile, layout }) => (
           <div
             key={tile.tile_id}
             className={`dashboard-layout-cell${enabled ? ' dashboard-layout-editable' : ''}`}
@@ -157,7 +168,7 @@ export function DashboardTileGrid({
               gridRow: `${layout.y + 1} / span ${layout.h}`,
             }}
           >
-            {children(tile, layout, index, rows.length)}
+            {children(tile, layout, position.get(tile.tile_id)!, rows.length)}
             {enabled &&
               (['move', 'resize'] as const).map((mode) => (
                 <button

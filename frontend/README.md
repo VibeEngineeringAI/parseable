@@ -171,6 +171,13 @@ typed-filter/limit, and opaque-query examples. `story-tests/dashboard-builder.sp
 checks generated SQL execution, preserved metadata, typed values, validation, ordering,
 and chart-type changes against the production editor.
 
+`e2e/dashboard-pointer-reorder.spec.ts` exercises vertical drags across siblings,
+cancellation, and keyboard ordering after a committed drag.
+`e2e/dashboard-builder-regressions.spec.ts` covers automatic time-bucket plotting,
+explicit sort precedence with limited results, and save/reload without rewriting
+legacy bindings or opaque metadata. The editing and builder Storybook interaction
+tests also cover these regressions in isolation.
+
 `Dashboards/Presentation` exercises the production presentation and PNG-export hooks
 with deterministic canvas and SVG fixtures. `story-tests/dashboard-presentation.spec.ts`
 checks focus/Escape behavior, retained state, shell isolation, and downloaded PNG pixels

@@ -1,11 +1,11 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 async function open(page: Page, story = 'editable') {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`/iframe.html?id=dashboards-editing--${story}&viewMode=story`);
   await expect(
     page.getByRole('heading', { name: 'Editing playground', exact: true }),
   ).toBeVisible();
-  if (story === 'editable')
+  if (story !== 'read-only')
     await expect(
       page.getByRole('button', { name: 'Move tile Requests', exact: true }),
     ).toBeVisible();
@@ -21,16 +21,31 @@ async function action(page: Page, title: string, name: string) {
   await page.getByRole('button', { name: `Section actions for ${title}`, exact: true }).click();
   await page.getByRole('menuitem', { name, exact: true }).click();
 }
-async function drag(page: Page, name: string, dx: number, cancel = false) {
+/** Presses a handle and returns a mover, so a test can assert mid-gesture. */
+async function press(page: Page, name: string) {
   const handle = page.getByRole('button', { name, exact: true });
   await handle.scrollIntoViewIfNeeded();
   const box = (await handle.boundingBox())!;
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
+  await page.mouse.move(x, y);
   await page.mouse.down();
-  await page.mouse.move(box.x + box.width / 2 + dx, box.y + box.height / 2, { steps: 6 });
+  return (dx: number, dy = 0) => page.mouse.move(x + dx, y + dy, { steps: 6 });
+}
+async function drag(page: Page, name: string, dx: number, cancel = false) {
+  await (
+    await press(page, name)
+  )(dx);
   if (cancel) await page.keyboard.press('Escape');
   await page.mouse.up();
 }
+const cellFor = (page: Page, title: string) =>
+  page.getByRole('region', { name: `Tile ${title}`, exact: true }).locator('..');
+/** One grid row in CSS pixels, read from the properties the component measures. */
+const rowHeight = (grid: Locator) =>
+  grid.evaluate((el) => {
+    const style = getComputedStyle(el);
+    return (parseFloat(style.gridAutoRows) || 70) + (parseFloat(style.rowGap) || 0);
+  });
 
 test('production editing story persists drag, resize and keyboard edits while Escape and Discard cancel', async ({
   page,
@@ -126,4 +141,46 @@ test('read-only production story permits transient collapse and hides editing co
   await expect(page.getByRole('region', { name: 'Tile Requests', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Reload saved dashboard' }).click();
   await expect(page.getByRole('region', { name: 'Tile Requests', exact: true })).toBeVisible();
+});
+
+test('stacked tiles keep a vertical drag alive while it crosses a sibling', async ({ page }) => {
+  await open(page, 'stacked-tiles');
+  const grid = page
+    .locator('.dashboard-layout-grid')
+    .filter({ has: page.getByRole('button', { name: 'Move tile Requests', exact: true }) });
+  const cells = grid.locator('.dashboard-layout-cell');
+  await expect(cells.first()).toContainText('Requests');
+  // Three rows down puts Requests below Latency, which swaps their reading order.
+  await (
+    await press(page, 'Move tile Requests')
+  )(0, (await rowHeight(grid)) * 3);
+  await expect(cellFor(page, 'Requests')).toHaveCSS('grid-row-start', '4');
+  await page.mouse.up();
+  await expect(cellFor(page, 'Requests')).toHaveCSS('grid-row-start', '4');
+  await expect(cells.first()).toContainText('Latency');
+  await expect(cells.getByRole('heading', { level: 2 })).toHaveText(['Latency', 'Requests']);
+  const document = await save(page);
+  expect(document.tiles.find((tile: any) => tile.title === 'Requests').layout).toMatchObject({
+    y: 3,
+  });
+  expect(document.tiles.find((tile: any) => tile.title === 'Latency').layout).toMatchObject({
+    y: 0,
+  });
+});
+
+test('Escape during a reordering drag restores the stacked order and leaves nothing to save', async ({
+  page,
+}) => {
+  await open(page, 'stacked-tiles');
+  const grid = page
+    .locator('.dashboard-layout-grid')
+    .filter({ has: page.getByRole('button', { name: 'Move tile Requests', exact: true }) });
+  await (
+    await press(page, 'Move tile Requests')
+  )(0, (await rowHeight(grid)) * 3);
+  await page.keyboard.press('Escape');
+  await expect(cellFor(page, 'Requests')).toHaveCSS('grid-row-start', '1');
+  await page.mouse.up();
+  await expect(grid.locator('.dashboard-layout-cell').first()).toContainText('Requests');
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
 });
