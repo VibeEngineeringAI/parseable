@@ -33,6 +33,33 @@ export function createQueryTab(name: string, query = '', range: TimeRange = '1h'
     chart: createSqlChartConfig(),
   };
 }
+export function hydrateQueryTabs(
+  drafts: QueryTab[],
+  activeTabs: QueryTab[],
+  editedTabs: ReadonlySet<string>,
+): QueryTab[] {
+  // Each stored draft can hydrate one live tab. Never match against live tabs:
+  // identical SQL and ranges do not imply that two tabs are the same tab.
+  const remaining = [...drafts];
+  const hydrated = activeTabs.map((item) => {
+    const index = remaining.findIndex(
+      (draft) =>
+        draft.query === item.query && JSON.stringify(draft.range) === JSON.stringify(item.range),
+    );
+    if (index < 0) return item;
+    const stored = remaining.splice(index, 1)[0];
+    return editedTabs.has(item.id)
+      ? { ...item, savedId: item.savedId || stored.savedId }
+      : {
+          ...item,
+          name: stored.name,
+          savedId: stored.savedId,
+          datasets: stored.datasets,
+          chart: stored.chart,
+        };
+  });
+  return [...remaining, ...hydrated];
+}
 export function datasetQuery(names: string[]): string {
   if (!names.length) return '';
   const source = names

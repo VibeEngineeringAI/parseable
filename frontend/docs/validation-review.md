@@ -18,6 +18,18 @@ Saved queries persist in browser local storage; draft workspaces use session sto
 
 Evidence: [tabs, chart and library](parity-screenshots/sql-workspace/tabs-chart-library.png), [results](parity-screenshots/sql-workspace/tabs-results-library.png), and the [Mayfly implementation page](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=b4561c87-a6dc-43cd-9f66-517144242e8e#J63UryiLZKvb1G5vnY7RVQhXPDhXy-GpIhjXiCB_TzM).
 
+### PR #25 review fixes (2026-10-12)
+
+The two review findings were reproduced before correction. Initial account hydration now matches live tabs only against unconsumed restored drafts, using each stored draft once. Distinct live tabs with identical SQL and time ranges retain their names, dataset selections, results and runtime state. Matching untouched query-link placeholders still inherit saved metadata; explicit edits retain precedence.
+
+The results table is keyed by query-tab ID. Switching tabs resets table sorting and pagination to the query's returned order and page 1, preventing one tab's table state from changing another's results. Sort and page choices are not persisted per query tab.
+
+- Production build, TypeScript and formatting pass; **1,911 unit tests in 68 files** pass, including three new hydration regressions.
+- **27 SQL application tests** pass on an isolated Vite server: the existing 24 cases plus three new cases in `e2e/sql-workspace-isolation.spec.ts`. The new cases cover delayed identity with and without a matching stored draft, independent names/datasets/results and persisted drafts, and sort/page isolation between different completed result sets.
+- Four Sol 6.1 agents handled implementation, browser regressions, independent review and shared-wiki discovery. Opus 5.5 approved the fixes with no actionable findings and re-ran all 15 SQL unit tests.
+
+Browser tests use mocked API responses. This follow-up did not repeat the earlier Storybook or DataFusion engine checks and did not use a deployed Parseable service.
+
 ## Dataset management (2026-10-11)
 
 The Datasets page creates datasets (name, telemetry type, optional custom partition) and opens a Manage sheet with information and statistics, schema, retention, hot tier and typed deletion. Contracts were read from the server and checked against a running v3.2.5 server: `/info`, `/stats`, `/retention` (`[]` when unset) and `/hottier` (403 "Hot tier is not enabled at the server config" when the server has no hot tier). Creation does not offer a time partition, because `create_update_stream` passes an empty time partition to `create_stream` (`src/parseable/mod.rs`), so the header would be ignored.

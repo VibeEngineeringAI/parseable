@@ -18,7 +18,7 @@ import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
 import { SqlEditor, type SqlEditorHandle } from './SqlEditor';
 import { SqlSidebar } from './SqlSidebar';
 import { SqlChartPanel, readSqlChartConfig } from './SqlChartPanel';
-import { createQueryTab, datasetQuery, type QueryTab } from './workspace';
+import { createQueryTab, datasetQuery, hydrateQueryTabs, type QueryTab } from './workspace';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { paramsRange, timeBounds } from '../../lib/query';
@@ -162,28 +162,7 @@ function SqlWorkspace() {
           item.datasets.length ||
           editedTabs.current.has(item.id),
       );
-      const merged = [...drafts];
-      for (const item of anonymous) {
-        const index = merged.findIndex(
-          (draft) =>
-            draft.query === item.query &&
-            JSON.stringify(draft.range) === JSON.stringify(item.range),
-        );
-        if (index >= 0) {
-          const stored = merged.splice(index, 1)[0];
-          merged.push(
-            editedTabs.current.has(item.id)
-              ? { ...item, savedId: item.savedId || stored.savedId }
-              : {
-                  ...item,
-                  name: stored.name,
-                  savedId: stored.savedId,
-                  datasets: stored.datasets,
-                  chart: stored.chart,
-                },
-          );
-        } else merged.push(item);
-      }
+      const merged = hydrateQueryTabs(drafts, anonymous, editedTabs.current);
       const next = merged.length ? merged : tabs;
       setTabs(next);
       setActiveId(anonymous.length ? anonymous[anonymous.length - 1].id : next[next.length - 1].id);
@@ -691,6 +670,7 @@ function SqlWorkspace() {
                     !tab.error &&
                     (tab.view === 'results' ? (
                       <DataTable
+                        key={tab.id}
                         rows={tab.rows}
                         columns={tab.columns}
                         onSelect={setRow}
