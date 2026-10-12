@@ -1,0 +1,57 @@
+.sql-chart-panel {
+  min-width: 0;
+}
+.sql-chart-preview {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sql-chart-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.sql-chart-actions p {
+  margin: 0;
+}
+.sql-chart-config {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.sql-chart-config > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.sql-chart-config fieldset {
+  min-width: 0;
+  margin: 12px 0 0;
+  padding: 0;
+  border: 0;
+}
+.sql-chart-config legend {
+  font-size: 0.875rem;
+  margin-bottom: 8px;
+}
+.sql-chart-panel .dashboard-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.sql-chart-panel .dashboard-variable-control {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+}
+.sql-chart-panel .dashboard-variable-control .ui-field {
+  flex: 1;
+  min-width: 0;
+}
+@media (max-width: 700px) {
+  .sql-chart-panel .dashboard-editor-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

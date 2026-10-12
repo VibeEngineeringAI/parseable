@@ -1,11 +1,13 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useImperativeHandle, type Ref } from 'react';
 import { EditorView, keymap } from '@codemirror/view';
 import { Compartment, EditorState, Prec } from '@codemirror/state';
 import { sql } from '@codemirror/lang-sql';
 import { basicSetup } from 'codemirror';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
+export type SqlEditorHandle = { insertText: (text: string) => void };
 export function SqlEditor({
+  ref,
   value,
   onChange,
   onRun,
@@ -13,6 +15,7 @@ export function SqlEditor({
   describedBy,
   readOnly = false,
 }: {
+  ref?: Ref<SqlEditorHandle>;
   value: string;
   onChange: (value: string) => void;
   onRun: () => void;
@@ -25,6 +28,24 @@ export function SqlEditor({
   const attributes = useRef(new Compartment());
   const callbacks = useRef({ onChange, onRun });
   callbacks.current = { onChange, onRun };
+  useImperativeHandle(
+    ref,
+    () => ({
+      insertText(text) {
+        const editor = view.current;
+        if (!editor || editor.state.readOnly) return;
+        const selection = editor.state.selection.main;
+        editor.dispatch({
+          changes: { from: selection.from, to: selection.to, insert: text },
+          selection: { anchor: selection.from + text.length },
+          scrollIntoView: true,
+          userEvent: 'input',
+        });
+        editor.focus();
+      },
+    }),
+    [],
+  );
   useEffect(() => {
     const editor = new EditorView({
       parent: element.current!,
