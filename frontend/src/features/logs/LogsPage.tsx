@@ -196,7 +196,11 @@ export function LogsPage() {
           ? decodeLogView(restoredParams.get('logView')!)
           : view;
       if (nativeNavigation || restoreNavigation) {
-        const linkedRange = observabilityRange(params);
+        // Trace focus alone does not override the time window encoded by Share.
+        const hasTimeContext = ['start', 'end', 'range', 'observe'].some((name) =>
+          params.has(name),
+        );
+        const linkedRange = hasTimeContext ? observabilityRange(params) : linkedView.range;
         setHandoffBounds({
           range: JSON.stringify(linkedRange),
           bounds: observabilityBounds(params, linkedRange),

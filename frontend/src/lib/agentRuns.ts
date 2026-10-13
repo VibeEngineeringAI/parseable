@@ -154,27 +154,81 @@ function status(
     return 'success';
   return 'incomplete';
 }
+// Prefer the available epoch resolution: backend timestamp text can be reduced
+// to milliseconds. Numeric epochs may already have been rounded by Float64.
+function eventTimestamp(row: LogRecord): bigint | undefined {
+  const field = 'event_time_unix_nano';
+  const recordedEpoch = row[`${field}_epoch`];
+  if (recordedEpoch !== undefined) {
+    if (typeof recordedEpoch === 'string' && /^\d+$/.test(recordedEpoch.trim())) {
+      const epoch = BigInt(recordedEpoch.trim());
+      return epoch > 0n ? epoch : undefined;
+    }
+    if (typeof recordedEpoch === 'number' && Number.isInteger(recordedEpoch) && recordedEpoch > 0)
+      return BigInt(recordedEpoch);
+    // An explicit zero or invalid epoch means the event time is absent.
+    return;
+  }
+  const millis = timestamp(row, field);
+  if (millis === undefined) return;
+  const raw = row[field];
+  if (typeof raw === 'string' && !/^\d+(\.\d+)?$/.test(raw)) {
+    const parsed = parseEventTimestamp(raw);
+    if (Number.isFinite(parsed)) {
+      const fraction = raw.trim().match(/\.(\d+)(?:Z|[+-]\d{2}:?\d{2})?$/i)?.[1] ?? '';
+      return BigInt(Math.trunc(parsed)) * 1_000_000n + BigInt(fraction.slice(3, 9).padEnd(6, '0'));
+    }
+  }
+  const epoch = row[`${field}_epoch`] ?? raw;
+  if (typeof epoch === 'string' && /^\d+$/.test(epoch.trim())) return BigInt(epoch.trim());
+  if (typeof epoch === 'number' && Number.isInteger(epoch)) return BigInt(epoch);
+}
+
 function capturedConversation(rows: LogRecord[]) {
   const entries: AgentConversationEntry[] = [];
   const seen = new Set<string>();
-  for (const row of rows) {
+  // Unknown event times retain their original slots; only timestamped rows move.
+  const timed = rows
+    .map((row) => ({ row, time: eventTimestamp(row) }))
+    .filter((entry): entry is { row: LogRecord; time: bigint } => entry.time !== undefined)
+    .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+  let nextTimed = 0;
+  const ordered = rows.map((row) =>
+    eventTimestamp(row) === undefined ? row : timed[nextTimed++].row,
+  );
+  for (const row of ordered) {
     for (const [key, value] of Object.entries(row)) {
       const plain = key.replace(/^event_/, '');
+      // Schema conflicts route values to backend datatype siblings. Match their
+      // semantic field while keeping the recorded key in labels and signatures.
+      const semantic = plain.replace(
+        /_(null|bool|u?int(8|16|32|64)|float(16|32|64)|utf8|binary|date|timestamp_(s|ms|us|ns)|time|list|struct|map|unknown)$/,
+        '',
+      );
       const messageEvent =
         typeof row.event_name === 'string' &&
         /^gen_ai\.(user|assistant|system|tool)\.message$/.test(row.event_name) &&
-        /^event_(content|body|message|role|tool_calls)([._]|$)/.test(key);
+        /^(content|body|message|role|tool_calls)([._]|$)/.test(semantic) &&
+        key.startsWith('event_');
       if (
         !messageEvent &&
         !/^(gen_ai\.(input\.messages|output\.messages|prompt|completion|system_instructions|tool\.(call\.(arguments|result)|parameters|result))|llm\.(input_messages|output_messages)|input\.value|output\.value)(\.|$)/.test(
-          plain,
+          semantic,
         )
       )
         continue;
       if (value === undefined || value === null || value === '') continue;
       const signature = JSON.stringify(
         key.startsWith('event_')
-          ? [key, row.event_name, row.event_time_unix_nano, value]
+          ? [
+              key,
+              row.event_name,
+              eventTimestamp(row)?.toString() ?? [
+                row.event_time_unix_nano,
+                row.event_time_unix_nano_epoch,
+              ],
+              value,
+            ]
           : [key, value],
       );
       if (seen.has(signature)) continue;
@@ -349,10 +403,47 @@ export function buildAgentRuns(
         warnings.add('Some spans lack completion or status telemetry.');
       const tokenTotal = (field: 'inputTokens' | 'outputTokens') => {
         const reported = spans.filter((span) => span[field] !== undefined);
-        // Model-call usage is more precise than agent/tool rollups, including when
-        // a missing parent prevents the tree from identifying the rollup's children.
         const modelCalls = reported.filter((span) => span.kind === 'model');
-        const candidates = modelCalls.length ? modelCalls : reported;
+        const ancestorCache = new Map<AgentSpan, Set<AgentSpan>>();
+        const rootCache = new Map<AgentSpan, AgentSpan>();
+        const ancestors = (span: AgentSpan) => {
+          const cached = ancestorCache.get(span);
+          if (cached) return cached;
+          const result = new Set<AgentSpan>();
+          let root = span;
+          let parent = parents.get(span);
+          while (parent) {
+            result.add(parent);
+            root = parent;
+            parent = parents.get(parent);
+          }
+          ancestorCache.set(span, result);
+          rootCache.set(span, root);
+          return result;
+        };
+        const root = (span: AgentSpan) => {
+          ancestors(span);
+          return rootCache.get(span)!;
+        };
+        // Prefer model calls over their rollups. Include other reported branches
+        // only when the captured tree proves they are independent of every call.
+        // Disconnected rollups could repeat usage from an orphaned model call.
+        const candidates = modelCalls.length
+          ? reported.filter((span) => {
+              if (span.kind === 'model') return true;
+              if (modelCalls.some((call) => ancestors(call).has(span) || ancestors(span).has(call)))
+                return false;
+              if (
+                !warnings.has('A cycle in span parent IDs was removed from the tree.') &&
+                modelCalls.every((call) => root(call) === root(span))
+              )
+                return true;
+              warnings.add(
+                'Token usage is partial because disconnected rollups may overlap model calls.',
+              );
+              return false;
+            })
+          : reported;
         const candidateSet = new Set(candidates);
         // Parent usage commonly repeats the child model-call rollup. Count only the deepest reported usage on each branch.
         const hasDescendantUsage = (span: AgentSpan): boolean =>

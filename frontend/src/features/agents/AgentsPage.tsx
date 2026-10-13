@@ -1,5 +1,12 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
-import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  useParams,
+  useSearchParams,
+} from 'react-router-dom';
 import { Bot, RefreshCw } from 'lucide-react';
 import { Badge, Button, EmptyState, Input, Select, Sheet } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
@@ -18,6 +25,7 @@ import {
   discoverAgentDatasets,
 } from '../../lib/agents';
 import { buildAgentRuns } from '../../lib/agentRuns';
+import { agentValueMatchesSearch } from '../../lib/agentSearch';
 import {
   currentObservabilitySearch,
   useObservabilityNavigation,
@@ -33,6 +41,7 @@ export function AgentsPage() {
   const { dataset } = useParams<{ dataset: string }>();
   const navigate = useNavigate();
   const location = useLocation();
+  const navigationType = useNavigationType();
   const [params, setParams] = useSearchParams();
   const searchString = params.toString();
   // Filter edits must not recapture a moving relative time range and rerun the query.
@@ -47,7 +56,22 @@ export function AgentsPage() {
   );
   const boundsKey = JSON.stringify(rawBounds);
   const bounds = useMemo(() => JSON.parse(boundsKey) as ReturnType<typeof timeBounds>, [boundsKey]);
-  const search = params.get('search') ?? '';
+  const urlSearch = params.get('search') ?? '';
+  // Router updates can run in a transition. Keep typing synchronous, and do not
+  // let an earlier URL commit replace a newer edit while navigation catches up.
+  const [search, setSearch] = useState(urlSearch);
+  const pendingSearch = useRef<{ value: string; dataset?: string } | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (
+      pendingSearch.current &&
+      pendingSearch.current.dataset === dataset &&
+      navigationType !== 'POP' &&
+      pendingSearch.current.value !== urlSearch
+    )
+      return;
+    pendingSearch.current = undefined;
+    setSearch(urlSearch);
+  }, [urlSearch, dataset, navigationType, location.key]);
   const status = params.get('status') ?? '';
   const model = params.get('model') ?? '';
   const setupOpen = params.get('setup') === '1';
@@ -121,9 +145,7 @@ export function AgentsPage() {
           (!model || run.models.includes(model)) &&
           (!search ||
             run.spans.some((span) =>
-              span.rows.some((row) =>
-                JSON.stringify(row).toLowerCase().includes(search.toLowerCase()),
-              ),
+              span.rows.some((row) => agentValueMatchesSearch(row, search)),
             )),
       ),
     [runs, search, status, model],
@@ -298,7 +320,12 @@ export function AgentsPage() {
                     aria-label="Search agent runs"
                     placeholder="Search loaded runs"
                     value={search}
-                    onChange={(event) => updateFilter('search', event.target.value)}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      pendingSearch.current = { value, dataset };
+                      setSearch(value);
+                      updateFilter('search', value);
+                    }}
                   />
                   <Select
                     aria-label="Run status"

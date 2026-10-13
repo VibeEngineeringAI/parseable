@@ -172,7 +172,8 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
     [range, refresh, params.get('start'), params.get('end')],
   );
   const boundsKey = JSON.stringify(rawBounds);
-  const bounds = useMemo(() => JSON.parse(boundsKey) as typeof rawBounds, [boundsKey]);
+  // A refresh must also reload requests whose absolute bounds have not changed.
+  const bounds = useMemo(() => JSON.parse(boundsKey) as typeof rawBounds, [boundsKey, refresh]);
   const [serviceInput, setServiceInput] = useState(service);
   const [lookup, setLookup] = useState(traceId);
   useEffect(() => setServiceInput(service), [service]);
@@ -273,8 +274,7 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
                 if (typeof range === 'string') {
                   const refreshed = timeBounds(range);
                   update({ start: refreshed.startTime, end: refreshed.endTime }, false);
-                }
-                setRefresh((value) => value + 1);
+                } else setRefresh((value) => value + 1);
               }}
             >
               <RefreshCw size={15} aria-hidden="true" />

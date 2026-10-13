@@ -538,6 +538,227 @@ describe('agent run telemetry normalization', () => {
     ]);
     expect(buildAgentRuns([span('a')])[0].spans[0].conversation).toEqual([]);
   });
+  it('captures recognized typed content siblings without hiding recorded field names', () => {
+    const row = span('tool', '', 0, 100, {
+      'gen_ai.tool.name': 'lookup',
+      'gen_ai.tool.call.result': 'Canonical result',
+      'gen_ai.tool.call.result_utf8': 'Typed result',
+      'gen_ai.input.messages_list': ['Question'],
+      'gen_ai.output.messages_struct': { content: 'Answer' },
+      'input.value_int64': 7,
+      'output.value_bool': false,
+      'gen_ai.prompt_unrecognized': 'Not a content sibling',
+    });
+    const [run] = buildAgentRuns([row, { ...row, link_span_id: 'linked' }]);
+    expect(run.spans[0].conversation).toEqual([
+      { label: 'gen_ai.tool.call.result', value: 'Canonical result' },
+      { label: 'gen_ai.tool.call.result_utf8', value: 'Typed result' },
+      { label: 'gen_ai.input.messages_list', value: ['Question'] },
+      { label: 'gen_ai.output.messages_struct', value: { content: 'Answer' } },
+      { label: 'input.value_int64', value: 7 },
+      { label: 'output.value_bool', value: false },
+    ]);
+  });
+  it('captures typed GenAI attributes on flattened events', () => {
+    const [run] = buildAgentRuns([
+      span('model', '', 0, 100, {
+        event_name: 'gen_ai.assistant.message',
+        'event_gen_ai.output.messages_utf8': '[{"content":"Answer"}]',
+        event_content_utf8: 'Answer',
+      }),
+    ]);
+    expect(run.spans[0].conversation).toEqual([
+      {
+        label: 'gen_ai.assistant.message · gen_ai.output.messages_utf8',
+        value: '[{"content":"Answer"}]',
+      },
+      { label: 'gen_ai.assistant.message · content_utf8', value: 'Answer' },
+    ]);
+  });
+  it('orders conversation by event time while retaining unknown positions and stable ties', () => {
+    const event = (value: string, time?: string) =>
+      span('model', '', 0, 100, {
+        event_name: 'gen_ai.user.message',
+        event_time_unix_nano: time,
+        event_content: value,
+      });
+    const [run] = buildAgentRuns([
+      event('Answer', '2026-10-01T00:00:02Z'),
+      event('Unknown'),
+      event('Question', '2026-10-01 00:00:01'),
+      event('Same-time followup', '2026-10-01T00:00:01Z'),
+      event('Answer', '2026-10-01T00:00:02Z'),
+    ]);
+    expect(run.spans[0].conversation.map((entry) => entry.value)).toEqual([
+      'Question',
+      'Unknown',
+      'Same-time followup',
+      'Answer',
+    ]);
+  });
+  it('orders sub-millisecond event times and retains distinct repeated messages', () => {
+    const event = (time: string) =>
+      span('model', '', 0, 100, {
+        event_name: 'gen_ai.user.message',
+        event_time_unix_nano: time,
+        event_content: 'Repeat',
+      });
+    const [run] = buildAgentRuns([
+      { ...event('2026-10-01 00:00:00.000000002'), event_role: 'second' },
+      { ...event('2026-10-01T00:00:00.000000001Z'), event_role: 'first' },
+      { ...event(String(BigInt(started) * 1_000_000n + 3n)), event_role: 'third' },
+    ]);
+    expect(
+      run.spans[0].conversation
+        .filter((entry) => entry.label.endsWith('role'))
+        .map((entry) => entry.value),
+    ).toEqual(['first', 'second', 'third']);
+    expect(run.spans[0].conversation.filter((entry) => entry.value === 'Repeat')).toHaveLength(3);
+  });
+  it('prefers epochs over backend millisecond text for event order and deduplication', () => {
+    const epoch = BigInt(started) * 1_000_000n;
+    const event = (role: string, recordedEpoch: number | string) =>
+      span('model', '', 0, 100, {
+        event_name: 'gen_ai.user.message',
+        // Arrow's millisecond timestamp column renders both events identically.
+        event_time_unix_nano: '2026-10-01 00:00:00.000',
+        event_time_unix_nano_epoch: recordedEpoch,
+        event_content: 'Repeat',
+        event_role: role,
+      });
+    const later = event('second', Number(epoch + 200_000n));
+    const [run] = buildAgentRuns([
+      later,
+      event('first', String(epoch + 100_000n)),
+      { ...later, link_span_id: 'linked' },
+    ]);
+    expect(
+      run.spans[0].conversation
+        .filter((entry) => entry.label.endsWith('role'))
+        .map((entry) => entry.value),
+    ).toEqual(['first', 'second']);
+    expect(run.spans[0].conversation.filter((entry) => entry.value === 'Repeat')).toHaveLength(2);
+  });
+  it('keeps missing and invalid epoch events in place without trusting their timestamp text', () => {
+    const epoch = BigInt(started) * 1_000_000n;
+    const event = (content: string, recordedEpoch?: unknown) =>
+      span('model', '', 0, 100, {
+        event_name: 'gen_ai.user.message',
+        event_time_unix_nano: '2026-10-01 00:00:00.000',
+        event_time_unix_nano_epoch: recordedEpoch,
+        event_content: content,
+      });
+    for (const invalid of [0, '0', -1, NaN, 1.5, 'invalid', true, null]) {
+      const [run] = buildAgentRuns([
+        event('Later', String(epoch + 200_000n)),
+        event('Unknown', invalid),
+        event('Earlier', Number(epoch + 100_000n)),
+      ]);
+      expect(run.spans[0].conversation.map((entry) => entry.value)).toEqual([
+        'Earlier',
+        'Unknown',
+        'Later',
+      ]);
+    }
+    const [run] = buildAgentRuns([
+      event('Later', String(epoch + 200_000n)),
+      { ...event('Missing'), event_time_unix_nano: undefined },
+      event('Earlier', Number(epoch + 100_000n)),
+    ]);
+    expect(run.spans[0].conversation.map((entry) => entry.value)).toEqual([
+      'Earlier',
+      'Missing',
+      'Later',
+    ]);
+  });
+  it('includes independent connected agent branches without counting their ancestor rollups', () => {
+    const [run] = buildAgentRuns([
+      span('root', '', 0, 1000, {
+        'gen_ai.operation.name': 'invoke_agent',
+        'gen_ai.usage.input_tokens': 5100,
+        'gen_ai.usage.output_tokens': 910,
+      }),
+      span('chat', 'root', 10, 100, {
+        ...modelFields,
+        'gen_ai.usage.input_tokens': 100,
+        'gen_ai.usage.output_tokens': 10,
+      }),
+      span('opaque', 'root', 200, 100, {
+        'gen_ai.operation.name': 'invoke_agent',
+        'gen_ai.usage.input_tokens': 5000,
+        'gen_ai.usage.output_tokens': 900,
+      }),
+    ]);
+    expect(run.inputTokens).toBe(5100);
+    expect(run.outputTokens).toBe(910);
+    expect(run.warnings).toEqual([]);
+  });
+  it('selects independent usage per direction and the deepest rollup in a branch', () => {
+    const [run] = buildAgentRuns([
+      span('root', '', 0, 1000, { 'gen_ai.operation.name': 'invoke_agent' }),
+      span('chat', 'root', 10, 100, {
+        ...modelFields,
+        'gen_ai.usage.input_tokens': 100,
+        'gen_ai.usage.output_tokens': 10,
+      }),
+      span('opaque', 'root', 200, 300, {
+        'gen_ai.operation.name': 'invoke_agent',
+        'gen_ai.usage.input_tokens': 5000,
+        'gen_ai.usage.output_tokens': 900,
+      }),
+      span('tool', 'opaque', 250, 100, {
+        'gen_ai.tool.name': 'lookup',
+        'gen_ai.usage.input_tokens': 5000,
+      }),
+    ]);
+    expect(run.inputTokens).toBe(5100);
+    expect(run.outputTokens).toBe(910);
+  });
+  it('discloses excluded disconnected rollups while preserving model-call precedence', () => {
+    const [run] = buildAgentRuns([
+      span('root', '', 0, 1000, {
+        'gen_ai.operation.name': 'invoke_agent',
+        'gen_ai.usage.input_tokens': 100,
+      }),
+      span('chat', 'missing', 10, 100, { ...modelFields, 'gen_ai.usage.input_tokens': 100 }),
+    ]);
+    expect(run.inputTokens).toBe(100);
+    expect(run.warnings).toContain(
+      'Token usage is partial because disconnected rollups may overlap model calls.',
+    );
+  });
+  it('discloses missing model usage even when a connected agent branch reports a rollup', () => {
+    const [run] = buildAgentRuns([
+      span('root', '', 0, 1000, { 'gen_ai.operation.name': 'invoke_agent' }),
+      span('chat', 'root', 10, 100, { ...modelFields, 'gen_ai.usage.input_tokens': 100 }),
+      span('opaque', 'root', 200, 300, {
+        'gen_ai.operation.name': 'invoke_agent',
+        'gen_ai.usage.input_tokens': 5000,
+      }),
+      span('unreported', 'opaque', 250, 100, modelFields),
+    ]);
+    expect(run.inputTokens).toBe(5100);
+    expect(run.warnings).toContain(
+      'Token usage is partial because some model calls do not report usage.',
+    );
+  });
+  it('rejects unsafe totals that include independent agent usage', () => {
+    const [run] = buildAgentRuns([
+      span('root', '', 0, 1000, { 'gen_ai.operation.name': 'invoke_agent' }),
+      span('chat', 'root', 10, 100, {
+        ...modelFields,
+        'gen_ai.usage.input_tokens': Number.MAX_SAFE_INTEGER,
+      }),
+      span('opaque', 'root', 200, 100, {
+        'gen_ai.operation.name': 'invoke_agent',
+        'gen_ai.usage.input_tokens': 1,
+      }),
+    ]);
+    expect(run.inputTokens).toBeUndefined();
+    expect(run.warnings).toContain(
+      'Token usage exceeds the safe numeric range and cannot be totaled reliably.',
+    );
+  });
   it('provides realistic successful, failed, and incomplete demo runs', () => {
     const runs = buildAgentRuns(agentDemoRows(started));
     expect(runs.map((run) => run.status)).toEqual(['success', 'failed', 'incomplete']);

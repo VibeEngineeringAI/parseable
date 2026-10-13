@@ -1,5 +1,15 @@
 # Frontend validation and independent review
 
+## PR #32 review fixes (2026-10-12)
+
+The seven review findings are addressed. Trace-focused Logs share links retain their encoded time window, and Traces Refresh reloads fixed windows while advancing preset windows with one request per active list/detail. Agents search keeps typing and caret updates synchronous with URL navigation, and searches literal recorded values, including backslashes and quotes.
+
+Captured conversation includes backend datatype-suffixed fields and orders events by their available epoch precision; exact duplicates remain collapsed. Token totals include independently reported sibling branches without repeating model-call rollups, and identify ambiguous disconnected usage as partial.
+
+Each finding received a Sol 6.1 implementation pass, a separate Sol regression review and a dedicated Opus 5.5 review. Follow-up reviews caught and corrected duplicate preset refreshes and loss of event precision from backend timestamp text. Regression coverage includes actual Share links/reload/handoffs, exact refresh request counts, caret/rapid typing/history/dataset changes, literal nested search, typed content, event ordering/deduplication and branch-level token accounting.
+
+Final validation through the Swamp `blacksmith-test` workflow passed formatting, TypeScript/production build, **2,314 unit tests** (14 skipped), **95 relevant application browser tests**, and **24 production-build browser tests**. Browser tests ran with four workers and zero retries. Earlier runs exposed two test synchronization assumptions around modal closure and development StrictMode mount requests; the corrected tests retain the original behavior and exact Refresh assertions. The full application suite, Storybook and live exporter/ingestion checks were not repeated for these fixes.
+
 ## In-app agent telemetry setup guide (2026-10-12)
 
 Agents now has a **Set up telemetry** panel, also linked from the **Get started** connection step and the Agents empty state. It generates copyable Claude Code JSON, Codex TOML and a coding-agent brief using an editable collector base URL. Content flags default off and reset when changing providers; the guide explains that metadata and some tool snippets may still be exported. It links to collector ingestion setup, documents required span mappings and distinguishes receiving telemetry from complete run compatibility.
