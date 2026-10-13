@@ -194,6 +194,15 @@ function mapCodex(rows: LogRecord[], isCodex: (row: LogRecord) => boolean) {
   }
   const kept = rows.filter((row) => !plumbing(row));
   const keptSet = new Set(kept);
+  const keptAncestor = (row: LogRecord) => {
+    let ancestors = parent(row);
+    // Bounded, in case recorded parents form a cycle.
+    for (let hops = 0; ancestors?.length && hops < rows.length; hops++) {
+      const found = ancestors.find((entry) => keptSet.has(entry));
+      if (found) return found;
+      ancestors = parent(ancestors[0]);
+    }
+  };
   for (const row of kept) {
     if (!isCodex(row)) continue;
     if (row.span_name === AGENT_HARNESSES.codex.runSpan) {
@@ -214,7 +223,10 @@ function mapCodex(rows: LogRecord[], isCodex: (row: LogRecord) => boolean) {
     // and its model and tool calls directly to the turn.
     const trace = traceOf(row);
     if (!trace || !parentOf(row) || parent(row)?.some((entry) => keptSet.has(entry))) continue;
-    if (row.span_name === AGENT_HARNESSES.codex.runSpan) setParent(row, '');
+    // A loaded but dropped parent leads to the nearest kept ancestor.
+    const nearest = keptAncestor(row);
+    if (nearest) setParent(row, spanOf(nearest)!);
+    else if (row.span_name === AGENT_HARNESSES.codex.runSpan) setParent(row, '');
     else {
       // Only a call that started during exactly one loaded turn is known to belong to it;
       // the calls of an unexported (still running) turn stay detached.
@@ -237,12 +249,16 @@ export function mapHarnessRows(harnesses: AgentHarness[], rows: LogRecord[]) {
   const codex = harnesses.includes('codex');
   const claude = harnesses.includes('claude-code');
   // Codex mapping and filtering apply to Codex services only, as in harnessRowPredicate.
-  // Without a service name, any row that is not a Claude Code span is taken to be Codex.
+  // Without a service name, a Codex-only dataset is all Codex; a mixed one needs a
+  // Codex span name or a Codex tool call (Claude Code tools carry tool_use_id instead).
   const isCodexRow = (row: LogRecord) =>
     codex &&
     (present(row['service.name'])
       ? String(row['service.name']).startsWith('codex')
-      : !String(row.span_name ?? '').startsWith('claude_code.'));
+      : !claude ||
+        CODEX_SPANS.includes(String(row.span_name)) ||
+        row.span_name === CODEX_RESPONSE ||
+        (present(row.tool_name) && present(row.call_id)));
   const copies = rows.map((row) => {
     const copy = { ...row };
     const harness = isCodexRow(row) ? 'codex' : claude ? 'claude-code' : undefined;

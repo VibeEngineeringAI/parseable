@@ -542,6 +542,38 @@ describe('coding-agent harness mapping', () => {
     expect(runs.find((run) => run.traceId === codexTrace)!.inputTokens).toBe(32558);
     expect(runs.find((run) => run.traceId === claudeTrace)!.name).toBe('Claude Code');
   });
+  it('attaches a kept Codex response under its model call, not beside it', () => {
+    const rows = mapHarnessRows(
+      ['codex'],
+      [
+        codexTurn[0],
+        codex('6161616161616161', '6e055c16cf2ba610', 'try_run_sampling_request', 100, 500, {
+          model: 'gpt-6-luna',
+          'gen_ai.usage.input_tokens': '5',
+        }),
+        codex('6262626262626262', '6161616161616161', 'receiving_stream', 102, 400),
+        codex('6363636363636363', '6262626262626262', 'handle_responses', 450, 10, {
+          'gen_ai.operation.name': 'chat',
+          'gen_ai.usage.input_tokens': '5',
+        }),
+      ],
+    );
+    expect(rows.find((row) => row.span_span_id === '6363636363636363')!.span_parent_span_id).toBe(
+      '6161616161616161',
+    );
+    expect(buildAgentRuns(rows)[0].inputTokens).toBe(5);
+  });
+  it('leaves generic spans without a service name alone in a mixed dataset', () => {
+    const { 'service.name': _, ...turn } = codexTurn[0];
+    const generic = span(codexTrace, '7171717171717171', 'gone', 'chat remote-model', 200, 10, {
+      'gen_ai.operation.name': 'chat',
+    });
+    const rows = mapHarnessRows(['codex', 'claude-code'], [turn, generic]);
+    const chat = rows.find((row) => row.span_span_id === '7171717171717171')!;
+    expect(chat.span_parent_span_id).toBe('gone');
+    expect(mappedHarness(chat)).toBeUndefined();
+    expect(mappedHarness(rows[0])).toBe('codex');
+  });
   it('leaves rows untouched when no harness is detected', () => {
     expect(mapHarnessRows([], codexTurn)).toBe(codexTurn);
   });
