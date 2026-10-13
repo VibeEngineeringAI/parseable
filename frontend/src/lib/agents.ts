@@ -1,20 +1,16 @@
-import { detectAgentHarnesses, harnessRowPredicate, harnessRunPredicate } from './agentHarnesses';
+import {
+  AGENT_FIELDS,
+  detectAgentHarnesses,
+  harnessRowPredicate,
+  harnessRunPredicate,
+} from './agentHarnesses';
 import { ApiError } from './apiError';
 import { apmTransportBounds } from './apm';
 import { mapConcurrent } from './concurrency';
 import { paramsRange, quoteIdentifier, quoteLiteral, timeBounds } from './query';
 import type { LogRecord, ParseableClient, QueryRequest, TimeRange } from './types';
 
-// Classic agents uses Enterprise /api/prism/v1/agent-observability APIs.
-// Community can inspect the same flattened telemetry through its SQL endpoint.
-export const AGENT_FIELDS = [
-  'gen_ai.agent.name',
-  'gen_ai.agent.id',
-  'gen_ai.operation.name',
-  'gen_ai.request.model',
-  'gen_ai.response.model',
-  'gen_ai.tool.name',
-] as const;
+export { AGENT_FIELDS };
 export const AGENT_RECORD_LIMIT = 1000;
 export const AGENT_RUN_LIMIT = 100;
 export function isAgentSchema(fields: string[]) {
@@ -70,7 +66,7 @@ export function buildAgentRunQuery(
     ...harnesses.map(harnessRunPredicate),
   ].join(' OR ');
   const rowPredicate = harnesses
-    .map((harness) => harnessRowPredicate(harness, fields, AGENT_FIELDS))
+    .map((harness) => harnessRowPredicate(harness, fields))
     .filter(Boolean)
     .join(' AND ');
   const traceField = ['span_trace_id', 'trace_id'].find((field) => fields.includes(field));

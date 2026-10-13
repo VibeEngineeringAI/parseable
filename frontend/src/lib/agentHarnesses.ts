@@ -2,6 +2,17 @@ import { spanTiming } from './agentRuns';
 import { quoteIdentifier, quoteLiteral } from './query';
 import type { LogRecord } from './types';
 
+// Classic agents uses Enterprise /api/prism/v1/agent-observability APIs.
+// Community can inspect the same flattened telemetry through its SQL endpoint.
+export const AGENT_FIELDS = [
+  'gen_ai.agent.name',
+  'gen_ai.agent.id',
+  'gen_ai.operation.name',
+  'gen_ai.request.model',
+  'gen_ai.response.model',
+  'gen_ai.tool.name',
+] as const;
+
 // Coding-agent CLIs export OTLP with their own attribute names. A harness profile
 // recognizes that telemetry and adds the GenAI span fields the Agents view reads.
 // Recorded values are never replaced, and absent values stay absent.
@@ -49,14 +60,10 @@ export function harnessRunPredicate(harness: AgentHarness) {
 }
 
 /**
- * SQL keeping the run-relevant spans of a harness; other services' rows are untouched.
- * Spans carrying any of `agentFields` are always kept.
+ * SQL keeping the run-relevant spans of a harness; other services' rows, and spans
+ * already carrying GenAI fields, are untouched.
  */
-export function harnessRowPredicate(
-  harness: AgentHarness,
-  fields: string[],
-  agentFields: readonly string[] = [],
-) {
+export function harnessRowPredicate(harness: AgentHarness, fields: string[]) {
   if (harness !== 'codex' || !fields.includes('service.name')) return;
   const name = `COALESCE(${quoteIdentifier('span_name')}, '')`;
   const kept = [`${name} IN (${CODEX_SPANS.map(quoteLiteral).join(', ')})`];
@@ -64,7 +71,7 @@ export function harnessRowPredicate(
     kept.push(
       `(${name} = ${quoteLiteral(CODEX_RESPONSE)} AND ${quoteIdentifier('gen_ai.usage.input_tokens')} IS NOT NULL)`,
     );
-  for (const field of ['tool_name', ...agentFields])
+  for (const field of ['tool_name', ...AGENT_FIELDS])
     if (fields.includes(field)) kept.push(`${quoteIdentifier(field)} IS NOT NULL`);
   return `NOT (COALESCE(${quoteIdentifier('service.name')}, '') LIKE 'codex%' AND NOT (${kept.join(' OR ')}))`;
 }
@@ -145,7 +152,8 @@ function mapClaudeCode(row: LogRecord) {
   }
 }
 
-function mapCodex(rows: LogRecord[]) {
+// Rows of other services are kept as they are, but remain visible as parents.
+function mapCodex(rows: LogRecord[], isCodex: (row: LogRecord) => boolean) {
   const spans = new Map<string, LogRecord[]>();
   for (const row of rows) {
     const trace = traceOf(row);
@@ -158,9 +166,15 @@ function mapCodex(rows: LogRecord[]) {
     const span = parentOf(row);
     return trace && span ? spans.get(`${trace}/${span}`) : undefined;
   };
+  // Stream and response spans only connect a model call to its usage, unless they
+  // already describe something themselves.
+  const plumbing = (row: LogRecord) =>
+    isCodex(row) &&
+    (row.span_name === CODEX_STREAM || row.span_name === CODEX_RESPONSE) &&
+    !AGENT_FIELDS.some((field) => present(row[field]));
   // Usage is reported on the response handler two levels below its model call.
   for (const row of rows) {
-    if (row.span_name !== CODEX_RESPONSE) continue;
+    if (row.span_name !== CODEX_RESPONSE || !plumbing(row)) continue;
     const stream = parent(row)?.find((entry) => entry.span_name === CODEX_STREAM);
     const call = stream && parent(stream);
     if (call?.[0]?.span_name !== CODEX_MODEL_CALL) continue;
@@ -172,16 +186,16 @@ function mapCodex(rows: LogRecord[]) {
   for (const row of rows) {
     const trace = traceOf(row);
     const span = spanOf(row);
-    if (row.span_name !== AGENT_HARNESSES.codex.runSpan || !trace || !span) continue;
+    if (row.span_name !== AGENT_HARNESSES.codex.runSpan || !isCodex(row) || !trace || !span)
+      continue;
     const { start, durationMs } = spanTiming(row);
     if (start === undefined || durationMs === undefined) continue;
     runs.set(trace, [...(runs.get(trace) ?? []), { span, start, end: start + durationMs }]);
   }
-  const kept = rows.filter(
-    (row) => row.span_name !== CODEX_STREAM && row.span_name !== CODEX_RESPONSE,
-  );
+  const kept = rows.filter((row) => !plumbing(row));
   const keptSet = new Set(kept);
   for (const row of kept) {
+    if (!isCodex(row)) continue;
     if (row.span_name === AGENT_HARNESSES.codex.runSpan) {
       assign(row, 'gen_ai.agent.name', AGENT_HARNESSES.codex.label);
       assign(row, 'gen_ai.operation.name', 'invoke_agent');
@@ -223,10 +237,12 @@ export function mapHarnessRows(harnesses: AgentHarness[], rows: LogRecord[]) {
   const codex = harnesses.includes('codex');
   const claude = harnesses.includes('claude-code');
   // Codex mapping and filtering apply to Codex services only, as in harnessRowPredicate.
-  // Without a service name, rows of a Codex-only dataset are taken to be Codex.
+  // Without a service name, any row that is not a Claude Code span is taken to be Codex.
   const isCodexRow = (row: LogRecord) =>
     codex &&
-    (present(row['service.name']) ? String(row['service.name']).startsWith('codex') : !claude);
+    (present(row['service.name'])
+      ? String(row['service.name']).startsWith('codex')
+      : !String(row.span_name ?? '').startsWith('claude_code.'));
   const copies = rows.map((row) => {
     const copy = { ...row };
     const harness = isCodexRow(row) ? 'codex' : claude ? 'claude-code' : undefined;
@@ -234,7 +250,5 @@ export function mapHarnessRows(harnesses: AgentHarness[], rows: LogRecord[]) {
     return copy;
   });
   if (claude) copies.filter((row) => !isCodexRow(row)).forEach(mapClaudeCode);
-  if (!codex) return copies;
-  const kept = new Set(mapCodex(copies.filter(isCodexRow)));
-  return copies.filter((row) => !isCodexRow(row) || kept.has(row));
+  return codex ? mapCodex(copies, isCodexRow) : copies;
 }

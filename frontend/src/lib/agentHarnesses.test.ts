@@ -502,6 +502,46 @@ describe('coding-agent harness mapping', () => {
     expect(rows.map((row) => row.span_name)).not.toContain('receiving_stream');
     expect(buildAgentRuns(rows)[0].name).toBe('Codex');
   });
+  it('keeps a Codex turn under a parent from another service', () => {
+    const outer = span(codexTrace, 'outer00000000001', '', 'gateway', -100, 5000, {
+      'service.name': 'agent-gateway',
+      'gen_ai.operation.name': 'invoke_agent',
+      'gen_ai.agent.name': 'Gateway',
+    });
+    const turn = { ...codexTurn[0], span_parent_span_id: 'outer00000000001' };
+    const rows = mapHarnessRows(['codex'], [outer, turn]);
+    expect(rows[1].span_parent_span_id).toBe('outer00000000001');
+    expect(buildAgentRuns(rows)[0].roots).toHaveLength(1);
+  });
+  it('keeps Codex stream and response spans that carry GenAI fields themselves', () => {
+    const fields = { 'gen_ai.operation.name': 'execute_tool', 'gen_ai.tool.name': 'exec' };
+    const rows = mapHarnessRows(
+      ['codex'],
+      [
+        codexTurn[0],
+        codex('5151515151515151', 'a131b912f2251684', 'receiving_stream', 200, 10, fields),
+        codex('5252525252525252', 'a131b912f2251684', 'handle_responses', 300, 10, {
+          ...fields,
+          'gen_ai.usage.input_tokens': '5',
+        }),
+      ],
+    );
+    const [run] = buildAgentRuns(rows);
+    expect(run.roots[0].children.map((child) => child.toolName)).toEqual(['exec', 'exec']);
+    // The kept response's usage is counted once, not also lifted onto a model call.
+    expect(run.inputTokens).toBe(5);
+  });
+  it('recognizes Codex rows without a service name in a mixed dataset', () => {
+    const strip = ({ 'service.name': _, ...row }: LogRecord) => row;
+    const rows = mapHarnessRows(
+      ['codex', 'claude-code'],
+      [...codexTurn.map(strip), ...claudeInteraction.map(strip)],
+    );
+    const runs = buildAgentRuns(rows);
+    expect(runs.find((run) => run.traceId === codexTrace)!.name).toBe('Codex');
+    expect(runs.find((run) => run.traceId === codexTrace)!.inputTokens).toBe(32558);
+    expect(runs.find((run) => run.traceId === claudeTrace)!.name).toBe('Claude Code');
+  });
   it('leaves rows untouched when no harness is detected', () => {
     expect(mapHarnessRows([], codexTurn)).toBe(codexTurn);
   });
