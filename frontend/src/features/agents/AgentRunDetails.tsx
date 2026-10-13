@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Bot, GitBranch, MessageSquare, Wrench } from 'lucide-react';
 import { Badge, Button, Tabs } from '../../components/ui';
+import { AGENT_HARNESSES, mappedHarness, recordedFields } from '../../lib/agentHarnesses';
 import type { AgentRun, AgentRunStatus, AgentSpan } from '../../lib/agentRuns';
 
 export function formatAgentDuration(value?: number) {
@@ -57,6 +58,11 @@ export function AgentRunDetails({ run }: { run: AgentRun }) {
   const [tab, setTab] = useState('tree');
   const [spanId, setSpanId] = useState(run.roots[0]?.id ?? run.spans[0]?.id);
   const selected = run.spans.find((span) => span.id === spanId) ?? run.spans[0];
+  const selectedHarness = selected?.rows.map(mappedHarness).find(Boolean);
+  // Harness mapping can attach a span to its run when intermediate spans were not loaded.
+  const recordedParent = selected?.rows
+    .map((row) => recordedFields(row).span_parent_span_id ?? recordedFields(row).parent_span_id)
+    .find((value) => typeof value === 'string' && value.trim() && !/^0+$/.test(value.trim()));
   const models = run.spans.filter((span) => span.kind === 'model');
   const tools = run.spans.filter((span) => span.kind === 'tool');
   const errors = run.spans.filter((span) => span.errors.length || span.status === 'failed');
@@ -233,7 +239,11 @@ export function AgentRunDetails({ run }: { run: AgentRun }) {
             <div>
               <dt>Parent span ID</dt>
               <dd>
-                <code>{selected.parentSpanId ?? 'Not recorded'}</code>
+                <code>
+                  {String(
+                    (selectedHarness ? recordedParent : selected.parentSpanId) ?? 'Not recorded',
+                  )}
+                </code>
               </dd>
             </div>
             <div>
@@ -255,6 +265,12 @@ export function AgentRunDetails({ run }: { run: AgentRun }) {
               </dd>
             </div>
           </dl>
+          {selectedHarness && (
+            <p className="agents-note">
+              Mapped from native {AGENT_HARNESSES[selectedHarness].label} telemetry. Recorded fields
+              are shown unchanged.
+            </p>
+          )}
           <details className="agents-raw-fields">
             <summary>
               Recorded fields ({selected.rows.length}{' '}
@@ -262,7 +278,7 @@ export function AgentRunDetails({ run }: { run: AgentRun }) {
             </summary>
             {selected.rows.map((row, index) => (
               <pre key={index} className="agents-record">
-                {JSON.stringify(row, null, 2)}
+                {JSON.stringify(recordedFields(row), null, 2)}
               </pre>
             ))}
           </details>

@@ -294,7 +294,7 @@ const agentFields = [...new Set(agentRows.flatMap((row) => Object.keys(row)))];
 type Captured = { query: string; startTime: string; endTime: string };
 async function serveAgents(
   page: Page,
-  options: { status?: number; rows?: LogRecord[]; datasets?: string[] } = {},
+  options: { status?: number; rows?: LogRecord[]; datasets?: string[]; fields?: string[] } = {},
 ) {
   const captured: Captured[] = [];
   const state = { status: options.status ?? 200, rows: options.rows ?? agentRows };
@@ -305,7 +305,9 @@ async function serveAgents(
         json: (options.datasets ?? ['agent_telemetry']).map((name) => ({ name })),
       });
     if (path.endsWith('/schema'))
-      return route.fulfill({ json: { fields: agentFields.map((name) => ({ name })) } });
+      return route.fulfill({
+        json: { fields: (options.fields ?? agentFields).map((name) => ({ name })) },
+      });
     if (path.endsWith('/info'))
       return route.fulfill({
         json: { telemetryType: 'traces', logSource: [{ log_source_format: 'otel-traces' }] },
@@ -723,3 +725,140 @@ for (const trace of ['trace-with-dashes', '']) {
     await expect(details.getByRole('tab', { name: 'Span tree (1)' })).toBeVisible();
   });
 }
+
+test('native Codex traces become runs with mapped model calls, tools and usage', async ({
+  page,
+}) => {
+  // Spans as Codex CLI 0.162.1 exports them: no GenAI agent fields, usage on the
+  // response handler below each model call, and intermediate spans filtered out.
+  const trace = 'e5'.repeat(16);
+  const codex = (span: Omit<SpanFixture, 'trace' | 'status'>) =>
+    spanRows({
+      ...span,
+      trace,
+      attributes: { 'service.name': 'codex-app-server', ...span.attributes },
+    });
+  const rows = [
+    codex({
+      id: 'e500000000000001',
+      parent: 'e5000000000000aa',
+      name: 'session_task.turn',
+      start: base + 1000,
+      duration: 4000,
+      attributes: {
+        model: 'gpt-6-luna',
+        'codex.turn.token_usage.input_tokens': '32558',
+        'codex.turn.token_usage.output_tokens': '38',
+      },
+    }),
+    codex({
+      id: 'e500000000000002',
+      parent: 'e5000000000000bb',
+      name: 'try_run_sampling_request',
+      start: base + 1100,
+      duration: 1600,
+      attributes: { model: 'gpt-6-luna' },
+    }),
+    codex({
+      id: 'e500000000000003',
+      parent: 'e500000000000002',
+      name: 'receiving_stream',
+      start: base + 1110,
+      duration: 1580,
+    }),
+    codex({
+      id: 'e500000000000004',
+      parent: 'e500000000000003',
+      name: 'handle_responses',
+      start: base + 2600,
+      duration: 40,
+      attributes: { 'gen_ai.usage.input_tokens': '32558', 'gen_ai.usage.output_tokens': '38' },
+    }),
+    codex({
+      id: 'e500000000000005',
+      parent: 'e5000000000000cc',
+      name: 'exec',
+      start: base + 2700,
+      duration: 137,
+      attributes: { tool_name: 'exec', call_id: 'call_codex' },
+    }),
+  ].flat();
+  const { captured } = await serveAgents(page, {
+    rows,
+    datasets: ['codex-traces'],
+    fields: [...new Set([...rows.flatMap((row) => Object.keys(row)), 'gen_ai.usage.input_tokens'])],
+  });
+  await page.goto(`/agents?${range}`);
+  await page.getByLabel('Agents dataset').selectOption('codex-traces');
+  const row = runRow(page, 'Codex');
+  await expect(cell(row, 'Status')).toHaveText('Successful');
+  await expect(cell(row, 'Model')).toHaveText('gpt-6-luna');
+  await expect(cell(row, 'Tokens')).toContainText('32,558 in');
+  await expect(cell(row, 'Tokens')).toContainText('38 out');
+  await expect(cell(row, 'Spans')).toHaveText('3');
+  expect(captured[0].query).toContain(`"span_name" = 'session_task.turn'`);
+  expect(captured[0].query).toContain(`LIKE 'codex%'`);
+
+  const details = await openRun(page, 'Codex');
+  const children = details
+    .getByRole('list', { name: 'Run span tree' })
+    .getByRole('list', { name: 'Child spans' });
+  await expect(children.getByRole('button')).toHaveCount(2);
+  await children.getByRole('button', { name: /exec/ }).click();
+  const span = details.getByRole('region', { name: 'Selected span' });
+  await expect(span).toContainText('Mapped from native Codex telemetry');
+  // Facts and raw records show what Codex recorded, not the attached tree position.
+  await expect(fact(span, 'Parent span ID')).toHaveText('e5000000000000cc');
+  await span.getByText('Recorded fields (1 record)').click();
+  await expect(span).toContainText('"tool_name": "exec"');
+  await expect(span).not.toContainText('gen_ai.tool.name');
+});
+
+test('discloses the record limit from the queried rows when Codex mapping drops some', async ({
+  page,
+}) => {
+  const trace = 'f6'.repeat(16);
+  const codex = (span: Omit<SpanFixture, 'trace' | 'status'>) =>
+    spanRows({
+      ...span,
+      trace,
+      attributes: { 'service.name': 'codex-app-server', ...span.attributes },
+    });
+  const rows = [
+    codex({
+      id: 'f600000000000001',
+      name: 'session_task.turn',
+      start: base + 1000,
+      duration: 4000,
+      attributes: { model: 'gpt-6-luna', 'codex.turn.token_usage.input_tokens': '10' },
+    }),
+    codex({
+      id: 'f600000000000002',
+      parent: 'f600000000000001',
+      name: 'try_run_sampling_request',
+      start: base + 1100,
+      duration: 3000,
+      attributes: { model: 'gpt-6-luna' },
+    }),
+    // Stream spans count toward the record limit but are not shown as run spans.
+    ...Array.from({ length: 998 }, (_, index) =>
+      codex({
+        id: (index + 1).toString(16).padStart(16, '0'),
+        parent: 'f600000000000002',
+        name: 'receiving_stream',
+        start: base + 1200,
+        duration: 10,
+      }),
+    ),
+  ].flat();
+  await serveAgents(page, {
+    rows,
+    datasets: ['codex-traces'],
+    fields: [...new Set(rows.flatMap((row) => Object.keys(row)))],
+  });
+  await page.goto(`/agents/codex-traces?${range}`);
+  await expect(cell(runRow(page, 'Codex'), 'Spans')).toHaveText('2');
+  await expect(page.getByRole('status').filter({ hasText: 'record limit' })).toContainText(
+    'narrow the time range',
+  );
+});

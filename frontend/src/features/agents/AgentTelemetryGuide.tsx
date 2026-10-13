@@ -75,24 +75,23 @@ export function AgentTelemetryGuide() {
         <h3>3. Validate real telemetry</h3>
         <p>
           Confirm collector receipt and stored rows first, then run discovery, parent links, models,
-          tools and usage in Agents. Test successful, failed and interrupted work. Native CLI
-          compatibility has not been verified end to end; capture Codex’s actual trace schema from
-          your installed runtime.
+          tools and usage in Agents. Test successful, failed and interrupted work. Agents reads
+          native Claude Code and Codex trace fields directly, so their trace datasets need no field
+          mapping. Runs come from traces; a logs dataset is not listed on its own.
         </p>
         <details className="agent-setup-details">
           <summary>Mapping and validation checklist</summary>
+          <p>For other agents and frameworks:</p>
           <ul>
             <li>
               Map agent and operation to <code>gen_ai.agent.name</code> and{' '}
               <code>gen_ai.operation.name</code>; models to <code>gen_ai.request.model</code> /{' '}
-              <code>gen_ai.response.model</code>; tools to <code>gen_ai.tool.name</code> (Claude:{' '}
-              <code>tool_name</code>).
+              <code>gen_ai.response.model</code>; tools to <code>gen_ai.tool.name</code>.
             </li>
             <li>
               Map usage to <code>gen_ai.usage.input_tokens</code> and{' '}
-              <code>gen_ai.usage.output_tokens</code>. Claude input totals include{' '}
-              <code>input_tokens + cache_read_tokens + cache_creation_tokens</code>. Preserve absent
-              values as unknown.
+              <code>gen_ai.usage.output_tokens</code>, including cached input tokens in the input
+              total. Preserve absent values as unknown.
             </li>
             <li>
               Validate 32-digit hexadecimal trace IDs, 16-digit hexadecimal span IDs, parent IDs,
