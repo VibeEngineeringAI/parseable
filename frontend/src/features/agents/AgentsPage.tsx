@@ -24,7 +24,13 @@ import {
   buildAgentRunQuery,
   discoverAgentDatasets,
 } from '../../lib/agents';
-import { detectAgentHarness, mapHarnessRows } from '../../lib/agentHarnesses';
+import { AGENT_HARNESSES, detectAgentHarness, mapHarnessRows } from '../../lib/agentHarnesses';
+import {
+  attachHarnessConversation,
+  buildHarnessLogQuery,
+  discoverHarnessLogs,
+  pairedLogsDataset,
+} from '../../lib/agentHarnessLogs';
 import { buildAgentRuns } from '../../lib/agentRuns';
 import { agentValueMatchesSearch } from '../../lib/agentSearch';
 import {
@@ -105,6 +111,7 @@ export function AgentsPage() {
             limitReached: false,
             timeColumn: 'p_timestamp',
             traces: false,
+            harness: undefined,
           };
         }
         const [fields, info] = await Promise.all([
@@ -116,14 +123,60 @@ export function AgentsPage() {
           buildAgentRunQuery(dataset, fields, bounds, timeColumn),
           signal,
         );
+        const harness = detectAgentHarness(fields);
         return {
-          rows: mapHarnessRows(detectAgentHarness(fields), rows),
+          rows: mapHarnessRows(harness, rows),
           limitReached: rows.length >= AGENT_RECORD_LIMIT,
           timeColumn,
           traces: info.logSourceFormats.includes('otel-traces'),
+          harness,
         };
       },
       [client, mode, dataset, bounds],
+    ),
+  );
+  const harness = result.data?.harness;
+  // Coding agents export prompts and tool results as logs in a separate dataset.
+  const logsCandidates = useAsync(
+    useCallback(
+      async (signal) => (harness ? discoverHarnessLogs(client, harness, signal) : undefined),
+      [client, harness],
+    ),
+  );
+  const logsParam = params.get('logs');
+  const logsDataset =
+    logsParam === 'none'
+      ? undefined
+      : logsParam ||
+        (dataset && logsCandidates.data?.length
+          ? pairedLogsDataset(dataset, logsCandidates.data)
+          : undefined);
+  const traceIds = useMemo(
+    () =>
+      JSON.stringify([
+        ...new Set(
+          (result.data?.rows ?? [])
+            .map((row) => row.span_trace_id ?? row.trace_id)
+            .filter((id): id is string => typeof id === 'string' && !!id.trim()),
+        ),
+      ]),
+    [result.data],
+  );
+  const logs = useAsync(
+    useCallback(
+      async (signal) => {
+        if (!harness || !logsDataset) return undefined;
+        const info = await client.datasetInfo(logsDataset, signal);
+        const request = buildHarnessLogQuery(
+          logsDataset,
+          harness,
+          JSON.parse(traceIds) as string[],
+          bounds,
+          info.timePartition || 'p_timestamp',
+        );
+        return request ? client.query(request, signal) : [];
+      },
+      [client, harness, logsDataset, traceIds, bounds],
     ),
   );
   const authorizedDataset = useRef<string | undefined>(undefined);
@@ -138,11 +191,15 @@ export function AgentsPage() {
   });
   const runs = useMemo(
     () =>
-      buildAgentRuns(result.data?.rows ?? [], result.data?.timeColumn, {
-        limitReached: result.data?.limitReached,
-        bounds,
-      }),
-    [result.data, bounds],
+      attachHarnessConversation(
+        buildAgentRuns(result.data?.rows ?? [], result.data?.timeColumn, {
+          limitReached: result.data?.limitReached,
+          bounds,
+        }),
+        result.data?.harness,
+        logs.data,
+      ),
+    [result.data, bounds, logs.data],
   );
   const visibleRuns = useMemo(
     () =>
@@ -151,8 +208,10 @@ export function AgentsPage() {
           (!status || run.status === status) &&
           (!model || run.models.includes(model)) &&
           (!search ||
-            run.spans.some((span) =>
-              span.rows.some((row) => agentValueMatchesSearch(row, search)),
+            run.spans.some(
+              (span) =>
+                span.rows.some((row) => agentValueMatchesSearch(row, search)) ||
+                span.conversation.some((entry) => agentValueMatchesSearch(entry.value, search)),
             )),
       ),
     [runs, search, status, model],
@@ -229,6 +288,24 @@ export function AgentsPage() {
             </option>
           ))}
         </Select>
+        {harness && mode !== 'demo' && (
+          <Select
+            aria-label="Conversation logs"
+            value={logsDataset ?? 'none'}
+            aria-busy={logsCandidates.loading}
+            onChange={(event) => updateFilter('logs', event.target.value)}
+          >
+            <option value="none">No conversation logs</option>
+            {logsDataset && !logsCandidates.data?.includes(logsDataset) && (
+              <option value={logsDataset}>{logsDataset}</option>
+            )}
+            {logsCandidates.data?.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </Select>
+        )}
         <TimeRangePicker value={range} onChange={changeRange} />
         <Button
           variant="secondary"
@@ -265,6 +342,21 @@ export function AgentsPage() {
             </Link>
           )}
         </nav>
+      )}
+      {harness && logs.error && (
+        <p role="status" className="agents-note">
+          Could not load {AGENT_HARNESSES[harness].label} conversation logs from {logsDataset}:{' '}
+          {logs.error.message}{' '}
+          <Button variant="ghost" onClick={logs.reload}>
+            Retry
+          </Button>
+        </p>
+      )}
+      {harness && logsCandidates.data && !logsCandidates.data.length && !logsParam && (
+        <p role="status" className="agents-note">
+          No {AGENT_HARNESSES[harness].label} logs dataset found. Export its logs to Parseable to
+          see prompts and tool results in run details.
+        </p>
       )}
       {dataset && discoveryEnabled && discovery.loading && (
         <p role="status" className="agents-note">

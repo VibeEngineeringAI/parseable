@@ -66,7 +66,9 @@ export function AgentRunDetails({ run }: { run: AgentRun }) {
   const models = run.spans.filter((span) => span.kind === 'model');
   const tools = run.spans.filter((span) => span.kind === 'tool');
   const errors = run.spans.filter((span) => span.errors.length || span.status === 'failed');
-  const conversation = run.spans.filter((span) => span.conversation.length);
+  const conversation = run.spans
+    .filter((span) => span.conversation.length)
+    .sort((a, b) => (Date.parse(a.startTime ?? '') || 0) - (Date.parse(b.startTime ?? '') || 0));
   const spanButton = (span: AgentSpan) => (
     <button
       type="button"
