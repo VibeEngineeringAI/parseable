@@ -1,3 +1,4 @@
+import { spanTiming } from './agentRuns';
 import { quoteIdentifier, quoteLiteral } from './query';
 import type { LogRecord } from './types';
 
@@ -34,9 +35,10 @@ const CODEX_STREAM = 'receiving_stream';
 const CODEX_RESPONSE = 'handle_responses';
 const CODEX_SPANS = [AGENT_HARNESSES.codex.runSpan, CODEX_MODEL_CALL, CODEX_STREAM];
 
-export function detectAgentHarness(fields: string[]): AgentHarness | undefined {
-  if (!fields.includes('span_name')) return;
-  return (Object.keys(AGENT_HARNESSES) as AgentHarness[]).find((harness) =>
+/** The harnesses whose telemetry a dataset holds; one dataset may hold several. */
+export function detectAgentHarnesses(fields: string[]): AgentHarness[] {
+  if (!fields.includes('span_name')) return [];
+  return (Object.keys(AGENT_HARNESSES) as AgentHarness[]).filter((harness) =>
     AGENT_HARNESSES[harness].signature.some((field) => fields.includes(field)),
   );
 }
@@ -46,8 +48,15 @@ export function harnessRunPredicate(harness: AgentHarness) {
   return `${quoteIdentifier('span_name')} = ${quoteLiteral(AGENT_HARNESSES[harness].runSpan)}`;
 }
 
-/** SQL keeping the run-relevant spans of a harness; other services' rows are untouched. */
-export function harnessRowPredicate(harness: AgentHarness, fields: string[]) {
+/**
+ * SQL keeping the run-relevant spans of a harness; other services' rows are untouched.
+ * Spans carrying any of `agentFields` are always kept.
+ */
+export function harnessRowPredicate(
+  harness: AgentHarness,
+  fields: string[],
+  agentFields: readonly string[] = [],
+) {
   if (harness !== 'codex' || !fields.includes('service.name')) return;
   const name = `COALESCE(${quoteIdentifier('span_name')}, '')`;
   const kept = [`${name} IN (${CODEX_SPANS.map(quoteLiteral).join(', ')})`];
@@ -55,11 +64,13 @@ export function harnessRowPredicate(harness: AgentHarness, fields: string[]) {
     kept.push(
       `(${name} = ${quoteLiteral(CODEX_RESPONSE)} AND ${quoteIdentifier('gen_ai.usage.input_tokens')} IS NOT NULL)`,
     );
-  if (fields.includes('tool_name')) kept.push(`${quoteIdentifier('tool_name')} IS NOT NULL`);
+  for (const field of ['tool_name', ...agentFields])
+    if (fields.includes(field)) kept.push(`${quoteIdentifier(field)} IS NOT NULL`);
   return `NOT (COALESCE(${quoteIdentifier('service.name')}, '') LIKE 'codex%' AND NOT (${kept.join(' OR ')}))`;
 }
 
-const recorded = new WeakMap<LogRecord, { row: LogRecord; harness: AgentHarness }>();
+const recorded = new WeakMap<LogRecord, { row: LogRecord; harness?: AgentHarness }>();
+const mapped = new WeakSet<LogRecord>();
 
 /** The fields a record was stored with, before any harness mapping. */
 export function recordedFields(row: LogRecord): LogRecord {
@@ -67,14 +78,20 @@ export function recordedFields(row: LogRecord): LogRecord {
 }
 /** The harness whose native names were mapped onto this record, if any. */
 export function mappedHarness(row: LogRecord): AgentHarness | undefined {
-  return recorded.get(row)?.harness;
+  return mapped.has(row) ? recorded.get(row)?.harness : undefined;
+}
+/** Note that a field was derived for, or the parent rewritten on, a copied record. */
+function markMapped(row: LogRecord) {
+  if (recorded.has(row)) mapped.add(row);
 }
 
 function present(value: unknown) {
   return value !== undefined && value !== null && value !== '';
 }
 function assign(row: LogRecord, field: string, value: unknown) {
-  if (present(value) && !present(row[field])) row[field] = value;
+  if (!present(value) || present(row[field])) return;
+  row[field] = value;
+  markMapped(row);
 }
 function count(value: unknown) {
   if (!present(value)) return;
@@ -90,6 +107,12 @@ function id(row: LogRecord, field: string) {
 const traceOf = (row: LogRecord) => id(row, 'span_trace_id') ?? id(row, 'trace_id');
 const spanOf = (row: LogRecord) => id(row, 'span_span_id') ?? id(row, 'span_id');
 const parentOf = (row: LogRecord) => id(row, 'span_parent_span_id') ?? id(row, 'parent_span_id');
+// Rewrite whichever parent fields the record has, since readers fall back between them.
+function setParent(row: LogRecord, value: string) {
+  const fields = ['span_parent_span_id', 'parent_span_id'].filter((field) => field in row);
+  for (const field of fields.length ? fields : ['span_parent_span_id']) row[field] = value;
+  markMapped(row);
+}
 
 function mapClaudeCode(row: LogRecord) {
   switch (row.span_name) {
@@ -100,11 +123,12 @@ function mapClaudeCode(row: LogRecord) {
     case 'claude_code.llm_request': {
       assign(row, 'gen_ai.operation.name', 'chat');
       assign(row, 'gen_ai.request.model', row.model);
-      // Anthropic reports cache reads and writes separately from input_tokens.
-      const input = ['input_tokens', 'cache_read_tokens', 'cache_creation_tokens']
-        .map((field) => count(row[field]))
-        .filter((value): value is number => value !== undefined);
-      if (input.length)
+      // Anthropic reports cache reads and writes separately from input_tokens, which
+      // must be reported. An absent cache count is zero; a malformed one leaves input unknown.
+      const input = ['input_tokens', 'cache_read_tokens', 'cache_creation_tokens'].map(
+        (field, index) => (index && !present(row[field]) ? 0 : count(row[field])),
+      );
+      if (input.every((value): value is number => value !== undefined))
         assign(
           row,
           'gen_ai.usage.input_tokens',
@@ -144,13 +168,14 @@ function mapCodex(rows: LogRecord[]) {
       for (const field of ['gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens'])
         assign(entry, field, row[field]);
   }
-  const runs = new Map<string, string>();
+  const runs = new Map<string, { span: string; start: number; end: number }[]>();
   for (const row of rows) {
     const trace = traceOf(row);
     const span = spanOf(row);
     if (row.span_name !== AGENT_HARNESSES.codex.runSpan || !trace || !span) continue;
-    // A trace with several turns cannot attribute detached spans to one of them.
-    runs.set(trace, runs.has(trace) && runs.get(trace) !== span ? '' : span);
+    const { start, durationMs } = spanTiming(row);
+    if (start === undefined || durationMs === undefined) continue;
+    runs.set(trace, [...(runs.get(trace) ?? []), { span, start, end: start + durationMs }]);
   }
   const kept = rows.filter(
     (row) => row.span_name !== CODEX_STREAM && row.span_name !== CODEX_RESPONSE,
@@ -175,21 +200,41 @@ function mapCodex(rows: LogRecord[]) {
     // and its model and tool calls directly to the turn.
     const trace = traceOf(row);
     if (!trace || !parentOf(row) || parent(row)?.some((entry) => keptSet.has(entry))) continue;
-    if (row.span_name === AGENT_HARNESSES.codex.runSpan) row.span_parent_span_id = '';
-    else if (runs.get(trace)) row.span_parent_span_id = runs.get(trace);
+    if (row.span_name === AGENT_HARNESSES.codex.runSpan) setParent(row, '');
+    else {
+      // Only a call that started during exactly one loaded turn is known to belong to it;
+      // the calls of an unexported (still running) turn stay detached.
+      const { start } = spanTiming(row);
+      if (start === undefined) continue;
+      const matches = new Set(
+        (runs.get(trace) ?? [])
+          .filter((run) => start >= run.start && start <= run.end)
+          .map((run) => run.span),
+      );
+      if (matches.size === 1) setParent(row, [...matches][0]);
+    }
   }
   return kept;
 }
 
-/** Add GenAI fields derived from a harness's native telemetry. */
-export function mapHarnessRows(harness: AgentHarness | undefined, rows: LogRecord[]) {
-  if (!harness) return rows;
-  const mapped = rows.map((row) => {
+/** Add GenAI fields derived from the native telemetry of the detected harnesses. */
+export function mapHarnessRows(harnesses: AgentHarness[], rows: LogRecord[]) {
+  if (!harnesses.length) return rows;
+  const codex = harnesses.includes('codex');
+  const claude = harnesses.includes('claude-code');
+  // Codex mapping and filtering apply to Codex services only, as in harnessRowPredicate.
+  // Without a service name, rows of a Codex-only dataset are taken to be Codex.
+  const isCodexRow = (row: LogRecord) =>
+    codex &&
+    (present(row['service.name']) ? String(row['service.name']).startsWith('codex') : !claude);
+  const copies = rows.map((row) => {
     const copy = { ...row };
+    const harness = isCodexRow(row) ? 'codex' : claude ? 'claude-code' : undefined;
     recorded.set(copy, { row, harness });
     return copy;
   });
-  if (harness === 'codex') return mapCodex(mapped);
-  mapped.forEach(mapClaudeCode);
-  return mapped;
+  if (claude) copies.filter((row) => !isCodexRow(row)).forEach(mapClaudeCode);
+  if (!codex) return copies;
+  const kept = new Set(mapCodex(copies.filter(isCodexRow)));
+  return copies.filter((row) => !isCodexRow(row) || kept.has(row));
 }

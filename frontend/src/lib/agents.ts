@@ -1,4 +1,4 @@
-import { detectAgentHarness, harnessRowPredicate, harnessRunPredicate } from './agentHarnesses';
+import { detectAgentHarnesses, harnessRowPredicate, harnessRunPredicate } from './agentHarnesses';
 import { ApiError } from './apiError';
 import { apmTransportBounds } from './apm';
 import { mapConcurrent } from './concurrency';
@@ -18,7 +18,9 @@ export const AGENT_FIELDS = [
 export const AGENT_RECORD_LIMIT = 1000;
 export const AGENT_RUN_LIMIT = 100;
 export function isAgentSchema(fields: string[]) {
-  return AGENT_FIELDS.some((field) => fields.includes(field)) || !!detectAgentHarness(fields);
+  return (
+    AGENT_FIELDS.some((field) => fields.includes(field)) || detectAgentHarnesses(fields).length > 0
+  );
 }
 export function agentsPath(dataset?: string) {
   return dataset ? `/agents/${encodeURIComponent(dataset)}` : '/agents';
@@ -60,14 +62,17 @@ export function buildAgentRunQuery(
     );
   if (!fields.includes(timeColumn))
     throw new Error(`Dataset schema is missing the time field ${timeColumn}.`);
-  const harness = detectAgentHarness(fields);
+  const harnesses = detectAgentHarnesses(fields);
   const agentPredicate = [
     ...AGENT_FIELDS.filter((field) => fields.includes(field)).map(
       (field) => `${quoteIdentifier(field)} IS NOT NULL`,
     ),
-    ...(harness ? [harnessRunPredicate(harness)] : []),
+    ...harnesses.map(harnessRunPredicate),
   ].join(' OR ');
-  const rowPredicate = harness && harnessRowPredicate(harness, fields);
+  const rowPredicate = harnesses
+    .map((harness) => harnessRowPredicate(harness, fields, AGENT_FIELDS))
+    .filter(Boolean)
+    .join(' AND ');
   const traceField = ['span_trace_id', 'trace_id'].find((field) => fields.includes(field));
   const table = quoteIdentifier(dataset);
   const time = quoteIdentifier(timeColumn);

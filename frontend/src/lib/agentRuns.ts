@@ -87,7 +87,8 @@ function timestamp(row: LogRecord, field: string): number | undefined {
   const epoch = number(rawEpoch ?? raw);
   if (epoch !== undefined && epoch > 0) return epoch / 1e6;
 }
-function timing(row: LogRecord, timeColumn: string) {
+/** A span's start and end in epoch milliseconds, and its duration. */
+export function spanTiming(row: LogRecord, timeColumn = 'p_timestamp') {
   const start = timestamp(row, 'span_start_time_unix_nano');
   const end = timestamp(row, 'span_end_time_unix_nano');
   const hasEnd =
@@ -312,7 +313,7 @@ export function buildAgentRuns(
             ),
           ),
         ) as LogRecord;
-        const { startTime, durationMs } = timing(row, timeColumn);
+        const { startTime, durationMs } = spanTiming(row, timeColumn);
         const errors = spanErrors(records);
         const operation = text(row, 'gen_ai.operation.name');
         const model = text(row, 'gen_ai.response.model', 'gen_ai.request.model', 'llm.model_name');
@@ -343,7 +344,12 @@ export function buildAgentRuns(
               'gen_ai.operation.name',
             ) ?? 'Unnamed span',
           kind,
-          status: status(records, durationMs, errors, timing(row, timeColumn).end !== undefined),
+          status: status(
+            records,
+            durationMs,
+            errors,
+            spanTiming(row, timeColumn).end !== undefined,
+          ),
           startTime,
           durationMs,
           model,
@@ -464,11 +470,11 @@ export function buildAgentRuns(
       const inputTokens = tokenTotal('inputTokens');
       const outputTokens = tokenTotal('outputTokens');
       const starts = spans
-        .map((span) => timing(span.row, timeColumn).start)
+        .map((span) => spanTiming(span.row, timeColumn).start)
         .filter((value): value is number => value !== undefined);
       const ends = spans
         .map((span) => {
-          const t = timing(span.row, timeColumn);
+          const t = spanTiming(span.row, timeColumn);
           return t.start !== undefined && t.end !== undefined && t.durationMs !== undefined
             ? t.start + t.durationMs
             : undefined;
