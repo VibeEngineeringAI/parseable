@@ -40,6 +40,12 @@ use serde::{Deserialize, Serialize};
 
 pub type Roles = HashMap<String, HashMap<String, Role>>;
 
+// Lock order: SESSIONS -> USERS -> USER_GROUPS -> ROLES -> DEFAULT_ROLE.
+// Never acquire a map while holding one later in this order, and never take a
+// second guard on a map this thread already holds (even two reads): these
+// locks are task-fair, so a queued writer blocks every new reader.
+// `Sessions::check_auth` reads USERS, USER_GROUPS and ROLES, so its caller
+// must hold no guard other than the SESSIONS one it is called on.
 pub static USERS: OnceCell<RwLock<Users>> = OnceCell::new();
 pub static ROLES: OnceCell<RwLock<Roles>> = OnceCell::new();
 pub static DEFAULT_ROLE: Lazy<RwLock<HashMap<String, Option<String>>>> =
