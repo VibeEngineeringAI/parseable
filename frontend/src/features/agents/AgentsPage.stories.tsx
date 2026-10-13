@@ -5,6 +5,7 @@ import { AppContext } from '../../app/AppProvider';
 import { createDemoClient } from '../../lib/demo';
 import { ApiError } from '../../lib/apiError';
 import { agentDemoFields, agentDemoRows } from '../../lib/agents';
+import { buildAgentRuns } from '../../lib/agentRuns';
 import { AgentsPage } from './AgentsPage';
 
 type State =
@@ -15,7 +16,24 @@ type State =
   | 'loading'
   | 'no-datasets'
   | 'missing-fields'
-  | 'demo';
+  | 'demo'
+  | 'success'
+  | 'failed'
+  | 'incomplete'
+  | 'missing-telemetry'
+  | 'setup'
+  | 'run-details';
+function exampleRows(state: State) {
+  if (state === 'missing-telemetry')
+    return [
+      {
+        p_timestamp: new Date().toISOString(),
+        'gen_ai.agent.name': 'Sparse assistant',
+        'gen_ai.operation.name': 'invoke_agent',
+      },
+    ];
+  return agentDemoRows();
+}
 function Example({ state }: { state: State }) {
   const client = useMemo(
     () => ({
@@ -46,7 +64,7 @@ function Example({ state }: { state: State }) {
           });
         if (state === 'permission') throw new ApiError('Access to agent_telemetry is denied', 403);
         if (state === 'error') throw new ApiError('Query node unavailable', 503);
-        return state === 'empty' ? [] : agentDemoRows();
+        return state === 'empty' ? [] : exampleRows(state);
       },
     }),
     [state],
@@ -58,7 +76,21 @@ function Example({ state }: { state: State }) {
           { path: '/agents', element: <AgentsPage /> },
           { path: '/agents/:dataset', element: <AgentsPage /> },
         ],
-        { initialEntries: [state === 'no-datasets' ? '/agents' : '/agents/agent_telemetry'] },
+        {
+          initialEntries: [
+            state === 'setup'
+              ? '/agents?setup=1'
+              : state === 'no-datasets'
+                ? '/agents'
+                : `/agents/agent_telemetry${
+                    state === 'run-details'
+                      ? `?${new URLSearchParams({ run: buildAgentRuns(exampleRows(state))[0].id })}`
+                      : ['success', 'failed', 'incomplete'].includes(state)
+                        ? `?status=${state}`
+                        : ''
+                  }`,
+          ],
+        },
       ),
     [state],
   );
@@ -94,3 +126,9 @@ export const Loading: Story = { args: { state: 'loading' } };
 export const NoDatasets: Story = { args: { state: 'no-datasets' } };
 export const MissingFields: Story = { args: { state: 'missing-fields' } };
 export const Demo: Story = { args: { state: 'demo' } };
+export const SuccessfulRuns: Story = { args: { state: 'success' } };
+export const FailedRuns: Story = { args: { state: 'failed' } };
+export const IncompleteRuns: Story = { args: { state: 'incomplete' } };
+export const MissingTelemetry: Story = { args: { state: 'missing-telemetry' } };
+export const RunDetails: Story = { args: { state: 'run-details' } };
+export const TelemetrySetup: Story = { args: { state: 'setup' } };

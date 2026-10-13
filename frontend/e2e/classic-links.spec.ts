@@ -1,5 +1,14 @@
 import { expect, test, type Page } from '@playwright/test';
 
+/** Only the preserved navigation context may remain after consuming a Logs link. */
+async function expectLogsURL(page: Page, target: string) {
+  await expect(page).toHaveURL((url) => {
+    const remaining = new URL(url);
+    remaining.searchParams.delete('observe');
+    return `${remaining.pathname}${remaining.search}${remaining.hash}` === target;
+  });
+}
+
 /** A live server with two datasets; returns the query requests it receives. */
 async function server(page: Page) {
   const queries: { query: string; startTime: string; endTime: string }[] = [];
@@ -30,7 +39,7 @@ test('a classic Logs bookmark opens with its range and filters', async ({ page }
   await expect(page.getByRole('status').filter({ hasText: 'Not carried over' })).toHaveText(
     /time zone Asia\/Kolkata \(times are shown in UTC\), 1 filter\./,
   );
-  await expect(page).toHaveURL('/logs/explore/app?keep=1');
+  await expectLogsURL(page, '/logs/explore/app?keep=1');
   await expect.poll(() => queries.length).toBeGreaterThan(0);
   expect(queries[0]).toMatchObject({
     startTime: '2026-10-09T08:00:00.000Z',
@@ -49,7 +58,7 @@ test('a classic quick range shows as that range', async ({ page }) => {
   await expect(page.getByLabel('Time range', { exact: true }).locator('option:checked')).toHaveText(
     'Last 10 minutes',
   );
-  await expect(page).toHaveURL('/logs/explore/app');
+  await expectLogsURL(page, '/logs/explore/app');
   await expect(page.getByText('Not carried over')).toHaveCount(0);
   await expect.poll(() => queries.length).toBeGreaterThan(0);
   const { startTime, endTime } = queries[0];
@@ -82,7 +91,7 @@ test('each classic Logs link opened while Logs is open is applied', async ({ pag
   await page.goto(link('app', '10m', 'error'));
   await expect(timeRange).toHaveValue('10m');
   await expect(pills).toHaveText(['error']);
-  await expect(page).toHaveURL('/logs/explore/app');
+  await expectLogsURL(page, '/logs/explore/app');
 
   await navigateInApp(page, link('app', '3d', 'warn', '&tz=Asia%2FKolkata&keep=1#row-7'), {
     from: 'test',
@@ -93,7 +102,7 @@ test('each classic Logs link opened while Logs is open is applied', async ({ pag
     /time zone Asia\/Kolkata/,
   );
   // The parameters come out, and the rest of the address and the history state stay.
-  await expect(page).toHaveURL('/logs/explore/app?keep=1#row-7');
+  await expectLogsURL(page, '/logs/explore/app?keep=1#row-7');
   expect(await page.evaluate(() => window.history.state.usr)).toEqual({ from: 'test' });
   await expect.poll(async () => (await lastQuery()).query).toContain(`"level" = 'warn'`);
   const warn = await lastQuery();
@@ -105,7 +114,7 @@ test('each classic Logs link opened while Logs is open is applied', async ({ pag
   await expect(timeRange).toHaveValue('30m');
   await expect(pills).toHaveText(['info']);
   await expect(page.getByText('Not carried over')).toHaveCount(0);
-  await expect(page).toHaveURL('/logs/explore/other');
+  await expectLogsURL(page, '/logs/explore/other');
   await expect.poll(async () => (await lastQuery()).query).toContain('FROM "other"');
   const info = await lastQuery();
   expect(info.query).toContain(`"level" = 'info'`);
@@ -140,12 +149,12 @@ test('a classic Logs link replaces a search typed before it', async ({ page }) =
 test('classic paths that moved open their page here', async ({ page }) => {
   await server(page);
   await page.goto('/logs/search/app?start=1h&end=now&type=fixed');
-  await expect(page).toHaveURL('/logs/explore/app');
+  await expectLogsURL(page, '/logs/explore/app');
   await page.goto('/settings');
   await expect(page).toHaveURL('/alerts/targets');
   // A redirect keeps the query, hash and history state of the link.
   await navigateInApp(page, '/logs/search/app?keep=1#row-3', { from: 'test' });
-  await expect(page).toHaveURL('/logs/explore/app?keep=1#row-3');
+  await expectLogsURL(page, '/logs/explore/app?keep=1#row-3');
   expect(await page.evaluate(() => window.history.state.usr)).toEqual({ from: 'test' });
   await navigateInApp(page, `/metrics/explore/x/metric/cpu?keep=1#m`, { from: 'test' });
   await expect(page).toHaveURL(/\/metrics\/explore\/x\?keep=1&query=cpu#m$/);
@@ -158,7 +167,8 @@ test('classic paths that moved open their page here', async ({ page }) => {
     ['/metrics/explore/x/metric/%E0%A4%A', '/metrics/explore/x/metric/%E0%A4%A'],
   ]) {
     await navigateInApp(page, path);
-    await expect(page).toHaveURL(target);
+    if (target.startsWith('/logs/')) await expectLogsURL(page, target);
+    else await expect(page).toHaveURL(target);
     await expect(page.getByRole('alert')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
   }

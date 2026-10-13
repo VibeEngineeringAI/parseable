@@ -216,9 +216,10 @@ test('native login switches from demo to live and sends backend query contracts'
       expect(request.headers().authorization).toBe(
         `Basic ${Buffer.from('reader:test-password').toString('base64')}`,
       );
-      expect(new URL(request.url()).searchParams.get('redirect')).toBe(
-        'http://127.0.0.1:5173/logs',
-      );
+      const redirect = new URL(new URL(request.url()).searchParams.get('redirect')!);
+      // The current Logs view may carry its preserved navigation context.
+      redirect.searchParams.delete('observe');
+      expect(redirect.href).toBe('http://127.0.0.1:5173/logs');
       authenticated = true;
       return route.fulfill({ status: 200, body: 'ok' });
     }

@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Badge, EmptyState, Sheet } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useAsync } from '../../hooks/useAsync';
@@ -71,10 +72,14 @@ export function TraceDetailSheet({
   client,
   request,
   onClose,
+  logsHref,
+  agentsHref,
 }: {
   client: ParseableClient;
   request: TraceDetailRequest;
   onClose: () => void;
+  logsHref?: string;
+  agentsHref?: string;
 }) {
   const detail = useAsync(
     useCallback((signal) => client.traceDetail(request, signal), [client, request]),
@@ -92,6 +97,20 @@ export function TraceDetailSheet({
     >
       <div className="stack">
         <CopyId label="Copy trace ID" value={request.traceId} />
+        {(logsHref || agentsHref) && (
+          <div className="inline">
+            {logsHref && (
+              <Link className="text-link" to={logsHref}>
+                Open trace logs
+              </Link>
+            )}
+            {agentsHref && (
+              <Link className="text-link" to={agentsHref}>
+                Open agents
+              </Link>
+            )}
+          </div>
+        )}
         <p className="muted traces-window-notice">
           Trace lookup searches the selected time window. Spans outside the discovered trace bounds
           may be unavailable.

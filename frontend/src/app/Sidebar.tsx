@@ -1,5 +1,10 @@
 import { useState } from 'react';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation, useNavigate } from 'react-router-dom';
+import {
+  currentObservabilitySearch,
+  observabilityHref,
+  observabilityView,
+} from '../lib/observabilityNavigation';
 import {
   Activity,
   Bell,
@@ -82,6 +87,8 @@ export function Sidebar({
   onConnect: () => void;
 }) {
   const { mode, demoEnabled } = useApp();
+  const location = useLocation();
+  const navigate = useNavigate();
   const [search, setSearch] = useState('');
   return (
     <aside
@@ -121,7 +128,34 @@ export function Sidebar({
                 <NavLink
                   end={to === '/'}
                   key={to}
-                  to={to}
+                  to={
+                    observabilityView(to) && observabilityView(location.pathname)
+                      ? observabilityHref(location, observabilityView(to)!)
+                      : to
+                  }
+                  onClick={(event) => {
+                    const target = observabilityView(to);
+                    if (
+                      target &&
+                      observabilityView(location.pathname) &&
+                      event.button === 0 &&
+                      !event.metaKey &&
+                      !event.ctrlKey &&
+                      !event.shiftKey &&
+                      !event.altKey
+                    ) {
+                      event.preventDefault();
+                      navigate(
+                        observabilityHref(
+                          {
+                            pathname: location.pathname,
+                            search: currentObservabilitySearch(location.pathname, location.search),
+                          },
+                          target,
+                        ),
+                      );
+                    }
+                  }}
                   aria-label={label}
                   title={collapsed ? label : undefined}
                   data-testid={`sidebar-${id}`}

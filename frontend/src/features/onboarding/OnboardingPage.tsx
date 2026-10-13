@@ -38,6 +38,12 @@ export function SetupGuide({
           <Link className="ui-button" data-variant="primary" to="/add-data">
             Set up ingestion
           </Link>
+          <p>
+            Using a coding agent?{' '}
+            <Link className="text-link" to="/agents?setup=1">
+              Set up Claude Code or Codex
+            </Link>
+          </p>
         </div>
       </Card>
       <Card className="setup-step">

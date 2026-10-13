@@ -5,6 +5,7 @@ import {
   agentBoundsFromParams,
   agentText,
   buildAgentQuery,
+  buildAgentRunQuery,
   discoverAgentDatasets,
   isAgentSchema,
 } from './agents';
@@ -39,10 +40,57 @@ describe('agent telemetry contract', () => {
       'event"time',
     );
     expect(query.sql).toBe(
-      'SELECT * FROM "a""b" WHERE "gen_ai.request.model" IS NOT NULL ORDER BY "event""time" DESC LIMIT 100',
+      'SELECT * FROM "a""b" WHERE "event""time" >= TIMESTAMP \'2026-10-01T00:00:00.000Z\' AND "event""time" < TIMESTAMP \'2026-10-02T00:00:00.000Z\' AND ("gen_ai.request.model" IS NOT NULL) ORDER BY "event""time" DESC LIMIT 1000',
     );
     expect(query.startTime).toBe('2026-10-01T00:00:00.000Z');
     expect(query.sql).not.toContain('gen_ai.agent.name');
+  });
+  it('seeds bounded recent traces and fetches untagged children with safe quoted SQL', () => {
+    const query = buildAgentRunQuery(
+      'a"b',
+      ['span_trace_id', 'gen_ai.request.model', 'p_timestamp'],
+      bounds,
+    );
+    expect(query.sql).toContain('"span_trace_id" IN (SELECT "span_trace_id" FROM "a""b"');
+    expect(query.sql).toContain(
+      'GROUP BY "span_trace_id" ORDER BY MAX("p_timestamp") DESC LIMIT 100',
+    );
+    expect(query.sql).toContain(
+      'OR (("span_trace_id" IS NULL OR "span_trace_id" = \'\') AND ("gen_ai.request.model" IS NOT NULL))',
+    );
+    expect(query.sql.match(/"p_timestamp" >= TIMESTAMP '2026-10-01T00:00:00.000Z'/g)).toHaveLength(
+      2,
+    );
+    expect(query.sql.match(/"p_timestamp" < TIMESTAMP '2026-10-02T00:00:00.000Z'/g)).toHaveLength(
+      2,
+    );
+    expect(query.startTime).toBe('2026-10-01T00:00:00.000Z');
+    expect(query.endTime).toBe('2026-10-02T00:01:00.000Z');
+  });
+  it('preserves exact sub-minute bounds in SQL while expanding the minute-rounded transport', () => {
+    const query = buildAgentRunQuery(
+      'agents',
+      ['span_trace_id', 'gen_ai.request.model', 'p_timestamp'],
+      { startTime: '2026-10-01T00:00:10.123Z', endTime: '2026-10-01T00:00:20.456Z' },
+    );
+    expect(query.startTime).toBe('2026-10-01T00:00:00.000Z');
+    expect(query.endTime).toBe('2026-10-01T00:01:00.000Z');
+    expect(query.sql.match(/"p_timestamp" >= TIMESTAMP '2026-10-01T00:00:10.123Z'/g)).toHaveLength(
+      2,
+    );
+    expect(query.sql.match(/"p_timestamp" < TIMESTAMP '2026-10-01T00:00:20.456Z'/g)).toHaveLength(
+      2,
+    );
+  });
+  it('supports trace ID aliases and response-only model schemas', () => {
+    expect(isAgentSchema(['gen_ai.response.model'])).toBe(true);
+    const query = buildAgentRunQuery(
+      'agents',
+      ['trace_id', 'gen_ai.response.model', 'p_timestamp'],
+      bounds,
+    );
+    expect(query.sql).toContain('"trace_id" IN (SELECT "trace_id"');
+    expect(query.sql).not.toContain('span_trace_id');
   });
   it('rejects unsupported schemas and invalid time bounds before executing SQL', () => {
     expect(() => buildAgentQuery('x', ['p_timestamp'], bounds)).toThrow('no recognized');

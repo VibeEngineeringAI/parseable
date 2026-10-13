@@ -1,7 +1,14 @@
 import { createPortal } from 'react-dom';
 import { createId } from '../../lib/ids';
-import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
-import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  useParams,
+  useSearchParams,
+} from 'react-router-dom';
 import { PanelLeft, RefreshCw, Terminal, WrapText, Download } from 'lucide-react';
 import { Button, EmptyState, Select, Dialog, Input } from '../../components/ui';
 import { LinkNotice } from '../../components/explorer/LinkNotice';
@@ -31,7 +38,14 @@ import {
 import { useApp } from '../../app/AppProvider';
 import { ApiError } from '../../lib/client';
 import { useAsync } from '../../hooks/useAsync';
-import { timeBounds } from '../../lib/query';
+import { timeBounds, quoteIdentifier, quoteLiteral } from '../../lib/query';
+import {
+  observabilityRange,
+  observabilityBounds,
+  observabilitySnapshot,
+  captureObservability,
+  useObservabilityNavigation,
+} from '../../lib/observabilityNavigation';
 import { classicLogsParams, classicLogsState } from '../../lib/classicUi';
 import type { LogRecord, LogFilter } from '../../lib/types';
 export function LogsPage() {
@@ -41,13 +55,30 @@ export function LogsPage() {
   const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
   const dataset = currentDataset || datasets.data?.[0]?.name || '';
   const location = useLocation();
+  const initialLocationKey = useRef(location.key);
+  // BrowserRouter initializes idx even when this render trails a newer URL;
+  // MemoryRouter previews have no browser history index to synchronize with.
+  const browserRouter = useRef(
+    typeof window !== 'undefined' && typeof window.history.state?.idx === 'number',
+  );
+  const navigationType = useNavigationType();
   const [params] = useSearchParams();
+  const schema = useAsync(
+    useCallback(
+      (signal) => (dataset ? client.schema(dataset, signal) : Promise.resolve([])),
+      [client, dataset],
+    ),
+  );
+  const [traceFocus, setTraceFocus] = useState<{ field: string; traceId: string }>();
   const [dropped, setDropped] = useState<string[]>([]);
   const [view, dispatchView] = useReducer(logViewReducer, dataset, initialLogView);
   const { range, search, expression, timezone, limit, columns, wrap, showHistogram } = view;
   const editView = (patch: Partial<Omit<LogViewState, 'version' | 'dataset'>>) =>
     dispatchView({ type: 'edit', patch });
-  const setRange = (range: LogViewState['range']) => editView({ range });
+  const setRange = (range: LogViewState['range']) => {
+    setHandoffBounds(undefined);
+    editView({ range });
+  };
   const setSearch = (search: string) => editView({ search });
   const setExpression = (expression: LogFilterExpression) => {
     setFilterNotice('');
@@ -62,6 +93,10 @@ export function LogsPage() {
   const [debounced, setDebounced] = useState({ dataset, search: '' });
   const [filterNotice, setFilterNotice] = useState('');
   const [revision, setRevision] = useState(0);
+  const [handoffBounds, setHandoffBounds] = useState<{
+    range: string;
+    bounds: { startTime: string; endTime: string };
+  }>();
   const [contextRow, setContextRow] = useState<LogRecord>();
   const [shareUrl, setShareUrl] = useState('');
   const [shareStatus, setShareStatus] = useState('');
@@ -88,15 +123,23 @@ export function LogsPage() {
     setShareUrl('');
     setLinkError('');
     setRowFields({ fields: [] });
+    setTraceFocus(undefined);
   }
   // A classic Logs link carries its range and filters in the query string. Each
   // one is applied once, including one that arrives while this page is open,
   // and after the dataset reset above so a link to another dataset keeps them.
-  const link = classicLogsParams.some((name) => params.has(name)) ? location.key : undefined;
+  const traceNavigation = params.has('traceId') || params.has('logTraceId');
+  const nativeNavigation =
+    traceNavigation || (params.has('observe') && ['start', 'end'].some((name) => params.has(name)));
+  const link =
+    !params.has('observe') && !traceNavigation && classicLogsParams.some((name) => params.has(name))
+      ? location.key
+      : undefined;
   const [appliedLink, setAppliedLink] = useState<string>();
   if (link && dataset && appliedLink !== link) {
     const linked = classicLogsState(params);
     setAppliedLink(link);
+    setTraceFocus(undefined);
     setFilterNotice('');
     setRow(undefined);
     setContextRow(undefined);
@@ -129,36 +172,123 @@ export function LogsPage() {
     setLinkError('');
   };
   const [appliedView, setAppliedView] = useState<string>();
-  if (params.has('logView') && appliedView !== location.key && dataset) {
+  const savedSnapshot = observabilitySnapshot(params, 'logs');
+  const restoredParams =
+    savedSnapshot?.dataset === dataset ? new URLSearchParams(savedSnapshot.query) : undefined;
+  const restoreNavigation =
+    !!restoredParams &&
+    !params.has('logView') &&
+    !nativeNavigation &&
+    ((appliedView === undefined && location.key === initialLocationKey.current) ||
+      (navigationType === 'POP' && appliedView !== location.key));
+  const incomingTraceId =
+    params.get('traceId') ??
+    params.get('logTraceId') ??
+    (restoreNavigation ? restoredParams?.get('logTraceId') : undefined);
+  const hasTraceFocus = !!incomingTraceId && /^[a-fA-F0-9]{32}$/.test(incomingTraceId);
+  if (
+    (params.has('logView') || nativeNavigation || restoreNavigation) &&
+    appliedView !== location.key &&
+    dataset &&
+    view.dataset === dataset &&
+    (!hasTraceFocus || !schema.loading)
+  ) {
     setAppliedView(location.key);
     try {
-      const view = decodeLogView(params.get('logView')!);
-      if (view.dataset !== dataset)
+      let linkedView = params.has('logView')
+        ? decodeLogView(params.get('logView')!)
+        : restoreNavigation && restoredParams?.has('logView')
+          ? decodeLogView(restoredParams.get('logView')!)
+          : view;
+      if (nativeNavigation || restoreNavigation) {
+        // Trace focus alone does not override the time window encoded by Share.
+        const hasTimeContext = ['start', 'end', 'range', 'observe'].some((name) =>
+          params.has(name),
+        );
+        const linkedRange = hasTimeContext ? observabilityRange(params) : linkedView.range;
+        setHandoffBounds({
+          range: JSON.stringify(linkedRange),
+          bounds: observabilityBounds(params, linkedRange),
+        });
+        linkedView = { ...linkedView, range: linkedRange };
+      }
+      if (hasTraceFocus) {
+        const field = ['span_trace_id', 'trace_id', 'trace.id', 'traceId'].find((field) =>
+          schema.data?.includes(field),
+        );
+        if (!field)
+          throw new Error(
+            schema.error
+              ? 'Could not check the trace ID fields for this dataset. Retry after checking dataset access.'
+              : 'This dataset has no trace ID field. Trace-focused logs are unavailable.',
+          );
+        setTraceFocus({ field, traceId: incomingTraceId! });
+      } else setTraceFocus(undefined);
+      if (linkedView.dataset !== dataset)
         throw new Error('The shared view dataset does not match this page.');
-      applyView(view);
+      applyView(linkedView);
+      if (traceNavigation && !hasTraceFocus)
+        setFilterNotice('The trace ID in this link is invalid and was not applied.');
     } catch (error) {
       setLinkError(error instanceof Error ? error.message : 'Invalid shared view');
     }
   }
   // Consume handoffs once so subsequent edits are not overwritten by navigation.
   useEffect(() => {
+    // Router renders can lag behind browser history. A pending Logs handoff
+    // must not replace a newer navigation when its consumption effect runs.
+    if (
+      browserRouter.current &&
+      (window.location.pathname !== appPath(location.pathname) ||
+        window.location.search !== location.search)
+    )
+      return;
     const classicApplied = !!link && appliedLink === link;
-    const nativeApplied = params.has('logView') && appliedView === location.key && !linkError;
+    const nativeApplied =
+      (params.has('logView') || nativeNavigation) && appliedView === location.key && !linkError;
     if (!classicApplied && !nativeApplied) return;
     const rest = new URLSearchParams(location.search);
     if (classicApplied) for (const name of classicLogsParams) rest.delete(name);
-    if (nativeApplied) rest.delete('logView');
+    if (nativeApplied) {
+      rest.delete('logView');
+      rest.delete('logTraceId');
+      if (nativeNavigation)
+        for (const name of ['start', 'end', 'range', 'traceId']) rest.delete(name);
+    }
+    // Store the applied view atomically with consuming the handoff so a reload cannot lose its focus.
+    const captured = nativeApplied
+      ? captureObservability(rest, {
+          view: 'logs',
+          dataset,
+          range: view.range,
+          bounds:
+            handoffBounds?.range === JSON.stringify(view.range)
+              ? handoffBounds.bounds
+              : timeBounds(view.range),
+          query: new URLSearchParams({
+            logView: encodeLogView(view),
+            ...(traceFocus ? { logTraceId: traceFocus.traceId } : {}),
+          }),
+        })
+      : rest;
     navigate(
-      { pathname: location.pathname, search: rest.toString(), hash: location.hash },
+      { pathname: location.pathname, search: captured.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [link, appliedLink, appliedView, linkError, location, navigate, params]);
-  const schema = useAsync(
-    useCallback(
-      (signal) => (dataset ? client.schema(dataset, signal) : Promise.resolve([])),
-      [client, dataset],
-    ),
-  );
+  }, [
+    link,
+    appliedLink,
+    appliedView,
+    linkError,
+    location,
+    navigate,
+    params,
+    nativeNavigation,
+    dataset,
+    view,
+    handoffBounds,
+    traceFocus,
+  ]);
   const debouncedSearch = debounced.dataset === dataset ? debounced.search : '';
   const info = useAsync(
     useCallback(
@@ -169,10 +299,20 @@ export function LogsPage() {
   const timestampField = info.data?.timePartition || 'p_timestamp';
   const compiled = useMemo(() => {
     try {
+      let criteria = dataset
+        ? compileLogCriteria(dataset, debouncedSearch, expression, timestampField)
+        : undefined;
+      if (criteria && traceFocus) {
+        const focusPredicate = `${quoteIdentifier(traceFocus.field)} = ${quoteLiteral(traceFocus.traceId)}`;
+        criteria = {
+          ...criteria,
+          predicate: criteria.predicate
+            ? `(${criteria.predicate}) AND ${focusPredicate}`
+            : focusPredicate,
+        };
+      }
       return {
-        criteria: dataset
-          ? compileLogCriteria(dataset, debouncedSearch, expression, timestampField)
-          : undefined,
+        criteria,
         error: '',
       };
     } catch (error) {
@@ -181,7 +321,7 @@ export function LogsPage() {
         error: error instanceof Error ? error.message : 'Invalid log query',
       };
     }
-  }, [dataset, debouncedSearch, expression, timestampField]);
+  }, [dataset, debouncedSearch, expression, timestampField, traceFocus]);
   const { source, predicate, timestamp } = compiled.criteria ?? {};
   // Stabilize by semantic SQL values: client IDs and empty groups do not trigger queries.
   const criteria = useMemo(
@@ -190,18 +330,57 @@ export function LogsPage() {
     [source, predicate, timestamp],
   );
   // Capture now again only for a changed range, effective criteria, or explicit refresh.
-  const bounds = useMemo(() => timeBounds(range), [range, criteria, revision]);
+  const bounds = useMemo(
+    () =>
+      handoffBounds?.range === JSON.stringify(range) ? handoffBounds.bounds : timeBounds(range),
+    [range, criteria, revision, handoffBounds],
+  );
   const sql = useMemo(
     () => (criteria ? buildRowsFromCriteria(criteria, limit, bounds) : ''),
     [criteria, limit, bounds],
   );
-  const ready = !!criteria && !info.loading && !linkError && !compiled.error;
+  const ready =
+    !!criteria &&
+    !info.loading &&
+    !linkError &&
+    !compiled.error &&
+    (!hasTraceFocus || appliedView === location.key);
   const results = useAsync(
     useCallback(
       (signal) => (ready ? client.query({ sql, ...bounds }, signal) : Promise.resolve(undefined)),
       [client, sql, bounds, ready],
     ),
   );
+  const authorizedDataset = useRef<string | undefined>(undefined);
+  if (results.data) authorizedDataset.current = dataset;
+  const encodedNavigationView = useMemo(() => {
+    try {
+      return encodeLogView(view);
+    } catch {
+      return undefined;
+    }
+  }, [view]);
+  const navigation = useObservabilityNavigation({
+    view: 'logs',
+    dataset,
+    range,
+    bounds,
+    params,
+    query:
+      encodedNavigationView === undefined
+        ? undefined
+        : new URLSearchParams({
+            logView: encodedNavigationView,
+            ...(traceFocus ? { logTraceId: traceFocus.traceId } : {}),
+          }),
+    enabled:
+      encodedNavigationView !== undefined &&
+      authorizedDataset.current === dataset &&
+      !link &&
+      !params.has('logView') &&
+      !nativeNavigation &&
+      !restoreNavigation,
+  });
   const histogram = useAsync(
     useCallback(
       async (signal) => {
@@ -229,14 +408,17 @@ export function LogsPage() {
       setFilterNotice(error instanceof Error ? error.message : 'Could not add this filter.');
     }
   };
-  const refresh = () => setRevision((value) => value + 1);
+  const refresh = () => {
+    setHandoffBounds(undefined);
+    setRevision((value) => value + 1);
+  };
   const share = () => {
     try {
       const encoded = encodeLogView({ ...view, range: bounds });
       setShareUrl(
         new URL(
           appPath(
-            `/logs/explore/${encodeURIComponent(dataset)}?${new URLSearchParams({ logView: encoded })}`,
+            `/logs/explore/${encodeURIComponent(dataset)}?${new URLSearchParams({ logView: encoded, ...(traceFocus ? { logTraceId: traceFocus.traceId } : {}) })}`,
           ),
           window.location.origin,
         ).href,
@@ -255,7 +437,7 @@ export function LogsPage() {
           <Select
             aria-label="Dataset"
             value={dataset}
-            onChange={(e) => navigate(`/logs/explore/${encodeURIComponent(e.target.value)}`)}
+            onChange={(e) => navigate(navigation.href('logs', { dataset: e.target.value }))}
           >
             {!datasets.data?.length && <option value="">Select a dataset</option>}
             {datasets.data?.map((d) => (
@@ -296,6 +478,16 @@ export function LogsPage() {
             />
           )}
           <section className="explorer-content" aria-label="Log results">
+            {traceFocus && (
+              <div className="notice inline" role="status">
+                <span>
+                  Logs for trace <code>{traceFocus.traceId}</code>
+                </span>
+                <Button size="sm" variant="ghost" onClick={() => setTraceFocus(undefined)}>
+                  Clear trace filter
+                </Button>
+              </div>
+            )}
             <div className="explorer-toolbar">
               <Button
                 variant="ghost"
@@ -386,7 +578,16 @@ export function LogsPage() {
                 <Button
                   onClick={() => {
                     const rest = new URLSearchParams(location.search);
-                    rest.delete('logView');
+                    for (const name of [
+                      'logView',
+                      'logTraceId',
+                      'traceId',
+                      'start',
+                      'end',
+                      'range',
+                    ])
+                      rest.delete(name);
+                    setTraceFocus(undefined);
                     setLinkError('');
                     navigate(
                       { pathname: location.pathname, search: rest.toString() },
