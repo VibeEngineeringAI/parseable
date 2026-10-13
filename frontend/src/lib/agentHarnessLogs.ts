@@ -138,7 +138,7 @@ export function attachHarnessConversation(
   const requests = new Map<string, AgentSpan>();
   const roots = new Map<string, AgentSpan>();
   const turns = new Map<string, AgentSpan[]>();
-  // Codex logs a prompt on the turn's input span, which is the turn's recorded parent.
+  // Codex logs a prompt on its turn's input span, which the turn records as its parent.
   const inputs = new Map<string, AgentSpan | undefined>();
   for (const run of runs) {
     if (run.traceId) {
@@ -199,10 +199,10 @@ export function attachHarnessConversation(
   for (const row of logs) {
     const trace = text(row, 'trace_id');
     if (!trace || !roots.has(trace)) continue;
+    const event = String(row['event.name'] ?? '').replace(/^claude_code\./, '');
     const own =
       spans.get(`${trace}/${text(row, 'span_id')}`) ??
-      inputs.get(`${trace}/${text(row, 'span_id')}`);
-    const event = String(row['event.name'] ?? '').replace(/^claude_code\./, '');
+      (event === 'codex.user_prompt' ? inputs.get(`${trace}/${text(row, 'span_id')}`) : undefined);
     const time = at(row, 'event.timestamp', 'time_unix_nano', 'p_timestamp');
     const call = text(row, 'tool_use_id', 'call_id');
     const tool = own?.kind === 'tool' ? own : calls.get(`${trace}/${call ?? ''}`);

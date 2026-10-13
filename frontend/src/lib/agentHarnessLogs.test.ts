@@ -536,6 +536,27 @@ describe('coding-agent conversation', () => {
     );
     expect(conversations(foreign)).toEqual([]);
   });
+  it('uses a turn input span only for Codex prompts', () => {
+    const rows = [
+      span(codexTrace, 'turn-0', 'external-parent', 'session_task.turn', 10, 2, {
+        'service.name': 'codex_exec',
+      }),
+      span(codexTrace, 'turn-1', '', 'session_task.turn', 25, 2, { 'service.name': 'codex_exec' }),
+    ];
+    const [run] = attachHarnessConversation(
+      buildAgentRuns(mapHarnessRows(['codex'], rows)),
+      'codex',
+      [
+        codexLog({
+          'event.name': 'codex.tool_decision',
+          'event.timestamp': stamp(26),
+          span_id: 'external-parent',
+          decision: 'approved',
+        }),
+      ],
+    );
+    expect(run.spans.map((entry) => entry.conversation.length)).toEqual([0, 1]);
+  });
   it('leaves prompts unattached when turn ranges overlap', () => {
     const [run] = attachHarnessConversation(
       codexTurns([
