@@ -1,5 +1,5 @@
 import { parseEventTimestamp } from '../components/explorer/timestamp';
-import { AGENT_HARNESSES, type AgentHarness } from './agentHarnesses';
+import { AGENT_HARNESSES, recordedFields, type AgentHarness } from './agentHarnesses';
 import type { AgentConversationEntry, AgentRun, AgentSpan } from './agentRuns';
 import { AGENT_RECORD_LIMIT } from './agents';
 import { ApiError } from './apiError';
@@ -138,13 +138,26 @@ export function attachHarnessConversation(
   const requests = new Map<string, AgentSpan>();
   const roots = new Map<string, AgentSpan>();
   const turns = new Map<string, AgentSpan[]>();
+  // Codex logs a prompt on the turn's input span, which is the turn's recorded parent.
+  const inputs = new Map<string, AgentSpan | undefined>();
   for (const run of runs) {
     if (run.traceId) {
       roots.set(run.traceId, run.roots.find((span) => span.kind === 'agent') ?? run.roots[0]);
       // The harness's own turns; an enclosing agent span of another service is not a turn.
-      const agents = run.spans.filter((span) => span.kind === 'agent');
-      const own = agents.filter((span) => span.row.span_name === AGENT_HARNESSES[harness].runSpan);
-      turns.set(run.traceId, own.length ? own : agents);
+      const own = run.spans.filter(
+        (span) => span.kind === 'agent' && span.row.span_name === AGENT_HARNESSES[harness].runSpan,
+      );
+      turns.set(run.traceId, own);
+      for (const span of own) {
+        const input = text(
+          recordedFields(span.rows[0] ?? span.row),
+          'span_parent_span_id',
+          'parent_span_id',
+        );
+        const key = `${run.traceId}/${input}`;
+        // A parent shared by several turns is not one turn's input.
+        if (input) inputs.set(key, inputs.has(key) ? undefined : span);
+      }
     }
     for (const span of run.spans) {
       if (run.traceId && span.spanId) spans.set(`${run.traceId}/${span.spanId}`, span);
@@ -176,15 +189,19 @@ export function attachHarnessConversation(
     if (inside.length) return inside.length === 1 ? inside[0] : undefined;
     // Codex logs a prompt just before its turn span starts (10 ms in the exported
     // fixture), so a prompt belongs to a turn starting right after it.
-    if (prompt && harness === 'codex')
-      return agents
-        .filter((span) => start(span) >= time && start(span) - time <= CODEX_PROMPT_LEAD_MS)
-        .sort((a, b) => start(a) - start(b))[0];
+    if (!prompt || harness !== 'codex') return;
+    const next = agents
+      .filter((span) => start(span) >= time && start(span) - time <= CODEX_PROMPT_LEAD_MS)
+      .sort((a, b) => start(a) - start(b));
+    // Turns starting together leave the prompt's turn unknown.
+    if (next.length === 1 || (next.length > 1 && start(next[0]) < start(next[1]))) return next[0];
   };
   for (const row of logs) {
     const trace = text(row, 'trace_id');
     if (!trace || !roots.has(trace)) continue;
-    const own = spans.get(`${trace}/${text(row, 'span_id')}`);
+    const own =
+      spans.get(`${trace}/${text(row, 'span_id')}`) ??
+      inputs.get(`${trace}/${text(row, 'span_id')}`);
     const event = String(row['event.name'] ?? '').replace(/^claude_code\./, '');
     const time = at(row, 'event.timestamp', 'time_unix_nano', 'p_timestamp');
     const call = text(row, 'tool_use_id', 'call_id');

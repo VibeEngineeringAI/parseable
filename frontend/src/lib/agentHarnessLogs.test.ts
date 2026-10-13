@@ -480,6 +480,62 @@ describe('coding-agent conversation', () => {
     );
     expect(conversations(later)).toEqual([]);
   });
+  it('matches a prompt to the turn whose recorded parent is its input span', () => {
+    const turn = (id: string, parent: string, start: number) =>
+      span(codexTrace, id, parent, 'session_task.turn', start, 4, { 'service.name': 'codex_exec' });
+    const prompt = (spanId: string, seconds: number, text: string) =>
+      codexLog({
+        'event.name': 'codex.user_prompt',
+        'event.timestamp': stamp(seconds),
+        span_id: spanId,
+        prompt: text,
+      });
+    // Logged well before the turn starts, so only the recorded parent places it.
+    const [slow] = attachHarnessConversation(
+      buildAgentRuns(mapHarnessRows(['codex'], [turn('turn-0', 'input-0', 15.8)])),
+      'codex',
+      [prompt('input-0', 13.8, 'slow start')],
+    );
+    expect(slow.roots[0].conversation).toEqual([{ label: 'User prompt', value: 'slow start' }]);
+    // A parent shared by several turns falls back to their time ranges.
+    const [shared] = attachHarnessConversation(
+      buildAgentRuns(
+        mapHarnessRows(['codex'], [turn('turn-0', 'shared', 15.8), turn('turn-1', 'shared', 25.8)]),
+      ),
+      'codex',
+      [prompt('shared', 16, 'first'), prompt('shared', 26, 'second')],
+    );
+    expect(shared.spans.map((entry) => entry.conversation)).toEqual([
+      [{ label: 'User prompt', value: 'first' }],
+      [{ label: 'User prompt', value: 'second' }],
+    ]);
+  });
+  it('leaves a prompt unattached when turns start together or only foreign agents are loaded', () => {
+    const prompt = codexLog({
+      'event.name': 'codex.user_prompt',
+      'event.timestamp': stamp(9.99),
+      prompt: 'tied',
+    });
+    const [tied] = attachHarnessConversation(
+      codexTurns([
+        [10, 1],
+        [10, 2],
+      ]),
+      'codex',
+      [prompt],
+    );
+    expect(conversations(tied)).toEqual([]);
+    const orchestrator = span(codexTrace, 'orchestrator0001', '', 'orchestrate', 0, 60, {
+      'service.name': 'orchestrator',
+      'gen_ai.operation.name': 'invoke_agent',
+    });
+    const [foreign] = attachHarnessConversation(
+      buildAgentRuns(mapHarnessRows(['codex'], [orchestrator])),
+      'codex',
+      [codexLog({ 'event.name': 'codex.user_prompt', 'event.timestamp': stamp(20), prompt: 'x' })],
+    );
+    expect(conversations(foreign)).toEqual([]);
+  });
   it('leaves prompts unattached when turn ranges overlap', () => {
     const [run] = attachHarnessConversation(
       codexTurns([
