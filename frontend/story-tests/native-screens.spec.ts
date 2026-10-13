@@ -60,6 +60,7 @@ const states = [
   ['agents-telemetry--incomplete-runs', 'Agents'],
   ['agents-telemetry--missing-telemetry', 'Agents'],
   ['agents-telemetry--run-details', 'Agent run details'],
+  ['agents-telemetry--telemetry-setup', 'Set up agent telemetry'],
   ['settings-capabilities--llm-providers', 'LLM settings'],
   ['settings-network-access--default', 'Network access'],
   ['settings-network-access--permission-denied', 'Network access'],

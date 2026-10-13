@@ -16,7 +16,13 @@ function destination(href: string) {
 describe('observability navigation', () => {
   it('restores each view filters independently while carrying exact bounds and preset semantics', () => {
     const agents = captureObservability(
-      new URLSearchParams({ search: 'research', status: 'incomplete', model: 'm1', run: 'r1' }),
+      new URLSearchParams({
+        search: 'research',
+        status: 'incomplete',
+        model: 'm1',
+        run: 'r1',
+        setup: '1',
+      }),
       { view: 'agents', dataset: 'agent spans', range: '1h', bounds },
     );
     const tracesUrl = destination(
@@ -63,6 +69,8 @@ describe('observability navigation', () => {
     );
     for (const key of ['search', 'status', 'model', 'run'])
       expect(backAgents.searchParams.get(key)).toBe(agents.get(key));
+    expect(agents.get('setup')).toBe('1');
+    expect(backAgents.searchParams.has('setup')).toBe(false);
     expect(observabilityRange(backAgents.searchParams)).toBe('1h');
     expect(observabilityBounds(backAgents.searchParams, '1h')).toEqual(bounds);
     const backTraces = destination(

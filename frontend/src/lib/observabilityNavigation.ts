@@ -88,6 +88,8 @@ function nativeParams(params: URLSearchParams) {
   const next = new URLSearchParams(params);
   next.delete(contextKey);
   next.delete('from');
+  // Setup is a transient panel, not an explorer filter to restore on a handoff.
+  next.delete('setup');
   return next;
 }
 export function captureObservability(

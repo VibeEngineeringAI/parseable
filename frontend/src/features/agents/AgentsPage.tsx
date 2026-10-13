@@ -25,6 +25,7 @@ import {
 import { timeBounds } from '../../lib/query';
 import type { TimeRange } from '../../lib/types';
 import { AgentRunDetails, AgentStatus, AgentTokens, formatAgentDuration } from './AgentRunDetails';
+import { AgentTelemetryGuide } from './AgentTelemetryGuide';
 import './agents.css';
 
 export function AgentsPage() {
@@ -49,6 +50,7 @@ export function AgentsPage() {
   const search = params.get('search') ?? '';
   const status = params.get('status') ?? '';
   const model = params.get('model') ?? '';
+  const setupOpen = params.get('setup') === '1';
   const [discoveryRequested, setDiscoveryRequested] = useState(false);
   const discoveryEnabled = !dataset || discoveryRequested || mode === 'demo';
   const discovery = useAsync(
@@ -162,7 +164,12 @@ export function AgentsPage() {
       <PageHeader
         title="Agents"
         description="Follow agent runs from model calls to tools and captured conversation."
-        actions={<Badge>{mode === 'demo' ? 'Demo telemetry' : 'Live data'}</Badge>}
+        actions={
+          <>
+            <Badge>{mode === 'demo' ? 'Demo telemetry' : 'Live data'}</Badge>
+            <Button onClick={() => updateFilter('setup', '1')}>Set up telemetry</Button>
+          </>
+        }
       />
       <div className="agents-controls">
         <Select
@@ -258,9 +265,12 @@ export function AgentsPage() {
           }
           description="Datasets with GenAI agent, operation, model, or tool fields appear here. Ingest your instrumentation to get started."
           action={
-            <Link className="text-link" to="/add-data">
-              Add data
-            </Link>
+            <div className="inline">
+              <Button onClick={() => updateFilter('setup', '1')}>Configure an agent</Button>
+              <Link className="text-link" to="/add-data">
+                Add data
+              </Link>
+            </div>
           }
         />
       )}
@@ -422,7 +432,7 @@ export function AgentsPage() {
         </>
       )}
       <Sheet
-        open={!!selected}
+        open={!!selected && !setupOpen}
         onOpenChange={(open) => {
           if (!open) closeRun();
         }}
@@ -457,6 +467,15 @@ export function AgentsPage() {
             <AgentRunDetails run={selected} key={selected.id} />
           </>
         )}
+      </Sheet>
+      <Sheet
+        open={setupOpen}
+        onOpenChange={(open) => updateFilter('setup', open ? '1' : '')}
+        title="Set up agent telemetry"
+        description="Connect Claude Code or Codex to your collector, then verify runs in Agents."
+        className="agents-setup-sheet"
+      >
+        <AgentTelemetryGuide />
       </Sheet>
     </div>
   );

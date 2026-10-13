@@ -13,6 +13,30 @@ function problems(page: Page): string[] {
 
 for (const mount of ['', '/next']) {
   test.describe(`the production build mounted at ${mount || '/'}`, () => {
+    test('opens the shared agent setup guide from Get started under its mount', async ({
+      page,
+    }) => {
+      const failed = problems(page);
+      await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
+      await page.goto(`${mount}/onboarding`);
+      await page.getByRole('link', { name: 'Set up Claude Code or Codex' }).click();
+      await expect(page).toHaveURL(`${mount}/agents?setup=1`);
+      const guide = page.getByRole('dialog', { name: 'Set up agent telemetry' });
+      await expect(guide).toBeVisible();
+      await guide.getByRole('tab', { name: 'Codex', exact: true }).click();
+      await expect(guide.getByLabel('Codex settings', { exact: true })).toContainText(
+        '[otel.trace_exporter.otlp-http]',
+      );
+      await expect(
+        guide.getByRole('link', { name: 'View collector and ingestion setup' }),
+      ).toHaveAttribute('href', `${mount}/add-data`);
+      await page.reload();
+      await expect(guide).toBeVisible();
+      await guide.getByRole('button', { name: 'Close dialog' }).click();
+      await expect(page).toHaveURL(`${mount}/agents`);
+      expect(failed).toEqual([]);
+    });
+
     test('loads lazy pages on deep routes from its own mount', async ({ page }) => {
       const failed = problems(page);
       const paths: string[] = [];

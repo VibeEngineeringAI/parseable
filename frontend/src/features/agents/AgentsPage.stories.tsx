@@ -21,6 +21,7 @@ type State =
   | 'failed'
   | 'incomplete'
   | 'missing-telemetry'
+  | 'setup'
   | 'run-details';
 function exampleRows(state: State) {
   if (state === 'missing-telemetry')
@@ -77,15 +78,17 @@ function Example({ state }: { state: State }) {
         ],
         {
           initialEntries: [
-            state === 'no-datasets'
-              ? '/agents'
-              : `/agents/agent_telemetry${
-                  state === 'run-details'
-                    ? `?${new URLSearchParams({ run: buildAgentRuns(exampleRows(state))[0].id })}`
-                    : ['success', 'failed', 'incomplete'].includes(state)
-                      ? `?status=${state}`
-                      : ''
-                }`,
+            state === 'setup'
+              ? '/agents?setup=1'
+              : state === 'no-datasets'
+                ? '/agents'
+                : `/agents/agent_telemetry${
+                    state === 'run-details'
+                      ? `?${new URLSearchParams({ run: buildAgentRuns(exampleRows(state))[0].id })}`
+                      : ['success', 'failed', 'incomplete'].includes(state)
+                        ? `?status=${state}`
+                        : ''
+                  }`,
           ],
         },
       ),
@@ -128,3 +131,4 @@ export const FailedRuns: Story = { args: { state: 'failed' } };
 export const IncompleteRuns: Story = { args: { state: 'incomplete' } };
 export const MissingTelemetry: Story = { args: { state: 'missing-telemetry' } };
 export const RunDetails: Story = { args: { state: 'run-details' } };
+export const TelemetrySetup: Story = { args: { state: 'setup' } };

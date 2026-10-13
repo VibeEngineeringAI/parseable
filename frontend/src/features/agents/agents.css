@@ -289,3 +289,62 @@
     padding-left: 4px;
   }
 }
+.agents-setup-sheet {
+  width: min(760px, 100vw);
+}
+.agent-setup-guide {
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.agent-setup-guide > p:first-child {
+  margin-top: 0;
+}
+.agent-setup-provider h3 {
+  font-size: 15px;
+  margin: 24px 0 8px;
+}
+.agent-setup-provider .field {
+  margin: 16px 0;
+}
+.agent-setup-capture {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 16px;
+  cursor: pointer;
+}
+.agent-setup-hint,
+.agent-setup-sources {
+  font-size: 12px;
+  color: var(--muted);
+}
+.agent-setup-details {
+  border-top: 1px solid var(--border);
+  padding: 12px 0;
+}
+.agent-setup-details summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+.agent-setup-details summary:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
+}
+.agent-setup-details ul {
+  padding-left: 20px;
+}
+.agent-setup-details li + li {
+  margin-top: 10px;
+}
+.agent-setup-details .ingestion-code-block {
+  margin-top: 12px;
+}
+.agent-setup-guide .ingestion-code-heading {
+  flex-wrap: wrap;
+}
+.agent-setup-guide .ingestion-code-block pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

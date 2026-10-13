@@ -1,5 +1,15 @@
 # Frontend validation and independent review
 
+## In-app agent telemetry setup guide (2026-10-12)
+
+Agents now has a **Set up telemetry** panel, also linked from the **Get started** connection step and the Agents empty state. It generates copyable Claude Code JSON, Codex TOML and a coding-agent brief using an editable collector base URL. Content flags default off and reset when changing providers; the guide explains that metadata and some tool snippets may still be exported. It links to collector ingestion setup, documents required span mappings and distinguishes receiving telemetry from complete run compatibility.
+
+Claude configuration uses per-signal logs/traces destinations without disabling existing metrics. Existing configuration must be merged in place, including Codex inline exporters and tables. The panel remains available on discovery errors, preserves filters and frozen time bounds, and uses `setup=1` for direct links/reload. This transient parameter is excluded from remembered observability filters.
+
+Final follow-up checks pass: TypeScript/production build, **62 focused unit tests**, **28 application tests**, **8 production mount tests** and **22 relevant Storybook tests**. New cases cover copying both configurations/agent brief, content opt-in, invalid URLs, clipboard failure, empty/error states, stable query counts and filters, keyboard/mobile accessibility, and `/` + `/next` mounts. All four generated JSON/TOML variants also pass real parsers. A host build initially encountered root-owned generated files from previous container runs; the pinned Playwright container completed the final build and tests. The full application suite was not repeated for this follow-up, and no live Claude Code/Codex exporter integration is claimed.
+
+The [Mayfly UI decision and screenshot demo](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=6345efc5-183e-4dce-8f81-dbd4cd83ee1d) records the three placement options, selected design, setup flow, provider references and four screenshots. Sol 6.1 implemented the component and unit coverage; Two Opus 5.5 reviews checked provider correctness and follow-up corrections; the final review confirmed all five initial findings fixed with no remaining regressions or blockers. Evaluations and cost estimates remain deferred.
+
 ## Agents run dashboard (2026-10-12)
 
 Implemented on `feat/agent-runs-dashboard` from `origin/main` `06030daa`. The [Mayfly Agents record](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=b3577b4a-031d-46d3-827a-df813856231a) lives beneath the existing native-screens page. Sol 6.1 implementation and integration reviewers, Opus 5.5 telemetry/browser/final reviewers, and Luna wiki discovery contributed to this change.
