@@ -504,7 +504,7 @@ fn callback_base_url(req: &HttpRequest) -> String {
 /// Re-verifies the Basic credentials and swaps their session for a cookie one.
 /// `new_basic_session` re-reads the user under SESSIONS, so an admin change
 /// racing the login cannot leave a cookie session with stale credentials.
-fn exchange_basic_for_cookie(
+pub(crate) fn exchange_basic_for_cookie(
     username: &str,
     password: &str,
     tenant_id: &Option<String>,

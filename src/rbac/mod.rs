@@ -493,12 +493,14 @@ mod lock_order_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use actix_web::cookie::Cookie;
     use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version, password_hash::SaltString};
     use parking_lot::RwLock;
     use ulid::Ulid;
 
     use super::*;
     use crate::handlers::http::modal::query::querier_rbac::remove_user_from_groups;
+    use crate::handlers::http::oidc::exchange_basic_for_cookie;
     use crate::rbac::map::{
         ROLES, SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups, mut_roles, write_user_groups,
     };
@@ -979,26 +981,40 @@ mod lock_order_tests {
         assert!(!Users.session_exists(&login));
     }
 
-    /// Runs the `/login` cookie exchange (`exchange_basic_for_cookie` in `oidc`)
-    /// for a Basic key. Returns the cookie session key and whether it was tracked.
-    fn cookie_login(key: &SessionKey, tenant: &str) -> (SessionKey, mpsc::Receiver<bool>) {
-        let cookie = SessionKey::SessionId(Ulid::new());
-        let rx = spawn({
-            let (key, cookie, tenant) = (key.clone(), cookie.clone(), tenant.to_owned());
-            move || {
-                let (username, password) = credentials(&key);
-                Users
-                    .new_basic_session(
-                        username,
-                        password,
-                        &tenant,
-                        cookie,
-                        Utc::now() + EXPIRY_DURATION,
-                    )
-                    .is_some()
-            }
-        });
-        (cookie, rx)
+    /// Runs `/login`'s exchange of a Basic key for a session cookie.
+    fn cookie_login(key: &SessionKey, tenant: &str) -> mpsc::Receiver<Option<Cookie<'static>>> {
+        let (key, tenant) = (key.clone(), Some(tenant.to_owned()));
+        spawn(move || {
+            let (username, password) = credentials(&key);
+            exchange_basic_for_cookie(username, password, &tenant, EXPIRY_DURATION)
+        })
+    }
+
+    /// The session a `/login` cookie names, checked to belong to `login`'s user
+    /// and tenant, with the Basic session `/login` authorized through removed.
+    fn issued_session(
+        cookie: Option<Cookie<'static>>,
+        login: &SessionKey,
+        tenant: &str,
+    ) -> SessionKey {
+        let cookie = cookie.expect("the cookie login to issue a cookie");
+        let session = SessionKey::SessionId(cookie.value().parse().unwrap());
+        assert_eq!(
+            Users.get_userid_from_session(&session),
+            Some((credentials(login).0.to_owned(), tenant.to_owned()))
+        );
+        assert!(!Users.session_exists(login));
+        session
+    }
+
+    /// How many sessions, of any kind, are tracked for `login`'s user.
+    fn tracked_sessions(login: &SessionKey, tenant: &str) -> usize {
+        let username = credentials(login).0;
+        sessions()
+            .get_active_sessions()
+            .into_iter()
+            .filter(|(_, userid, tenant_id)| userid == username && tenant_id == tenant)
+            .count()
     }
 
     // `/login` verified the password and then tracked its cookie session from a
@@ -1011,7 +1027,7 @@ mod lock_order_tests {
         let (user, login) = native_user(&tenant, &[ROLE]);
 
         let reader = sessions();
-        let (cookie, login_rx) = cookie_login(&login, &tenant);
+        let login_rx = cookie_login(&login, &tenant);
         wait_until("the cookie login to queue for SESSIONS", || {
             writer_queued(sessions_lock())
         });
@@ -1029,8 +1045,8 @@ mod lock_order_tests {
         finish(&writer, "password change");
         drop(reader);
 
-        assert!(!finish(&login_rx, "cookie login"));
-        assert!(!Users.session_exists(&cookie));
+        assert!(finish(&login_rx, "cookie login").is_none());
+        assert_eq!(tracked_sessions(&login, &tenant), 0);
     }
 
     #[test]
@@ -1040,20 +1056,19 @@ mod lock_order_tests {
         let (_, login) = native_user(&tenant, &[ROLE]);
         let (_, roleless) = native_user(&tenant, &[]);
 
-        let (cookie, tracked) = cookie_login(&login, &tenant);
-        assert!(finish(&tracked, "cookie login"));
+        // `/login` authorizes the Basic key, which tracks it, before exchanging it.
+        finish(&first_login(&login), "login");
+        assert!(Users.session_exists(&login));
+        let cookie = finish(&cookie_login(&login, &tenant), "cookie login");
+        let session = issued_session(cookie, &login, &tenant);
         assert_eq!(
-            Users.get_userid_from_session(&cookie),
-            Some((credentials(&login).0.to_owned(), tenant.clone()))
-        );
-        assert_eq!(
-            Users.authorize(cookie, Action::Query, None, None),
+            Users.authorize(session, Action::Query, None, None),
             Response::Authorized
         );
-        let (cookie, tracked) = cookie_login(&roleless, &tenant);
-        assert!(finish(&tracked, "cookie login"));
+        let cookie = finish(&cookie_login(&roleless, &tenant), "cookie login");
+        let session = issued_session(cookie, &roleless, &tenant);
         assert_eq!(
-            Users.authorize(cookie, Action::Query, None, None),
+            Users.authorize(session, Action::Query, None, None),
             Response::UnAuthorized
         );
 
@@ -1062,9 +1077,9 @@ mod lock_order_tests {
             username: username.to_owned(),
             password: "wrong".into(),
         };
-        let (cookie, tracked) = cookie_login(&wrong, &tenant);
-        assert!(!finish(&tracked, "cookie login"));
-        assert!(!Users.session_exists(&cookie));
+        let before = tracked_sessions(&login, &tenant);
+        assert!(finish(&cookie_login(&wrong, &tenant), "cookie login").is_none());
+        assert_eq!(tracked_sessions(&login, &tenant), before);
     }
 
     // The Basic lookups verify passwords after dropping USERS; they must still
