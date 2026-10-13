@@ -294,19 +294,42 @@ const agentFields = [...new Set(agentRows.flatMap((row) => Object.keys(row)))];
 type Captured = { query: string; startTime: string; endTime: string };
 async function serveAgents(
   page: Page,
-  options: { status?: number; rows?: LogRecord[]; datasets?: string[]; fields?: string[] } = {},
+  options: {
+    status?: number;
+    rows?: LogRecord[];
+    datasets?: string[];
+    fields?: string[];
+    logs?: { dataset: string; fields: string[]; rows: LogRecord[] };
+    /** Per-dataset schema fields, or an error status. */
+    schemas?: Record<string, string[] | number>;
+  } = {},
 ) {
   const captured: Captured[] = [];
-  const state = { status: options.status ?? 200, rows: options.rows ?? agentRows };
+  const requests: string[] = [];
+  const state = {
+    status: options.status ?? 200,
+    rows: options.rows ?? agentRows,
+    datasets: options.datasets ?? ['agent_telemetry'],
+    schemas: options.schemas ?? {},
+  };
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
+    requests.push(path);
     if (path === '/api/v1/logstream')
-      return route.fulfill({
-        json: (options.datasets ?? ['agent_telemetry']).map((name) => ({ name })),
-      });
+      return route.fulfill({ json: state.datasets.map((name) => ({ name })) });
+    const schema = state.schemas[decodeURIComponent(path.split('/').at(-2) ?? '')];
+    if (path.endsWith('/schema') && typeof schema === 'number')
+      return route.fulfill({ status: schema, body: 'Unavailable' });
+    if (path.endsWith('/schema') && Array.isArray(schema))
+      return route.fulfill({ json: { fields: schema.map((name) => ({ name })) } });
     if (path.endsWith('/schema'))
       return route.fulfill({
-        json: { fields: (options.fields ?? agentFields).map((name) => ({ name })) },
+        json: {
+          fields: (path.includes(`/${options.logs?.dataset}/`)
+            ? options.logs!.fields
+            : (options.fields ?? agentFields)
+          ).map((name) => ({ name })),
+        },
       });
     if (path.endsWith('/info'))
       return route.fulfill({
@@ -314,14 +337,17 @@ async function serveAgents(
       });
     if (path === '/api/v1/about') return route.fulfill({ json: { capabilities: {} } });
     if (path === '/api/v1/query') {
-      captured.push(route.request().postDataJSON());
+      const request: Captured = route.request().postDataJSON();
+      captured.push(request);
+      if (options.logs && request.query.includes(`FROM "${options.logs.dataset}"`))
+        return route.fulfill({ json: options.logs.rows });
       return state.status === 200
         ? route.fulfill({ json: state.rows })
         : route.fulfill({ status: state.status, body: 'Access denied' });
     }
     return route.fulfill({ status: 404, body: 'No fixture' });
   });
-  return { captured, state };
+  return { captured, requests, state };
 }
 
 const columns = ['Run', 'Status', 'Started (UTC)', 'Duration', 'Model', 'Tokens', 'Spans'];
@@ -726,67 +752,100 @@ for (const trace of ['trace-with-dashes', '']) {
   });
 }
 
+// Spans as Codex CLI 0.162.1 exports them: no GenAI agent fields, usage on the
+// response handler below each model call, and intermediate spans filtered out.
+const codexTrace = 'e5'.repeat(16);
+const codex = (span: Omit<SpanFixture, 'trace' | 'status'>) =>
+  spanRows({
+    ...span,
+    trace: codexTrace,
+    attributes: { 'service.name': 'codex-app-server', ...span.attributes },
+  });
+const codexRows = [
+  codex({
+    id: 'e500000000000001',
+    parent: 'e5000000000000aa',
+    name: 'session_task.turn',
+    start: base + 1000,
+    duration: 4000,
+    attributes: {
+      model: 'gpt-6-luna',
+      'codex.turn.token_usage.input_tokens': '32558',
+      'codex.turn.token_usage.output_tokens': '38',
+    },
+  }),
+  codex({
+    id: 'e500000000000002',
+    parent: 'e5000000000000bb',
+    name: 'try_run_sampling_request',
+    start: base + 1100,
+    duration: 1600,
+    attributes: { model: 'gpt-6-luna' },
+  }),
+  codex({
+    id: 'e500000000000003',
+    parent: 'e500000000000002',
+    name: 'receiving_stream',
+    start: base + 1110,
+    duration: 1580,
+  }),
+  codex({
+    id: 'e500000000000004',
+    parent: 'e500000000000003',
+    name: 'handle_responses',
+    start: base + 2600,
+    duration: 40,
+    attributes: { 'gen_ai.usage.input_tokens': '32558', 'gen_ai.usage.output_tokens': '38' },
+  }),
+  codex({
+    id: 'e500000000000005',
+    parent: 'e5000000000000cc',
+    name: 'exec',
+    start: base + 2700,
+    duration: 137,
+    attributes: { tool_name: 'exec', call_id: 'call_codex' },
+  }),
+].flat();
+const codexFields = [
+  ...new Set([...codexRows.flatMap((row) => Object.keys(row)), 'gen_ai.usage.input_tokens']),
+];
+// Log records as Codex exports them with log_user_prompt on, stamped with the
+// trace and span they happened in. The tool result names the call it answers.
+const codexLogs: LogRecord[] = [
+  {
+    'event.name': 'codex.user_prompt',
+    'event.timestamp': ingested(base + 1000),
+    trace_id: codexTrace,
+    span_id: 'e5000000000000aa',
+    'conversation.id': 'conversation',
+    prompt: 'List the files here',
+  },
+  {
+    'event.name': 'codex.tool_result',
+    'event.timestamp': ingested(base + 2840),
+    trace_id: codexTrace,
+    span_id: 'e5000000000000dd',
+    call_id: 'call_codex',
+    tool_name: 'exec',
+    arguments: 'ls',
+    output: 'README.md',
+  },
+];
+const codexLogFields = [
+  ...new Set([...codexLogs.flatMap((row) => Object.keys(row)), 'originator', 'p_timestamp']),
+];
+const claudeFields = [
+  ...codexFields.filter((field) => !field.startsWith('codex.')),
+  'interaction.sequence',
+];
+
 test('native Codex traces become runs with mapped model calls, tools and usage', async ({
   page,
 }) => {
-  // Spans as Codex CLI 0.162.1 exports them: no GenAI agent fields, usage on the
-  // response handler below each model call, and intermediate spans filtered out.
-  const trace = 'e5'.repeat(16);
-  const codex = (span: Omit<SpanFixture, 'trace' | 'status'>) =>
-    spanRows({
-      ...span,
-      trace,
-      attributes: { 'service.name': 'codex-app-server', ...span.attributes },
-    });
-  const rows = [
-    codex({
-      id: 'e500000000000001',
-      parent: 'e5000000000000aa',
-      name: 'session_task.turn',
-      start: base + 1000,
-      duration: 4000,
-      attributes: {
-        model: 'gpt-6-luna',
-        'codex.turn.token_usage.input_tokens': '32558',
-        'codex.turn.token_usage.output_tokens': '38',
-      },
-    }),
-    codex({
-      id: 'e500000000000002',
-      parent: 'e5000000000000bb',
-      name: 'try_run_sampling_request',
-      start: base + 1100,
-      duration: 1600,
-      attributes: { model: 'gpt-6-luna' },
-    }),
-    codex({
-      id: 'e500000000000003',
-      parent: 'e500000000000002',
-      name: 'receiving_stream',
-      start: base + 1110,
-      duration: 1580,
-    }),
-    codex({
-      id: 'e500000000000004',
-      parent: 'e500000000000003',
-      name: 'handle_responses',
-      start: base + 2600,
-      duration: 40,
-      attributes: { 'gen_ai.usage.input_tokens': '32558', 'gen_ai.usage.output_tokens': '38' },
-    }),
-    codex({
-      id: 'e500000000000005',
-      parent: 'e5000000000000cc',
-      name: 'exec',
-      start: base + 2700,
-      duration: 137,
-      attributes: { tool_name: 'exec', call_id: 'call_codex' },
-    }),
-  ].flat();
   const { captured } = await serveAgents(page, {
-    rows,
+    rows: codexRows,
     datasets: ['codex-traces'],
-    fields: [...new Set([...rows.flatMap((row) => Object.keys(row)), 'gen_ai.usage.input_tokens'])],
+    fields: codexFields,
   });
   await page.goto(`/agents?${range}`);
   await page.getByLabel('Agents dataset').selectOption('codex-traces');
@@ -812,6 +871,38 @@ test('native Codex traces become runs with mapped model calls, tools and usage',
   await span.getByText('Recorded fields (1 record)').click();
   await expect(span).toContainText('"tool_name": "exec"');
   await expect(span).not.toContainText('gen_ai.tool.name');
+});
+
+test('Codex conversation logs fill run details from the paired logs dataset', async ({ page }) => {
+  const { captured } = await serveAgents(page, {
+    rows: codexRows,
+    datasets: ['codex-traces', 'codex-logs', 'archive-logs'],
+    fields: codexFields,
+    logs: { dataset: 'codex-logs', fields: codexLogFields, rows: codexLogs },
+  });
+  await page.goto(`/agents/codex-traces?${range}`);
+  await expect(page.getByLabel('Conversation logs')).toHaveValue('codex-logs');
+  const details = await openRun(page, 'Codex');
+  await details.getByRole('tab', { name: 'Conversation' }).click();
+  const turn = details.getByRole('region', { name: 'Conversation from session_task.turn' });
+  await expect(turn).toContainText('User prompt');
+  await expect(turn).toContainText('List the files here');
+  const tool = details.getByRole('region', { name: 'Conversation from exec' });
+  await expect(tool).toContainText('Tool arguments · exec');
+  await expect(tool).toContainText('README.md');
+  const logQuery = captured.find((request) => request.query.includes('FROM "codex-logs"'));
+  expect(logQuery?.query).toContain(`"trace_id" IN ('${codexTrace}')`);
+  expect(sqlBounds(logQuery!.query)).toEqual([bounds.startTime, bounds.endTime]);
+
+  // Conversation text is searchable, and logs can be turned off.
+  await page.keyboard.press('Escape');
+  await expect(details).toBeHidden();
+  await page.getByLabel('Search agent runs').fill('README.md');
+  await expect(page).toHaveURL(/search=README\.md/);
+  await expect(runRow(page, 'Codex')).toBeVisible();
+  await page.getByLabel('Conversation logs').selectOption('none');
+  await expect(page).toHaveURL(/logs=none/);
+  await expect(page.getByRole('heading', { name: 'No matching runs' })).toBeVisible();
 });
 
 test('discloses the record limit from the queried rows when Codex mapping drops some', async ({
@@ -861,4 +952,133 @@ test('discloses the record limit from the queried rows when Codex mapping drops 
   await expect(page.getByRole('status').filter({ hasText: 'record limit' })).toContainText(
     'narrow the time range',
   );
+});
+
+test('a logs choice does not carry over to a traces dataset of another harness', async ({
+  page,
+}) => {
+  const { captured } = await serveAgents(page, {
+    rows: codexRows,
+    datasets: ['codex-traces', 'claude-code-traces', 'codex-logs'],
+    fields: codexFields,
+    schemas: { 'claude-code-traces': claudeFields },
+    logs: { dataset: 'codex-logs', fields: codexLogFields, rows: codexLogs },
+  });
+  const logQueries = () =>
+    captured.filter((request) => request.query.includes('FROM "codex-logs"')).length;
+  await page.goto(`/agents/codex-traces?${range}&logs=codex-logs`);
+  await expect(page.getByLabel('Conversation logs')).toHaveValue('codex-logs');
+  await expect.poll(logQueries).toBe(1);
+
+  await page.getByLabel('Agents dataset').focus();
+  await page.getByLabel('Agents dataset').selectOption('claude-code-traces');
+  await expect(page).toHaveURL(/\/agents\/claude-code-traces\?/);
+  expect(new URL(page.url()).searchParams.get('logs')).toBeNull();
+  await expect(page.getByRole('status').filter({ hasText: 'logs dataset found' })).toHaveText(
+    /No Claude Code logs dataset found/,
+  );
+  await expect(page.getByLabel('Conversation logs')).toHaveValue('none');
+  expect(logQueries()).toBe(1);
+
+  // A stale link naming another harness's logs is ignored too.
+  await page.goto(`/agents/claude-code-traces?${range}&logs=codex-logs`);
+  await expect(page.getByRole('status').filter({ hasText: 'logs dataset found' })).toBeVisible();
+  await expect(page.getByLabel('Conversation logs')).toHaveValue('none');
+  await expect(page.getByLabel('Conversation logs').locator('option')).toHaveText([
+    'No conversation logs',
+  ]);
+  expect(logQueries()).toBe(1);
+});
+
+test('Refresh keeps logs discovery, and Rescan finds a new logs dataset', async ({ page }) => {
+  const { captured, requests, state } = await serveAgents(page, {
+    rows: codexRows,
+    datasets: ['codex-traces'],
+    fields: codexFields,
+    logs: { dataset: 'codex-logs', fields: codexLogFields, rows: codexLogs },
+  });
+  const count = (match: (path: string) => boolean) => requests.filter(match).length;
+  const lists = () => count((path) => path === '/api/v1/logstream');
+  const schemas = () => count((path) => path.endsWith('/schema'));
+  await page.goto(`/agents/codex-traces?${range}`);
+  const missing = page.getByRole('status').filter({ hasText: 'No Codex logs dataset found' });
+  await expect(missing).toBeVisible();
+  const [listsBefore, schemasBefore] = [lists(), schemas()];
+
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect.poll(() => captured.length).toBe(2);
+  await expect(runRow(page, 'Codex')).toBeVisible();
+  await expect(page.getByLabel('Conversation logs')).toBeVisible();
+  // Only the traces dataset's own schema is read again.
+  expect(lists()).toBe(listsBefore);
+  expect(schemas()).toBe(schemasBefore + 1);
+
+  state.datasets.push('codex-logs');
+  await page.getByRole('button', { name: 'Rescan datasets' }).click();
+  await expect(page.getByLabel('Conversation logs')).toHaveValue('codex-logs');
+  await expect(missing).toBeHidden();
+  await expect
+    .poll(() => captured.filter((request) => request.query.includes('FROM "codex-logs"')).length)
+    .toBe(1);
+});
+
+test('discloses when conversation logs reach the record limit', async ({ page }) => {
+  const rows = Array.from({ length: 1000 }, (_, index) => ({
+    ...codexLogs[1],
+    'event.timestamp': ingested(base + 2000 + index),
+  }));
+  const { captured } = await serveAgents(page, {
+    rows: codexRows,
+    datasets: ['codex-traces', 'codex-logs'],
+    fields: codexFields,
+    logs: { dataset: 'codex-logs', fields: codexLogFields, rows },
+  });
+  await page.goto(`/agents/codex-traces?${range}`);
+  await expect(
+    page.getByRole('status').filter({ hasText: 'Conversation logs reached the record limit' }),
+  ).toContainText('the oldest events may be missing');
+  // The newest events are kept when the limit cuts the result.
+  const logQuery = captured.find((request) => request.query.includes('FROM "codex-logs"'));
+  expect(logQuery?.query).toMatch(/ORDER BY "p_timestamp" DESC LIMIT 1000$/);
+});
+
+test('a failed logs scan offers Retry instead of reporting no logs dataset', async ({ page }) => {
+  const { state } = await serveAgents(page, {
+    rows: codexRows,
+    datasets: ['codex-traces', 'codex-logs'],
+    fields: codexFields,
+    schemas: { 'codex-logs': 503 },
+    logs: { dataset: 'codex-logs', fields: codexLogFields, rows: codexLogs },
+  });
+  await page.goto(`/agents/codex-traces?${range}`);
+  const unchecked = page.getByRole('status').filter({ hasText: 'Could not inspect codex-logs' });
+  await expect(unchecked).toContainText('for Codex logs');
+  await expect(page.getByText('No Codex logs dataset found')).toHaveCount(0);
+
+  delete state.schemas['codex-logs'];
+  await unchecked.getByRole('button', { name: 'Retry' }).click();
+  await expect(page.getByLabel('Conversation logs')).toHaveValue('codex-logs');
+  await expect(unchecked).toBeHidden();
+});
+
+test('a mixed traces dataset joins logs of whichever harness is selected', async ({ page }) => {
+  const { state } = await serveAgents(page, {
+    rows: codexRows,
+    datasets: ['agent-traces'],
+    fields: [...codexFields, 'interaction.sequence'],
+    logs: { dataset: 'codex-logs', fields: codexLogFields, rows: codexLogs },
+  });
+  await page.goto(`/agents/agent-traces?${range}`);
+  await expect(page.getByRole('status').filter({ hasText: 'logs dataset found' })).toHaveText(
+    /No Codex or Claude Code logs dataset found/,
+  );
+
+  state.datasets.push('codex-logs');
+  await page.getByRole('button', { name: 'Rescan datasets' }).click();
+  await expect(page.getByLabel('Conversation logs')).toHaveValue('codex-logs');
+  const details = await openRun(page, 'Codex');
+  await details.getByRole('tab', { name: 'Conversation' }).click();
+  await expect(
+    details.getByRole('region', { name: 'Conversation from session_task.turn' }),
+  ).toContainText('List the files here');
 });

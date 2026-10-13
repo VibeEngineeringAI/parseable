@@ -24,7 +24,18 @@ import {
   buildAgentRunQuery,
   discoverAgentDatasets,
 } from '../../lib/agents';
-import { detectAgentHarnesses, mapHarnessRows } from '../../lib/agentHarnesses';
+import {
+  AGENT_HARNESSES,
+  detectAgentHarnesses,
+  mapHarnessRows,
+  type AgentHarness,
+} from '../../lib/agentHarnesses';
+import {
+  attachHarnessConversation,
+  buildHarnessLogQuery,
+  discoverHarnessLogs,
+  pairedLogsDataset,
+} from '../../lib/agentHarnessLogs';
 import { buildAgentRuns } from '../../lib/agentRuns';
 import { agentValueMatchesSearch } from '../../lib/agentSearch';
 import {
@@ -105,6 +116,7 @@ export function AgentsPage() {
             limitReached: false,
             timeColumn: 'p_timestamp',
             traces: false,
+            harnesses: [] as AgentHarness[],
           };
         }
         const [fields, info] = await Promise.all([
@@ -116,14 +128,87 @@ export function AgentsPage() {
           buildAgentRunQuery(dataset, fields, bounds, timeColumn),
           signal,
         );
+        const harnesses = detectAgentHarnesses(fields);
         return {
-          rows: mapHarnessRows(detectAgentHarnesses(fields), rows),
+          rows: mapHarnessRows(harnesses, rows),
           limitReached: rows.length >= AGENT_RECORD_LIMIT,
           timeColumn,
           traces: info.logSourceFormats.includes('otel-traces'),
+          harnesses,
         };
       },
       [client, mode, dataset, bounds],
+    ),
+  );
+  // Held across reloads of the same dataset, so logs discovery and the logs
+  // selector do not restart on every Refresh.
+  const [detected, setDetected] = useState<{ dataset?: string; harnesses: AgentHarness[] }>({
+    harnesses: [],
+  });
+  const loadedHarnesses = result.data?.harnesses;
+  if (
+    loadedHarnesses &&
+    (detected.dataset !== dataset || detected.harnesses.join() !== loadedHarnesses.join())
+  )
+    setDetected({ dataset, harnesses: loadedHarnesses });
+  const harnesses = detected.dataset === dataset ? detected.harnesses : [];
+  const harnessLabels = harnesses.map((harness) => AGENT_HARNESSES[harness].label).join(' or ');
+  const [logsDiscoveryEnabled, setLogsDiscoveryEnabled] = useState(false);
+  if (harnesses.length && !logsDiscoveryEnabled) setLogsDiscoveryEnabled(true);
+  // Coding agents export prompts and tool results as logs in a separate dataset.
+  const logsDiscovery = useAsync(
+    useCallback(
+      async (signal) => (logsDiscoveryEnabled ? discoverHarnessLogs(client, signal) : undefined),
+      [client, logsDiscoveryEnabled],
+    ),
+    { keepPreviousData: true },
+  );
+  const logsCandidates = logsDiscovery.data?.datasets.filter((entry) =>
+    harnesses.includes(entry.harness),
+  );
+  const logsParam = params.get('logs');
+  // A logs choice only applies while it is a candidate for the current dataset.
+  const logsDataset =
+    logsParam === 'none' || !dataset || !logsCandidates?.length
+      ? undefined
+      : logsCandidates.some((entry) => entry.name === logsParam)
+        ? logsParam!
+        : pairedLogsDataset(
+            dataset,
+            logsCandidates.map((entry) => entry.name),
+          );
+  const logsHarness = logsCandidates?.find((entry) => entry.name === logsDataset)?.harness;
+  const rescan = () => {
+    if (discoveryEnabled) discovery.reload();
+    else setDiscoveryRequested(true);
+    logsDiscovery.reload();
+  };
+  const traceIds = useMemo(
+    () =>
+      JSON.stringify([
+        ...new Set(
+          (result.data?.rows ?? [])
+            .map((row) => row.span_trace_id ?? row.trace_id)
+            .filter((id): id is string => typeof id === 'string' && !!id.trim()),
+        ),
+      ]),
+    [result.data],
+  );
+  const logs = useAsync(
+    useCallback(
+      async (signal) => {
+        if (!logsHarness || !logsDataset) return undefined;
+        const info = await client.datasetInfo(logsDataset, signal);
+        const request = buildHarnessLogQuery(
+          logsDataset,
+          logsHarness,
+          JSON.parse(traceIds) as string[],
+          bounds,
+          info.timePartition || 'p_timestamp',
+        );
+        return request ? client.query(request, signal) : [];
+      },
+      [client, logsHarness, logsDataset, traceIds, bounds],
     ),
   );
   const authorizedDataset = useRef<string | undefined>(undefined);
@@ -138,11 +223,17 @@ export function AgentsPage() {
   });
   const runs = useMemo(
     () =>
-      buildAgentRuns(result.data?.rows ?? [], result.data?.timeColumn, {
-        limitReached: result.data?.limitReached,
-        bounds,
-      }),
-    [result.data, bounds],
+      // The selected logs join their own harness; each harness still attaches
+      // what its traces record, e.g. Claude Code tool output.
+      (result.data?.harnesses ?? []).reduce(
+        (built, harness) =>
+          attachHarnessConversation(built, harness, harness === logsHarness ? logs.data : []),
+        buildAgentRuns(result.data?.rows ?? [], result.data?.timeColumn, {
+          limitReached: result.data?.limitReached,
+          bounds,
+        }),
+      ),
+    [result.data, bounds, logsHarness, logs.data],
   );
   const visibleRuns = useMemo(
     () =>
@@ -151,8 +242,10 @@ export function AgentsPage() {
           (!status || run.status === status) &&
           (!model || run.models.includes(model)) &&
           (!search ||
-            run.spans.some((span) =>
-              span.rows.some((row) => agentValueMatchesSearch(row, search)),
+            run.spans.some(
+              (span) =>
+                span.rows.some((row) => agentValueMatchesSearch(row, search)) ||
+                span.conversation.some((entry) => agentValueMatchesSearch(entry.value, search)),
             )),
       ),
     [runs, search, status, model],
@@ -212,6 +305,7 @@ export function AgentsPage() {
               currentObservabilitySearch(location.pathname, params.toString()),
             );
             next.delete('run');
+            next.delete('logs');
             next.set('start', bounds.startTime);
             next.set('end', bounds.endTime);
             navigate(`${agentsPath(event.target.value)}?${next}`);
@@ -229,6 +323,21 @@ export function AgentsPage() {
             </option>
           ))}
         </Select>
+        {!!harnesses.length && mode !== 'demo' && (
+          <Select
+            aria-label="Conversation logs"
+            value={logsDataset ?? 'none'}
+            aria-busy={logsDiscovery.loading}
+            onChange={(event) => updateFilter('logs', event.target.value)}
+          >
+            <option value="none">No conversation logs</option>
+            {logsCandidates?.map(({ name }) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </Select>
+        )}
         <TimeRangePicker value={range} onChange={changeRange} />
         <Button
           variant="secondary"
@@ -243,13 +352,7 @@ export function AgentsPage() {
           <RefreshCw size={14} aria-hidden="true" /> Refresh
         </Button>
         {dataset && (
-          <Button
-            variant="ghost"
-            onClick={() => {
-              if (discoveryEnabled) discovery.reload();
-              else setDiscoveryRequested(true);
-            }}
-          >
+          <Button variant="ghost" onClick={rescan}>
             Rescan datasets
           </Button>
         )}
@@ -266,6 +369,49 @@ export function AgentsPage() {
           )}
         </nav>
       )}
+      {logsHarness && logs.error && (
+        <p role="status" className="agents-note">
+          Could not load {AGENT_HARNESSES[logsHarness].label} conversation logs from {logsDataset}:{' '}
+          {logs.error.message}{' '}
+          <Button variant="ghost" onClick={logs.reload}>
+            Retry
+          </Button>
+        </p>
+      )}
+      {logsHarness && logs.data && logs.data.length >= AGENT_RECORD_LIMIT && (
+        <p role="status" className="agents-note">
+          Conversation logs reached the record limit; the oldest events may be missing. Narrow the
+          time range to load them.
+        </p>
+      )}
+      {!!harnesses.length && logsDiscovery.error && (
+        <p role="status" className="agents-note">
+          Could not find {harnessLabels} logs datasets: {logsDiscovery.error.message}{' '}
+          <Button variant="ghost" onClick={logsDiscovery.reload}>
+            Retry
+          </Button>
+        </p>
+      )}
+      {!!harnesses.length && !!logsDiscovery.data?.unchecked.length && (
+        <p role="status" className="agents-note">
+          Could not inspect {logsDiscovery.data.unchecked.map((entry) => entry.name).join(', ')} for{' '}
+          {harnessLabels} logs.{' '}
+          <Button variant="ghost" onClick={logsDiscovery.reload}>
+            Retry
+          </Button>
+        </p>
+      )}
+      {!!harnesses.length &&
+        logsCandidates &&
+        !logsCandidates.length &&
+        !logsDiscovery.error &&
+        !logsDiscovery.data?.unchecked.length &&
+        logsParam !== 'none' && (
+          <p role="status" className="agents-note">
+            No {harnessLabels} logs dataset found. Export its logs to Parseable to see prompts and
+            tool results in run details.
+          </p>
+        )}
       {dataset && discoveryEnabled && discovery.loading && (
         <p role="status" className="agents-note">
           Finding compatible datasets…
@@ -279,7 +425,7 @@ export function AgentsPage() {
       {!!discovery.data?.unchecked.length && (
         <p role="status" className="agents-note">
           Could not inspect {discovery.data.unchecked.map((entry) => entry.name).join(', ')}.{' '}
-          <Button variant="ghost" onClick={discovery.reload}>
+          <Button variant="ghost" onClick={rescan}>
             Rescan datasets
           </Button>
         </p>

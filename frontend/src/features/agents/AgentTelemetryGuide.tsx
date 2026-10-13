@@ -77,7 +77,9 @@ export function AgentTelemetryGuide() {
           Confirm collector receipt and stored rows first, then run discovery, parent links, models,
           tools and usage in Agents. Test successful, failed and interrupted work. Agents reads
           native Claude Code and Codex trace fields directly, so their trace datasets need no field
-          mapping. Runs come from traces; a logs dataset is not listed on its own.
+          mapping. Runs come from traces. Export logs to their own dataset too: Agents joins their
+          prompts, responses and tool results into run details. Content appears only where the
+          content flags above allow it.
         </p>
         <details className="agent-setup-details">
           <summary>Mapping and validation checklist</summary>
