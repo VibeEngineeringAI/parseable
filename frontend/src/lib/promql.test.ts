@@ -306,10 +306,10 @@ describe('PromQL chart data and history', () => {
   }
   it('deduplicates newest-first history, limits it to ten and separates datasets', () => {
     const local = storage();
-    for (let index = 0; index < 12; index++) pushHistory('cpu', `query${index}`);
-    pushHistory('cpu', 'query5');
-    pushHistory('other', 'different');
-    expect(loadHistory('cpu')).toEqual([
+    for (let index = 0; index < 12; index++) pushHistory('cpu', `query${index}`, 'scope');
+    pushHistory('cpu', 'query5', 'scope');
+    pushHistory('other', 'different', 'scope');
+    expect(loadHistory('cpu', 'scope')).toEqual([
       'query5',
       'query11',
       'query10',
@@ -321,27 +321,27 @@ describe('PromQL chart data and history', () => {
       'query3',
       'query2',
     ]);
-    expect(loadHistory('other')).toEqual(['different']);
-    expect(local.setItem).toHaveBeenCalledWith('parseable:promql-history:other', '["different"]');
+    expect(loadHistory('other', 'scope')).toEqual(['different']);
+    expect(local.setItem).toHaveBeenCalledWith('scope:history:other', '["different"]');
     const count = local.setItem.mock.calls.length;
-    pushHistory('cpu', '  ');
+    pushHistory('cpu', '  ', 'scope');
     expect(local.setItem).toHaveBeenCalledTimes(count);
   });
   it('recovers from malformed JSON and filters invalid stored entries', () => {
     const local = storage();
-    local.setItem('parseable:promql-history:cpu', '{bad json');
-    expect(loadHistory('cpu')).toEqual([]);
-    pushHistory('cpu', 'cpu');
-    expect(loadHistory('cpu')).toEqual(['cpu']);
-    local.setItem('parseable:promql-history:cpu', '[1,"cpu","cpu",null,""," ","memory"]');
-    expect(loadHistory('cpu')).toEqual(['cpu', 'memory']);
-    local.setItem('parseable:promql-history:cpu', '{"query":"cpu"}');
-    expect(loadHistory('cpu')).toEqual([]);
+    local.setItem('scope:history:cpu', '{bad json');
+    expect(loadHistory('cpu', 'scope')).toEqual([]);
+    pushHistory('cpu', 'cpu', 'scope');
+    expect(loadHistory('cpu', 'scope')).toEqual(['cpu']);
+    local.setItem('scope:history:cpu', '[1,"cpu","cpu",null,""," ","memory"]');
+    expect(loadHistory('cpu', 'scope')).toEqual(['cpu', 'memory']);
+    local.setItem('scope:history:cpu', '{"query":"cpu"}');
+    expect(loadHistory('cpu', 'scope')).toEqual([]);
   });
   it('handles missing or unavailable storage without throwing', () => {
     vi.stubGlobal('localStorage', undefined);
-    expect(loadHistory('cpu')).toEqual([]);
-    expect(() => pushHistory('cpu', 'cpu')).not.toThrow();
+    expect(loadHistory('cpu', 'scope')).toEqual([]);
+    expect(() => pushHistory('cpu', 'cpu', 'scope')).not.toThrow();
     vi.stubGlobal('localStorage', {
       getItem() {
         throw new Error('Unavailable');
@@ -350,7 +350,7 @@ describe('PromQL chart data and history', () => {
         throw new Error('Full');
       },
     });
-    expect(loadHistory('cpu')).toEqual([]);
-    expect(() => pushHistory('cpu', 'cpu')).not.toThrow();
+    expect(loadHistory('cpu', 'scope')).toEqual([]);
+    expect(() => pushHistory('cpu', 'cpu', 'scope')).not.toThrow();
   });
 });

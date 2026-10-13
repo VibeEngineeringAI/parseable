@@ -6,23 +6,47 @@ import {
   validateRange,
 } from '../../lib/promql';
 import { timeBounds } from '../../lib/query';
+import { createId } from '../../lib/ids';
 import type { PromqlQueryRequest, PromqlRangeRequest, TimeRange } from '../../lib/types';
 
 export const maxQueries = 5;
 export type QueryType = 'range' | 'instant' | 'both';
-export type ExplorerState = { queries: string[]; type: QueryType; step: string; range: TimeRange };
+export type ExplorerState = {
+  queries: string[];
+  type: QueryType;
+  step: string;
+  range: TimeRange;
+  rowIds?: string[];
+  aliases?: string[];
+};
 export type Bounds = { start: number; end: number };
 export type RunSnapshot = Bounds & {
   stream: string;
   type: QueryType;
   step: string;
-  queries: Array<{ id: string; query: string; resolvedStep: string }>;
+  queries: Array<{ id: string; query: string; resolvedStep: string; alias?: string }>;
+  rowOrder?: string[];
+  aliases?: string[];
 };
 export type { QueryResult } from '../../lib/promqlResults';
 import type { QueryResult } from '../../lib/promqlResults';
 export { chartResults, instantRows } from '../../lib/promqlResults';
 import { chartResults } from '../../lib/promqlResults';
 export const queryId = (index: number) => String.fromCharCode(65 + index);
+
+export function ensureRowIdentity(state: ExplorerState): ExplorerState {
+  const rowIds = state.queries.map((_, index) => state.rowIds?.[index] ?? createId());
+  const used = new Set(state.aliases ?? []);
+  const aliases = state.queries.map((_, index) => {
+    if (state.aliases?.[index] !== undefined) return state.aliases[index];
+    let next = 0;
+    while (used.has(queryId(next))) next++;
+    const alias = queryId(next);
+    used.add(alias);
+    return alias;
+  });
+  return { ...state, rowIds, aliases };
+}
 
 // The picker's presets, and the classic quick ranges a classic link brings.
 const urlPresets = ['10m', '15m', '30m', '1h', '5h', '6h', '24h', '3d', '7d'];
@@ -50,17 +74,30 @@ export function parseExplorerSearch(search: string): ExplorerState {
       range = { startTime: new Date(start).toISOString(), endTime: new Date(end).toISOString() };
     }
   }
+  const ids = params.getAll('qid').slice(0, maxQueries);
+  const aliases = params.getAll('alias').slice(0, maxQueries);
+  const rows = queries.length ? queries : [''];
   return {
-    queries: queries.length ? queries : [''],
+    queries: rows,
     type: type === 'range' || type === 'instant' ? type : 'both',
     step: stepError(step) ? '' : step,
     range,
+    ...(ids.length === rows.length &&
+    ids.every((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id)) &&
+    new Set(ids).size === ids.length
+      ? { rowIds: ids }
+      : {}),
+    ...(aliases.length === rows.length
+      ? { aliases: aliases.map((alias) => alias.slice(0, 80)) }
+      : {}),
   };
 }
 
 export function serializeExplorerState(state: ExplorerState): string {
   const params = new URLSearchParams();
   for (const query of state.queries.slice(0, maxQueries)) params.append('query', query);
+  state.rowIds?.slice(0, maxQueries).forEach((id) => params.append('qid', id));
+  state.aliases?.slice(0, maxQueries).forEach((alias) => params.append('alias', alias));
   params.set('type', state.type);
   if (state.step) params.set('step', state.step);
   if (typeof state.range === 'string') params.set('range', state.range);
@@ -96,7 +133,8 @@ export function createRunSnapshot(
     query.trim()
       ? [
           {
-            id: queryId(index),
+            id: state.rowIds?.[index] ?? queryId(index),
+            ...(state.aliases ? { alias: state.aliases[index] } : {}),
             query,
             resolvedStep: state.step.trim()
               ? state.step
@@ -111,14 +149,34 @@ export function createRunSnapshot(
   if (state.type !== 'instant') {
     for (const query of queries) {
       const error = validateRange({ ...bounds, step: query.resolvedStep });
-      if (error) return { error: `${query.id} · ${error}` };
+      if (error) return { error: `${query.alias || query.id} · ${error}` };
     }
   }
   if (!queries.length) return { error: 'Enter a PromQL query to run.' };
-  return { snapshot: { ...bounds, stream, type: state.type, step: state.step, queries } };
+  return {
+    snapshot: {
+      ...bounds,
+      stream,
+      type: state.type,
+      step: state.step,
+      queries,
+      ...(state.rowIds ? { rowOrder: [...state.rowIds], aliases: [...(state.aliases ?? [])] } : {}),
+    },
+  };
 }
 
 export function snapshotState(snapshot: RunSnapshot, range: TimeRange): ExplorerState {
+  if (snapshot.rowOrder) {
+    const byId = new Map(snapshot.queries.map((row) => [row.id, row.query]));
+    return {
+      queries: snapshot.rowOrder.map((id) => byId.get(id) ?? ''),
+      rowIds: [...snapshot.rowOrder],
+      aliases: [...(snapshot.aliases ?? [])],
+      type: snapshot.type,
+      step: snapshot.step,
+      range,
+    };
+  }
   // Preserve row IDs when some applied rows were empty.
   const queries = Array.from({ length: snapshot.queries.at(-1)!.id.charCodeAt(0) - 64 }, () => '');
   for (const row of snapshot.queries) queries[row.id.charCodeAt(0) - 65] = row.query;
@@ -126,10 +184,29 @@ export function snapshotState(snapshot: RunSnapshot, range: TimeRange): Explorer
 }
 
 /**
- * Mirror removing the query at `index` from the panel. Query IDs are positional, so the
- * remaining snapshot rows are relabelled to match the panel and the removed row's results go away.
+ * Remove a stable identity from the executed row set, which may differ from the draft.
+ * Numeric positions remain supported only for legacy positional snapshots.
  */
-export function removeSnapshotQuery(snapshot: RunSnapshot, index: number): RunSnapshot | undefined {
+export function removeSnapshotQuery(
+  snapshot: RunSnapshot,
+  id: string | number,
+): RunSnapshot | undefined {
+  if (snapshot.rowOrder) {
+    if (typeof id !== 'string') return snapshot;
+    const index = snapshot.rowOrder.indexOf(id);
+    if (index === -1) return snapshot;
+    const removed = id;
+    const queries = snapshot.queries.filter((row) => row.id !== removed);
+    return queries.length
+      ? {
+          ...snapshot,
+          queries,
+          rowOrder: snapshot.rowOrder.filter((_, i) => i !== index),
+          aliases: snapshot.aliases?.filter((_, i) => i !== index),
+        }
+      : undefined;
+  }
+  const index = typeof id === 'number' ? id : id.charCodeAt(0) - 65;
   const queries = snapshot.queries.flatMap((row) => {
     const position = row.id.charCodeAt(0) - 65;
     if (position === index) return [];

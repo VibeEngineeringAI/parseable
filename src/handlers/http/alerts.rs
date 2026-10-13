@@ -229,10 +229,11 @@ pub async fn list_internal(
     // Get alerts from the manager
     let guard = ALERTS.read().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
+        alerts.clone()
     } else {
         return Err(AlertError::CustomError("No AlertManager set".into()));
     };
+    drop(guard);
 
     // Fetch alerts for the user
     let alerts = alerts
@@ -255,6 +256,18 @@ pub async fn list_internal(
     Ok(paginated_alerts)
 }
 
+// POST /alerts/preview — query evaluation only; the route requires PutAlert.
+pub async fn preview(
+    req: HttpRequest,
+    Json(request): Json<crate::alerts::sql_preview::AlertPreviewRequest>,
+) -> Result<impl Responder, AlertError> {
+    let session = extract_session_key_from_req(&req)?;
+    let tenant = get_tenant_id_from_request(&req);
+    Ok(Json(
+        crate::alerts::sql_preview::preview(request, &session, &tenant).await?,
+    ))
+}
+
 // POST /alerts
 pub async fn post(
     req: HttpRequest,
@@ -273,7 +286,7 @@ pub async fn post_internal(
     session_key: &SessionKey,
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
-    let mut alert: AlertConfig = alert.into(tenant_id.clone()).await?;
+    let mut alert: AlertConfig = alert.into(tenant_id.clone(), session_key).await?;
     crate::alerts::promql_alerts::capture_identity(&mut alert, session_key)?;
 
     if alert.notification_config.interval > alert.get_eval_frequency() {
@@ -320,10 +333,11 @@ pub async fn post_internal(
 
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
+        alerts.clone()
     } else {
         return Err(AlertError::CustomError("No AlertManager set".into()));
     };
+    drop(guard);
 
     // validate the incoming alert query
     // does the user have access to these tables or not?
@@ -370,10 +384,11 @@ pub async fn get_internal(
 ) -> Result<AlertConfigResponse, AlertError> {
     let guard = ALERTS.read().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
+        alerts.clone()
     } else {
         return Err(AlertError::CustomError("No AlertManager set".into()));
     };
+    drop(guard);
 
     let alert = alerts.get_alert_by_id(alert_id, tenant_id).await?;
     // validate that the user has access to the tables mentioned in the query
@@ -387,14 +402,15 @@ pub async fn get_internal(
 pub async fn delete(req: HttpRequest, alert_id: Path<Ulid>) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
-    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
+    let mut lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let tenant_id = get_tenant_id_from_request(&req);
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
+        alerts.clone()
     } else {
         return Err(AlertError::CustomError("No AlertManager set".into()));
     };
+    drop(guard);
 
     let alert = alerts.get_alert_by_id(alert_id, &tenant_id).await?;
 
@@ -405,6 +421,7 @@ pub async fn delete(req: HttpRequest, alert_id: Path<Ulid>) -> Result<impl Respo
         .metastore
         .delete_alert(&*alert, &tenant_id)
         .await?;
+    crate::alerts::promql_alerts::mark_lifecycle_changed(&mut lifecycle);
 
     // delete the associated alert state
     let state_to_delete =
@@ -434,7 +451,7 @@ pub async fn update_notification_state(
 ) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
-    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
+    let mut lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let tenant_id = get_tenant_id_from_request(&req);
     let new_notification_state = match new_notification_state.state.as_str() {
         "notify" => NotificationState::Notify,
@@ -465,10 +482,11 @@ pub async fn update_notification_state(
 
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
+        alerts.clone()
     } else {
         return Err(AlertError::CustomError("No AlertManager set".into()));
     };
+    drop(guard);
 
     // check if alert id exists in map
     let alert = alerts.get_alert_by_id(alert_id, &tenant_id).await?;
@@ -478,6 +496,7 @@ pub async fn update_notification_state(
     alerts
         .update_notification_state(alert_id, new_notification_state, &tenant_id)
         .await?;
+    crate::alerts::promql_alerts::mark_lifecycle_changed(&mut lifecycle);
     let alert = alerts.get_alert_by_id(alert_id, &tenant_id).await?;
 
     Ok(web::Json(alert.to_alert_config().to_response()))
@@ -504,13 +523,14 @@ pub async fn disable_alert_internal(
     alert_id: Ulid,
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
-    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
+    let mut lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
+        alerts.clone()
     } else {
         return Err(AlertError::CustomError("No AlertManager set".into()));
     };
+    drop(guard);
 
     // check if alert id exists in map
     let alert = alerts.get_alert_by_id(alert_id, tenant_id).await?;
@@ -520,6 +540,7 @@ pub async fn disable_alert_internal(
     alerts
         .update_state(alert_id, AlertState::Disabled, Some("".into()), tenant_id)
         .await?;
+    crate::alerts::promql_alerts::mark_lifecycle_changed(&mut lifecycle);
     let alert = alerts.get_alert_by_id(alert_id, tenant_id).await?;
 
     Ok(alert.to_alert_config().to_response())
@@ -546,13 +567,14 @@ pub async fn enable_alert_internal(
     alert_id: Ulid,
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
-    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
+    let mut lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
+        alerts.clone()
     } else {
         return Err(AlertError::CustomError("No AlertManager set".into()));
     };
+    drop(guard);
 
     // check if alert id exists in map
     let alert = alerts.get_alert_by_id(alert_id, tenant_id).await?;
@@ -575,6 +597,7 @@ pub async fn enable_alert_internal(
             tenant_id,
         )
         .await?;
+    crate::alerts::promql_alerts::mark_lifecycle_changed(&mut lifecycle);
     let alert = alerts.get_alert_by_id(alert_id, tenant_id).await?;
 
     Ok(alert.to_alert_config().to_response())
@@ -590,7 +613,7 @@ pub async fn modify_alert(
 ) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
-    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
+    let mut lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
     let tenant_id = get_tenant_id_from_request(&req);
     // Get alerts manager reference without holding the global lock
     let alerts = {
@@ -606,8 +629,24 @@ pub async fn modify_alert(
     let alert = alerts.get_alert_by_id(alert_id, &tenant_id).await?;
     user_auth_for_alert_config(&session_key, &alert.to_alert_config()).await?;
 
-    let mut new_config = alert_request.into(tenant_id.clone()).await?;
-    crate::alerts::promql_alerts::capture_identity(&mut new_config, &session_key)?;
+    let old_snapshot = alert.to_alert_config();
+    crate::alerts::sql_builder::enforce_precedence(
+        alert_request.query_type,
+        &alert_request.query,
+        alert_request.builder_config.is_some(),
+        None,
+        old_snapshot.builder_config.is_some(),
+    )?;
+    let previously_bound = old_snapshot
+        .other_fields
+        .as_ref()
+        .is_some_and(|fields| fields.contains_key("executionIdentity"));
+    let mut new_config = alert_request.into(tenant_id.clone(), &session_key).await?;
+    crate::alerts::promql_alerts::capture_identity_for_edit(
+        &mut new_config,
+        &session_key,
+        previously_bound,
+    )?;
     if new_config.get_eval_frequency() == 0 || new_config.notification_config.interval == 0 {
         return Err(AlertError::ValidationFailure(
             "Evaluation and notification intervals must be nonzero".into(),
@@ -642,11 +681,17 @@ pub async fn modify_alert(
     old_config.notification_config = new_config.notification_config;
     old_config.query = new_config.query;
     old_config.query_type = new_config.query_type;
+    old_config.builder_config = new_config.builder_config;
     old_config.severity = new_config.severity;
     old_config.tags = new_config.tags;
     old_config.targets = new_config.targets;
     old_config.title = new_config.title;
-    old_config.other_fields = new_config.other_fields;
+    let mut extras = old_config.other_fields.take().unwrap_or_default();
+    for managed in ["promqlRuntime", "sqlRuntime", "executionIdentity"] {
+        extras.remove(managed);
+    }
+    extras.extend(new_config.other_fields.unwrap_or_default());
+    old_config.other_fields = (!extras.is_empty()).then_some(extras);
 
     let new_alert: Box<dyn AlertTrait> = match &new_config.alert_type {
         AlertType::Threshold => Box::new(ThresholdAlert::from(old_config)) as Box<dyn AlertTrait>,
@@ -665,6 +710,7 @@ pub async fn modify_alert(
         .metastore
         .put_alert(&new_alert.to_alert_config(), &tenant_id)
         .await?;
+    crate::alerts::promql_alerts::mark_lifecycle_changed(&mut lifecycle);
 
     let is_disabled = new_alert.get_state().eq(&AlertState::Disabled);
     // Now perform the atomic operations
@@ -700,22 +746,20 @@ pub async fn evaluate_alert_internal(
     alert_id: Ulid,
     tenant_id: &Option<String>,
 ) -> Result<AlertConfigResponse, AlertError> {
-    let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
-    let guard = ALERTS.write().await;
-    let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
-    } else {
-        return Err(AlertError::CustomError("No AlertManager set".into()));
-    };
+    let mut lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
+    let alerts = crate::alerts::get_alert_manager().await;
 
     let alert = alerts.get_alert_by_id(alert_id, tenant_id).await?;
 
     user_auth_for_alert_config(session_key, &alert.to_alert_config()).await?;
 
+    ensure_evaluation_enabled(*alert.get_state())?;
+
     let config = alert.to_alert_config().to_response();
 
     // remove task
     alerts.delete_task(alert_id).await?;
+    crate::alerts::promql_alerts::mark_lifecycle_changed(&mut lifecycle);
 
     // add the task back again so that it evaluates right now
     alerts.start_task(alert).await?;
@@ -723,18 +767,47 @@ pub async fn evaluate_alert_internal(
     Ok(config)
 }
 
-pub async fn list_tags(req: HttpRequest) -> Result<impl Responder, AlertError> {
-    let tenant_id = get_tenant_id_from_request(&req);
-    Ok(web::Json(list_tags_internal(&tenant_id).await?))
+fn ensure_evaluation_enabled(state: AlertState) -> Result<(), AlertError> {
+    if state == AlertState::Disabled {
+        return Err(AlertError::InvalidStateChange(
+            "Cannot evaluate a disabled alert".into(),
+        ));
+    }
+    Ok(())
 }
 
-/// Shared alert-tag implementation for HTTP handlers and in-process callers.
-pub async fn list_tags_internal(tenant_id: &Option<String>) -> Result<Vec<String>, AlertError> {
-    let guard = ALERTS.read().await;
-    let alerts = if let Some(alerts) = guard.as_ref() {
-        alerts
-    } else {
-        return Err(AlertError::CustomError("No AlertManager set".into()));
-    };
-    Ok(alerts.list_tags(tenant_id).await)
+pub async fn list_tags(req: HttpRequest) -> Result<impl Responder, AlertError> {
+    let session = extract_session_key_from_req(&req)?;
+    Ok(web::Json(list_tags_internal(&session).await?))
+}
+
+/// Tags inherit the same tenant and dataset visibility as the alert list.
+pub async fn list_tags_internal(session: &SessionKey) -> Result<Vec<String>, AlertError> {
+    let alerts = crate::alerts::get_alert_manager().await;
+    let visible = alerts.list_alerts_for_user(session.clone(), vec![]).await?;
+    let mut tags = visible
+        .into_iter()
+        .filter_map(|alert| alert.tags)
+        .flatten()
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+    use actix_web::ResponseError;
+
+    #[test]
+    fn manual_evaluation_rejects_disabled_alerts_with_bad_request() {
+        let error = ensure_evaluation_enabled(AlertState::Disabled).unwrap_err();
+        assert_eq!(
+            error.status_code(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+        assert!(ensure_evaluation_enabled(AlertState::NotTriggered).is_ok());
+        assert!(ensure_evaluation_enabled(AlertState::Triggered).is_ok());
+    }
 }

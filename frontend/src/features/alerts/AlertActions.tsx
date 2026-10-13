@@ -8,7 +8,10 @@ import {
   InlineError,
 } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
-import type { AlertSummary } from '../../lib/types';
+import { builderEditable } from '../../lib/sqlBuilderContract';
+import { useAsync } from '../../hooks/useAsync';
+import { useCallback } from 'react';
+import type { Alert, AlertSummary } from '../../lib/types';
 import { muteState } from './helpers';
 import { useMutation } from '../../hooks/useMutation';
 import { MuteMenu } from './MuteMenu';
@@ -30,6 +33,13 @@ export function AlertActions({
 }) {
   const { client } = useApp();
   const navigate = useNavigate();
+  const about = useAsync(
+    useCallback(
+      (signal) => (detail ? client.about(signal) : Promise.resolve(undefined)),
+      [client, detail],
+    ),
+  );
+  const editable = builderEditable(alert as Alert, about.data?.capabilities.alertBuilder === true);
   const [muting, setMuting] = useState(false),
     [removing, setRemoving] = useState(false),
     [status, setStatus] = useState('');
@@ -99,13 +109,13 @@ export function AlertActions({
     <div className="alerts-action-block">
       {detail ? (
         <div className="alerts-actions">
-          {alert.queryType !== 'builder' && (
+          {(alert.queryType !== 'builder' || detail) && (
             <Button
               size="sm"
               disabled={mutation.pending}
               onClick={() => navigate(`/alerts/${encodeURIComponent(alert.id)}/edit`)}
             >
-              Edit
+              {editable ? 'Edit' : 'Inspect / convert'}
             </Button>
           )}
           {[evaluate, toggle, { ...mute, label: muted ? 'Unmute' : 'Mute' }].map((item) => (
@@ -113,7 +123,7 @@ export function AlertActions({
               {item.label}
             </Button>
           ))}
-          {alert.queryType !== 'builder' && (
+          {(alert.queryType !== 'builder' || detail) && (
             <Button
               size="sm"
               disabled={mutation.pending}
@@ -125,7 +135,7 @@ export function AlertActions({
                 });
               }}
             >
-              Duplicate
+              {editable ? 'Duplicate' : 'Duplicate as SQL'}
             </Button>
           )}
           <Button size="sm" variant="danger" disabled={mutation.pending} onClick={remove.onSelect}>

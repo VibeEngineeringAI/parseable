@@ -112,3 +112,79 @@ test('UI creation with a custom partition, retention set/clear, hot-tier availab
   const remaining: Array<{ name: string }> = await inventory.json();
   expect(remaining.some((dataset) => dataset.name === name)).toBe(false);
 });
+
+test('static schema metadata and ingestion survive custom partition change and removal', async ({
+  page,
+  request,
+}) => {
+  const staticName = `${name}_static`,
+    path = `/api/v1/logstream/${staticName}`;
+  await signIn(page);
+  try {
+    await page.getByRole('button', { name: 'Create dataset', exact: true }).click();
+    const create = page.getByRole('dialog', { name: 'Create dataset', exact: true });
+    await create.getByLabel('Dataset name', { exact: true }).fill(staticName);
+    await create.getByText('Advanced', { exact: true }).click();
+    await create.getByLabel('Static schema', { exact: true }).check();
+    await create
+      .getByLabel('Creation schema JSON', { exact: true })
+      .fill(
+        '{"fields":[{"name":"service","data_type":"string"},{"name":"value","data_type":"int"}]}',
+      );
+    await create.getByLabel('Custom partition', { exact: true }).fill('service');
+    await create.getByLabel('apm', { exact: true }).check();
+    await create.getByLabel('Labels', { exact: true }).fill('live-fixture, static-schema');
+    await create.locator('[data-dialog-confirm]').click();
+    await expect(create).toHaveCount(0);
+    const info = await request.get(`${path}/info`, { headers });
+    expect(info.ok(), await info.text()).toBe(true);
+    const metadata = await info.json();
+    expect(metadata).toMatchObject({
+      staticSchemaFlag: 'true',
+      datasetTags: ['a-p-m'],
+      customPartition: 'service',
+    });
+    expect([...metadata.datasetLabels].sort()).toEqual(['live-fixture', 'static-schema']);
+    const schema = await request.get(`${path}/schema`, { headers });
+    expect(schema.ok(), await schema.text()).toBe(true);
+    expect((await schema.json()).fields).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'value', data_type: 'Int64' })]),
+    );
+    const ingest = await request.post(path, { headers, data: [{ service: 'checkout', value: 7 }] });
+    expect(ingest.ok(), await ingest.text()).toBe(true);
+    await page.getByLabel('Search datasets', { exact: true }).fill('apm');
+    await page.getByRole('button', { name: `Manage ${staticName}`, exact: true }).click();
+    const sheet = page.getByRole('dialog', { name: staticName, exact: true });
+    await expect(
+      sheet
+        .getByRole('region', { name: 'Overview', exact: true })
+        .getByText('apm', { exact: true }),
+    ).toBeVisible();
+    const partitions = sheet.getByRole('region', { name: 'Partitions', exact: true });
+    await partitions.getByLabel('Custom partition field', { exact: true }).fill('value');
+    await partitions.getByRole('button', { name: 'Save custom partition', exact: true }).click();
+    await expect(partitions.locator('p[role=status]')).toHaveText('Custom partition saved.');
+    await partitions.getByRole('button', { name: 'Remove custom partition', exact: true }).click();
+    await expect(partitions.getByLabel('Custom partition field', { exact: true })).toHaveValue('');
+    await expect
+      .poll(async () => {
+        const response = await request.post('/api/v1/query', {
+          headers,
+          data: {
+            query: `SELECT service, value FROM "${staticName}"`,
+            startTime: new Date(Date.now() - 3600000).toISOString(),
+            endTime: new Date(Date.now() + 60000).toISOString(),
+            sendNull: true,
+          },
+        });
+        expect(response.ok(), await response.text()).toBe(true);
+        return await response.json();
+      })
+      .toEqual(
+        expect.arrayContaining([expect.objectContaining({ service: 'checkout', value: 7 })]),
+      );
+  } finally {
+    const response = await request.delete(path, { headers });
+    expect(response.ok() || response.status() === 404, await response.text()).toBe(true);
+  }
+});

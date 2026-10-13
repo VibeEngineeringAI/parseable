@@ -1,4 +1,6 @@
 import { ApiError } from './client';
+import { sqlBuilderConfig, demoCompileSqlBuilder, sqlFieldType } from './sqlBuilderContract';
+import type { SqlBuilderV1 } from './sqlBuilderContract';
 import { createId } from './ids';
 import {
   alertDraft,
@@ -20,6 +22,7 @@ import type {
 } from './types';
 
 type Methods =
+  | 'previewAlert'
   | 'listAlerts'
   | 'getAlert'
   | 'createAlert'
@@ -40,7 +43,11 @@ const fail = (message: string, status = 400): never => {
   throw new ApiError(message, status);
 };
 
-export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Methods> {
+export function createDemoAlerts(
+  now = Date.now(),
+  datasets?: Pick<ParseableClient, 'datasetSchema' | 'listDatasets'>,
+  records: import('./types').LogRecord[] = [],
+): Pick<ParseableClient, Methods> {
   const created = new Date(now - 86400_000).toISOString();
   const target1 = '01M4H000000000000000000001',
     target2 = '01M4H000000000000000000002';
@@ -90,6 +97,9 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
       hold: '5m',
     }),
     queryType,
+    ...(queryType !== 'promql'
+      ? { executionMode: 'server' as const }
+      : { executionMode: 'owner' as const, executionOwner: 'Demo user' }),
     version: 'v2',
     id,
     created,
@@ -148,6 +158,73 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
     await Promise.resolve();
     signal?.throwIfAborted();
   }
+  async function normalize(
+    body: AlertRequest,
+    previous?: Alert,
+    preview = false,
+  ): Promise<AlertRequest> {
+    const normalized = clone(body);
+    for (const key of [
+      'executionOwner',
+      'executionMode',
+      'executionIdentity',
+      'builderStatus',
+      'sqlRuntime',
+    ])
+      delete normalized[key];
+    if (body.builderConfig != null) {
+      if (body.queryType === 'code') fail('Omit builderConfig to convert to SQL.', 409);
+      if (body.queryType !== 'builder' || !sqlBuilderConfig(body.builderConfig))
+        fail('Unsupported or invalid builderConfig');
+      const spec = clone(body.builderConfig as SqlBuilderV1);
+      if (datasets) {
+        if (!(await datasets.listDatasets()).some((item) => item.name === spec.dataset))
+          fail('Invalid alert dataset');
+        const schema = await datasets.datasetSchema(spec.dataset);
+        const getField = (name: string) =>
+          schema.fields.find((field) => field.name === name) ??
+          fail(`Unknown builder column: ${name}`);
+        if (spec.aggregate.column) {
+          const field = getField(spec.aggregate.column);
+          if (
+            spec.aggregate.function !== 'count' &&
+            !['int', 'float'].includes(sqlFieldType(field) ?? '')
+          )
+            fail('Aggregate requires a numeric column');
+        }
+        for (const name of spec.groupBy ?? [])
+          if (!['int', 'string', 'boolean'].includes(sqlFieldType(getField(name)) ?? ''))
+            fail('Unsupported groupBy type');
+        const normalizeGroup = (group: import('./types').LogContextConditions) => {
+          for (const condition of group.conditionConfig ?? []) {
+            const type = sqlFieldType(getField(condition.column));
+            if (!type) fail('Unsupported filter field type');
+            condition.type = type;
+          }
+          for (const child of group.groups ?? []) normalizeGroup(child);
+        };
+        if (spec.filters) normalizeGroup(spec.filters);
+      }
+      if (!sqlBuilderConfig(spec)) fail('Invalid builder filter literal');
+      const query = demoCompileSqlBuilder(spec);
+      if (body.query.trim() && body.query.trim() !== query)
+        fail(
+          'BuilderConflict: query does not match builderConfig; convert to SQL to edit the query directly.',
+          409,
+        );
+      normalized.query = query;
+      normalized.builderConfig = spec;
+      normalized.datasets = [spec.dataset];
+    } else if (previous?.builderConfig && body.queryType === 'builder')
+      fail(
+        'BuilderConflict: a stored specification cannot be omitted without converting to SQL.',
+        409,
+      );
+    const errors = validateAlert(alertDraft(normalized), true);
+    if (preview) delete errors.title;
+    if (Object.keys(errors).length) fail(Object.values(errors)[0]!);
+    return normalized;
+  }
   function validate(body: AlertRequest) {
     const errors = validateAlert(alertDraft(body), true);
     if (Object.keys(errors).length) fail(Object.values(errors)[0]!);
@@ -159,12 +236,13 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
     body.targets.forEach(getTarget);
     if (
       !body.datasets.length ||
-      body.datasets.some(
-        (dataset) =>
-          !['demo_metrics', 'application_logs', 'api_logs', 'infrastructure_logs'].includes(
-            dataset,
-          ),
-      )
+      (!body.builderConfig &&
+        body.datasets.some(
+          (dataset) =>
+            !['demo_metrics', 'application_logs', 'api_logs', 'infrastructure_logs'].includes(
+              dataset,
+            ),
+        ))
     )
       fail('Invalid alert dataset');
     if (
@@ -179,6 +257,109 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
       if ((sql.match(/\bselect\b/gi) ?? []).length > 1) fail('Subquery not allowed');
     }
   }
+
+  function previewBuilder(spec: SqlBuilderV1, body: AlertRequest) {
+    const testCondition = (
+      item: NonNullable<import('./types').LogContextConditions['conditionConfig']>[number],
+      row: import('./types').LogRecord,
+    ): boolean => {
+      const value = row[item.column],
+        target = item.value ?? '',
+        op = item.operator;
+      if (op === 'is null') return value == null;
+      if (op === 'is not null') return value != null;
+      if (value == null) return false;
+      const comparison =
+        item.type === 'int' || item.type === 'float'
+          ? Number(target)
+          : item.type === 'boolean'
+            ? target === 'true'
+            : target;
+      if (op === '=') return value === comparison;
+      if (op === '!=') return value !== comparison;
+      const left = typeof comparison === 'number' ? Number(value) : String(value),
+        right = typeof comparison === 'number' ? comparison : String(comparison);
+      if (op === '<') return left < right;
+      if (op === '>') return left > right;
+      if (op === '<=') return left <= right;
+      if (op === '>=') return left >= right;
+      const text = String(value).toLowerCase(),
+        needle = target.toLowerCase();
+      let matched = op.includes('begin')
+        ? text.startsWith(needle)
+        : op.includes('end')
+          ? text.endsWith(needle)
+          : op === 'ilike'
+            ? text.includes(needle.replaceAll('%', ''))
+            : text.includes(needle);
+      if (Array.isArray(value)) matched = value.includes(target);
+      return op.startsWith('does not') ? !matched : matched;
+    };
+    const matchGroup = (
+      group: import('./types').LogContextConditions,
+      row: import('./types').LogRecord,
+    ): boolean => {
+      const results = [
+        ...(group.conditionConfig ?? []).map((condition) => testCondition(condition, row)),
+        ...(group.groups ?? []).map((child) => matchGroup(child, row)),
+      ];
+      return (
+        !results.length ||
+        (group.operator === 'or' ? results.some(Boolean) : results.every(Boolean))
+      );
+    };
+    const source = ['application_logs', 'api_logs', 'infrastructure_logs'].includes(spec.dataset)
+      ? records
+      : [];
+    const eligible = source.filter((row) => !spec.filters || matchGroup(spec.filters, row));
+    const grouped = new Map<
+      string,
+      { labels: Record<string, string>; rows: import('./types').LogRecord[] }
+    >();
+    if (!spec.groupBy?.length) grouped.set('{}', { labels: {}, rows: [] });
+    for (const row of eligible) {
+      const labels = Object.fromEntries(
+          (spec.groupBy ?? []).map((name) => [name, String(row[name] ?? 'null')]),
+        ),
+        key = JSON.stringify(labels);
+      const entry = grouped.get(key) ?? { labels, rows: [] };
+      entry.rows.push(row);
+      grouped.set(key, entry);
+    }
+    return [...grouped.values()].map(({ labels, rows }) => {
+      const values = rows
+          .map((row) => (spec.aggregate.column ? row[spec.aggregate.column] : 1))
+          .filter((value) => value != null),
+        numbers = values.filter((value): value is number => typeof value === 'number');
+      let value = 0;
+      switch (spec.aggregate.function) {
+        case 'count':
+          value = values.length;
+          break;
+        case 'sum':
+          value = numbers.reduce((sum, x) => sum + x, 0);
+          break;
+        case 'avg':
+          value = numbers.length ? numbers.reduce((sum, x) => sum + x, 0) / numbers.length : 0;
+          break;
+        case 'min':
+          value = numbers.length ? Math.min(...numbers) : 0;
+          break;
+        case 'max':
+          value = numbers.length ? Math.max(...numbers) : 0;
+      }
+      return {
+        labels,
+        value,
+        breached: !!compareThreshold(
+          value,
+          body.thresholdConfig.operator,
+          body.thresholdConfig.value,
+        ),
+      };
+    });
+  }
+
   function mask(body: AlertTargetRequest, id: string): AlertTarget {
     const endpoint = `${new URL(body.endpoint).protocol}//********`;
     if (body.type === 'slack') return { id, name: body.name, type: 'slack', endpoint };
@@ -224,6 +405,48 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
       fail('Private target is not allowed by outbound policy');
   }
   return {
+    async previewAlert(body, signal) {
+      await ready(signal);
+      body = await normalize(body, undefined, true);
+      if (body.queryType === 'promql') fail('SQL preview only');
+      const groups = body.builderConfig
+        ? previewBuilder(body.builderConfig as SqlBuilderV1, body)
+        : [
+            {
+              labels: {},
+              value: 8,
+              breached: !!compareThreshold(
+                8,
+                body.thresholdConfig.operator,
+                body.thresholdConfig.value,
+              ),
+            },
+          ];
+      const breachedGroups = groups.filter((group) => group.breached).length;
+      signal?.throwIfAborted();
+      return {
+        queryType: body.queryType as 'builder' | 'code',
+        compiledQuery: body.query,
+        builderConfig: body.builderConfig,
+        datasets: body.datasets,
+        measure: 'alert_value',
+        dimensions: (body.builderConfig as SqlBuilderV1 | undefined)?.groupBy ?? [],
+        window: {
+          start: new Date(
+            now - (alertDuration(body.evalConfig.rollingWindow.evalStart) ?? 600) * 1000,
+          ).toISOString(),
+          end: new Date(now).toISOString(),
+        },
+        threshold: body.thresholdConfig,
+        simple: !(body.builderConfig as SqlBuilderV1 | undefined)?.groupBy?.length,
+        noData: groups.length === 0,
+        wouldTrigger: breachedGroups > 0,
+        groups: groups.sort((a, b) => Number(b.breached) - Number(a.breached)).slice(0, 200),
+        totalGroups: groups.length,
+        breachedGroups,
+        truncated: groups.length > 200,
+      };
+    },
     async listAlerts(signal) {
       await ready(signal);
       return clone(
@@ -249,9 +472,19 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
     },
     async createAlert(body) {
       await ready();
+      body = await normalize(body);
       validate(body);
       const value: Alert = {
         ...clone(body),
+        ...(body.builderConfig
+          ? {
+              builderStatus: 'editable' as const,
+              executionMode: 'owner' as const,
+              executionOwner: 'Demo user',
+            }
+          : body.queryType !== 'promql'
+            ? { executionMode: 'server' as const }
+            : { executionMode: 'owner' as const, executionOwner: 'Demo user' }),
         version: 'v2',
         id: createId(),
         state: 'not-triggered',
@@ -265,9 +498,22 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
     async updateAlert(id, body) {
       await ready();
       const previous = get(id);
+      body = await normalize(body, previous);
       validate(body);
       const value: Alert = {
         ...clone(body),
+        ...(body.builderConfig ? { builderStatus: 'editable' as const } : {}),
+        ...(body.queryType !== 'promql'
+          ? {
+              executionMode:
+                body.builderConfig || previous.executionMode === 'owner'
+                  ? ('owner' as const)
+                  : ('server' as const),
+            }
+          : {}),
+        ...(body.queryType === 'promql' || body.builderConfig || previous.executionMode === 'owner'
+          ? { executionMode: 'owner' as const, executionOwner: 'Demo user' }
+          : {}),
         version: previous.version,
         id,
         state: previous.state,
@@ -324,13 +570,15 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
           deliveries: [],
         };
       else {
-        value.state = compareThreshold(
-          8,
-          value.thresholdConfig.operator,
-          value.thresholdConfig.value,
-        )
-          ? 'triggered'
-          : 'not-triggered';
+        value.sqlRuntime = { health: 'ok', error: null, lastEvaluatedAt: new Date().toISOString() };
+        value.state =
+          value.builderConfig && sqlBuilderConfig(value.builderConfig)
+            ? previewBuilder(value.builderConfig, value).some((group) => group.breached)
+              ? 'triggered'
+              : 'not-triggered'
+            : compareThreshold(8, value.thresholdConfig.operator, value.thresholdConfig.value)
+              ? 'triggered'
+              : 'not-triggered';
       }
       return clone(value);
     },

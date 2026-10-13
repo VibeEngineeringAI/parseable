@@ -350,11 +350,12 @@ impl Server {
                     .route(web::post().to(alerts::post).authorize(Action::PutAlert)),
             )
             .service(
-                web::resource("/list_tags").route(
-                    web::get()
-                        .to(alerts::list_tags)
-                        .authorize(Action::ListDashboard),
-                ),
+                web::resource("/list_tags")
+                    .route(web::get().to(alerts::list_tags).authorize(Action::GetAlert)),
+            )
+            .service(
+                web::resource("/preview")
+                    .route(web::post().to(alerts::preview).authorize(Action::PutAlert)),
             )
             .service(
                 web::resource("/{alert_id}")

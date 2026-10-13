@@ -71,9 +71,91 @@ pub async fn evaluate_alert(alert: &dyn AlertTrait) -> Result<(), AlertError> {
     if alert.get_query_type() == super::AlertQueryType::Promql {
         return super::promql_alerts::evaluate(*alert.get_id(), alert.get_tenant_id()).await;
     }
-    let message = alert.eval_alert().await?;
+    // Snapshot a generation before executing without locks. CRUD uses the same
+    // lifecycle, so stale queries cannot restore an edited or disabled rule.
+    let lifecycle = super::promql_alerts::lifecycle(*alert.get_id());
+    let manager = super::get_alert_manager().await;
+    let (current, generation) = {
+        let guard = lifecycle.lock().await;
+        let current = manager
+            .get_alert_by_id(*alert.get_id(), alert.get_tenant_id())
+            .await?;
+        if current.get_state() == &AlertState::Disabled {
+            return Ok(());
+        }
+        (current, *guard)
+    };
+    // AlertError can wrap an Actix ResponseError, which is not Send. Keep only
+    // its sanitized diagnostic while crossing scheduler await points.
+    let result = current
+        .eval_alert()
+        .await
+        .map_err(|error| super::target::safe_runtime_error(&error.to_string()));
+    let mut guard = lifecycle.lock().await;
+    let latest = manager
+        .get_alert_by_id(*current.get_id(), current.get_tenant_id())
+        .await
+        .map_err(|error| super::target::safe_runtime_error(&error.to_string()));
+    if !sql_result_is_current(
+        *guard,
+        generation,
+        latest.as_ref().ok().map(|rule| *rule.get_state()),
+    ) {
+        return Ok(());
+    }
+    *guard += 1;
+    let mut config = latest.map_err(AlertError::CustomError)?.to_alert_config();
+    let runtime = serde_json::json!({
+        "health": if result.is_ok() { "ok" } else { "error" },
+        "error": result.as_ref().err(),
+        "lastEvaluatedAt": chrono::Utc::now(),
+    });
+    let previous = config
+        .other_fields
+        .as_ref()
+        .and_then(|fields| fields.get("sqlRuntime"));
+    let persist_error = sql_error_needs_persistence(previous, &runtime, result.is_err());
+    config
+        .other_fields
+        .get_or_insert_with(Default::default)
+        .insert("sqlRuntime".into(), runtime);
+    // Successful evaluations include runtime in the existing state write below.
+    // Identical failures refresh their timestamp in memory; only a health/error
+    // change writes storage. A restart retains the last persisted error observation.
+    if persist_error {
+        PARSEABLE
+            .metastore
+            .put_alert(&config, &config.tenant_id)
+            .await?;
+    }
+    manager
+        .update(&super::alert_types::ThresholdAlert::from(config))
+        .await;
+    let message = result.map_err(AlertError::CustomError)?;
+    update_alert_state(&*current, message).await
+}
 
-    update_alert_state(alert, message).await
+fn sql_error_needs_persistence(
+    previous: Option<&serde_json::Value>,
+    runtime: &serde_json::Value,
+    failed: bool,
+) -> bool {
+    failed
+        && previous.is_none_or(|previous| {
+            previous.get("health") != runtime.get("health")
+                || previous.get("error") != runtime.get("error")
+        })
+}
+
+fn sql_result_is_current(generation: u64, observed: u64, state: Option<AlertState>) -> bool {
+    generation == observed && state.is_some_and(|state| state != AlertState::Disabled)
+}
+
+/// SQL failures retain a scheduler with a capped exponential recovery delay.
+pub(crate) fn sql_retry_delay(failures: u32) -> u64 {
+    1u64.checked_shl(failures.saturating_sub(1).min(5))
+        .unwrap_or(30)
+        .min(30)
 }
 
 /// Extract time range from alert evaluation configuration
@@ -84,6 +166,65 @@ pub fn extract_time_range(eval_config: &super::EvalConfig) -> Result<TimeRange, 
 
     TimeRange::parse_human_time(start_time, end_time)
         .map_err(|err| AlertError::CustomError(err.to_string()))
+}
+
+/// Query execution credentials for both saved SQL rules and their read-only preview.
+pub(crate) fn alert_execution_headers(
+    tenant_id: &Option<String>,
+) -> Result<Option<HeaderMap>, AlertError> {
+    use crate::handlers::http::middleware::{CLUSTER_SECRET, CLUSTER_SECRET_HEADER};
+    use actix_web::http::header::{HeaderName, HeaderValue};
+    let tenant = tenant_id
+        .as_deref()
+        .unwrap_or(crate::parseable::DEFAULT_TENANT);
+    let Some((_, hash)) = CLUSTER_SECRET.get() else {
+        return Ok(None);
+    };
+    let mut headers = HeaderMap::new();
+    let header_value = |value: &str| {
+        HeaderValue::from_str(value).map_err(|_| {
+            AlertError::ValidationFailure("Invalid internal alert execution credential".into())
+        })
+    };
+    if let Some(header) = TENANT_METADATA.get_global_query_auth(tenant) {
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            header_value(&header)?,
+        );
+    }
+    headers.insert(
+        HeaderName::from_static(CLUSTER_SECRET_HEADER),
+        header_value(hash)?,
+    );
+    headers.insert(
+        HeaderName::from_static("intra-cluster-tenant"),
+        header_value(tenant)?,
+    );
+    Ok(Some(headers))
+}
+
+/// The shared threshold semantics for execution and preview, including the
+/// historical zero value for a simple query that returns no rows.
+pub fn evaluate_query_result(
+    result: &AlertQueryResult,
+    threshold: &super::ThresholdConfig,
+) -> Vec<(GroupResult, bool)> {
+    let groups = if result.is_simple_query {
+        vec![result.groups.first().cloned().unwrap_or(GroupResult {
+            group_values: HashMap::new(),
+            aggregate_value: 0.0,
+        })]
+    } else {
+        result.groups.clone()
+    };
+    groups
+        .into_iter()
+        .map(|group| {
+            let breached =
+                evaluate_condition(&threshold.operator, group.aggregate_value, threshold.value);
+            (group, breached)
+        })
+        .collect()
 }
 
 /// Execute the alert query based on the current mode and return structured group results
@@ -531,7 +672,10 @@ fn sanitize_array_elements(value: &str) -> Result<String, String> {
             }
 
             // Numeric literal — pass through as-is
-            if elem.parse::<f64>().is_ok() {
+            if let Ok(number) = elem.parse::<f64>() {
+                if !number.is_finite() {
+                    return Err("Array numeric literal must be finite".into());
+                }
                 return Ok(elem.to_string());
             }
 
@@ -621,10 +765,20 @@ fn scalar_condition_expr(
                     .parse::<bool>()
                     .map_err(|_| format!("Invalid boolean literal: {value}"))?
                     .to_string(),
-                Some("int") | Some("float") | Some("number") => value
-                    .parse::<f64>()
-                    .map_err(|_| format!("Invalid numeric literal: {value}"))?
-                    .to_string(),
+                Some("int") => value
+                    .parse::<i64>()
+                    .map(|value| value.to_string())
+                    .or_else(|_| value.parse::<u64>().map(|value| value.to_string()))
+                    .map_err(|_| format!("Invalid integer literal: {value}"))?,
+                Some("float") | Some("number") => {
+                    let number = value
+                        .parse::<f64>()
+                        .map_err(|_| format!("Invalid numeric literal: {value}"))?;
+                    if !number.is_finite() {
+                        return Err("Numeric literal must be finite".into());
+                    }
+                    number.to_string()
+                }
                 Some(_) => format!("'{}'", value.replace("'", "''")),
                 None => match ValueType::from_string(value.to_owned()) {
                     ValueType::Number(val) => format!("{val}"),
@@ -638,7 +792,7 @@ fn scalar_condition_expr(
     Ok(format!("{column} {operator_and_value}"))
 }
 
-fn quote_identifier(value: &str) -> String {
+pub(crate) fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
@@ -850,6 +1004,88 @@ mod tests {
     // -------------------------------------------------------------------------
     // sanitize_array_elements — happy-path cases
     // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rejected_mutation_serializes_with_query_apply_without_invalidating_result() {
+        use super::super::promql_alerts::{forget_lifecycle, lifecycle, lock_lifecycle};
+        let id = ulid::Ulid::new();
+        let shared = lifecycle(id);
+        let observed = *shared.lock().await;
+        // The edit is still validating and holds the same guard used by apply.
+        let rejected_edit = lock_lifecycle(id).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut completion = tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            let generation = shared.lock().await;
+            sql_result_is_current(*generation, observed, Some(AlertState::NotTriggered))
+        });
+        ready_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut completion)
+                .await
+                .is_err()
+        );
+        // Authorization/validation rejects the edit: no successful mutation.
+        drop(rejected_edit);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(*lock_lifecycle(id).await, observed);
+        forget_lifecycle(id);
+    }
+
+    #[test]
+    fn sql_runtime_uses_state_write_for_success_and_persists_only_changed_errors() {
+        let success = serde_json::json!({"health":"ok","error":null,"lastEvaluatedAt":"now"});
+        let error =
+            serde_json::json!({"health":"error","error":"denied","lastEvaluatedAt":"earlier"});
+        assert!(!sql_error_needs_persistence(None, &success, false));
+        assert!(!sql_error_needs_persistence(Some(&error), &success, false));
+        assert!(sql_error_needs_persistence(None, &error, true));
+        assert!(sql_error_needs_persistence(Some(&success), &error, true));
+        let later = serde_json::json!({"health":"error","error":"denied","lastEvaluatedAt":"now"});
+        assert!(!sql_error_needs_persistence(Some(&error), &later, true));
+        let changed =
+            serde_json::json!({"health":"error","error":"different error","lastEvaluatedAt":"now"});
+        assert!(sql_error_needs_persistence(Some(&error), &changed, true));
+    }
+
+    #[test]
+    fn sql_recovery_backoff_is_bounded_and_does_not_exhaust() {
+        assert_eq!(
+            (1..=7).map(sql_retry_delay).collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16, 30, 30]
+        );
+        assert_eq!(sql_retry_delay(u32::MAX), 30);
+    }
+
+    #[tokio::test]
+    async fn sql_in_flight_result_is_discarded_after_disable_edit_or_deletion() {
+        use super::super::promql_alerts::{
+            forget_lifecycle, lifecycle, lock_lifecycle, mark_lifecycle_changed,
+        };
+        for final_state in [
+            Some(AlertState::Disabled),
+            Some(AlertState::NotTriggered),
+            None,
+        ] {
+            let id = ulid::Ulid::new();
+            let lifecycle = lifecycle(id);
+            let observed = *lifecycle.lock().await;
+            // Represents the mutation completing while the query has released its lock.
+            let mut changed = lock_lifecycle(id).await;
+            mark_lifecycle_changed(&mut changed);
+            assert!(!sql_result_is_current(*changed, observed, final_state));
+            drop(changed);
+            forget_lifecycle(id);
+        }
+        assert!(!sql_result_is_current(0, 0, Some(AlertState::Disabled)));
+        assert!(!sql_result_is_current(0, 0, None));
+        assert!(sql_result_is_current(0, 0, Some(AlertState::Triggered)));
+    }
 
     #[test]
     fn test_sanitize_numeric_elements() {

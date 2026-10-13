@@ -44,6 +44,8 @@ pub mod alert_types;
 pub mod alerts_utils;
 pub mod outbound_http_policy;
 pub mod promql_alerts;
+pub mod sql_builder;
+pub mod sql_preview;
 pub mod target;
 
 pub use crate::alerts::alert_enums::{
@@ -222,6 +224,7 @@ impl AlertConfig {
             title: basic_fields.title,
             query,
             query_type: AlertQueryType::Builder,
+            builder_config: None,
             datasets,
             alert_type: AlertType::Threshold,
             threshold_config,
@@ -828,10 +831,10 @@ impl AlertConfig {
             serde_json::to_value(self.query_type).unwrap_or_default(),
         );
 
-        if let Some(other_fields) = &self.other_fields {
-            for (key, value) in other_fields {
-                map.insert(key.clone(), value.clone());
-            }
+        if let Some(other_fields) =
+            alert_structs::response_other_fields(self.other_fields.clone(), true)
+        {
+            map.extend(other_fields);
         }
 
         map
@@ -1207,6 +1210,12 @@ pub enum AlertError {
     CustomError(String),
     #[error("Invalid State Change: {0}")]
     InvalidStateChange(String),
+    #[error("Builder conflict: {0}")]
+    BuilderConflict(String),
+    #[error("Alert preview is busy; retry shortly")]
+    PreviewBusy,
+    #[error("Alert preview exceeded 30 seconds")]
+    PreviewTimeout,
     #[error("{0}")]
     StreamNotFound(#[from] StreamNotFound),
     #[error("{0}")]
@@ -1250,6 +1259,9 @@ impl actix_web::ResponseError for AlertError {
             Self::DatafusionError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CustomError(_) => StatusCode::BAD_REQUEST,
             Self::InvalidStateChange(_) => StatusCode::BAD_REQUEST,
+            Self::BuilderConflict(_) => StatusCode::CONFLICT,
+            Self::PreviewBusy => StatusCode::TOO_MANY_REQUESTS,
+            Self::PreviewTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::StreamNotFound(_) => StatusCode::NOT_FOUND,
             Self::Anyhow(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidAlertModifyRequest => StatusCode::BAD_REQUEST,
@@ -1807,6 +1819,115 @@ fn get_severity_priority(severity: &Severity) -> u8 {
 mod tests {
     use super::alert_tenant_from_storage_key;
     use crate::parseable::DEFAULT_TENANT;
+
+    fn runtime_fixture() -> super::AlertConfig {
+        serde_json::from_value(serde_json::json!({
+            "version":"v2","id":ulid::Ulid::new(),"severity":"high","title":"Load",
+            "queryType":"code","query":"SELECT COUNT(*) FROM logs","datasets":["logs"],"alertType":"threshold",
+            "thresholdConfig":{"operator":">","value":8.0},
+            "evalConfig":{"rollingWindow":{"evalStart":"5m","evalEnd":"now","evalFrequency":10}},
+            "targets":[],"notificationState":"notify","notificationConfig":{"interval":2},
+            "created":chrono::Utc::now(),
+            "executionIdentity":{"userId":"private-user-id","tenantId":"workspace"},
+            "promqlRuntime":{"health":"ok","deliveries":[{"error":"request failed https://user:password@host/secret-token?apiKey=hidden"}]},
+            "sqlRuntime":{"health":"error","error":"source https://host/secret-token failed"},
+            "customField":{"retain":"me"}
+        })).unwrap()
+    }
+
+    #[test]
+    fn builder_spec_roundtrip_and_unknown_versions_remain_inspectable() {
+        use super::alert_traits::AlertTrait;
+        let mut config = runtime_fixture();
+        config.query_type = super::AlertQueryType::Builder;
+        config.builder_config = Some(
+            serde_json::json!({"kind":"sql","version":1,"dataset":"logs","aggregate":{"function":"count"},"groupBy":[]}),
+        );
+        config.query = r#"SELECT COUNT(*) AS "alert_value" FROM "logs""#.into();
+        // Server and trait conversions retain the exact raw representation.
+        let trait_alert = super::ThresholdAlert::from(config.clone());
+        let roundtrip: super::AlertConfig =
+            serde_json::from_slice(&serde_json::to_vec(&trait_alert.to_alert_config()).unwrap())
+                .unwrap();
+        assert_eq!(roundtrip.builder_config, config.builder_config);
+        assert_eq!(
+            roundtrip.clone().to_response().builder_status.as_deref(),
+            Some("editable")
+        );
+        let mut unknown = roundtrip;
+        unknown.builder_config.as_mut().unwrap()["version"] = serde_json::json!(999);
+        let loaded: super::AlertConfig =
+            serde_json::from_value(serde_json::to_value(&unknown).unwrap()).unwrap();
+        let response = loaded.clone().to_response();
+        assert_eq!(response.builder_status.as_deref(), Some("unsupported"));
+        assert_eq!(response.builder_config, unknown.builder_config);
+        assert!(loaded.to_summary().get("builderStatus").is_none());
+        assert!(loaded.to_summary().get("executionMode").is_none());
+        let mut converted = loaded;
+        converted.builder_config = None;
+        converted.query_type = super::AlertQueryType::Code;
+        assert_eq!(
+            converted.to_response().execution_mode.as_deref(),
+            Some("owner")
+        );
+        let mut legacy = runtime_fixture();
+        legacy
+            .other_fields
+            .as_mut()
+            .unwrap()
+            .remove("executionIdentity");
+        assert_eq!(
+            legacy.to_response().execution_mode.as_deref(),
+            Some("server")
+        );
+    }
+
+    #[test]
+    fn list_and_detail_redact_historic_runtime_errors_and_internal_identity() {
+        let config = runtime_fixture();
+        let summary = config.to_summary();
+        assert!(summary["promqlRuntime"].get("deliveries").is_none());
+        assert_eq!(summary["customField"]["retain"], "me");
+        for output in [
+            serde_json::to_string(&summary).unwrap(),
+            serde_json::to_string(&config.clone().to_response()).unwrap(),
+        ] {
+            for secret in [
+                "private-user-id",
+                "password",
+                "secret-token",
+                "apiKey",
+                "https://",
+            ] {
+                assert!(!output.contains(secret), "leaked {secret}");
+            }
+        }
+        // Serialization for storage retains the identity used by authorization.
+        assert!(
+            serde_json::to_string(&config)
+                .unwrap()
+                .contains("private-user-id")
+        );
+    }
+
+    #[test]
+    fn sql_notification_repeats_are_derived_after_persistence_reload() {
+        use super::alert_traits::AlertTrait;
+        let alert = super::ThresholdAlert::from(runtime_fixture());
+        assert_eq!(
+            alert.notification_config.times,
+            super::target::Retry::Finite(5)
+        );
+        let persisted = serde_json::to_vec(&alert.to_alert_config()).unwrap();
+        let restored = super::ThresholdAlert::from(
+            serde_json::from_slice::<super::AlertConfig>(&persisted).unwrap(),
+        );
+        assert_eq!(
+            restored.notification_config.times,
+            super::target::Retry::Finite(5)
+        );
+        assert_eq!(restored.notification_config.interval, 2);
+    }
 
     #[test]
     fn alert_errors_preserve_authorization_status() {

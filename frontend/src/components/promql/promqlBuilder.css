@@ -1,0 +1,28 @@
+.promql-builder {
+  display: grid;
+  gap: 10px;
+}
+.promql-builder fieldset {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+.promql-builder legend {
+  font-size: 12px;
+}
+.promql-builder-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.promql-builder-row input {
+  flex: 1;
+  min-width: 100px;
+}
+.promql-builder p {
+  margin: 0;
+  font-size: 12px;
+}

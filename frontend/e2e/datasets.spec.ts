@@ -191,6 +191,8 @@ test('keyboard creation and cancellation restore focus', async ({ page }) => {
   await page.keyboard.press('Tab');
   await page.keyboard.press('Space');
   await page.keyboard.press('Tab');
+  await expect(dialog.getByLabel('agent-observability', { exact: true })).toBeFocused();
+  for (let index = 0; index < 7; index++) await page.keyboard.press('Tab');
   await expect(dialog.getByLabel('Custom partition', { exact: true })).toBeFocused();
   await page.keyboard.type('service');
   await page.keyboard.press('Tab');
@@ -299,7 +301,7 @@ test('server 403 errors explain each action inline without blocking other sectio
   const confirm = page.getByRole('dialog', { name: 'Delete dataset', exact: true });
   await confirm.getByLabel('Confirmation name', { exact: true }).fill('web_logs');
   await confirm.locator('[data-dialog-confirm]').click();
-  await expect(confirm.getByRole('alert')).toContainText(
+  await expect(confirm.getByRole('alert').filter({ hasText: 'delete this dataset' })).toContainText(
     "You don't have permission to delete this dataset.",
   );
   await page.keyboard.press('Escape');

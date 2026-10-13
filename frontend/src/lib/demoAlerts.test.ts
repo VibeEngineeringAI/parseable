@@ -147,3 +147,61 @@ describe('demo alerts', () => {
     expect(empty).toEqual([{ 'count(*)': 0 }]);
   });
 });
+
+it('preview compiles typed builder specs without mutating saved rules, and evaluation agrees', async () => {
+  const client = createDemoClient();
+  const before = await Promise.all(
+    (await client.listAlerts()).map((row) => client.getAlert(row.id)),
+  );
+  const request = {
+    ...alertRequest,
+    title: 'Count fixture',
+    queryType: 'builder' as const,
+    query: '',
+    datasets: ['application_logs'],
+    builderConfig: {
+      kind: 'sql',
+      version: 1,
+      dataset: 'application_logs',
+      aggregate: { function: 'count' },
+      groupBy: ['service'],
+    },
+    thresholdConfig: { operator: '>' as const, value: 5 },
+    targets: [],
+  };
+  const preview = await client.previewAlert(request);
+  expect(preview.compiledQuery).toContain('COUNT(*) AS "alert_value"');
+  expect(preview.groups.length).toBeGreaterThan(0);
+  expect(
+    await Promise.all((await client.listAlerts()).map((row) => client.getAlert(row.id))),
+  ).toEqual(before);
+  const saved = await client.createAlert(request);
+  expect(saved.builderStatus).toBe('editable');
+  expect(saved.executionMode).toBe('owner');
+  const evaluated = await client.evaluateAlert(saved.id);
+  expect(evaluated.state).toBe(preview.wouldTrigger ? 'triggered' : 'not-triggered');
+  const code = await client.updateAlert(
+    saved.id,
+    buildAlertPayload({ ...alertDraft(saved), type: 'code', builderConfig: undefined }, saved),
+  );
+  expect(code).not.toHaveProperty('builderConfig');
+  expect(code.executionMode).toBe('owner');
+  const legacy = before.find((row) => row.queryType === 'builder')!;
+  const converted = await client.updateAlert(
+    legacy.id,
+    buildAlertPayload({ ...alertDraft(legacy), type: 'code' }, legacy),
+  );
+  expect(converted.executionMode).toBe('server');
+});
+
+it('demo exposes safe owner display without an execution identity', async () => {
+  const client = createDemoClient(),
+    original = await client.getAlert('01M4H000000000000000000010');
+  expect(original.executionOwner).toBe('Demo user');
+  expect(original).not.toHaveProperty('executionIdentity');
+  const saved = await client.updateAlert(
+    original.id,
+    buildAlertPayload(alertDraft(original), original),
+  );
+  expect(saved.executionOwner).toBe('Demo user');
+});

@@ -250,7 +250,7 @@ test('the label browser inserts selectors predictably into the active query', as
   await expect(panel).toBeVisible();
 });
 
-test('removing a query relabels applied results to match the panel', async ({ page }) => {
+test('removing a query preserves remaining identity and alias', async ({ page }) => {
   const running = page.getByRole('status').filter({ hasText: 'Running queries…' });
   await mockLive(page, {
     promql: (route, call) =>
@@ -271,11 +271,11 @@ test('removing a query relabels applied results to match the panel', async ({ pa
   await expect(legend(page)).toContainText('A:');
   await page.getByRole('button', { name: 'Remove query A' }).click();
   await expect(page.getByRole('textbox', { name: /PromQL query/ })).toHaveCount(1);
-  await expect(editor(page, 'A')).toHaveText('failing_b');
-  // Results follow the panel: the failing query is now A, and no stale B or series remain.
+  await expect(editor(page, 'B')).toHaveText('failing_b');
+  // The failing row retains its alias; the removed row's series disappear.
   await expect(alerts).toHaveCount(1);
-  await expect(alerts).toContainText('A ·');
-  await expect(alerts).not.toContainText('B ·');
+  await expect(alerts).toContainText('B ·');
+  await expect(alerts).not.toContainText('A ·');
   await expect(legend(page)).toHaveCount(0);
   await expect(running).toHaveCount(0);
 });
@@ -328,10 +328,13 @@ test('the first run shows a loading state instead of "No data" until requests se
   await expect(running).toHaveCount(0);
 });
 
-test('successful queries enter per-dataset history and selecting one does not run', async ({
+test('successful queries enter scoped per-dataset history and selecting one does not run', async ({
   page,
 }) => {
   const calls = await mockLive(page);
+  await page.addInitScript(() => {
+    document.cookie = 'user_id=metrics-test-user; Path=/';
+  });
   await openLive(page);
   await editor(page).fill(cpuQuery);
   await run(page);
@@ -870,7 +873,10 @@ test('metadata lists cap rendering, search, show counts and expose truncation wa
   const metrics = panel.getByRole('region', { name: 'Metrics', exact: true });
   await expect(metrics.getByRole('list').getByRole('button')).toHaveCount(300);
   await expect(
-    panel.getByText('Metadata results truncated to the requested limit.', { exact: true }),
+    panel.getByRole('status').filter({
+      hasText:
+        'Metadata results truncated to the requested limit of 1,000. Search filters only the loaded names.',
+    }),
   ).toBeVisible();
   await metrics.getByRole('button', { name: 'Show more (50)' }).click();
   await expect(metrics.getByRole('list').getByRole('button')).toHaveCount(350);

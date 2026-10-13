@@ -468,7 +468,7 @@ async fn execute_alert_tool(
         "list_alert_tags" => {
             authorize(context.session_key, Action::GetAlert, None, None)?;
             serde_json::to_value(
-                alerts::list_tags_internal(context.tenant_id)
+                alerts::list_tags_internal(context.session_key)
                     .await
                     .map_err(|error| error.to_string())?,
             )

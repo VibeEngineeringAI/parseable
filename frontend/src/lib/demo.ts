@@ -352,7 +352,7 @@ export function createDemoClient(): ParseableClient {
     demo_traces: traceRows,
   });
   const metrics = createDemoMetrics(fixtureTime);
-  const alerts = createDemoAlerts(fixtureTime);
+  const alerts = createDemoAlerts(fixtureTime, datasets, records);
   const dashboards = createDemoDashboards(fixtureTime);
   const roles: Roles = {
     administrators: [{ privilege: 'admin' }],
@@ -550,6 +550,8 @@ export function createDemoClient(): ParseableClient {
           promqlAlerts: true,
           promqlDashboard: true,
           promqlMetadata: true,
+          alertBuilder: true,
+          alertPreview: true,
         },
       };
     },

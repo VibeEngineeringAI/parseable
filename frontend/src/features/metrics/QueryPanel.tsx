@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react';
 import { PanelRight, Play, Plus, Trash2 } from 'lucide-react';
 import { Badge, Button, Card, Input } from '../../components/ui';
-import { PromqlEditor, type PromqlMetadataSource } from '../../components/promql/PromqlEditor';
+import type { PromqlMetadataSource } from '../../components/promql/PromqlEditor';
+import { PromqlQueryEditor } from '../../components/promql/PromqlQueryEditor';
 import { maxQueries, queryId, stepError, type ExplorerState, type QueryType } from './helpers';
 
 function QueryHistory({
@@ -75,6 +76,10 @@ export function QueryPanel({
   onToggleBrowser: () => void;
 }) {
   const error = stepError(state.step);
+  const [invalid, setInvalid] = useState<Set<string>>(() => new Set());
+  const invalidBuilder = state.queries.some((_, index) =>
+    invalid.has(state.rowIds?.[index] ?? queryId(index)),
+  );
   function updateQuery(index: number, text: string) {
     onChange((current) => ({
       ...current,
@@ -98,7 +103,8 @@ export function QueryPanel({
       </div>
       <div className="metrics-query-list">
         {state.queries.map((query, index) => {
-          const id = queryId(index);
+          const id = state.rowIds?.[index] ?? queryId(index);
+          const displayName = state.aliases?.[index] || queryId(index);
           return (
             <div
               className="metrics-query-row"
@@ -107,18 +113,34 @@ export function QueryPanel({
               onFocusCapture={() => onFocus(index)}
             >
               <div className="metrics-query-heading">
-                <Badge>{id}</Badge>
+                <Badge>{displayName}</Badge>
+                <Input
+                  aria-label={`Query ${displayName} alias`}
+                  placeholder="Alias"
+                  value={state.aliases?.[index] ?? ''}
+                  maxLength={80}
+                  onChange={(event) =>
+                    onChange((current) => ({
+                      ...current,
+                      aliases: current.queries.map((_, row) =>
+                        row === index
+                          ? event.target.value
+                          : (current.aliases?.[row] ?? queryId(row)),
+                      ),
+                    }))
+                  }
+                />
                 <span className="muted">PromQL</span>
                 <div className="inline">
                   <QueryHistory
-                    id={id}
+                    id={displayName}
                     history={history}
                     onSelect={(text) => updateQuery(index, text)}
                   />
                   <Button
                     variant="ghost"
                     size="icon"
-                    aria-label={`Remove query ${id}`}
+                    aria-label={`Remove query ${displayName}`}
                     disabled={state.queries.length === 1}
                     onClick={() => {
                       onRemove(index);
@@ -129,12 +151,21 @@ export function QueryPanel({
                   </Button>
                 </div>
               </div>
-              <PromqlEditor
+              <PromqlQueryEditor
                 value={query}
                 onChange={(text) => updateQuery(index, text)}
-                onRun={onRun}
+                onRun={invalidBuilder ? undefined : onRun}
                 metadata={metadata}
-                label={`PromQL query ${id}`}
+                label={`PromQL query ${displayName}`}
+                onValidityChange={(valid) =>
+                  setInvalid((current) => {
+                    if (current.has(id) === !valid) return current;
+                    const next = new Set(current);
+                    if (valid) next.delete(id);
+                    else next.add(id);
+                    return next;
+                  })
+                }
               />
             </div>
           );
@@ -188,7 +219,11 @@ export function QueryPanel({
         <Button
           variant="primary"
           onClick={onRun}
-          disabled={Boolean(error || rangeError) || !state.queries.some((query) => query.trim())}
+          disabled={
+            invalidBuilder ||
+            Boolean(error || rangeError) ||
+            !state.queries.some((query) => query.trim())
+          }
         >
           <Play size={14} aria-hidden="true" />
           Run

@@ -5,10 +5,23 @@ import { authEndpoint, cookieIdentity } from './auth';
 import { demoEnabled } from './config';
 import { apiKey, groupRoles, object, roles, roleSources, strings, userRoles } from './teamContract';
 import { instantResult, rangeResult, successEnvelope } from './promqlContract';
-import { alert, alertSummary, alertTarget, alertTargetStatus } from './alertsContract';
+import {
+  alert,
+  alertSummary,
+  alertPreview,
+  alertTarget,
+  alertTargetStatus,
+} from './alertsContract';
 import { dashboard, dashboardSummary } from './dashboardsContract';
 import { savedLogView, logContextResponse } from './logsContract';
-import { datasetHotTier, datasetRetention, datasetStats } from './datasetsContract';
+import {
+  normalizeDatasetTag,
+  datasetLabelsError,
+  datasetHotTier,
+  datasetRetention,
+  readDatasetSchema,
+  datasetStats,
+} from './datasetsContract';
 import { traceListResponse, decodeTraceDetail } from './tracesContract';
 import type {
   AlertSeverity,
@@ -269,6 +282,12 @@ export function createClient({
         if (data.length < 1000) return result;
       }
     },
+    async previewAlert(body, signal) {
+      const endpoint = `${base}/alerts/preview`;
+      const data = await readJson(endpoint, { ...jsonBody('POST', body), signal }, onUnauthorized);
+      if (!alertPreview(data)) return malformed(endpoint);
+      return data;
+    },
     getAlert: (id, signal) => readAlert(alertPath(id), { signal }),
     createAlert: (body) => readAlert(`${base}/alerts`, jsonBody('POST', body)),
     updateAlert: (id, body) => readAlert(alertPath(id), jsonBody('PUT', body)),
@@ -323,6 +342,8 @@ export function createClient({
           'promqlAlerts',
           'promqlDashboard',
           'promqlMetadata',
+          'alertBuilder',
+          'alertPreview',
         ].some(
           (field) => capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean',
         )
@@ -336,6 +357,8 @@ export function createClient({
           promqlAlerts: capabilities.promqlAlerts === true,
           promqlDashboard: capabilities.promqlDashboard === true,
           promqlMetadata: capabilities.promqlMetadata === true,
+          alertBuilder: capabilities.alertBuilder === true,
+          alertPreview: capabilities.alertPreview === true,
           promql:
             typeof capabilities.promql === 'boolean'
               ? capabilities.promql
@@ -437,11 +460,45 @@ export function createClient({
       return data;
     },
     deleteApiKey: (id) => mutate(`${keys}/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-    createDataset: (name, options) => {
+    createDataset: async (name, options) => {
+      const labelsError = datasetLabelsError(options.datasetLabels ?? []);
+      if (labelsError) throw new ApiError(labelsError, 400);
       const headers: Record<string, string> = { 'X-P-Telemetry-Type': options.telemetryType };
       if (options.customPartition) headers['X-P-Custom-Partition'] = options.customPartition;
       if (options.logSource) headers['X-P-Log-Source'] = options.logSource;
-      return mutate(datasetPath(name), { method: 'PUT', headers });
+      if (options.datasetTags?.length) headers['X-P-Dataset-Tags'] = options.datasetTags.join(',');
+      if (options.datasetLabels?.length)
+        headers['X-P-Dataset-Labels'] = options.datasetLabels.join(',');
+      if (options.inferTimestamp !== undefined)
+        headers['X-P-Infer-Timestamp'] = String(options.inferTimestamp);
+      if (options.staticSchema) {
+        headers['X-P-Static-Schema-Flag'] = 'true';
+        headers['Content-Type'] = 'application/json';
+      }
+      return mutate(datasetPath(name), {
+        method: 'PUT',
+        headers,
+        ...(options.staticSchema ? { body: JSON.stringify(options.staticSchema) } : {}),
+      });
+    },
+    updateDatasetCustomPartition: (name, field) =>
+      mutate(datasetPath(name), {
+        method: 'PUT',
+        headers: {
+          'X-P-Update-Stream': 'true',
+          ...(field ? { 'X-P-Custom-Partition': field } : {}),
+        },
+      }),
+    setDatasetTimePartitionLimit: (name, days) =>
+      mutate(datasetPath(name), {
+        method: 'PUT',
+        headers: { 'X-P-Update-Stream': 'true', 'X-P-Time-Partition-Limit': `${days}d` },
+      }),
+    async datasetSchema(dataset, signal) {
+      const endpoint = `${datasetPath(dataset)}/schema`;
+      const data = readDatasetSchema(await readJson(endpoint, { signal }, onUnauthorized));
+      if (!data) return malformed(endpoint);
+      return data;
     },
     deleteDataset: (name) => mutate(datasetPath(name), { method: 'DELETE' }),
     async datasetStats(name, signal) {
@@ -505,6 +562,13 @@ export function createClient({
           'customPartition',
           'streamType',
         ].some((key) => data[key] != null && typeof data[key] !== 'string') ||
+        ['datasetTags', 'datasetLabels'].some(
+          (key) =>
+            data[key] !== undefined &&
+            (!Array.isArray(data[key]) ||
+              !(data[key] as unknown[]).every((x) => typeof x === 'string')),
+        ) ||
+        (data.inferTimestamp !== undefined && typeof data.inferTimestamp !== 'boolean') ||
         (data.hotTierEnabled !== undefined && typeof data.hotTierEnabled !== 'boolean') ||
         (data.staticSchemaFlag !== undefined && data.staticSchemaFlag !== 'true') ||
         (data.logSource !== undefined &&
@@ -530,6 +594,15 @@ export function createClient({
           typeof data.customPartition === 'string' ? data.customPartition : undefined,
         streamType: typeof data.streamType === 'string' ? data.streamType : undefined,
         staticSchemaFlag: data.staticSchemaFlag === 'true' ? true : undefined,
+        ...(data.datasetTags !== undefined
+          ? { datasetTags: (data.datasetTags as string[]).map(normalizeDatasetTag) }
+          : {}),
+        ...(data.datasetLabels !== undefined
+          ? { datasetLabels: data.datasetLabels as string[] }
+          : {}),
+        ...(data.inferTimestamp !== undefined
+          ? { inferTimestamp: data.inferTimestamp as boolean }
+          : {}),
         hotTierEnabled: typeof data.hotTierEnabled === 'boolean' ? data.hotTierEnabled : undefined,
       };
     },

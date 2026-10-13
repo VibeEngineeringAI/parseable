@@ -30,7 +30,7 @@ use itertools::Itertools;
 use once_cell::sync::Lazy;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
-use tracing::{error, trace, warn};
+use tracing::{error, trace};
 use ulid::Ulid;
 use url::Url;
 
@@ -44,6 +44,20 @@ use crate::{
     parseable::{DEFAULT_TENANT, PARSEABLE},
     storage::object_storage::target_json_path,
 };
+
+/// Bound diagnostics and remove URL-bearing details before storage or API output.
+/// Historic reqwest messages can include credentials in paths, query strings or userinfo.
+pub fn safe_runtime_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("http://") || lower.contains("https://") {
+        return "Request failed (URL details redacted)".into();
+    }
+    error.chars().take(1024).collect()
+}
+
+fn safe_delivery_error(error: reqwest::Error) -> String {
+    safe_runtime_error(&error.without_url().to_string())
+}
 
 pub static TARGETS: Lazy<TargetConfigs> = Lazy::new(|| TargetConfigs {
     target_configs: RwLock::new(HashMap::new()),
@@ -298,7 +312,7 @@ impl Target {
                     None,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| safe_runtime_error(&e.to_string()))?;
                 prepared
                     .client
                     .post(target.endpoint.clone())
@@ -313,7 +327,7 @@ impl Target {
                     Some(&target.headers),
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| safe_runtime_error(&e.to_string()))?;
                 prepared
                     .client
                     .post(target.endpoint.clone())
@@ -325,9 +339,9 @@ impl Target {
         request
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(safe_delivery_error)?
             .error_for_status()
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_delivery_error)?;
         Ok(())
     }
 
@@ -381,21 +395,6 @@ impl Target {
         let alert_id = alert_context.alert_info.alert_id;
         let tenant_id = self.tenant.clone();
 
-        let sleep_and_check_if_call =
-            move |timeout_state: Arc<Mutex<TimeoutState>>, current_state: AlertState| async move {
-                tokio::time::sleep(Duration::from_secs(timeout * 60)).await;
-
-                let mut state = timeout_state.lock().unwrap();
-
-                if current_state == AlertState::Triggered {
-                    state.awaiting_resolve = true;
-                    true
-                } else {
-                    state.timed_out = false;
-                    false
-                }
-            };
-
         trace!("Spawning retry task");
         tokio::spawn(async move {
             // Get alerts manager reference once at the start
@@ -410,51 +409,42 @@ impl Target {
                 }
             }; // Lock released immediately
 
-            match retry {
-                Retry::Infinite => loop {
-                    let current_state = if let Ok(state) =
-                        alerts.get_state(alert_id, &tenant_id).await
-                    {
-                        state
-                    } else {
-                        *state.lock().unwrap() = TimeoutState::default();
-                        warn!(
-                            "Unable to fetch state for given alert_id- {alert_id}, stopping target notifs"
-                        );
-                        return;
-                    };
-
-                    let should_call =
-                        sleep_and_check_if_call(Arc::clone(&state), current_state).await;
-                    if should_call {
-                        call_target(target.clone(), tenant_id.clone(), alert_context.clone())
-                    }
-                },
-                Retry::Finite(times) => {
-                    for _ in 0..(times - 1) {
-                        let current_state = if let Ok(state) =
-                            alerts.get_state(alert_id, &tenant_id).await
-                        {
-                            state
-                        } else {
-                            *state.lock().unwrap() = TimeoutState::default();
-                            warn!(
-                                "Unable to fetch state for given alert_id- {alert_id}, stopping target notifs"
-                            );
-                            return;
-                        };
-
-                        let should_call =
-                            sleep_and_check_if_call(Arc::clone(&state), current_state).await;
-                        if should_call {
-                            call_target(target.clone(), tenant_id.clone(), alert_context.clone())
-                        }
-                    }
+            let mut remaining = match retry {
+                Retry::Infinite => None,
+                Retry::Finite(times) => Some(times.saturating_sub(1)),
+            };
+            while remaining.is_none_or(|count| count > 0) {
+                tokio::time::sleep(Duration::from_secs(timeout.saturating_mul(60))).await;
+                // Re-read after sleeping: resolution, mute, disable, edits or deletion
+                // during the wait must prevent a delayed firing notification.
+                let lifecycle = super::promql_alerts::lifecycle(alert_id);
+                let _lifecycle = lifecycle.lock().await;
+                let Ok(current) = alerts.get_alert_by_id(alert_id, &tenant_id).await else {
+                    break;
+                };
+                let current = current.to_alert_config();
+                if !repeat_is_current(&current, &alert_context.notification_config, Utc::now()) {
+                    break;
+                }
+                state.lock().unwrap().awaiting_resolve = true;
+                call_target(target.clone(), tenant_id.clone(), alert_context.clone());
+                if let Some(count) = remaining.as_mut() {
+                    *count -= 1;
                 }
             }
             *state.lock().unwrap() = TimeoutState::default();
         });
     }
+}
+
+fn repeat_is_current(
+    current: &super::AlertConfig,
+    original: &NotificationConfig,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    current.state == AlertState::Triggered
+        && super::promql_alerts::notifications_allowed(&current.notification_state, now)
+        && Arc::ptr_eq(&current.notification_config.state, &original.state)
 }
 
 impl MetastoreObject for Target {
@@ -660,7 +650,7 @@ impl AlertManager {
             None,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| safe_runtime_error(&e.to_string()))?;
         let mut request = prepared.client.post(self.endpoint.clone()).json(alerts);
         if let Some(auth) = &self.auth {
             if !prepared.authorization_allowed {
@@ -671,9 +661,9 @@ impl AlertManager {
         request
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(safe_delivery_error)?
             .error_for_status()
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_delivery_error)?;
         Ok(())
     }
 }
@@ -782,6 +772,49 @@ pub struct Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_redact_url_secrets_and_bound_non_url_errors() {
+        for url in [
+            "https://user:secret@host/path",
+            "HTTP://host/private-token",
+            "https://host/path?token=secret",
+        ] {
+            assert_eq!(
+                safe_runtime_error(&format!("request failed for {url}")),
+                "Request failed (URL details redacted)"
+            );
+        }
+        assert_eq!(
+            safe_runtime_error("Notification delivery timed out"),
+            "Notification delivery timed out"
+        );
+        assert_eq!(safe_runtime_error(&"x".repeat(5000)).len(), 1024);
+    }
+
+    #[test]
+    fn pending_repeat_checks_latest_state_mute_and_rule_identity() {
+        let mut config: super::super::AlertConfig = serde_json::from_value(json!({
+            "version":"v2","id":Ulid::new(),"severity":"high","title":"Count",
+            "queryType":"code","query":"SELECT COUNT(*) FROM logs","datasets":["logs"],"alertType":"threshold",
+            "thresholdConfig":{"operator":">","value":8.0},
+            "evalConfig":{"rollingWindow":{"evalStart":"5m","evalEnd":"now","evalFrequency":10}},
+            "targets":[],"notificationState":"notify","notificationConfig":{"interval":1},"created":Utc::now()
+        })).unwrap();
+        let original = config.notification_config.clone();
+        config.state = AlertState::Triggered;
+        assert!(repeat_is_current(&config, &original, Utc::now()));
+        for state in [AlertState::NotTriggered, AlertState::Disabled] {
+            config.state = state;
+            assert!(!repeat_is_current(&config, &original, Utc::now()));
+        }
+        config.state = AlertState::Triggered;
+        config.notification_state = super::super::NotificationState::Mute("indefinite".into());
+        assert!(!repeat_is_current(&config, &original, Utc::now()));
+        config.notification_state = super::super::NotificationState::Notify;
+        config.notification_config = NotificationConfig::default();
+        assert!(!repeat_is_current(&config, &original, Utc::now()));
+    }
 
     #[test]
     fn test_masked_target_hides_secrets() {

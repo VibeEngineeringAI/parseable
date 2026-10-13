@@ -316,6 +316,8 @@ describe('metrics capabilities and dataset discovery', () => {
       promqlAlerts: false,
       promqlDashboard: false,
       promqlMetadata: false,
+      alertBuilder: false,
+      alertPreview: false,
       promql,
     });
   });

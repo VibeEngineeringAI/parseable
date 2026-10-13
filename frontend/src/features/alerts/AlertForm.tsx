@@ -13,11 +13,13 @@ import {
 } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
-import { PromqlEditor } from '../../components/promql/PromqlEditor';
+import { PromqlQueryEditor } from '../../components/promql/PromqlQueryEditor';
 import { SqlEditor } from '../sql/SqlEditor';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
+import { builderEditable, newSqlBuilder, sqlBuilderConfig } from '../../lib/sqlBuilderContract';
+import { SqlAlertBuilder } from './SqlAlertBuilder';
 import { alert as isAlert } from '../../lib/alertsContract';
 import type { Alert } from '../../lib/types';
 import { AlertPreview } from './AlertPreview';
@@ -31,6 +33,7 @@ import {
   severities,
   severityLabel,
   validateAlert,
+  rememberAlertType,
   type AlertDraft,
 } from './helpers';
 import { useAlertAccess } from './shared';
@@ -50,17 +53,27 @@ export function AlertForm({ original }: { original?: Alert }) {
   const about = useAsync(useCallback((signal) => client.about(signal), [client]));
   const canWrite = useAlertAccess();
   const duplicateValue: unknown = location.state?.duplicate;
-  const duplicate =
-    isAlert(duplicateValue) && duplicateValue.queryType !== 'builder' ? duplicateValue : undefined;
+  const duplicate = isAlert(duplicateValue) ? duplicateValue : undefined;
+  const [convertedId, setConvertedId] = useState<string>();
+  const converted = !!original && convertedId === original.id;
   const source = original ?? duplicate;
+  const builderEnabled = about.data?.capabilities.alertBuilder === true;
+  const previewEnabled = about.data?.capabilities.alertPreview === true;
+  const editable = !source || builderEditable(source, builderEnabled);
   const promqlEnabled = about.data?.capabilities.promqlAlerts === true;
   // Keep draft row IDs stable when the shell re-renders (for example on a theme change).
   const initial = useMemo(
     () =>
       source
-        ? { ...alertDraft(source), title: duplicate ? `${source.title} (Copy)` : source.title }
+        ? {
+            ...alertDraft(source),
+            ...(converted || (duplicate && !editable)
+              ? { type: 'code' as const, builderConfig: undefined }
+              : {}),
+            title: duplicate ? `${source.title} (Copy)` : source.title,
+          }
         : newAlertDraft(promqlEnabled, params),
-    [source, duplicate, promqlEnabled, params],
+    [source, duplicate, promqlEnabled, params, converted, editable],
   );
   return (
     <div className="page alerts-page">
@@ -78,17 +91,45 @@ export function AlertForm({ original }: { original?: Alert }) {
             title="Permission denied"
             description="Ask your administrator for permission to manage alerts."
           />
-        ) : original?.queryType === 'builder' ? (
-          <EmptyState
-            title="Builder alerts are read-only"
-            description="Editing builder alerts is not supported yet."
-          />
+        ) : original?.queryType === 'builder' && !editable && !converted ? (
+          <Card>
+            <CardBody className="stack">
+              <h2>Builder alerts are read-only</h2>
+              <p>
+                This legacy or unsupported builder specification can be inspected but cannot be
+                edited in guided mode.
+              </p>
+              <pre className="alerts-query">{original.query}</pre>
+              {original.builderConfig !== undefined && (
+                <pre className="alerts-query">
+                  {JSON.stringify(original.builderConfig, null, 2)}
+                </pre>
+              )}
+              <Button
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      `Convert to SQL? The builder specification will be detached. ${original.executionMode === 'owner' ? 'Saving runs this rule as you.' : original.executionMode === 'server' ? 'This legacy rule keeps server execution.' : 'Execution mode is not reported; the server validates execution permissions.'}`,
+                    )
+                  )
+                    setConvertedId(original.id);
+                }}
+              >
+                Convert to SQL
+              </Button>
+              <Button onClick={() => navigate('/alerts/new', { state: { duplicate: original } })}>
+                Duplicate as SQL
+              </Button>
+            </CardBody>
+          </Card>
         ) : (
           <AlertFormFields
-            key={source?.id ?? location.key}
+            key={`${source?.id ?? location.key}-${converted}`}
             original={original}
             source={source}
             promqlEnabled={promqlEnabled}
+            builderEnabled={builderEnabled}
+            previewEnabled={previewEnabled}
             initial={initial}
             onSaved={(id) => navigate(`/alerts/${encodeURIComponent(id)}`)}
           />
@@ -101,12 +142,16 @@ function AlertFormFields({
   original,
   source,
   promqlEnabled,
+  builderEnabled,
+  previewEnabled,
   initial,
   onSaved,
 }: {
   original?: Alert;
   source?: Alert;
   promqlEnabled: boolean;
+  builderEnabled: boolean;
+  previewEnabled: boolean;
   initial: AlertDraft;
   onSaved: (id: string) => void;
 }) {
@@ -116,6 +161,26 @@ function AlertFormFields({
     [status, setStatus] = useState(''),
     [newTarget, setNewTarget] = useState(false);
   const mutation = useMutation();
+  const [promqlValid, setPromqlValid] = useState(true);
+  const [compiled, setCompiled] = useState({
+    spec: JSON.stringify(initial.builderConfig),
+    query: initial.type === 'builder' ? initial.query : '',
+  });
+  const compiledCurrent = compiled.spec === JSON.stringify(draft.builderConfig) && !!compiled.query;
+  function convertBuilder() {
+    if (!compiledCurrent) return;
+    if (
+      window.confirm(
+        `Convert to SQL? The builder specification will be detached. ${original?.executionMode === 'owner' ? 'Saving runs this rule as you.' : 'This raw SQL rule uses server execution.'}`,
+      )
+    )
+      setDraft((previous) => ({
+        ...previous,
+        type: 'code',
+        builderConfig: undefined,
+        query: compiled.query,
+      }));
+  }
   const markSaved = useLeaveGuard(JSON.stringify(draft) !== JSON.stringify(initial));
   const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
   const metrics = useAsync(
@@ -158,7 +223,10 @@ function AlertFormFields({
     (unverified && !unchecked.includes(draft.dataset) && draft.dataset !== original?.datasets[0]
       ? 'Select an OTLP metrics dataset.'
       : undefined);
-  const valid = !Object.keys(errors).length && !datasetError;
+  if (draft.type === 'builder' && !builderEnabled)
+    errors.type = 'SQL builder is not supported on this server.';
+  const valid =
+    !Object.keys(errors).length && !datasetError && (draft.type !== 'promql' || promqlValid);
   // Validation never disables Create or Save: submitting an invalid form reveals every error.
   const ready =
     !mutation.pending &&
@@ -182,6 +250,9 @@ function AlertFormFields({
     Boolean(shown.errors.targets) &&
     (unavailable.length ? unavailable.includes(id) : draft.targets.includes(id));
   const invalidPreview = Boolean(
+    errors.frequency ||
+    errors.builderConfig ||
+    (draft.type === 'promql' && !promqlValid) ||
     errors.query ||
     errors.dataset ||
     datasetError ||
@@ -208,6 +279,7 @@ function AlertFormFields({
             ? await client.updateAlert(original.id, body)
             : await client.createAlert(body);
           if (mutation.isActive()) {
+            rememberAlertType(client, saved);
             markSaved();
             onSaved(saved.id);
           }
@@ -227,9 +299,21 @@ function AlertFormFields({
                 disabled={Boolean(original) || mutation.pending}
                 error={shown.errors.type}
                 onChange={(event) => {
-                  update('type', event.target.value as AlertDraft['type']);
-                  update('dataset', '');
-                  update('query', '');
+                  const type = event.target.value as AlertDraft['type'];
+                  if (draft.type === 'builder' && type === 'code') {
+                    convertBuilder();
+                    return;
+                  }
+                  update('type', type);
+                  if (type === 'builder') {
+                    update('builderConfig', newSqlBuilder(draft.dataset));
+                    update('query', '');
+                  } else update('builderConfig', undefined);
+                  if (type === 'promql' || draft.type === 'promql') {
+                    update('dataset', '');
+                    update('query', '');
+                  }
+                  setPromqlValid(true);
                 }}
               >
                 {promqlEnabled && <option value="promql">PromQL threshold</option>}
@@ -239,6 +323,7 @@ function AlertFormFields({
                   </option>
                 )}
                 <option value="code">SQL threshold</option>
+                {builderEnabled && <option value="builder">SQL guided threshold</option>}
               </Select>
               <Select
                 label="Dataset"
@@ -253,7 +338,11 @@ function AlertFormFields({
                       ? 'Only OTLP metrics datasets support PromQL.'
                       : 'SQL can query any accessible dataset.'
                 }
-                onChange={(event) => update('dataset', event.target.value)}
+                onChange={(event) => {
+                  update('dataset', event.target.value);
+                  if (draft.type === 'builder')
+                    update('builderConfig', newSqlBuilder(event.target.value));
+                }}
               >
                 <option value="">Select a dataset</option>
                 {draft.dataset &&
@@ -298,9 +387,33 @@ function AlertFormFields({
             ) : null}
             {/* Focus leaving the editor, including its completion list, touches the query. */}
             <div onBlur={() => shown.touch('query')}>
-              {draft.type === 'promql' ? (
-                <PromqlEditor
+              {draft.type === 'builder' ? (
+                <div className="stack">
+                  <SqlAlertBuilder
+                    value={draft.builderConfig ?? newSqlBuilder(draft.dataset)}
+                    onChange={(spec) => update('builderConfig', spec)}
+                    disabled={mutation.pending}
+                    error={errors.builderConfig}
+                  />
+                  <div>
+                    <Button
+                      disabled={mutation.pending || !compiledCurrent}
+                      onClick={convertBuilder}
+                    >
+                      Convert to SQL
+                    </Button>
+                  </div>
+                  {!compiledCurrent && (
+                    <p className="muted">
+                      Preview the current specification to capture its generated SQL before
+                      converting.
+                    </p>
+                  )}
+                </div>
+              ) : draft.type === 'promql' ? (
+                <PromqlQueryEditor
                   value={draft.query}
+                  onValidityChange={setPromqlValid}
                   onChange={(value) => update('query', value)}
                   metadata={draft.dataset ? metadata : undefined}
                   invalid={Boolean(shown.errors.query)}
@@ -368,7 +481,7 @@ function AlertFormFields({
                 label="Evaluation frequency (minutes)"
                 type="number"
                 min={1}
-                max={draft.type === 'promql' ? 1440 : undefined}
+                max={draft.type !== 'code' ? 1440 : undefined}
                 step={1}
                 value={draft.frequency}
                 disabled={mutation.pending}
@@ -524,7 +637,9 @@ function AlertFormFields({
           {status}
         </p>
         <div className="alerts-form-footer">
-          {original?.queryType === 'promql' && (
+          {(original?.queryType === 'promql' ||
+            original?.executionMode === 'owner' ||
+            draft.type === 'builder') && (
             <p className="muted">
               Saving resets per-series runtime state and makes you the execution owner.
             </p>
@@ -549,13 +664,27 @@ function AlertFormFields({
         key={JSON.stringify([
           draft.type,
           draft.dataset,
-          draft.query,
+          draft.type === 'builder' ? '' : draft.query,
           draft.operator,
           draft.threshold,
           draft.window,
+          draft.builderConfig,
         ])}
         draft={draft}
         disabled={invalidPreview || mutation.pending}
+        serverPreview={previewEnabled}
+        onCompiled={(query) => {
+          if (draft.type !== 'builder') return;
+          const spec = JSON.stringify(draft.builderConfig);
+          setCompiled((previous) =>
+            previous.spec === spec && previous.query === query ? previous : { spec, query },
+          );
+          setDraft((previous) =>
+            previous.type === 'builder' && previous.query !== query
+              ? { ...previous, query }
+              : previous,
+          );
+        }}
         buttonRef={previewButton}
       />
       {newTarget && (

@@ -450,7 +450,7 @@ pub async fn alert_runtime(mut rx: mpsc::Receiver<AlertTask>) -> Result<(), anyh
                 let alert = alert.clone_box();
                 let id = *alert.get_id();
                 let handle = tokio::spawn(async move {
-                    let mut retry_counter = 0;
+                    let mut retry_counter: u32 = 0;
                     loop {
                         let sleep_duration = match alerts_utils::evaluate_alert(&*alert).await {
                             Ok(_) => {
@@ -458,29 +458,20 @@ pub async fn alert_runtime(mut rx: mpsc::Receiver<AlertTask>) -> Result<(), anyh
                                 alert.get_eval_frequency()
                             }
                             Err(err) => {
+                                retry_counter = retry_counter.saturating_add(1);
                                 let retry_delay = if alert.get_query_type()
                                     == crate::alerts::AlertQueryType::Promql
                                 {
                                     alert.get_eval_frequency()
                                 } else {
-                                    1
+                                    alerts_utils::sql_retry_delay(retry_counter)
                                 };
                                 warn!(
-                                    "Error while evaluation- {}\nRetrying after sleeping for {} minute(s)",
-                                    err, retry_delay
+                                    "Alert {} failed to evaluate: {}. Retrying after {} minute(s)",
+                                    id,
+                                    crate::alerts::target::safe_runtime_error(&err.to_string()),
+                                    retry_delay
                                 );
-                                retry_counter += 1;
-
-                                if retry_counter > 3
-                                    && alert.get_query_type()
-                                        != crate::alerts::AlertQueryType::Promql
-                                {
-                                    error!(
-                                        "Alert with id {} failed to evaluate after 3 retries with err- {}",
-                                        id, err
-                                    );
-                                    break;
-                                }
                                 retry_delay
                             }
                         };

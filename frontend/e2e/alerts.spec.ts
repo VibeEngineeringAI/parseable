@@ -253,7 +253,10 @@ test('SQL create and preview use the existing editor with optional targets', asy
     .fill('SELECT COUNT(*) AS errors FROM "application_logs" WHERE level = \'ERROR\'');
   await page.getByLabel('Title', { exact: true }).fill('SQL test');
   await page.getByRole('button', { name: 'Preview SQL (no notifications)', exact: true }).click();
-  await expect(page.getByRole('table', { name: 'Preview values' })).toContainText('errors=');
+  await expect(page.locator('[aria-label="Generated SQL"]')).toContainText('COUNT(*) AS errors');
+  await expect(page.getByRole('table', { name: 'Preview values' })).toContainText(
+    'Threshold breached',
+  );
   await expect(
     page
       .getByRole('table', { name: 'Preview values' })
@@ -336,14 +339,20 @@ test('detail shows firing instances, delivery attempts, disabled banner and cust
   await expect(page.getByRole('button', { name: 'Disable', exact: true })).toBeFocused();
   await expect(page.getByRole('button', { name: 'Evaluate now', exact: true })).toBeEnabled();
 });
-test('builder rules are read-only with SQL and no Edit action', async ({ page }) => {
+test('legacy builder rules are inspectable with SQL and explicit conversion actions', async ({
+  page,
+}) => {
   await demo(page, '/alerts/01M4H000000000000000000012');
   await expect(
-    page.getByText('Editing builder alerts is not supported yet.', { exact: false }),
+    page.getByText('This legacy or unsupported builder rule is read-only in guided mode.', {
+      exact: false,
+    }),
   ).toBeVisible();
   await expect(page.locator('.alerts-query')).toContainText('SELECT COUNT(*)');
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Duplicate', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Inspect / convert', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Duplicate as SQL', exact: true })).toBeVisible();
 });
 test('title search, tag filtering and sorting distinguish empty searches', async ({ page }) => {
   await demo(page);
@@ -1021,13 +1030,8 @@ test('an invalid handoff shows its error on load while a blank new form stays qu
   await expect(query).toHaveAccessibleDescription('Enter a query.');
 });
 
-for (const duplicate of [
-  { id: 'stale', title: 'Stale' },
-  { ...alertFixture, queryType: 'builder' },
-])
-  test(`invalid or builder duplicate history is ignored safely: ${duplicate.id}`, async ({
-    page,
-  }) => {
+for (const duplicate of [{ id: 'stale', title: 'Stale' }])
+  test(`invalid duplicate history is ignored safely: ${duplicate.id}`, async ({ page }) => {
     const api = await mocked(page);
     await page.addInitScript((duplicate) => {
       history.replaceState({ ...history.state, usr: { duplicate } }, '');

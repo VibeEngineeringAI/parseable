@@ -1,8 +1,24 @@
 import type { ClusterNode, ClusterMetrics } from './operationsContract';
 export type Dataset = { name: string; type: 'logs' | 'metrics' | 'traces' };
+export type DatasetTag =
+  'agent-observability' | 'k8s-observability' | 'database-observability' | 'apm' | 'service-map';
+export type DatasetStaticType =
+  'int' | 'double' | 'float' | 'boolean' | 'string' | 'datetime' | 'date';
+export type DatasetStaticSchema = { fields: Array<{ name: string; data_type: DatasetStaticType }> };
+export type DatasetSchemaField = {
+  name: string;
+  dataType?: unknown;
+  nullable?: boolean;
+  metadata?: Record<string, string>;
+};
+export type DatasetSchema = { fields: DatasetSchemaField[]; metadata?: Record<string, string> };
 export type DatasetCreateOptions = {
   telemetryType: Dataset['type'];
   customPartition?: string;
+  staticSchema?: DatasetStaticSchema;
+  datasetTags?: DatasetTag[];
+  datasetLabels?: string[];
+  inferTimestamp?: boolean;
   logSource?: 'json' | 'otel-logs' | 'otel-metrics' | 'otel-traces';
 };
 export type DatasetStats = {
@@ -66,6 +82,9 @@ export type DatasetInfo = {
   streamType?: string;
   staticSchemaFlag?: boolean;
   hotTierEnabled?: boolean;
+  datasetTags?: string[];
+  datasetLabels?: string[];
+  inferTimestamp?: boolean;
 };
 export type LogRecord = Record<string, unknown>;
 export type TraceSortBy =
@@ -257,6 +276,8 @@ export type About = {
     promqlAlerts: boolean;
     promqlDashboard: boolean;
     promqlMetadata: boolean;
+    alertBuilder?: boolean;
+    alertPreview?: boolean;
   };
 };
 export type AlertSeverity = 'critical' | 'high' | 'medium' | 'low';
@@ -303,6 +324,28 @@ export type AlertSummary = {
   promqlConfig?: PromqlAlertConfig;
   promqlRuntime?: PromqlAlertRuntime;
 };
+export type SqlAlertRuntime = {
+  health: 'ok' | 'noData' | 'error';
+  error: string | null;
+  lastEvaluatedAt: string | null;
+};
+export type AlertPreviewResponse = {
+  queryType: 'builder' | 'code';
+  compiledQuery: string;
+  builderConfig?: unknown;
+  datasets: string[];
+  measure: string;
+  dimensions: string[];
+  window: { start: string; end: string };
+  threshold: { operator: ThresholdOperator; value: number };
+  simple: boolean;
+  noData: boolean;
+  wouldTrigger: boolean;
+  groups: Array<{ labels: Record<string, string>; value: number; breached: boolean }>;
+  totalGroups: number;
+  breachedGroups: number;
+  truncated: boolean;
+};
 export type AlertRequest = {
   title: string;
   severity: AlertSeverity;
@@ -316,6 +359,7 @@ export type AlertRequest = {
   targets: string[];
   tags?: string[] | null;
   promqlConfig?: PromqlAlertConfig;
+  builderConfig?: unknown;
   [key: string]: unknown;
 };
 export type Alert = AlertRequest & {
@@ -327,6 +371,10 @@ export type Alert = AlertRequest & {
   lastTriggeredAt: string | null;
   promqlRuntime?: PromqlAlertRuntime;
   executionIdentity?: { userId: string; tenantId: string };
+  builderStatus?: 'editable' | 'unsupported';
+  executionMode?: 'owner' | 'server';
+  executionOwner?: string;
+  sqlRuntime?: SqlAlertRuntime;
 };
 export type AlertTargetType = 'slack' | 'webhook' | 'alertManager';
 export type AlertTargetRequest =
@@ -423,6 +471,9 @@ export interface ParseableClient {
   datasetInfo(name: string, signal?: AbortSignal): Promise<DatasetInfo>;
   createDataset(name: string, options: DatasetCreateOptions): Promise<void>;
   deleteDataset(name: string): Promise<void>;
+  datasetSchema(name: string, signal?: AbortSignal): Promise<DatasetSchema>;
+  updateDatasetCustomPartition(name: string, field?: string): Promise<void>;
+  setDatasetTimePartitionLimit(name: string, days: number): Promise<void>;
   datasetStats(name: string, signal?: AbortSignal): Promise<DatasetStats>;
   datasetRetention(name: string, signal?: AbortSignal): Promise<DatasetRetention>;
   setDatasetRetention(name: string, retention: DatasetRetention): Promise<void>;
@@ -458,6 +509,7 @@ export interface ParseableClient {
   /** Bodyless partial PUT: the server skips tile validation and keeps the stored document. */
   setDashboardFavorite(id: string, isFavorite: boolean): Promise<Dashboard>;
   deleteDashboard(id: string): Promise<void>;
+  previewAlert(request: AlertRequest, signal?: AbortSignal): Promise<AlertPreviewResponse>;
   listAlerts(signal?: AbortSignal): Promise<AlertSummary[]>;
   getAlert(id: string, signal?: AbortSignal): Promise<Alert>;
   createAlert(alert: AlertRequest): Promise<Alert>;

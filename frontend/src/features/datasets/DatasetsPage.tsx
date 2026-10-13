@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Database, ArrowUpRight, Search, RefreshCw, Plus } from 'lucide-react';
-import { Badge, Button, Card, Input, EmptyState } from '../../components/ui';
+import { Badge, Button, Card, Input, EmptyState, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
@@ -9,15 +9,23 @@ import { useAsync } from '../../hooks/useAsync';
 import { CreateDatasetDialog } from './CreateDatasetDialog';
 import { ManageDatasetSheet } from './ManageDatasetSheet';
 import './datasets.css';
+import { forgetMetricsDatasets } from '../../lib/metrics';
 import { datasetPath, listDatasetInventory } from '../../lib/datasetPath';
 export function DatasetsPage() {
   const { client } = useApp();
   const data = useAsync(useCallback((signal) => listDatasetInventory(client, signal), [client]));
   const [search, setSearch] = useState('');
+  const [type, setType] = useState('all');
   const [selected, setSelected] = useState<string>();
   const [creating, setCreating] = useState(false);
   const datasets =
-    data.data?.filter((d) => d.name.toLowerCase().includes(search.toLowerCase())) || [];
+    data.data?.filter(
+      (d) =>
+        (type === 'all' || (type === 'unknown' ? !d.type : d.type === type)) &&
+        [d.name, ...(d.info?.datasetTags ?? []), ...(d.info?.datasetLabels ?? [])].some((value) =>
+          value.toLowerCase().includes(search.toLowerCase()),
+        ),
+    ) || [];
   return (
     <div className="page datasets-page">
       <PageHeader
@@ -26,7 +34,13 @@ export function DatasetsPage() {
 
         actions={
           <>
-            <Button variant="secondary" onClick={data.reload}>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                forgetMetricsDatasets(client);
+                data.reload();
+              }}
+            >
               <RefreshCw size={15} aria-hidden="true" />
               Refresh
             </Button>
@@ -42,11 +56,18 @@ export function DatasetsPage() {
           <Search size={16} />
           <Input
             aria-label="Search datasets"
-            placeholder="Search by name…"
+            placeholder="Search by name, tag or label…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
+        <Select label="Dataset type" value={type} onChange={(event) => setType(event.target.value)}>
+          <option value="all">All types</option>
+          <option value="logs">Logs</option>
+          <option value="metrics">Metrics</option>
+          <option value="traces">Traces</option>
+          <option value="unknown">Type unavailable</option>
+        </Select>
         <span className="muted">{datasets.length} datasets</span>
       </div>
       <QueryState loading={data.loading} error={data.error} retry={data.reload} />
@@ -76,6 +97,12 @@ export function DatasetsPage() {
                   </td>
                   <td>
                     <Badge>{d.type ?? 'Type unavailable'}</Badge>
+                    {d.info?.datasetTags?.length ? (
+                      <p className="muted">Tags: {d.info.datasetTags.join(', ')}</p>
+                    ) : null}
+                    {d.info?.datasetLabels?.length ? (
+                      <p className="muted">Labels: {d.info.datasetLabels.join(', ')}</p>
+                    ) : null}
                     {d.typeError && <p className="muted">{d.typeError}</p>}
                   </td>
                   <td>
@@ -114,6 +141,7 @@ export function DatasetsPage() {
           onClose={() => setCreating(false)}
           onCreated={() => {
             setSearch('');
+            setType('all');
             data.reload();
           }}
         />

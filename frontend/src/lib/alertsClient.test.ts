@@ -313,3 +313,70 @@ describe('alerts client requests', () => {
     await expect(createClient({ mode: 'live' }).about()).rejects.toMatchObject({ status: 502 });
   });
 });
+
+describe('SQL alert preview and capabilities', () => {
+  const preview = {
+    queryType: 'code',
+    compiledQuery: 'SELECT COUNT(*) FROM "app"',
+    datasets: ['app'],
+    measure: 'alert_value',
+    dimensions: [],
+    window: { start: '2026-10-12T12:00:00Z', end: '2026-10-12T12:10:00Z' },
+    threshold: { operator: '>', value: 10 },
+    simple: true,
+    noData: false,
+    wouldTrigger: true,
+    groups: [{ labels: {}, value: 12, breached: true }],
+    totalGroups: 1,
+    breachedGroups: 1,
+    truncated: false,
+  };
+  it('posts to the dedicated preview endpoint with session and cancellation; performs no write', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(preview)));
+    vi.stubGlobal('fetch', fetch);
+    const signal = new AbortController().signal;
+    expect(
+      await createClient({ mode: 'live' }).previewAlert(
+        { ...alertRequest, queryType: 'code' },
+        signal,
+      ),
+    ).toEqual(preview);
+    expect(fetch).toHaveBeenCalledOnce();
+    const [url, init] = fetch.mock.calls[0];
+    expect(url).toBe('/api/v1/alerts/preview');
+    expect(init.method).toBe('POST');
+    expect(init.signal).toBe(signal);
+    expect(init.credentials).toBe('include');
+    expect(JSON.parse(init.body)).toMatchObject({ queryType: 'code' });
+  });
+  it.each(['alertBuilder', 'alertPreview'])(
+    'requires a strict boolean %s and defaults to unavailable',
+    async (key) => {
+      const fetch = vi
+        .fn()
+        .mockResolvedValueOnce(new Response('{}'))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ capabilities: { [key]: true } })))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ capabilities: { [key]: 'true' } })));
+      vi.stubGlobal('fetch', fetch);
+      const client = createClient({ mode: 'live' });
+      expect((await client.about()).capabilities[key as 'alertBuilder']).toBe(false);
+      expect((await client.about()).capabilities[key as 'alertBuilder']).toBe(true);
+      await expect(client.about()).rejects.toMatchObject({ status: 502 });
+    },
+  );
+  it('rejects malformed engine results rather than pretending query-only preview is equivalent', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            JSON.stringify({ ...preview, groups: [{ labels: {}, value: '12', breached: true }] }),
+          ),
+        ),
+    );
+    await expect(
+      createClient({ mode: 'live' }).previewAlert({ ...alertRequest, queryType: 'code' }),
+    ).rejects.toMatchObject({ status: 502 });
+  });
+});

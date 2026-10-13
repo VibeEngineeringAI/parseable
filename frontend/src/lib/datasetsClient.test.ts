@@ -302,3 +302,107 @@ describe('Dataset HTTP contracts', () => {
     },
   );
 });
+
+describe('advanced dataset contracts', () => {
+  it('sends static creation format and metadata without Arrow conversion', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response('Created'));
+    vi.stubGlobal('fetch', fetch);
+    const staticSchema = { fields: [{ name: 'service', data_type: 'string' as const }] };
+    await createClient({ mode: 'live' }).createDataset('new', {
+      telemetryType: 'metrics',
+      logSource: 'otel-metrics',
+      staticSchema,
+      datasetTags: ['apm'],
+      datasetLabels: ['production', 'customer-a'],
+      inferTimestamp: false,
+    });
+    const [url, init] = fetch.mock.calls[0];
+    expect(url).toBe('/api/v1/logstream/new');
+    expect(init.headers).toEqual({
+      'Content-Type': 'application/json',
+      'X-P-Telemetry-Type': 'metrics',
+      'X-P-Log-Source': 'otel-metrics',
+      'X-P-Static-Schema-Flag': 'true',
+      'X-P-Dataset-Tags': 'apm',
+      'X-P-Dataset-Labels': 'production,customer-a',
+      'X-P-Infer-Timestamp': 'false',
+    });
+    expect(JSON.parse(init.body)).toEqual(staticSchema);
+  });
+  it('keeps partition updates independent and removes custom partition by omitting only that header', async () => {
+    const fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('Updated')));
+    vi.stubGlobal('fetch', fetch);
+    const c = createClient({ mode: 'live' });
+    await c.updateDatasetCustomPartition('x', 'service');
+    await c.setDatasetTimePartitionLimit('x', 14);
+    await c.updateDatasetCustomPartition('x');
+    expect(fetch.mock.calls.map(([, init]) => init.headers)).toEqual([
+      { 'X-P-Update-Stream': 'true', 'X-P-Custom-Partition': 'service' },
+      { 'X-P-Update-Stream': 'true', 'X-P-Time-Partition-Limit': '14d' },
+      { 'X-P-Update-Stream': 'true' },
+    ]);
+  });
+  it('retains metadata and typed schema while preserving field-name consumers and abort signal', async () => {
+    const arrow = {
+      fields: [{ name: 'value', data_type: 'Int64', nullable: false, metadata: { unit: 'count' } }],
+    };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({ datasetTags: ['apm'], datasetLabels: ['prod'], inferTimestamp: false }),
+      )
+      .mockResolvedValueOnce(json(arrow))
+      .mockResolvedValueOnce(json(arrow));
+    vi.stubGlobal('fetch', fetch);
+    const c = createClient({ mode: 'live' }),
+      signal = new AbortController().signal;
+    expect(await c.datasetInfo('x', signal)).toMatchObject({
+      datasetTags: ['apm'],
+      datasetLabels: ['prod'],
+      inferTimestamp: false,
+    });
+    expect((await c.datasetSchema('x', signal)).fields[0]).toEqual({
+      name: 'value',
+      dataType: 'Int64',
+      nullable: false,
+      metadata: { unit: 'count' },
+    });
+    expect(await c.schema('x', signal)).toEqual(['value']);
+    expect(fetch.mock.calls[1][1].signal).toBe(signal);
+  });
+});
+
+it('reads APM using its accepted creation spelling for consistent inventory search and display', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockResolvedValue(
+      json({
+        datasetTags: ['a-p-m', 'future-domain'],
+        datasetLabels: ['static-schema', 'live-fixture'],
+      }),
+    ),
+  );
+  expect(await createClient({ mode: 'live' }).datasetInfo('typed')).toMatchObject({
+    datasetTags: ['apm', 'future-domain'],
+    datasetLabels: ['static-schema', 'live-fixture'],
+  });
+});
+
+it.each(
+  [['équipe', 'prod'], ['チーム'], ['team\nprod'], ['prod,staging'], [''], ['\tprod']].map(
+    (datasetLabels) => ({ datasetLabels }),
+  ),
+)(
+  'rejects unsafe label headers before sending a creation request %#',
+  async ({ datasetLabels }) => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    await expect(
+      createClient({ mode: 'live' }).createDataset('labels', {
+        telemetryType: 'logs',
+        datasetLabels,
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(fetch).not.toHaveBeenCalled();
+  },
+);

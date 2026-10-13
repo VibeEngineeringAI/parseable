@@ -53,6 +53,12 @@ function extras(value: Record<string, unknown>) {
       (object(value.promqlConfig) &&
         (value.promqlConfig.holdDuration === undefined ||
           typeof value.promqlConfig.holdDuration === 'string'))) &&
+    (value.executionOwner === undefined || typeof value.executionOwner === 'string') &&
+    (value.sqlRuntime === undefined ||
+      (object(value.sqlRuntime) &&
+        oneOf(value.sqlRuntime.health, ['ok', 'noData', 'error']) &&
+        nullableString(value.sqlRuntime.error) &&
+        nullableString(value.sqlRuntime.lastEvaluatedAt))) &&
     (value.promqlRuntime === undefined || promqlRuntime(value.promqlRuntime)) &&
     (value.executionIdentity === undefined ||
       (object(value.executionIdentity) &&
@@ -132,5 +138,40 @@ export function alertTargetStatus(value: unknown): value is AlertTargetStatus {
     alertTarget(value.target) &&
     typeof value.enabled === 'boolean' &&
     (value.error === undefined || typeof value.error === 'string')
+  );
+}
+
+export function alertPreview(value: unknown): value is import('./types').AlertPreviewResponse {
+  if (
+    !object(value) ||
+    !oneOf(value.queryType, ['builder', 'code']) ||
+    typeof value.compiledQuery !== 'string' ||
+    !strings(value.datasets) ||
+    typeof value.measure !== 'string' ||
+    !strings(value.dimensions) ||
+    !object(value.window) ||
+    typeof value.window.start !== 'string' ||
+    typeof value.window.end !== 'string' ||
+    !object(value.threshold) ||
+    !oneOf(value.threshold.operator, ['>', '>=', '<', '<=', '=', '!=']) ||
+    !finite(value.threshold.value)
+  )
+    return false;
+  return (
+    ['simple', 'noData', 'wouldTrigger', 'truncated'].every(
+      (key) => typeof value[key] === 'boolean',
+    ) &&
+    ['totalGroups', 'breachedGroups'].every(
+      (key) => Number.isSafeInteger(value[key]) && (value[key] as number) >= 0,
+    ) &&
+    Array.isArray(value.groups) &&
+    value.groups.length <= 200 &&
+    value.groups.every(
+      (group) =>
+        object(group) &&
+        labels(group.labels) &&
+        finite(group.value) &&
+        typeof group.breached === 'boolean',
+    )
   );
 }

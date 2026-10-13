@@ -1,6 +1,7 @@
 import { parser } from '@prometheus-io/lezer-promql';
 import { getType } from '@prometheus-io/codemirror-promql/dist/esm/parser/type';
 import { parseDuration } from '../../lib/promql';
+import { sqlBuilderConfig, type SqlBuilderV1 } from '../../lib/sqlBuilderContract';
 import { createId } from '../../lib/ids';
 import type {
   Alert,
@@ -85,7 +86,8 @@ export function alertDuration(value: string): number | undefined {
 
 export type TagDraft = { id: string; value: string };
 export type AlertDraft = {
-  type: 'promql' | 'code';
+  type: 'promql' | 'code' | 'builder';
+  builderConfig?: SqlBuilderV1;
   dataset: string;
   query: string;
   operator: ThresholdOperator;
@@ -121,7 +123,15 @@ export function newAlertDraft(promql: boolean, params = new URLSearchParams()): 
 }
 export function alertDraft(alert: AlertRequest): AlertDraft {
   return {
-    type: alert.queryType === 'promql' ? 'promql' : 'code',
+    type:
+      alert.queryType === 'promql'
+        ? 'promql'
+        : alert.queryType === 'builder' && sqlBuilderConfig(alert.builderConfig)
+          ? 'builder'
+          : 'code',
+    ...(sqlBuilderConfig(alert.builderConfig)
+      ? { builderConfig: structuredClone(alert.builderConfig) }
+      : {}),
     dataset: alert.datasets[0] ?? '',
     query: alert.query,
     operator: alert.thresholdConfig.operator,
@@ -161,7 +171,10 @@ export function validateAlert(
   const errors: Partial<Record<keyof AlertDraft, string>> = {};
   if (!draft.title.trim()) errors.title = 'Enter an alert title.';
   if (!draft.dataset) errors.dataset = 'Select a dataset.';
-  if (!draft.query.trim()) errors.query = 'Enter a query.';
+  if (draft.type === 'builder') {
+    if (!sqlBuilderConfig(draft.builderConfig))
+      errors.builderConfig = 'Complete a supported SQL builder specification.';
+  } else if (!draft.query.trim()) errors.query = 'Enter a query.';
   else if (draft.type === 'promql') errors.query = promqlSyntaxError(draft.query);
   if (draft.type === 'promql' && !promqlEnabled)
     errors.type = 'PromQL alerts are not available on this server.';
@@ -172,14 +185,16 @@ export function validateAlert(
   if (
     !Number.isSafeInteger(frequency) ||
     frequency < 1 ||
-    (draft.type === 'promql' && frequency > 1440)
+    (draft.type !== 'code' && frequency > 1440)
   )
     errors.frequency =
-      draft.type === 'promql'
+      draft.type !== 'code'
         ? 'Use 1–1440 whole minutes.'
         : 'Use a positive whole number of minutes.';
   if (alertDuration(draft.window.trim()) === undefined)
     errors.window = 'Use a duration such as 10m or 1h30m.';
+  if (draft.type === 'builder' && (alertDuration(draft.window.trim()) ?? Infinity) > 30 * 86400)
+    errors.window = 'Evaluation window cannot exceed 30 days.';
   if (draft.type === 'promql') {
     const hold = alertDuration(draft.hold.trim());
     if (hold === undefined) errors.hold = 'Use a duration such as 0s, 5m or 1h30m.';
@@ -212,6 +227,12 @@ const managedFields = new Set([
   'promqlRuntime',
   'executionIdentity',
   'promqlConfig',
+  'builderConfig',
+  'builder_config',
+  'builderStatus',
+  'executionMode',
+  'executionOwner',
+  'sqlRuntime',
 ]);
 export function buildAlertPayload(draft: AlertDraft, original?: AlertRequest): AlertRequest {
   const extra = Object.fromEntries(
@@ -221,7 +242,8 @@ export function buildAlertPayload(draft: AlertDraft, original?: AlertRequest): A
     ...extra,
     title: draft.title.trim(),
     severity: draft.severity,
-    query: draft.query.trim(),
+    query: draft.type === 'builder' ? '' : draft.query.trim(),
+    ...(draft.type === 'builder' ? { builderConfig: draft.builderConfig } : {}),
     queryType: draft.type,
     datasets: [draft.dataset],
     alertType: 'threshold',
@@ -335,8 +357,13 @@ export function filterSortAlerts(
       (a, b) => (key(a).localeCompare(key(b)) || a.id.localeCompare(b.id)) * (descending ? -1 : 1),
     );
 }
-// Query type and id are immutable, so resolved types survive list reloads.
+// Retain types across list reloads; saving a conversion replaces the cached type.
 const resolvedTypes = new WeakMap<ParseableClient, Map<string, AlertQueryType>>();
+export function rememberAlertType(client: ParseableClient, alert: Pick<Alert, 'id' | 'queryType'>) {
+  const known = resolvedTypes.get(client) ?? new Map<string, AlertQueryType>();
+  known.set(alert.id, alert.queryType);
+  resolvedTypes.set(client, known);
+}
 export async function resolveAlertTypes(
   client: ParseableClient,
   rows: AlertSummary[],

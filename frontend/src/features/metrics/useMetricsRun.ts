@@ -3,7 +3,11 @@ import { pushHistory } from '../../lib/promql';
 import type { ParseableClient } from '../../lib/types';
 import { requestsForSnapshot, type QueryResult, type RunSnapshot } from './helpers';
 
-export function useMetricsRun(client: ParseableClient, snapshot?: RunSnapshot) {
+export function useMetricsRun(
+  client: ParseableClient,
+  snapshot?: RunSnapshot,
+  scope: string | null = null,
+) {
   const [state, setState] = useState<{ snapshot?: RunSnapshot; results: QueryResult[] }>({
     results: [],
   });
@@ -72,12 +76,12 @@ export function useMetricsRun(client: ParseableClient, snapshot?: RunSnapshot) {
         });
       void Promise.allSettled(requests).then((outcomes) => {
         if (!abort.signal.aborted && outcomes.every((outcome) => outcome.status === 'fulfilled')) {
-          pushHistory(snapshot.stream, row.query);
+          pushHistory(snapshot.stream, row.query, scope);
           setHistoryRevision((revision) => revision + 1);
         }
       });
     }
     return () => abort.abort();
-  }, [client, snapshot]);
+  }, [client, snapshot, scope]);
   return state.snapshot === snapshot ? state.results : [];
 }

@@ -33,15 +33,20 @@ use ulid::Ulid;
 /// query or a delivery, so a slow rule cannot stall other alerts or tenants.
 static LIFECYCLES: Lazy<DashMap<Ulid, Arc<Mutex<u64>>>> = Lazy::new(DashMap::new);
 
-fn lifecycle(id: Ulid) -> Arc<Mutex<u64>> {
+pub(super) fn lifecycle(id: Ulid) -> Arc<Mutex<u64>> {
     LIFECYCLES.entry(id).or_default().clone()
 }
 
-/// Lock an alert for a change. Hold the guard until the change is persisted.
+/// Serialize validation and changes without invalidating in-flight work merely
+/// because a request acquired the lock. Rejected requests leave its generation intact.
 pub async fn lock_lifecycle(id: Ulid) -> OwnedMutexGuard<u64> {
-    let mut guard = lifecycle(id).lock_owned().await;
-    *guard += 1;
-    guard
+    lifecycle(id).lock_owned().await
+}
+
+/// Call after the first successful mutation, holding the guard through commit.
+/// A later partial failure must still invalidate results from the prior definition.
+pub fn mark_lifecycle_changed(guard: &mut OwnedMutexGuard<u64>) {
+    **guard += 1;
 }
 
 /// Drop a deleted alert's lock. Call this while still holding its guard.
@@ -120,10 +125,35 @@ pub fn hold_duration(config: &AlertConfig) -> Result<std::time::Duration, AlertE
 
 /// Capture a stable user ID, never a password or expiring browser session.
 pub fn capture_identity(config: &mut AlertConfig, session: &SessionKey) -> Result<(), AlertError> {
+    capture_identity_for_edit(config, session, false)
+}
+
+pub fn requires_execution_identity(config: &AlertConfig) -> bool {
+    config
+        .other_fields
+        .as_ref()
+        .is_some_and(|fields| fields.contains_key("executionIdentity"))
+        || config
+            .builder_config
+            .as_ref()
+            .and_then(|spec| spec.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("sql")
+}
+
+pub fn capture_identity_for_edit(
+    config: &mut AlertConfig,
+    session: &SessionKey,
+    previously_bound: bool,
+) -> Result<(), AlertError> {
+    let bind = config.query_type == AlertQueryType::Promql
+        || config.builder_config.is_some()
+        || previously_bound;
     let fields = config.other_fields.get_or_insert_with(Default::default);
     fields.remove("promqlRuntime");
+    fields.remove("sqlRuntime");
     fields.remove("executionIdentity");
-    if config.query_type == AlertQueryType::Promql {
+    if bind {
         let (user, tenant) = sessions().get_user_and_tenant_id(session).ok_or_else(|| {
             AlertError::ValidationFailure("Unable to identify alert owner".into())
         })?;
@@ -138,6 +168,39 @@ pub fn capture_identity(config: &mut AlertConfig, session: &SessionKey) -> Resul
         );
     }
     Ok(())
+}
+
+/// Response display names are deliberately separate from internal execution IDs.
+/// Unknown/deleted owners and OAuth records without display data stay anonymous.
+pub(super) fn execution_owner(config: &AlertConfig) -> Option<String> {
+    let identity = config.other_fields.as_ref()?.get("executionIdentity")?;
+    let tenant = config.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+    if identity.get("tenantId").and_then(serde_json::Value::as_str) != Some(tenant) {
+        return None;
+    }
+    let owner = identity.get("userId")?.as_str()?;
+    let users = crate::rbac::map::USERS.get()?.read();
+    owner_display(users.get(tenant)?.get(owner)?)
+}
+
+fn owner_display(user: &crate::rbac::user::User) -> Option<String> {
+    use crate::rbac::user::UserType;
+    let display = match &user.ty {
+        UserType::Native(user) => Some(user.username.as_str()),
+        UserType::OAuth(user) => user
+            .user_info
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .or(user.user_info.email.as_deref()),
+        UserType::ApiKey(user) => Some(user.key_name.as_str()),
+    }?;
+    let display: String = display
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect();
+    (!display.trim().is_empty()).then_some(display)
 }
 
 pub(super) fn authorize_execution(config: &AlertConfig) -> Result<(), String> {
@@ -169,9 +232,22 @@ pub(super) fn authorize_execution(config: &AlertConfig) -> Result<(), String> {
         permissions,
         &config.tenant_id,
     );
-    let dataset = config.datasets.first().ok_or("Missing alert dataset")?;
-    if auth.check_auth(&key, Action::Query, Some(dataset), None) != Some(Response::Authorized) {
-        return Err("Alert owner's dataset permission has been revoked".into());
+    authorize_execution_datasets(&config.datasets, |dataset| {
+        auth.check_auth(&key, Action::Query, Some(dataset), None) == Some(Response::Authorized)
+    })
+}
+
+fn authorize_execution_datasets(
+    datasets: &[String],
+    authorized: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    if datasets.is_empty() {
+        return Err("Missing alert dataset".into());
+    }
+    for dataset in datasets {
+        if !authorized(dataset) {
+            return Err("Alert owner's dataset permission has been revoked".into());
+        }
     }
     Ok(())
 }
@@ -438,7 +514,7 @@ fn firing_valid_until(config: &AlertConfig, now: DateTime<Utc>) -> DateTime<Utc>
     now + staleness_bound(config)
 }
 
-fn notifications_allowed(state: &NotificationState, now: DateTime<Utc>) -> bool {
+pub(super) fn notifications_allowed(state: &NotificationState, now: DateTime<Utc>) -> bool {
     match state {
         NotificationState::Notify => true,
         NotificationState::Mute(till) => {
@@ -469,6 +545,14 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
         .map(|v| serde_json::from_value(v.clone()))
         .transpose()?
         .unwrap_or_default();
+    if let Some(error) = runtime.error.as_mut() {
+        *error = super::target::safe_runtime_error(error);
+    }
+    for delivery in &mut runtime.deliveries {
+        if let Some(error) = delivery.error.as_mut() {
+            *error = super::target::safe_runtime_error(error);
+        }
+    }
     let authorized = authorize_execution(&config);
     let may_deliver = authorized.is_ok();
     let result = match authorized {
@@ -493,7 +577,11 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
     let transitions = match result {
         Ok(transitions) => transitions,
         Err(error) => {
-            runtime.discontinuity("error", Some(error), now);
+            runtime.discontinuity(
+                "error",
+                Some(super::target::safe_runtime_error(&error)),
+                now,
+            );
             vec![]
         }
     };
@@ -593,7 +681,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
                     delivery.attempts = u32::MAX;
                     delivery.error = None;
                 }
-                Err(error) => delivery.error = Some(error),
+                Err(error) => delivery.error = Some(super::target::safe_runtime_error(&error)),
             }
         }
         // Alertmanager expects active alerts to be re-sent, so every
@@ -688,6 +776,92 @@ mod tests {
     fn sample(host: &str, value: f64) -> (Labels, f64) {
         (BTreeMap::from([("host".into(), host.into())]), value)
     }
+    #[test]
+    fn execution_owner_display_uses_names_and_never_credential_or_subject_fallbacks() {
+        use crate::rbac::user::{ApiKeyUser, Basic, OAuth, User, UserInfo, UserType};
+        let mut user = User {
+            ty: UserType::Native(Basic {
+                username: "Owner\n".into(),
+                password_hash: "secret-password-hash".into(),
+                email: None,
+            }),
+            roles: Default::default(),
+            user_groups: Default::default(),
+            tenant: None,
+            protected: false,
+        };
+        assert_eq!(owner_display(&user).as_deref(), Some("Owner"));
+        user.ty = UserType::OAuth(Box::new(OAuth {
+            userid: "private-subject".into(),
+            user_info: UserInfo {
+                name: Some("Display name".into()),
+                ..Default::default()
+            },
+            bearer: None,
+            issuer: None,
+            role_grants: None,
+        }));
+        assert_eq!(owner_display(&user).as_deref(), Some("Display name"));
+        if let UserType::OAuth(oauth) = &mut user.ty {
+            oauth.user_info.name = None;
+        }
+        assert_eq!(owner_display(&user), None);
+        user.ty = UserType::ApiKey(Box::new(ApiKeyUser {
+            userid: "private-key-owner".into(),
+            key_id: ulid::Ulid::new(),
+            api_key: "secret-api-key".into(),
+            key_name: "Deploy notifications".into(),
+            created_by: "creator-id".into(),
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            expires_at: None,
+        }));
+        assert_eq!(
+            owner_display(&user).as_deref(),
+            Some("Deploy notifications")
+        );
+        let mut rule = config();
+        rule.other_fields.as_mut().unwrap().insert(
+            "executionIdentity".into(),
+            serde_json::json!({"userId":"private-subject","tenantId":"wrong-tenant"}),
+        );
+        assert_eq!(execution_owner(&rule), None);
+        let response = rule.to_response();
+        assert_eq!(response.execution_mode.as_deref(), Some("owner"));
+        assert_eq!(response.execution_owner, None);
+    }
+
+    #[test]
+    fn owner_authorization_rechecks_every_sql_dataset_and_fails_closed_on_empty() {
+        let authorized = |dataset: &str| dataset == "first";
+        assert!(authorize_execution_datasets(&["first".into()], authorized).is_ok());
+        assert!(
+            authorize_execution_datasets(&["first".into(), "revoked".into()], authorized).is_err()
+        );
+        assert!(authorize_execution_datasets(&[], authorized).is_err());
+        assert!(authorize_execution_datasets(&["first".into(), "second".into()], |_| true).is_ok());
+    }
+
+    #[test]
+    fn legacy_sql_stays_server_executed_and_spec_without_owner_fails_closed() {
+        let mut rule = config();
+        rule.query_type = AlertQueryType::Code;
+        assert!(!requires_execution_identity(&rule));
+        rule.builder_config = Some(serde_json::json!({"kind":"sql","version":999}));
+        assert!(requires_execution_identity(&rule));
+        assert!(
+            authorize_execution(&rule)
+                .unwrap_err()
+                .contains("identity is missing")
+        );
+        rule.builder_config = None;
+        rule.other_fields.as_mut().unwrap().insert(
+            "executionIdentity".into(),
+            serde_json::json!({"userId":"owner"}),
+        );
+        assert!(requires_execution_identity(&rule));
+    }
+
     #[test]
     fn independent_hosts_hold_and_recover() {
         let config = config();
@@ -924,20 +1098,23 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn lifecycle_locks_are_per_alert_and_count_changes() {
-        let (held_id, other_id) = (Ulid::new(), Ulid::new());
-        let held = lock_lifecycle(held_id).await;
-        // A change to one alert must not wait for another alert's lock.
+    async fn lifecycle_locks_are_per_alert_and_count_only_committed_changes() {
+        let held_id = ulid::Ulid::new();
+        let other_id = ulid::Ulid::new();
+        let mut held = lock_lifecycle(held_id).await;
         let other =
             tokio::time::timeout(std::time::Duration::from_secs(1), lock_lifecycle(other_id))
                 .await
                 .expect("an unrelated alert's lock should be free");
-        assert_eq!((*held, *other), (1, 1));
+        assert_eq!((*held, *other), (0, 0));
+        mark_lifecycle_changed(&mut held);
+        assert_eq!(*held, 1);
         drop(held);
-        assert_eq!(*lock_lifecycle(held_id).await, 2);
+        assert_eq!(*lock_lifecycle(held_id).await, 1);
         forget_lifecycle(held_id);
         forget_lifecycle(other_id);
     }
+
     #[test]
     fn duplicate_labels_leave_instance_state_unchanged() {
         let mut config = config();

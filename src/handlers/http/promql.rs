@@ -683,6 +683,14 @@ enum BatchPurpose {
     Metadata,
 }
 
+/// Save and execution must agree on the actual ingestion source, independent of
+/// a dataset's advertised telemetry label or metric-looking columns.
+pub(crate) fn metrics_source_eligible(sources: &[crate::event::format::LogSourceEntry]) -> bool {
+    sources
+        .iter()
+        .any(|source| source.log_source_format == LogSource::OtelMetrics)
+}
+
 async fn load_batches(
     plan: &QueryPlan,
     dataset: &str,
@@ -694,11 +702,7 @@ async fn load_batches(
     let stream = PARSEABLE
         .get_stream(dataset, tenant)
         .map_err(|e| ApiError::bad(e.to_string()))?;
-    if !stream
-        .get_log_source()
-        .iter()
-        .any(|source| source.log_source_format == LogSource::OtelMetrics)
-    {
+    if !metrics_source_eligible(&stream.get_log_source()) {
         return Err(ApiError::bad(
             "X-P-Stream must select an otel-metrics dataset",
         ));
@@ -1011,6 +1015,21 @@ fn finish_series(grouped: BTreeMap<Labels, Vec<Sample>>) -> Result<Vec<Series>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alert_save_and_execution_require_actual_metrics_source() {
+        use crate::event::format::LogSourceEntry;
+        let entry = |source| LogSourceEntry::new(source, Default::default());
+        assert!(!metrics_source_eligible(&[]));
+        for source in [LogSource::Json, LogSource::OtelLogs, LogSource::OtelTraces] {
+            assert!(!metrics_source_eligible(&[entry(source)]));
+        }
+        assert!(metrics_source_eligible(&[entry(LogSource::OtelMetrics)]));
+        assert!(metrics_source_eligible(&[
+            entry(LogSource::Json),
+            entry(LogSource::OtelMetrics)
+        ]));
+    }
 
     #[test]
     fn ingestion_window_bounds_scan_by_delay() {

@@ -9,6 +9,7 @@ import { useAsync } from '../../hooks/useAsync';
 import type { Alert } from '../../lib/types';
 import { AlertActions } from './AlertActions';
 import { PromqlRuntime } from './PromqlRuntime';
+import { builderEditable } from '../../lib/sqlBuilderContract';
 import { muteState, queryTypeLabel, severityLabel, stateLabel } from './helpers';
 import { targetType, targetTypeLabel } from './targetHelpers';
 import { DateText, useAlertAccess } from './shared';
@@ -17,6 +18,8 @@ export function AlertDetail({ alert, onChanged }: { alert: Alert; onChanged: () 
   const { client } = useApp();
   const navigate = useNavigate();
   const canWrite = useAlertAccess();
+  const about = useAsync(useCallback((signal) => client.about(signal), [client]));
+  const editable = builderEditable(alert, about.data?.capabilities.alertBuilder === true);
   const targets = useAsync(useCallback((signal) => client.listAlertTargets(signal), [client]));
   const targetRows = targets.data ?? [];
   const mute = muteState(alert.notificationState),
@@ -79,9 +82,10 @@ export function AlertDetail({ alert, onChanged }: { alert: Alert; onChanged: () 
               <dd>{alert.datasets.join(', ')}</dd>
             </dl>
             <pre className="alerts-query">{alert.query}</pre>
-            {alert.queryType === 'builder' && (
+            {alert.queryType === 'builder' && !editable && (
               <p className="notice">
-                Editing builder alerts is not supported yet. This SQL rule is read-only.
+                This legacy or unsupported builder rule is read-only in guided mode. Use Inspect /
+                convert to edit its SQL.
               </p>
             )}
           </CardBody>
@@ -172,15 +176,57 @@ export function AlertDetail({ alert, onChanged }: { alert: Alert; onChanged: () 
                   : 'No tags'}
               </dd>
             </div>
-            {alert.executionIdentity && (
+            {alert.queryType !== 'promql' && (
+              <div>
+                <dt>Execution mode</dt>
+                <dd>
+                  {alert.executionMode === 'owner'
+                    ? 'Saved execution owner; saving binds the editor'
+                    : alert.executionMode === 'server'
+                      ? 'Server (legacy or raw SQL rule)'
+                      : 'Not reported'}
+                </dd>
+              </div>
+            )}
+            {alert.executionOwner && (
               <div>
                 <dt>Execution owner</dt>
-                <dd>{alert.executionIdentity.userId}</dd>
+                <dd>{alert.executionOwner}</dd>
               </div>
             )}
           </dl>
         </CardBody>
       </Card>
+      {alert.queryType !== 'promql' && (
+        <Card>
+          <CardHeader>
+            <h2>SQL execution health</h2>
+          </CardHeader>
+          <CardBody>
+            {alert.sqlRuntime ? (
+              <div className="stack">
+                <Badge
+                  tone={
+                    alert.sqlRuntime.health === 'error'
+                      ? 'danger'
+                      : alert.sqlRuntime.health === 'ok'
+                        ? 'success'
+                        : 'neutral'
+                  }
+                >
+                  {alert.sqlRuntime.health}
+                </Badge>
+                {alert.sqlRuntime.error && <p className="error-text">{alert.sqlRuntime.error}</p>}
+                <p>
+                  Last evaluated: <DateText value={alert.sqlRuntime.lastEvaluatedAt} />
+                </p>
+              </div>
+            ) : (
+              <p className="muted">Execution health has not been reported.</p>
+            )}
+          </CardBody>
+        </Card>
+      )}
       {alert.queryType === 'promql' && <PromqlRuntime alert={alert} targets={targets.data ?? []} />}
     </div>
   );

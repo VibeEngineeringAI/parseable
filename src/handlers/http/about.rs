@@ -110,6 +110,8 @@ pub async fn about() -> Json<Value> {
             "promqlDashboard": promql_enabled,
             "promqlMetadata": promql_enabled,
             "promqlAlerts": promql_enabled,
+            "alertBuilder": true,
+            "alertPreview": matches!(PARSEABLE.options.mode, crate::option::Mode::All | crate::option::Mode::Query | crate::option::Mode::Prism),
         },
         "mode": mode,
         "staging": staging,

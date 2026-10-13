@@ -71,6 +71,13 @@ const RESERVED_FIELDS: &[&str] = &[
     "tags",
     "lastTriggeredAt",
     "last_triggered_at",
+    "tenantId",
+    "tenant_id",
+    "builderConfig",
+    "builder_config",
+    "builderStatus",
+    "executionMode",
+    "executionOwner",
 ];
 
 /// Helper struct for basic alert fields during migration
@@ -286,9 +293,12 @@ pub struct AlertRequest {
     #[serde(default = "Severity::default")]
     pub severity: Severity,
     pub title: String,
+    #[serde(default)]
     pub query: String,
     #[serde(default)]
     pub query_type: AlertQueryType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_config: Option<Value>,
     #[serde(default)]
     pub datasets: Vec<String>,
     pub alert_type: String,
@@ -305,7 +315,11 @@ pub struct AlertRequest {
 }
 
 impl AlertRequest {
-    pub async fn into(self, tenant_id: Option<String>) -> Result<AlertConfig, AlertError> {
+    pub async fn into(
+        self,
+        tenant_id: Option<String>,
+        session: &crate::rbac::map::SessionKey,
+    ) -> Result<AlertConfig, AlertError> {
         // Validate that other_fields doesn't contain reserved field names
         let other_fields = if let Some(mut other_fields) = self.other_fields {
             // Limit other_fields to maximum 10 fields
@@ -335,8 +349,18 @@ impl AlertRequest {
         for id in &self.targets {
             TARGETS.get_target_by_id(id, &tenant_id).await?;
         }
+        let (query, builder_config) = super::sql_builder::prepare(
+            self.query_type,
+            &self.query,
+            self.builder_config,
+            &self.eval_config,
+            &self.threshold_config,
+            &tenant_id,
+            session,
+        )
+        .await?;
         let datasets = match self.query_type {
-            AlertQueryType::Builder | AlertQueryType::Code => resolve_stream_names(&self.query)?,
+            AlertQueryType::Builder | AlertQueryType::Code => resolve_stream_names(&query)?,
             AlertQueryType::Promql => self.datasets,
         };
 
@@ -349,15 +373,22 @@ impl AlertRequest {
                 "Alert should include only one dataset. Found: {datasets:?}"
             )));
         }
-        if self.query_type == AlertQueryType::Promql
-            && !PARSEABLE
+        if self.query_type == AlertQueryType::Promql {
+            if !PARSEABLE
                 .check_or_load_stream(&datasets[0], &tenant_id)
                 .await
-        {
-            return Err(AlertError::ValidationFailure(format!(
-                "Invalid PromQL metrics stream: {}",
-                datasets[0]
-            )));
+            {
+                return Err(AlertError::ValidationFailure(format!(
+                    "Invalid PromQL metrics stream: {}",
+                    datasets[0]
+                )));
+            }
+            let stream = PARSEABLE.get_stream(&datasets[0], &tenant_id)?;
+            if !crate::handlers::http::promql::metrics_source_eligible(&stream.get_log_source()) {
+                return Err(AlertError::ValidationFailure(
+                    "PromQL alerts require an otel-metrics dataset".into(),
+                ));
+            }
         }
 
         let created_timestamp = Utc::now();
@@ -367,8 +398,9 @@ impl AlertRequest {
             id: Ulid::new(),
             severity: self.severity,
             title: self.title,
-            query: self.query,
+            query,
             query_type: self.query_type,
+            builder_config,
             datasets,
             alert_type: {
                 match self.alert_type.as_str() {
@@ -422,6 +454,8 @@ pub struct AlertConfig {
     pub query: String,
     #[serde(default)]
     pub query_type: AlertQueryType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_config: Option<Value>,
     pub datasets: Vec<String>,
     pub alert_type: AlertType,
     pub threshold_config: ThresholdConfig,
@@ -450,6 +484,14 @@ pub struct AlertConfigResponse {
     pub title: String,
     pub query: String,
     pub query_type: AlertQueryType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_config: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_owner: Option<String>,
     pub datasets: Vec<String>,
     pub alert_type: &'static str,
     pub anomaly_config: Option<AnomalyConfig>,
@@ -467,6 +509,44 @@ pub struct AlertConfigResponse {
     pub last_triggered_at: Option<DateTime<Utc>>,
     #[serde(flatten)]
     pub other_fields: Option<serde_json::Map<String, Value>>,
+}
+
+/// Preserve extension fields while hiding internal ownership and sanitizing old diagnostics.
+pub(super) fn response_other_fields(
+    fields: Option<serde_json::Map<String, Value>>,
+    summary: bool,
+) -> Option<serde_json::Map<String, Value>> {
+    let mut fields = fields?;
+    fields.remove("executionIdentity");
+    for name in ["promqlRuntime", "sqlRuntime"] {
+        if let Some(runtime) = fields.get_mut(name) {
+            sanitize_runtime_errors(runtime);
+            if summary && name == "promqlRuntime" {
+                if let Some(runtime) = runtime.as_object_mut() {
+                    runtime.remove("deliveries");
+                }
+            }
+        }
+    }
+    Some(fields)
+}
+
+pub(super) fn sanitize_runtime_errors(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key == "error" {
+                    if let Some(error) = value.as_str() {
+                        *value = Value::String(super::target::safe_runtime_error(error));
+                    }
+                } else {
+                    sanitize_runtime_errors(value);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(sanitize_runtime_errors),
+        _ => {}
+    }
 }
 
 impl AlertConfig {
@@ -489,7 +569,23 @@ impl AlertConfig {
         }
     }
 
-    pub fn to_response(self) -> AlertConfigResponse {
+    pub fn to_response(mut self) -> AlertConfigResponse {
+        let builder_status = self
+            .builder_config
+            .as_ref()
+            .map(|spec| super::sql_builder::builder_status(spec, &self.query).to_owned());
+        let execution_mode = Some(
+            if self.query_type == AlertQueryType::Promql
+                || super::promql_alerts::requires_execution_identity(&self)
+            {
+                "owner"
+            } else {
+                "server"
+            }
+            .to_owned(),
+        );
+        let execution_owner = super::promql_alerts::execution_owner(&self);
+        self.other_fields = response_other_fields(self.other_fields, false);
         AlertConfigResponse {
             version: self.version,
             id: self.id,
@@ -497,6 +593,10 @@ impl AlertConfig {
             title: self.title,
             query: self.query,
             query_type: self.query_type,
+            builder_config: self.builder_config,
+            builder_status,
+            execution_mode,
+            execution_owner,
             datasets: self.datasets,
             alert_type: {
                 match self.alert_type {
@@ -976,7 +1076,13 @@ mod tests {
             &[],
         );
 
-        let config = request.into(None).await.unwrap();
+        let config = request
+            .into(
+                None,
+                &crate::rbac::map::SessionKey::SessionId(ulid::Ulid::new()),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(config.datasets, ["logs-a", "logs-b"]);
     }
@@ -989,7 +1095,13 @@ mod tests {
             &[],
         );
 
-        let error = request.into(None).await.unwrap_err();
+        let error = request
+            .into(
+                None,
+                &crate::rbac::map::SessionKey::SessionId(ulid::Ulid::new()),
+            )
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, AlertError::ValidationFailure(_)));
     }
@@ -998,7 +1110,13 @@ mod tests {
     async fn promql_alert_request_rejects_multiple_datasets() {
         let request = alert_request("promql", "up", &["metrics-a", "metrics-b"]);
 
-        let error = request.into(None).await.unwrap_err();
+        let error = request
+            .into(
+                None,
+                &crate::rbac::map::SessionKey::SessionId(ulid::Ulid::new()),
+            )
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,

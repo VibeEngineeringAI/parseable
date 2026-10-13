@@ -309,6 +309,8 @@ describe('Team HTTP contracts', () => {
         promqlAlerts: false,
         promqlDashboard: false,
         promqlMetadata: false,
+        alertBuilder: false,
+        alertPreview: false,
       },
     });
   });

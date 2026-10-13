@@ -18,10 +18,11 @@ import { useAsync } from '../../hooks/useAsync';
 import { LinkNotice } from '../../components/explorer/LinkNotice';
 import { classicMetricsSearch } from '../../lib/classicUi';
 import { discoverMetricsDatasets, forgetMetricsDatasets } from '../../lib/metrics';
-import { autoStep, formatStep, loadHistory } from '../../lib/promql';
-import type { DatasetInfo } from '../../lib/types';
+import { autoStep, formatStep, loadHistory, metricsStorageScope } from '../../lib/promql';
+import type { DatasetInfo, TimeRange } from '../../lib/types';
 import {
   createRunSnapshot,
+  ensureRowIdentity,
   insertBrowserQuery,
   maxQueries,
   metadataAnchor,
@@ -38,6 +39,7 @@ import { QueryPanel } from './QueryPanel';
 import { LabelBrowser } from './LabelBrowser';
 import { ResultsCard } from './ResultsCard';
 import { useMetricsRun } from './useMetricsRun';
+import { MetricsReuse } from './MetricsReuse';
 import './metrics.css';
 
 const datasetPath = (name: string) => `/metrics/explore/${encodeURIComponent(name)}`;
@@ -54,7 +56,7 @@ type PageState = {
 } | null;
 
 export function MetricsPage() {
-  const { client } = useApp();
+  const { client, mode, identity } = useApp();
   const { dataset } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
@@ -154,8 +156,10 @@ export function MetricsPage() {
       <>
         {warning && <div className="page metrics-discovery">{warning}</div>}
         <MetricsExplorer
+          key={metricsStorageScope(mode, identity) ?? 'awaiting-identity'}
           dataset={dataset!}
           datasets={datasets}
+          promqlAlerts={about.data?.capabilities.promqlAlerts === true}
           notice={linkNotice}
           ownNavigation={ownNavigation}
         />
@@ -236,6 +240,7 @@ function MetricsExplorer({
   datasets,
   notice,
   ownNavigation,
+  promqlAlerts,
 }: {
   dataset: string;
   datasets: DatasetInfo[];
@@ -243,11 +248,13 @@ function MetricsExplorer({
   notice: ReactNode;
   /** Options for the explorer's own navigations, which keep that notice. */
   ownNavigation: NavigateOptions;
+  promqlAlerts: boolean;
 }) {
-  const { client } = useApp();
+  const { client, mode, identity } = useApp();
+  const scope = metricsStorageScope(mode, identity);
   const location = useLocation();
   const navigate = useNavigate();
-  const [state, setState] = useState(() => parseExplorerSearch(location.search));
+  const [state, setState] = useState(() => ensureRowIdentity(parseExplorerSearch(location.search)));
   const draft = useRef(state);
   const writtenSearch = useRef(location.search);
   const pendingSearches = useRef(new Set<string>());
@@ -259,6 +266,7 @@ function MetricsExplorer({
   const [runError, setRunError] = useState<string>();
   const resultElement = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(800);
+  const [zoomOrigin, setZoomOrigin] = useState<TimeRange>();
   const rangeKey = JSON.stringify(state.range);
   // Metadata bounds follow the dataset and range, not each run. Re-anchor during render so a
   // dataset or range change requests metadata once, with the new bounds.
@@ -271,11 +279,11 @@ function MetricsExplorer({
   const currentSnapshot = snapshot?.stream === dataset ? snapshot : undefined;
   const currentApplied =
     appliedSnapshot.current?.stream === dataset ? appliedSnapshot.current : undefined;
-  const results = useMetricsRun(client, currentSnapshot);
+  const results = useMetricsRun(client, currentSnapshot, scope);
 
   function update(change: (current: ExplorerState) => ExplorerState) {
     // Navigation can defer a render. Combine edits with the latest draft rather than old props.
-    const next = change(draft.current);
+    const next = ensureRowIdentity(change(draft.current));
     draft.current = next;
     setState(next);
     setRunError(undefined);
@@ -286,14 +294,17 @@ function MetricsExplorer({
 
   function removeQuery(index: number) {
     if (draft.current.queries.length === 1) return;
+    const removedId = draft.current.rowIds![index];
     update((current) => ({
       ...current,
       queries: current.queries.filter((_, row) => row !== index),
+      rowIds: current.rowIds?.filter((_, row) => row !== index),
+      aliases: current.aliases?.filter((_, row) => row !== index),
     }));
-    // Query IDs are positional: relabel applied results to match the panel.
-    setSnapshot((current) => current && removeSnapshotQuery(current, index));
+    // Remove this identity from both snapshots; remaining IDs keep their results.
+    setSnapshot((current) => current && removeSnapshotQuery(current, removedId));
     if (appliedSnapshot.current)
-      appliedSnapshot.current = removeSnapshotQuery(appliedSnapshot.current, index);
+      appliedSnapshot.current = removeSnapshotQuery(appliedSnapshot.current, removedId);
   }
 
   function apply(next: ExplorerState) {
@@ -310,9 +321,10 @@ function MetricsExplorer({
       pendingSearches.current.delete(location.search);
       if (location.search === writtenSearch.current) pendingSearches.current.clear();
     } else if (location.search !== writtenSearch.current) {
+      setZoomOrigin(undefined);
       pendingSearches.current.clear();
       writtenSearch.current = location.search;
-      const next = parseExplorerSearch(location.search);
+      const next = ensureRowIdentity(parseExplorerSearch(location.search));
       draft.current = next;
       setState(next);
       setActive(0);
@@ -333,6 +345,7 @@ function MetricsExplorer({
     // URL restoration may have scheduled new state before this render's range effect runs.
     if (draft.current !== state) return;
     if (previous.current.dataset !== dataset) {
+      setZoomOrigin(undefined);
       appliedSnapshot.current = undefined;
       setSnapshot(undefined);
       setRunError(undefined);
@@ -388,7 +401,10 @@ function MetricsExplorer({
             </Select>
             <TimeRangePicker
               value={state.range}
-              onChange={(range) => update((current) => ({ ...current, range }))}
+              onChange={(range) => {
+                setZoomOrigin(undefined);
+                update((current) => ({ ...current, range }));
+              }}
             />
             <Button
               size="icon"
@@ -422,7 +438,7 @@ function MetricsExplorer({
             apply(draft.current);
           }}
           metadata={metadata}
-          history={loadHistory(dataset)}
+          history={loadHistory(dataset, scope)}
           autoLabel={autoLabel}
           rangeError={validation}
           showBrowser={showBrowser}
@@ -457,7 +473,45 @@ function MetricsExplorer({
               {runError}
             </p>
           )}
-          <ResultsCard snapshot={currentSnapshot} results={results} />
+          <ResultsCard
+            snapshot={currentSnapshot}
+            results={results}
+            onZoomRange={(range) => {
+              setZoomOrigin((origin) => origin ?? state.range);
+              update((current) => ({ ...current, range }));
+            }}
+            onResetZoom={
+              zoomOrigin
+                ? () => {
+                    update((current) => ({ ...current, range: zoomOrigin }));
+                    setZoomOrigin(undefined);
+                  }
+                : undefined
+            }
+          />
+          <MetricsReuse
+            snapshot={currentSnapshot}
+            results={results}
+            scope={scope}
+            promqlAlerts={promqlAlerts}
+            onLoad={(item) => {
+              const next = ensureRowIdentity({
+                queries: [item.query],
+                aliases: [item.name],
+                type: item.type,
+                step: item.step,
+                range: state.range,
+              });
+              if (item.dataset === dataset) {
+                update(() => next);
+                setActive(0);
+              } else
+                navigate(
+                  `${datasetPath(item.dataset)}${serializeExplorerState(next)}`,
+                  ownNavigation,
+                );
+            }}
+          />
         </div>
       </div>
     </div>

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Card, EmptyState, Spinner, Tabs } from '../../components/ui';
+import { Button, Card, EmptyState, Spinner, Tabs } from '../../components/ui';
 import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart';
 import { ApiError, promqlErrorType } from '../../lib/client';
 import {
@@ -10,6 +10,7 @@ import {
   type RunSnapshot,
 } from './helpers';
 import { ResultTable } from './ResultTable';
+import type { TimeRange } from '../../lib/types';
 
 const prompt = 'Build or write a PromQL query above to plot the chart.';
 
@@ -33,20 +34,55 @@ function groupErrors(errors: QueryError[]) {
 export function ResultsCard({
   snapshot,
   results,
+  onZoomRange,
+  onResetZoom,
 }: {
   snapshot?: RunSnapshot;
   results: QueryResult[];
+  onZoomRange?: (range: Exclude<TimeRange, string>) => void;
+  onResetZoom?: () => void;
 }) {
   const [tab, setTab] = useState('chart');
   const count = snapshot?.queries.length ?? 0;
-  const chart = useMemo(() => chartResults(results, count), [results, count]);
-  const instant = useMemo(() => instantRows(results, count), [results, count]);
-  const range = useMemo(() => rangeRows(results, count), [results, count]);
+  const names = useMemo(
+    () =>
+      new Map(
+        snapshot?.queries.map((row, index) => [row.id, row.alias?.trim() || `Query ${index + 1}`]),
+      ),
+    [snapshot],
+  );
+  const displayResults = useMemo(
+    () => results.map((row) => ({ ...row, id: names.get(row.id) ?? row.id })),
+    [results, names],
+  );
+  const chart = useMemo(() => {
+    const data = chartResults(results, count);
+    return {
+      ...data,
+      series: data.series.map((series) => {
+        const row = snapshot?.queries.find((row) => series.id.startsWith(`${row.id}:`));
+        return {
+          ...series,
+          label:
+            row && count > 1
+              ? `${names.get(row.id)}: ${series.label.slice(row.id.length + 2)}`
+              : series.label,
+        };
+      }),
+    };
+  }, [results, count, snapshot, names]);
+  const instant = useMemo(() => instantRows(displayResults, count), [displayResults, count]);
+  const range = useMemo(() => rangeRows(displayResults, count), [displayResults, count]);
   const pending = snapshot && (!results.length || results.some((row) => row.pending > 0));
   return (
     <Card className="metrics-results-card">
       <div className="panel-heading">
         <h2>Results</h2>
+        {onResetZoom && (
+          <Button size="sm" onClick={onResetZoom}>
+            Reset zoom
+          </Button>
+        )}
         {pending && (
           <span role="status" className="inline muted">
             <Spinner size={14} />
@@ -59,7 +95,7 @@ export function ResultsCard({
           <div className="metrics-query-error" role="alert" key={`${row.id}-${kinds.join('-')}`}>
             <div className="inline wrap">
               <strong>
-                {row.id} ·{' '}
+                {names.get(row.id) ?? row.id} ·{' '}
                 {promqlErrorType(error) ??
                   (error instanceof ApiError ? `HTTP ${error.status}` : 'error')}
               </strong>
@@ -103,6 +139,7 @@ export function ResultsCard({
                 timestamps={chart.timestamps}
                 series={chart.series}
                 title="PromQL range result"
+                onZoomRange={onZoomRange}
               />
             ),
           },

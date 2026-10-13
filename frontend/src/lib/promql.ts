@@ -1,5 +1,5 @@
 import { formatChartValue } from '../components/charts/format';
-import type { PromqlLabels, PromqlRangeResult } from './types';
+import type { PromqlLabels, PromqlRangeResult, SessionIdentity } from './types';
 
 const units: Array<[string, number]> = [
   ['y', 365 * 86400],
@@ -127,8 +127,7 @@ export function validateRange({
 const legacyIdentifier = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 // Unlike metric names, label names cannot contain colons.
 const labelIdentifier = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-const quoted = (value: string) =>
-  `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n').replaceAll('\r', '\\r').replaceAll('\t', '\\t')}"`;
+const quoted = (value: string) => JSON.stringify(value);
 
 export function metricSelector(name: string): string {
   return legacyIdentifier.test(name) ? name : `{${quoted(name)}}`;
@@ -232,11 +231,21 @@ export function summarizeSeries(values: readonly (number | null)[]): {
   return { last, min, max, avg };
 }
 
-export function loadHistory(stream: string): string[] {
+export function metricsStorageScope(
+  mode: 'live' | 'demo',
+  identity?: SessionIdentity,
+  server = typeof location === 'undefined' ? '' : location.origin,
+): string | null {
+  if (mode === 'live' && !identity?.id) return null;
+  return `parseable:metrics:v1:${encodeURIComponent(server)}:${mode}:${encodeURIComponent(mode === 'demo' ? 'demo' : identity!.id)}`;
+}
+const historyKey = (stream: string, scope: string) =>
+  `${scope}:history:${encodeURIComponent(stream)}`;
+
+export function loadHistory(stream: string, scope: string | null = null): string[] {
+  if (!scope) return [];
   try {
-    const value: unknown = JSON.parse(
-      localStorage.getItem(`parseable:promql-history:${stream}`) ?? '[]',
-    );
+    const value: unknown = JSON.parse(localStorage.getItem(historyKey(stream, scope)) ?? '[]');
     return Array.isArray(value)
       ? [
           ...new Set(
@@ -249,16 +258,69 @@ export function loadHistory(stream: string): string[] {
   }
 }
 
-export function pushHistory(stream: string, query: string): void {
-  if (!query.trim()) return;
+export function pushHistory(stream: string, query: string, scope: string | null = null): void {
+  if (!scope || !query.trim()) return;
   try {
     localStorage.setItem(
-      `parseable:promql-history:${stream}`,
+      historyKey(stream, scope),
       JSON.stringify(
-        [query, ...loadHistory(stream).filter((entry) => entry !== query)].slice(0, 10),
+        [query, ...loadHistory(stream, scope).filter((entry) => entry !== query)].slice(0, 10),
       ),
     );
   } catch {
     /* Storage may be unavailable or full. */
+  }
+}
+
+export type NamedMetricQuery = {
+  id: string;
+  name: string;
+  dataset: string;
+  query: string;
+  type: 'range' | 'instant' | 'both';
+  step: string;
+  updatedAt: string;
+};
+export function loadMetricLibrary(scope: string | null): NamedMetricQuery[] {
+  if (!scope) return [];
+  try {
+    const data: unknown = JSON.parse(localStorage.getItem(`${scope}:library`) ?? '[]');
+    if (!Array.isArray(data)) return [];
+    const seen = new Set<string>();
+    return data
+      .filter((item): item is NamedMetricQuery => {
+        if (!item || typeof item !== 'object') return false;
+        const value = item as NamedMetricQuery;
+        if (
+          typeof value.id !== 'string' ||
+          !value.id ||
+          seen.has(value.id) ||
+          typeof value.name !== 'string' ||
+          !value.name.trim() ||
+          typeof value.dataset !== 'string' ||
+          !value.dataset ||
+          typeof value.query !== 'string' ||
+          !value.query.trim() ||
+          typeof value.step !== 'string' ||
+          !['range', 'instant', 'both'].includes(value.type) ||
+          typeof value.updatedAt !== 'string' ||
+          !Number.isFinite(Date.parse(value.updatedAt))
+        )
+          return false;
+        seen.add(value.id);
+        return true;
+      })
+      .slice(0, 100);
+  } catch {
+    return [];
+  }
+}
+export function saveMetricLibrary(scope: string | null, items: NamedMetricQuery[]): boolean {
+  if (!scope) return false;
+  try {
+    localStorage.setItem(`${scope}:library`, JSON.stringify(items.slice(0, 100)));
+    return true;
+  } catch {
+    return false;
   }
 }

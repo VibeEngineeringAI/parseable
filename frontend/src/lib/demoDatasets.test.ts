@@ -162,3 +162,56 @@ describe('per-client dataset demo', () => {
     }
   });
 });
+
+it('round-trips creation metadata and static types; partition changes preserve historical stats', async () => {
+  const client = createDemoClient();
+  await client.createDataset('typed', {
+    telemetryType: 'metrics',
+    logSource: 'otel-metrics',
+    datasetTags: ['apm'],
+    datasetLabels: ['prod'],
+    inferTimestamp: false,
+    customPartition: 'service',
+    staticSchema: {
+      fields: [
+        { name: 'service', data_type: 'string' },
+        { name: 'value', data_type: 'double' },
+      ],
+    },
+  });
+  expect(await client.datasetInfo('typed')).toMatchObject({
+    datasetTags: ['apm'],
+    datasetLabels: ['prod'],
+    inferTimestamp: false,
+    staticSchemaFlag: true,
+  });
+  expect((await client.datasetSchema('typed')).fields).toContainEqual({
+    name: 'value',
+    dataType: 'Float64',
+    nullable: true,
+  });
+  expect(await client.schema('typed')).toEqual(['p_timestamp', 'service', 'value']);
+  await expect(client.updateDatasetCustomPartition('typed', 'missing')).rejects.toMatchObject({
+    status: 400,
+  });
+  await client.updateDatasetCustomPartition('typed', 'value');
+  await client.setDatasetTimePartitionLimit('typed', 14);
+  expect(await client.datasetInfo('typed')).toMatchObject({
+    customPartition: 'value',
+    timePartitionLimit: '14',
+  });
+  await client.updateDatasetCustomPartition('typed');
+  expect((await client.datasetInfo('typed')).customPartition).toBeUndefined();
+  const before = await client.datasetStats('application_logs');
+  await client.updateDatasetCustomPartition('application_logs', 'service');
+  expect(await client.datasetStats('application_logs')).toEqual(before);
+});
+
+it('demo rejects labels that cannot round-trip through the live header', async () => {
+  const client = createDemoClient();
+  for (const datasetLabels of [['équipe'], ['prod,staging'], ['\tprod']])
+    await expect(
+      client.createDataset('unsafe_labels', { telemetryType: 'logs', datasetLabels }),
+    ).rejects.toMatchObject({ status: 400 });
+  expect((await client.listDatasets()).some((item) => item.name === 'unsafe_labels')).toBe(false);
+});

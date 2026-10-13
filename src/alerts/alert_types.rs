@@ -18,7 +18,6 @@
 
 use std::{str::FromStr, time::Duration};
 
-use actix_web::http::header::{HeaderName, HeaderValue};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tonic::async_trait;
@@ -36,16 +35,12 @@ use crate::{
         get_number_of_agg_exprs,
         target::{self, NotificationConfig},
     },
-    handlers::http::{
-        middleware::{CLUSTER_SECRET, CLUSTER_SECRET_HEADER},
-        query::create_streams_for_distributed,
-    },
+    handlers::http::query::create_streams_for_distributed,
     metastore::metastore_traits::MetastoreObject,
-    parseable::{DEFAULT_TENANT, PARSEABLE},
+    parseable::PARSEABLE,
     query::resolve_stream_names,
     rbac::map::SessionKey,
     storage::object_storage::alert_json_path,
-    tenants::TENANT_METADATA,
     utils::user_auth_for_query,
 };
 
@@ -60,6 +55,8 @@ pub struct ThresholdAlert {
     pub query: String,
     #[serde(default)]
     pub query_type: AlertQueryType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_config: Option<Value>,
     pub alert_type: AlertType,
     pub threshold_config: ThresholdConfig,
     pub eval_config: EvalConfig,
@@ -115,70 +112,33 @@ impl AlertTrait for ThresholdAlert {
                 .transpose();
         }
 
+        if super::promql_alerts::requires_execution_identity(&self.to_alert_config()) {
+            super::promql_alerts::authorize_execution(&self.to_alert_config())
+                .map_err(AlertError::InvalidAlertQuery)?;
+        }
+
         let time_range = extract_time_range(&self.eval_config)?;
 
-        let tenant = self.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let auth = if let Some((_, hash)) = CLUSTER_SECRET.get() {
-            let mut map = actix_web::http::header::HeaderMap::new();
-            if let Some(header) = TENANT_METADATA.get_global_query_auth(tenant) {
-                map.insert(
-                    HeaderName::from_static("authorization"),
-                    HeaderValue::from_str(&header).unwrap(),
-                );
-            }
-            map.insert(
-                HeaderName::from_static(CLUSTER_SECRET_HEADER),
-                HeaderValue::from_str(hash).unwrap(),
-            );
-            map.insert(
-                HeaderName::from_static("intra-cluster-tenant"),
-                HeaderValue::from_str(tenant).unwrap(),
-            );
-            Some(map)
-        } else {
-            None
-        };
+        let auth = super::alerts_utils::alert_execution_headers(&self.tenant_id)?;
 
         let query_result =
             execute_alert_query(auth, self.get_query(), &time_range, &self.tenant_id).await?;
 
+        let evaluated =
+            super::alerts_utils::evaluate_query_result(&query_result, &self.threshold_config);
+        let breached = evaluated
+            .into_iter()
+            .filter_map(|(group, breached)| breached.then_some(group))
+            .collect::<Vec<_>>();
         if query_result.is_simple_query {
-            // Handle simple queries
-            let final_value = query_result.get_single_value();
-            let result = evaluate_condition(
-                &self.threshold_config.operator,
-                final_value,
-                self.threshold_config.value,
-            );
-
-            let message = if result {
-                Some(self.create_threshold_message(final_value)?)
-            } else {
-                None
-            };
-            Ok(message)
+            breached
+                .first()
+                .map(|group| self.create_threshold_message(group.aggregate_value))
+                .transpose()
+        } else if breached.is_empty() {
+            Ok(None)
         } else {
-            // Handle GROUP BY queries - evaluate each group
-            let mut breached_groups = Vec::new();
-
-            for group in &query_result.groups {
-                let result = evaluate_condition(
-                    &self.threshold_config.operator,
-                    group.aggregate_value,
-                    self.threshold_config.value,
-                );
-
-                if result {
-                    breached_groups.push(group.clone());
-                }
-            }
-
-            let message = if !breached_groups.is_empty() {
-                Some(self.create_group_message(&breached_groups)?)
-            } else {
-                None
-            };
-            Ok(message)
+            Ok(Some(self.create_group_message(&breached)?))
         }
     }
 
@@ -282,6 +242,15 @@ impl AlertTrait for ThresholdAlert {
         new_state: AlertState,
         trigger_notif: Option<String>,
     ) -> Result<(), AlertError> {
+        if self.state == AlertState::Disabled && new_state == AlertState::Triggered {
+            return Err(AlertError::InvalidStateChange(
+                "Cannot trigger a disabled alert".into(),
+            ));
+        }
+        if new_state == AlertState::Disabled {
+            // Invalidate outstanding repeat loops, including disable/re-enable cycles.
+            self.notification_config.state = Default::default();
+        }
         if self.query_type == AlertQueryType::Promql && new_state == AlertState::Disabled {
             super::promql_alerts::reset_runtime_for_disable(&mut self.other_fields);
         }
@@ -487,7 +456,11 @@ impl MessageCreation for ThresholdAlert {
 }
 
 impl From<AlertConfig> for ThresholdAlert {
-    fn from(value: AlertConfig) -> Self {
+    fn from(mut value: AlertConfig) -> Self {
+        value.notification_config.times = target::Retry::Finite(
+            (value.get_eval_frequency() / value.notification_config.interval.max(1)).max(1)
+                as usize,
+        );
         Self {
             version: value.version,
             id: value.id,
@@ -495,6 +468,7 @@ impl From<AlertConfig> for ThresholdAlert {
             title: value.title,
             query: value.query,
             query_type: value.query_type,
+            builder_config: value.builder_config,
             alert_type: value.alert_type,
             threshold_config: value.threshold_config,
             eval_config: value.eval_config,
@@ -521,6 +495,7 @@ impl From<ThresholdAlert> for AlertConfig {
             title: val.title,
             query: val.query,
             query_type: val.query_type,
+            builder_config: val.builder_config,
             alert_type: val.alert_type,
             threshold_config: val.threshold_config,
             eval_config: val.eval_config,

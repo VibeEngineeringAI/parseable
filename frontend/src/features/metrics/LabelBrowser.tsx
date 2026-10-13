@@ -78,7 +78,8 @@ function useStaleWhileReloading<T>(
 function TruncationWarning({ truncated }: { truncated?: boolean }) {
   return truncated ? (
     <p className="metrics-metadata-warning" role="status">
-      Metadata results truncated to the requested limit.
+      Metadata results truncated to the requested limit of 1,000. Search filters only the loaded
+      names.
     </p>
   ) : null;
 }
@@ -146,8 +147,9 @@ export function LabelBrowser({
     <aside id="metrics-label-browser" className="metrics-label-browser" aria-label="Label browser">
       <h2>Label browser</h2>
       <p className="muted metrics-browser-help">
-        Choose a metric to see its labels. Values are added to the active query when it is empty or
-        selects only that metric; otherwise they start a new query.
+        Queryable metrics in this time range: gauges and cumulative sums. This is not a complete
+        catalog of ingested telemetry. Choose a metric to see its labels. Values are added to the
+        active query when it is empty or selects only that metric; otherwise they start a new query.
       </p>
       <QueryState loading={metrics.loading} error={metrics.error} retry={metrics.reload} />
       {metrics.data && (

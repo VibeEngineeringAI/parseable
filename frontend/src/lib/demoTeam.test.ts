@@ -13,6 +13,8 @@ describe('per-client Team demo', () => {
         promqlAlerts: true,
         promqlDashboard: true,
         promqlMetadata: true,
+        alertBuilder: true,
+        alertPreview: true,
       },
     });
     expect(

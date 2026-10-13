@@ -5,6 +5,7 @@ export type DatasetInventoryEntry = {
   name: string;
   type?: Dataset['type'];
   typeError?: string;
+  info?: DatasetInfo;
 };
 
 export function confirmedDatasetType(info: DatasetInfo): Dataset['type'] | undefined {
@@ -36,6 +37,7 @@ export async function listDatasetInventory(
           inventory[index] = {
             name: listed[index].name,
             type,
+            info,
             typeError: type ? undefined : 'Dataset metadata does not report its telemetry type.',
           };
         } catch (error) {

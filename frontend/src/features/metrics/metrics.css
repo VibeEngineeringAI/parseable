@@ -364,3 +364,17 @@
 .metrics-discovery .notice {
   margin: 0 0 20px;
 }
+.metrics-reuse {
+  padding: 12px;
+}
+.metrics-reuse p {
+  margin: 0;
+  font-size: 12px;
+}
+.metrics-reuse > details {
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 8px;
+}
+.metrics-query-heading > .input {
+  max-width: 150px;
+}

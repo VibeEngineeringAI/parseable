@@ -1,5 +1,9 @@
 import { ApiError } from './client';
-import { datasetRetention as validRetention } from './datasetsContract';
+import {
+  datasetRetention as validRetention,
+  datasetLabelsError,
+  parseStaticSchema,
+} from './datasetsContract';
 import { gib, validateCustomPartition, validateDatasetName } from '../features/datasets/helpers';
 import type {
   Dataset,
@@ -16,6 +20,9 @@ type Methods =
   | 'listDatasets'
   | 'datasetInfo'
   | 'schema'
+  | 'datasetSchema'
+  | 'updateDatasetCustomPartition'
+  | 'setDatasetTimePartitionLimit'
   | 'createDataset'
   | 'deleteDataset'
   | 'datasetStats'
@@ -34,7 +41,7 @@ export function createDemoDatasets(
   type Entry = {
     dataset: Dataset;
     info: DatasetInfo;
-    schema: string[];
+    schema: import('./types').DatasetSchema;
     stats: DatasetStats;
     retention: DatasetRetention;
     hotTier: DatasetHotTier | null;
@@ -61,10 +68,47 @@ export function createDemoDatasets(
         ],
         customPartition: options.customPartition || undefined,
         streamType: 'user',
-        staticSchemaFlag: false,
+        staticSchemaFlag: !!options.staticSchema,
+        datasetTags: options.datasetTags ?? [],
+        datasetLabels: options.datasetLabels ?? [],
+        inferTimestamp: options.inferTimestamp ?? true,
         hotTierEnabled: false,
       },
-      schema: seeded ? [...new Set(source.flatMap((row) => Object.keys(row)))] : [],
+      schema: {
+        fields: options.staticSchema
+          ? [
+              {
+                name: 'p_timestamp',
+                dataType: { Timestamp: ['Millisecond', null] },
+                nullable: true,
+              },
+              ...options.staticSchema.fields.map((field) => ({
+                name: field.name,
+                dataType: (
+                  {
+                    int: 'Int64',
+                    double: 'Float64',
+                    float: 'Float64',
+                    boolean: 'Boolean',
+                    string: 'Utf8',
+                    datetime: { Timestamp: ['Millisecond', null] },
+                    date: 'Date32',
+                  } as Record<string, unknown>
+                )[field.data_type],
+                nullable: true,
+              })),
+            ]
+          : seeded
+            ? [...new Set(source.flatMap((row) => Object.keys(row)))].map((name) => ({
+                name,
+                dataType:
+                  typeof source.find((row) => row[name] != null)?.[name] === 'number'
+                    ? 'Float64'
+                    : 'Utf8',
+                nullable: true,
+              }))
+            : [],
+      },
       stats: {
         stream: name,
         time: new Date(now).toISOString(),
@@ -107,19 +151,53 @@ export function createDemoDatasets(
     },
     async schema(name, signal) {
       await ready(signal);
-      return [...find(name).schema];
+      return find(name).schema.fields.map((field) => field.name);
+    },
+    async datasetSchema(name, signal) {
+      await ready(signal);
+      return clone(find(name).schema);
+    },
+    async updateDatasetCustomPartition(name, field) {
+      await ready();
+      const value = find(name);
+      const error = validateCustomPartition(field ?? '');
+      if (error) throw new ApiError(error, 400);
+      if (
+        field &&
+        value.info.staticSchemaFlag &&
+        !value.schema.fields.some((item) => item.name === field)
+      )
+        throw new ApiError(`custom partition field ${field} does not exist in the schema`, 400);
+      if (field && field === value.info.timePartition)
+        throw new ApiError('Time partition cannot be set as custom partition', 400);
+      value.info.customPartition = field || undefined;
+    },
+    async setDatasetTimePartitionLimit(name, days) {
+      await ready();
+      const value = find(name);
+      if (!Number.isInteger(days) || days < 1 || days > 4294967295)
+        throw new ApiError('Invalid time partition limit', 400);
+      value.info.timePartitionLimit = String(days);
     },
     async createDataset(name, options) {
       await ready();
       const error =
-        validateDatasetName(name) || validateCustomPartition(options.customPartition ?? '');
+        datasetLabelsError(options.datasetLabels ?? []) ||
+        validateDatasetName(name) ||
+        validateCustomPartition(options.customPartition ?? '');
       if (error) throw new ApiError(error, 400);
       if (entries.has(name))
         throw new ApiError(
           `Logstream ${name} already exists, please create a new log stream with unique name`,
           400,
         );
-      entries.set(name, entry(name, options));
+      if (options.staticSchema) parseStaticSchema(options.staticSchema, options.customPartition);
+      if (
+        options.inferTimestamp !== undefined &&
+        (options.telemetryType !== 'metrics' || options.logSource !== 'otel-metrics')
+      )
+        throw new ApiError('Timestamp inference is only supported for otel-metrics datasets', 400);
+      entries.set(name, entry(name, clone(options)));
     },
     async deleteDataset(name) {
       await ready();
