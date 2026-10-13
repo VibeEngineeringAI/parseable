@@ -24,6 +24,7 @@ import {
   buildAgentRunQuery,
   discoverAgentDatasets,
 } from '../../lib/agents';
+import { detectAgentHarness, mapHarnessRows } from '../../lib/agentHarnesses';
 import { buildAgentRuns } from '../../lib/agentRuns';
 import { agentValueMatchesSearch } from '../../lib/agentSearch';
 import {
@@ -101,6 +102,7 @@ export function AgentsPage() {
             rows: agentDemoRows(Date.parse(bounds.endTime)).filter(
               (row) => Date.parse(String(row.p_timestamp)) >= Date.parse(bounds.startTime),
             ),
+            limitReached: false,
             timeColumn: 'p_timestamp',
             traces: false,
           };
@@ -114,7 +116,12 @@ export function AgentsPage() {
           buildAgentRunQuery(dataset, fields, bounds, timeColumn),
           signal,
         );
-        return { rows, timeColumn, traces: info.logSourceFormats.includes('otel-traces') };
+        return {
+          rows: mapHarnessRows(detectAgentHarness(fields), rows),
+          limitReached: rows.length >= AGENT_RECORD_LIMIT,
+          timeColumn,
+          traces: info.logSourceFormats.includes('otel-traces'),
+        };
       },
       [client, mode, dataset, bounds],
     ),
@@ -132,7 +139,7 @@ export function AgentsPage() {
   const runs = useMemo(
     () =>
       buildAgentRuns(result.data?.rows ?? [], result.data?.timeColumn, {
-        limitReached: (result.data?.rows.length ?? 0) >= AGENT_RECORD_LIMIT,
+        limitReached: result.data?.limitReached,
         bounds,
       }),
     [result.data, bounds],

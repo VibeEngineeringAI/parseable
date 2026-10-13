@@ -1,0 +1,195 @@
+import { quoteIdentifier, quoteLiteral } from './query';
+import type { LogRecord } from './types';
+
+// Coding-agent CLIs export OTLP with their own attribute names. A harness profile
+// recognizes that telemetry and adds the GenAI span fields the Agents view reads.
+// Recorded values are never replaced, and absent values stay absent.
+export type AgentHarness = 'codex' | 'claude-code';
+
+type HarnessProfile = {
+  label: string;
+  // Any of these fields identifies the harness in a dataset schema.
+  signature: string[];
+  // The span that represents one agent run (a user turn).
+  runSpan: string;
+};
+
+export const AGENT_HARNESSES: Record<AgentHarness, HarnessProfile> = {
+  codex: {
+    label: 'Codex',
+    signature: ['codex.turn.token_usage.input_tokens', 'codex.turn.phase'],
+    runSpan: 'session_task.turn',
+  },
+  'claude-code': {
+    label: 'Claude Code',
+    signature: ['interaction.sequence', 'llm_request.context'],
+    runSpan: 'claude_code.interaction',
+  },
+};
+
+// Codex traces a turn with hundreds of internal spans. Only these, plus spans
+// carrying a tool name, describe the run; the others would exhaust the record limit.
+const CODEX_MODEL_CALL = 'try_run_sampling_request';
+const CODEX_STREAM = 'receiving_stream';
+const CODEX_RESPONSE = 'handle_responses';
+const CODEX_SPANS = [AGENT_HARNESSES.codex.runSpan, CODEX_MODEL_CALL, CODEX_STREAM];
+
+export function detectAgentHarness(fields: string[]): AgentHarness | undefined {
+  if (!fields.includes('span_name')) return;
+  return (Object.keys(AGENT_HARNESSES) as AgentHarness[]).find((harness) =>
+    AGENT_HARNESSES[harness].signature.some((field) => fields.includes(field)),
+  );
+}
+
+/** SQL selecting the spans that start a run of this harness. */
+export function harnessRunPredicate(harness: AgentHarness) {
+  return `${quoteIdentifier('span_name')} = ${quoteLiteral(AGENT_HARNESSES[harness].runSpan)}`;
+}
+
+/** SQL keeping the run-relevant spans of a harness; other services' rows are untouched. */
+export function harnessRowPredicate(harness: AgentHarness, fields: string[]) {
+  if (harness !== 'codex' || !fields.includes('service.name')) return;
+  const name = `COALESCE(${quoteIdentifier('span_name')}, '')`;
+  const kept = [`${name} IN (${CODEX_SPANS.map(quoteLiteral).join(', ')})`];
+  if (fields.includes('gen_ai.usage.input_tokens'))
+    kept.push(
+      `(${name} = ${quoteLiteral(CODEX_RESPONSE)} AND ${quoteIdentifier('gen_ai.usage.input_tokens')} IS NOT NULL)`,
+    );
+  if (fields.includes('tool_name')) kept.push(`${quoteIdentifier('tool_name')} IS NOT NULL`);
+  return `NOT (COALESCE(${quoteIdentifier('service.name')}, '') LIKE 'codex%' AND NOT (${kept.join(' OR ')}))`;
+}
+
+const recorded = new WeakMap<LogRecord, { row: LogRecord; harness: AgentHarness }>();
+
+/** The fields a record was stored with, before any harness mapping. */
+export function recordedFields(row: LogRecord): LogRecord {
+  return recorded.get(row)?.row ?? row;
+}
+/** The harness whose native names were mapped onto this record, if any. */
+export function mappedHarness(row: LogRecord): AgentHarness | undefined {
+  return recorded.get(row)?.harness;
+}
+
+function present(value: unknown) {
+  return value !== undefined && value !== null && value !== '';
+}
+function assign(row: LogRecord, field: string, value: unknown) {
+  if (present(value) && !present(row[field])) row[field] = value;
+}
+function count(value: unknown) {
+  if (!present(value)) return;
+  const result = Number(value);
+  return Number.isSafeInteger(result) && result >= 0 ? result : undefined;
+}
+function id(row: LogRecord, field: string) {
+  const value = row[field];
+  return typeof value === 'string' && value.trim() && !/^0+$/.test(value.trim())
+    ? value.trim()
+    : undefined;
+}
+const traceOf = (row: LogRecord) => id(row, 'span_trace_id') ?? id(row, 'trace_id');
+const spanOf = (row: LogRecord) => id(row, 'span_span_id') ?? id(row, 'span_id');
+const parentOf = (row: LogRecord) => id(row, 'span_parent_span_id') ?? id(row, 'parent_span_id');
+
+function mapClaudeCode(row: LogRecord) {
+  switch (row.span_name) {
+    case AGENT_HARNESSES['claude-code'].runSpan:
+      assign(row, 'gen_ai.agent.name', AGENT_HARNESSES['claude-code'].label);
+      assign(row, 'gen_ai.operation.name', 'invoke_agent');
+      break;
+    case 'claude_code.llm_request': {
+      assign(row, 'gen_ai.operation.name', 'chat');
+      assign(row, 'gen_ai.request.model', row.model);
+      // Anthropic reports cache reads and writes separately from input_tokens.
+      const input = ['input_tokens', 'cache_read_tokens', 'cache_creation_tokens']
+        .map((field) => count(row[field]))
+        .filter((value): value is number => value !== undefined);
+      if (input.length)
+        assign(
+          row,
+          'gen_ai.usage.input_tokens',
+          input.reduce((a, b) => a + b),
+        );
+      assign(row, 'gen_ai.usage.output_tokens', count(row.output_tokens));
+      break;
+    }
+    case 'claude_code.tool':
+      assign(row, 'gen_ai.operation.name', 'execute_tool');
+      assign(row, 'gen_ai.tool.name', row.tool_name);
+      assign(row, 'gen_ai.tool.call.id', row.tool_use_id);
+      break;
+  }
+}
+
+function mapCodex(rows: LogRecord[]) {
+  const spans = new Map<string, LogRecord[]>();
+  for (const row of rows) {
+    const trace = traceOf(row);
+    const span = spanOf(row);
+    if (trace && span)
+      spans.set(`${trace}/${span}`, [...(spans.get(`${trace}/${span}`) ?? []), row]);
+  }
+  const parent = (row: LogRecord) => {
+    const trace = traceOf(row);
+    const span = parentOf(row);
+    return trace && span ? spans.get(`${trace}/${span}`) : undefined;
+  };
+  // Usage is reported on the response handler two levels below its model call.
+  for (const row of rows) {
+    if (row.span_name !== CODEX_RESPONSE) continue;
+    const stream = parent(row)?.find((entry) => entry.span_name === CODEX_STREAM);
+    const call = stream && parent(stream);
+    if (call?.[0]?.span_name !== CODEX_MODEL_CALL) continue;
+    for (const entry of call)
+      for (const field of ['gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens'])
+        assign(entry, field, row[field]);
+  }
+  const runs = new Map<string, string>();
+  for (const row of rows) {
+    const trace = traceOf(row);
+    const span = spanOf(row);
+    if (row.span_name !== AGENT_HARNESSES.codex.runSpan || !trace || !span) continue;
+    // A trace with several turns cannot attribute detached spans to one of them.
+    runs.set(trace, runs.has(trace) && runs.get(trace) !== span ? '' : span);
+  }
+  const kept = rows.filter(
+    (row) => row.span_name !== CODEX_STREAM && row.span_name !== CODEX_RESPONSE,
+  );
+  const keptSet = new Set(kept);
+  for (const row of kept) {
+    if (row.span_name === AGENT_HARNESSES.codex.runSpan) {
+      assign(row, 'gen_ai.agent.name', AGENT_HARNESSES.codex.label);
+      assign(row, 'gen_ai.operation.name', 'invoke_agent');
+      assign(row, 'gen_ai.request.model', row.model);
+      assign(row, 'gen_ai.usage.input_tokens', row['codex.turn.token_usage.input_tokens']);
+      assign(row, 'gen_ai.usage.output_tokens', row['codex.turn.token_usage.output_tokens']);
+    } else if (row.span_name === CODEX_MODEL_CALL) {
+      assign(row, 'gen_ai.operation.name', 'chat');
+      assign(row, 'gen_ai.request.model', row.model);
+    } else if (present(row.tool_name)) {
+      assign(row, 'gen_ai.operation.name', 'execute_tool');
+      assign(row, 'gen_ai.tool.name', row.tool_name);
+      assign(row, 'gen_ai.tool.call.id', row.call_id);
+    }
+    // Intermediate spans were not loaded. Attach the turn to the top of the tree
+    // and its model and tool calls directly to the turn.
+    const trace = traceOf(row);
+    if (!trace || !parentOf(row) || parent(row)?.some((entry) => keptSet.has(entry))) continue;
+    if (row.span_name === AGENT_HARNESSES.codex.runSpan) row.span_parent_span_id = '';
+    else if (runs.get(trace)) row.span_parent_span_id = runs.get(trace);
+  }
+  return kept;
+}
+
+/** Add GenAI fields derived from a harness's native telemetry. */
+export function mapHarnessRows(harness: AgentHarness | undefined, rows: LogRecord[]) {
+  if (!harness) return rows;
+  const mapped = rows.map((row) => {
+    const copy = { ...row };
+    recorded.set(copy, { row, harness });
+    return copy;
+  });
+  if (harness === 'codex') return mapCodex(mapped);
+  mapped.forEach(mapClaudeCode);
+  return mapped;
+}

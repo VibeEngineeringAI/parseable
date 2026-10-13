@@ -1,3 +1,4 @@
+import { detectAgentHarness, harnessRowPredicate, harnessRunPredicate } from './agentHarnesses';
 import { ApiError } from './apiError';
 import { apmTransportBounds } from './apm';
 import { mapConcurrent } from './concurrency';
@@ -17,7 +18,7 @@ export const AGENT_FIELDS = [
 export const AGENT_RECORD_LIMIT = 1000;
 export const AGENT_RUN_LIMIT = 100;
 export function isAgentSchema(fields: string[]) {
-  return AGENT_FIELDS.some((field) => fields.includes(field));
+  return AGENT_FIELDS.some((field) => fields.includes(field)) || !!detectAgentHarness(fields);
 }
 export function agentsPath(dataset?: string) {
   return dataset ? `/agents/${encodeURIComponent(dataset)}` : '/agents';
@@ -59,9 +60,14 @@ export function buildAgentRunQuery(
     );
   if (!fields.includes(timeColumn))
     throw new Error(`Dataset schema is missing the time field ${timeColumn}.`);
-  const agentPredicate = AGENT_FIELDS.filter((field) => fields.includes(field))
-    .map((field) => `${quoteIdentifier(field)} IS NOT NULL`)
-    .join(' OR ');
+  const harness = detectAgentHarness(fields);
+  const agentPredicate = [
+    ...AGENT_FIELDS.filter((field) => fields.includes(field)).map(
+      (field) => `${quoteIdentifier(field)} IS NOT NULL`,
+    ),
+    ...(harness ? [harnessRunPredicate(harness)] : []),
+  ].join(' OR ');
+  const rowPredicate = harness && harnessRowPredicate(harness, fields);
   const traceField = ['span_trace_id', 'trace_id'].find((field) => fields.includes(field));
   const table = quoteIdentifier(dataset);
   const time = quoteIdentifier(timeColumn);
@@ -74,7 +80,7 @@ export function buildAgentRunQuery(
     ? `${trace} IN (SELECT ${trace} FROM ${table} WHERE ${timePredicate} AND (${agentPredicate}) AND ${trace} IS NOT NULL AND ${trace} <> '' GROUP BY ${trace} ORDER BY MAX(${time}) DESC LIMIT ${AGENT_RUN_LIMIT}) OR ((${trace} IS NULL OR ${trace} = '') AND (${agentPredicate}))`
     : agentPredicate;
   return {
-    sql: `SELECT * FROM ${table} WHERE ${timePredicate} AND (${predicate}) ORDER BY ${time} DESC LIMIT ${AGENT_RECORD_LIMIT}`,
+    sql: `SELECT * FROM ${table} WHERE ${timePredicate} AND (${predicate})${rowPredicate ? ` AND ${rowPredicate}` : ''} ORDER BY ${time} DESC LIMIT ${AGENT_RECORD_LIMIT}`,
     ...apmTransportBounds(exactBounds),
   };
 }
