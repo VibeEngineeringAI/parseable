@@ -62,3 +62,230 @@
     padding: 12px;
   }
 }
+.agents-related-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 8px 0 16px;
+  font-size: 13px;
+}
+.agents-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+.agents-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 12px;
+}
+.agents-summary span {
+  color: var(--muted);
+  font-size: 13px;
+}
+.agents-summary strong {
+  font-size: 24px;
+  font-weight: 600;
+}
+.agents-tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-variant-numeric: tabular-nums;
+}
+.agents-row-warning {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 6px;
+}
+.agents-run-sheet {
+  width: min(920px, 100vw);
+}
+.agents-run-details {
+  min-width: 0;
+}
+.agents-detail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.agents-detail-heading h2,
+.agents-detail-heading h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.agents-detail-heading h2 {
+  font-size: 18px;
+}
+.agents-detail-heading h3 {
+  font-size: 15px;
+}
+.agents-run-id {
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.agents-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 20px 0;
+  font-size: 13px;
+}
+.agents-facts dt {
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.agents-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.agents-warnings {
+  padding: 12px 16px;
+  background: var(--color-surface-hover);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 16px 0;
+}
+.agents-warnings ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+.agents-run-details .ui-tabs-list {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.agents-run-details .ui-tabs-trigger {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.agents-span-tree,
+.agents-call-list,
+.agents-error-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.agents-span-tree .agents-span-tree {
+  margin-left: 16px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+.agents-span-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.agents-span-button:hover,
+.agents-span-button[aria-pressed='true'] {
+  background: var(--color-surface-hover);
+  border-color: var(--border);
+}
+.agents-span-button:focus-visible,
+.agents-raw-fields summary:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+.agents-span-name,
+.agents-span-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.agents-span-name {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.agents-span-name svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.agents-span-meta {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.agents-call-list > li,
+.agents-error-list > li {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0;
+}
+.agents-call-facts {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.agents-selected-span {
+  border-top: 1px solid var(--border);
+  margin-top: 20px;
+  padding-top: 20px;
+}
+.agents-raw-fields summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 0;
+}
+.agents-raw-fields pre,
+.agents-message,
+.agents-error-list pre {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--color-surface-hover);
+  padding: 12px;
+}
+.agents-conversation h3 {
+  font-size: 14px;
+}
+.agents-message {
+  margin: 12px 0;
+}
+.agents-message h4 {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.agents-message pre {
+  margin: 0;
+}
+@media (max-width: 600px) {
+  .agents-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .agents-span-button {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .agents-facts {
+    grid-template-columns: 1fr;
+  }
+  .agents-span-tree .agents-span-tree {
+    margin-left: 8px;
+    padding-left: 4px;
+  }
+}

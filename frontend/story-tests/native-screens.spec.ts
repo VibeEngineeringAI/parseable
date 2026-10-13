@@ -55,6 +55,11 @@ const states = [
   ['agents-telemetry--no-datasets', 'No agent telemetry datasets found'],
   ['agents-telemetry--missing-fields', 'Could not load data'],
   ['agents-telemetry--demo', 'Agents'],
+  ['agents-telemetry--successful-runs', 'Agents'],
+  ['agents-telemetry--failed-runs', 'Agents'],
+  ['agents-telemetry--incomplete-runs', 'Agents'],
+  ['agents-telemetry--missing-telemetry', 'Agents'],
+  ['agents-telemetry--run-details', 'Agent run details'],
   ['settings-capabilities--llm-providers', 'LLM settings'],
   ['settings-network-access--default', 'Network access'],
   ['settings-network-access--permission-denied', 'Network access'],
@@ -150,17 +155,17 @@ for (const [id, heading] of [
   });
 }
 
-test('agent record search, keyboard inspection and focus restoration work', async ({ page }) => {
+test('agent run search, keyboard inspection and focus restoration work', async ({ page }) => {
   await story(page, 'agents-telemetry--default');
   const table = page.getByRole('table');
   await expect(table.getByRole('row')).toHaveCount(4);
-  const search = page.getByRole('textbox', { name: 'Search agent telemetry' });
+  const search = page.getByRole('textbox', { name: 'Search agent runs' });
   await search.fill('Research assistant');
   await expect(table.getByRole('row')).toHaveCount(2);
-  const inspect = page.getByRole('button', { name: 'Inspect telemetry record 1' });
+  const inspect = page.getByRole('button', { name: 'Inspect run Research assistant' });
   await inspect.focus();
   await inspect.press('Enter');
-  const dialog = page.getByRole('dialog', { name: 'Agent telemetry record' });
+  const dialog = page.getByRole('dialog', { name: 'Agent run details' });
   await expect(dialog).toContainText('Research assistant');
   await expect(dialog.getByRole('link', { name: 'Open trace' })).toHaveAttribute(
     'href',
@@ -171,7 +176,7 @@ test('agent record search, keyboard inspection and focus restoration work', asyn
   await expect(dialog).toHaveCount(0);
   await expect(inspect).toBeFocused();
   await search.fill('unmatched-search');
-  await expect(page.getByRole('heading', { name: 'No matching telemetry' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'No matching runs' })).toBeVisible();
   await search.clear();
   await expect(table.getByRole('row')).toHaveCount(4);
 });

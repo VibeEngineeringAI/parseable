@@ -1,5 +1,5 @@
-import { useCallback, useMemo, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useCallback, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Bot, RefreshCw } from 'lucide-react';
 import { Badge, Button, EmptyState, Input, Select, Sheet } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
@@ -9,35 +9,46 @@ import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import {
   AGENT_RECORD_LIMIT,
+  AGENT_RUN_LIMIT,
   agentDemoRows,
   agentRangeFromParams,
   agentBoundsFromParams,
   agentsPath,
-  agentText,
-  buildAgentQuery,
+  buildAgentRunQuery,
   discoverAgentDatasets,
 } from '../../lib/agents';
+import { buildAgentRuns } from '../../lib/agentRuns';
+import {
+  currentObservabilitySearch,
+  useObservabilityNavigation,
+} from '../../lib/observabilityNavigation';
 import { timeBounds } from '../../lib/query';
-import type { LogRecord, TimeRange } from '../../lib/types';
+import type { TimeRange } from '../../lib/types';
+import { AgentRunDetails, AgentStatus, AgentTokens, formatAgentDuration } from './AgentRunDetails';
 import './agents.css';
 
 export function AgentsPage() {
   const { client, mode } = useApp();
   const { dataset } = useParams<{ dataset: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const [params, setParams] = useSearchParams();
   const searchString = params.toString();
+  // Filter edits must not recapture a moving relative time range and rerun the query.
+  const timeString = JSON.stringify([params.get('start'), params.get('end'), params.get('range')]);
   const range = useMemo(
     () => agentRangeFromParams(new URLSearchParams(searchString)),
-    [searchString],
+    [timeString],
   );
-  const bounds = useMemo(
+  const rawBounds = useMemo(
     () => agentBoundsFromParams(new URLSearchParams(searchString)),
-    [searchString],
+    [timeString],
   );
-  const suffix = `?${new URLSearchParams({ start: bounds.startTime, end: bounds.endTime, ...(typeof range === 'string' ? { range } : {}) })}`;
-  const [search, setSearch] = useState('');
-  const [selected, setSelected] = useState<LogRecord>();
+  const boundsKey = JSON.stringify(rawBounds);
+  const bounds = useMemo(() => JSON.parse(boundsKey) as ReturnType<typeof timeBounds>, [boundsKey]);
+  const search = params.get('search') ?? '';
+  const status = params.get('status') ?? '';
+  const model = params.get('model') ?? '';
   const [discoveryRequested, setDiscoveryRequested] = useState(false);
   const discoveryEnabled = !dataset || discoveryRequested || mode === 'demo';
   const discovery = useAsync(
@@ -58,7 +69,7 @@ export function AgentsPage() {
         if (mode === 'demo') {
           if (dataset !== 'agent_telemetry')
             throw new Error(
-              'This dataset is not available in the demo workspace. Select agent_telemetry to explore sample records.',
+              'This dataset is not available in the demo workspace. Select agent_telemetry to explore sample runs.',
             );
           return {
             rows: agentDemoRows(Date.parse(bounds.endTime)).filter(
@@ -74,7 +85,7 @@ export function AgentsPage() {
         ]);
         const timeColumn = info.timePartition || 'p_timestamp';
         const rows = await client.query(
-          buildAgentQuery(dataset, fields, bounds, timeColumn),
+          buildAgentRunQuery(dataset, fields, bounds, timeColumn),
           signal,
         );
         return { rows, timeColumn, traces: info.logSourceFormats.includes('otel-traces') };
@@ -82,42 +93,77 @@ export function AgentsPage() {
       [client, mode, dataset, bounds],
     ),
   );
+  const authorizedDataset = useRef<string | undefined>(undefined);
+  if (result.data) authorizedDataset.current = dataset;
+  const { href } = useObservabilityNavigation({
+    view: 'agents',
+    dataset,
+    range,
+    bounds,
+    params,
+    enabled: !!dataset && authorizedDataset.current === dataset,
+  });
+  const runs = useMemo(
+    () =>
+      buildAgentRuns(result.data?.rows ?? [], result.data?.timeColumn, {
+        limitReached: (result.data?.rows.length ?? 0) >= AGENT_RECORD_LIMIT,
+        bounds,
+      }),
+    [result.data, bounds],
+  );
+  const visibleRuns = useMemo(
+    () =>
+      runs.filter(
+        (run) =>
+          (!status || run.status === status) &&
+          (!model || run.models.includes(model)) &&
+          (!search ||
+            run.spans.some((span) =>
+              span.rows.some((row) =>
+                JSON.stringify(row).toLowerCase().includes(search.toLowerCase()),
+              ),
+            )),
+      ),
+    [runs, search, status, model],
+  );
+  const selected = runs.find((run) => run.id === params.get('run'));
+  const selectedTraceId =
+    selected?.traceId && /^[a-fA-F0-9]{32}$/.test(selected.traceId) ? selected.traceId : undefined;
+  const updateFilter = (key: string, value: string) => {
+    const next = new URLSearchParams(
+      currentObservabilitySearch(location.pathname, params.toString()),
+    );
+    if (value) next.set(key, value);
+    else next.delete(key);
+    setParams(next, { replace: true });
+  };
+  const closeRun = () => {
+    const next = new URLSearchParams(
+      currentObservabilitySearch(location.pathname, params.toString()),
+    );
+    next.delete('run');
+    setParams(next, { replace: true });
+  };
   const changeRange = (value: TimeRange) => {
-    const next = new URLSearchParams(params),
+    const next = new URLSearchParams(
+        currentObservabilitySearch(location.pathname, params.toString()),
+      ),
       captured = timeBounds(value);
     next.set('start', captured.startTime);
     next.set('end', captured.endTime);
     if (typeof value === 'string') next.set('range', value);
     else next.delete('range');
+    next.delete('run');
     setParams(next);
-    setSelected(undefined);
   };
-  const rows =
-    result.data?.rows.filter((row) =>
-      Object.values(row).some(
-        (value) => typeof value === 'string' && value.toLowerCase().includes(search.toLowerCase()),
-      ),
-    ) ?? [];
+  const models = [...new Set(runs.flatMap((run) => run.models))].sort();
   return (
     <div className="page agents-page">
       <PageHeader
         title="Agents"
-        description="Inspect agent, model, and tool telemetry in your datasets."
+        description="Follow agent runs from model calls to tools and captured conversation."
         actions={<Badge>{mode === 'demo' ? 'Demo telemetry' : 'Live data'}</Badge>}
       />
-      <p className="agents-note">
-        Recent telemetry records, including individual spans and events. Run-level analytics and
-        model pricing are unavailable in this edition.
-      </p>
-      {[...params.keys()].some((key) => !['start', 'end', 'range'].includes(key)) && (
-        <p role="status" className="agents-note">
-          This link includes options that are not applied here:{' '}
-          {[...new Set(params.keys())]
-            .filter((key) => !['start', 'end', 'range'].includes(key))
-            .join(', ')}
-          . Use the native time range and search controls to refine these records.
-        </p>
-      )}
       <div className="agents-controls">
         <Select
           aria-label="Agents dataset"
@@ -126,9 +172,13 @@ export function AgentsPage() {
           onFocus={() => setDiscoveryRequested(true)}
           onChange={(event) => {
             setDiscoveryRequested(true);
-            setSelected(undefined);
-            setSearch('');
-            navigate(`${agentsPath(event.target.value)}${suffix}`);
+            const next = new URLSearchParams(
+              currentObservabilitySearch(location.pathname, params.toString()),
+            );
+            next.delete('run');
+            next.set('start', bounds.startTime);
+            next.set('end', bounds.endTime);
+            navigate(`${agentsPath(event.target.value)}?${next}`);
           }}
         >
           <option value="" disabled>
@@ -147,24 +197,38 @@ export function AgentsPage() {
         <Button
           variant="secondary"
           onClick={() => {
-            setSelected(undefined);
             if (typeof range === 'string') changeRange(range);
-            else result.reload();
+            else {
+              closeRun();
+              result.reload();
+            }
           }}
         >
-          <RefreshCw size={14} /> Refresh
+          <RefreshCw size={14} aria-hidden="true" /> Refresh
         </Button>
+        {dataset && (
+          <Button
+            variant="ghost"
+            onClick={() => {
+              if (discoveryEnabled) discovery.reload();
+              else setDiscoveryRequested(true);
+            }}
+          >
+            Rescan datasets
+          </Button>
+        )}
       </div>
-      {dataset && (
-        <Button
-          variant="ghost"
-          onClick={() => {
-            if (discoveryEnabled) discovery.reload();
-            else setDiscoveryRequested(true);
-          }}
-        >
-          Rescan datasets
-        </Button>
+      {dataset && mode !== 'demo' && (
+        <nav className="agents-related-links" aria-label="Related telemetry">
+          <Link className="text-link" to={href('logs', { dataset })}>
+            Open logs
+          </Link>
+          {result.data?.traces && (
+            <Link className="text-link" to={href('traces', { dataset })}>
+              Open traces
+            </Link>
+          )}
+        </nav>
       )}
       {dataset && discoveryEnabled && discovery.loading && (
         <p role="status" className="agents-note">
@@ -204,94 +268,193 @@ export function AgentsPage() {
         <>
           <QueryState loading={result.loading} error={result.error} retry={result.reload} />
           {result.data && (
-            <section aria-label="Agent telemetry" className="agents-panel">
-              <div className="agents-controls">
-                <Input
-                  aria-label="Search agent telemetry"
-                  placeholder="Search loaded telemetry"
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                />
-                <Badge>{result.data.rows.length} records loaded</Badge>
+            <>
+              <div className="agents-summary" aria-label="Loaded run summary">
+                {[
+                  ['Runs', runs.length],
+                  ['Successful', runs.filter((run) => run.status === 'success').length],
+                  ['Failed', runs.filter((run) => run.status === 'failed').length],
+                  ['Incomplete', runs.filter((run) => run.status === 'incomplete').length],
+                ].map(([label, value]) => (
+                  <div key={label}>
+                    <span>{label}</span>
+                    <strong>{value}</strong>
+                  </div>
+                ))}
               </div>
-              <p className="agents-note">
-                Showing up to {AGENT_RECORD_LIMIT} recent records in the selected time range. Search
-                filters loaded records.
-              </p>
-              {!rows.length ? (
-                <EmptyState
-                  title={search ? 'No matching telemetry' : 'No agent telemetry in this range'}
-                  description={
-                    search ? 'Try another search.' : 'Choose a wider time range or check ingestion.'
-                  }
-                />
-              ) : (
-                <div className="agents-table-scroll">
-                  <table className="agents-table">
-                    <thead>
-                      <tr>
-                        {['Time', 'Agent', 'Operation', 'Model / tool', 'Status', 'Details'].map(
-                          (label) => (
+              <section aria-label="Agent runs" className="agents-panel">
+                <div className="agents-controls">
+                  <Input
+                    aria-label="Search agent runs"
+                    placeholder="Search loaded runs"
+                    value={search}
+                    onChange={(event) => updateFilter('search', event.target.value)}
+                  />
+                  <Select
+                    aria-label="Run status"
+                    value={status}
+                    onChange={(event) => updateFilter('status', event.target.value)}
+                  >
+                    <option value="">All statuses</option>
+                    <option value="success">Successful</option>
+                    <option value="failed">Failed</option>
+                    <option value="incomplete">Incomplete</option>
+                    {status && !['success', 'failed', 'incomplete'].includes(status) && (
+                      <option value={status}>{status}</option>
+                    )}
+                  </Select>
+                  <Select
+                    aria-label="Run model"
+                    value={model}
+                    onChange={(event) => updateFilter('model', event.target.value)}
+                  >
+                    <option value="">All models</option>
+                    {model && !models.includes(model) && <option value={model}>{model}</option>}
+                    {models.map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </Select>
+                  <Badge>
+                    {visibleRuns.length} of {runs.length} runs
+                  </Badge>
+                </div>
+                <p className="agents-note">
+                  Related spans are grouped by trace or explicit run ID. Filters apply to loaded
+                  runs. Up to {AGENT_RUN_LIMIT} recent traces and{' '}
+                  {AGENT_RECORD_LIMIT.toLocaleString()}
+                  records are loaded in this time range; missing or partial telemetry is marked in
+                  run details.
+                </p>
+                {runs.filter((run) => run.traceId).length >= AGENT_RUN_LIMIT && (
+                  <p role="status" className="agents-warnings">
+                    The {AGENT_RUN_LIMIT}-trace limit was reached. Older runs may be omitted; narrow
+                    the time range to explore them.
+                  </p>
+                )}
+                {result.data.rows.length >= AGENT_RECORD_LIMIT && (
+                  <p role="status" className="agents-warnings">
+                    The record limit was reached. Runs may have additional spans or events; narrow
+                    the time range to improve coverage.
+                  </p>
+                )}
+                {!visibleRuns.length ? (
+                  <EmptyState
+                    title={
+                      search || status || model
+                        ? 'No matching runs'
+                        : 'No agent telemetry in this range'
+                    }
+                    description={
+                      search || status || model
+                        ? 'Try another search or clear the run filters.'
+                        : 'Choose a wider time range or check ingestion.'
+                    }
+                  />
+                ) : (
+                  <div className="agents-table-scroll">
+                    <table className="agents-table">
+                      <thead>
+                        <tr>
+                          {[
+                            'Run',
+                            'Status',
+                            'Started (UTC)',
+                            'Duration',
+                            'Model',
+                            'Tokens',
+                            'Spans',
+                            'Details',
+                          ].map((label) => (
                             <th key={label} scope="col">
                               {label}
                             </th>
-                          ),
-                        )}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((row, index) => (
-                        <tr key={index}>
-                          <td>{agentText(row, result.data!.timeColumn)}</td>
-                          <td>{agentText(row, 'gen_ai.agent.name', 'gen_ai.agent.id')}</td>
-                          <td>{agentText(row, 'gen_ai.operation.name', 'span_name')}</td>
-                          <td>{agentText(row, 'gen_ai.tool.name', 'gen_ai.request.model')}</td>
-                          <td>
-                            {row.span_status_code === 2
-                              ? 'Error'
-                              : row.span_status_code === 1
-                                ? 'OK'
-                                : '—'}
-                          </td>
-                          <td>
-                            <Button
-                              variant="ghost"
-                              onClick={() => setSelected(row)}
-                              aria-label={`Inspect telemetry record ${index + 1}`}
-                            >
-                              Inspect
-                            </Button>
-                          </td>
+                          ))}
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </section>
+                      </thead>
+                      <tbody>
+                        {visibleRuns.map((run) => (
+                          <tr key={run.id}>
+                            <td>
+                              <strong>{run.name}</strong>
+                              {!!run.warnings.length && (
+                                <span className="agents-row-warning">Partial telemetry</span>
+                              )}
+                            </td>
+                            <td>
+                              <AgentStatus status={run.status} />
+                            </td>
+                            <td>{run.startTime ?? 'Not recorded'}</td>
+                            <td>{formatAgentDuration(run.durationMs)}</td>
+                            <td>{run.models.join(', ') || 'Not recorded'}</td>
+                            <td>
+                              <AgentTokens input={run.inputTokens} output={run.outputTokens} />
+                            </td>
+                            <td>{run.spans.length}</td>
+                            <td>
+                              <Button
+                                variant="ghost"
+                                onClick={() => {
+                                  const next = new URLSearchParams(
+                                    currentObservabilitySearch(
+                                      location.pathname,
+                                      params.toString(),
+                                    ),
+                                  );
+                                  next.set('run', run.id);
+                                  setParams(next);
+                                }}
+                                aria-label={`Inspect run ${run.name}`}
+                              >
+                                Inspect run
+                              </Button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            </>
           )}
         </>
       )}
       <Sheet
-        open={!!selected && !!result.data && result.data.rows.includes(selected)}
+        open={!!selected}
         onOpenChange={(open) => {
-          if (!open) setSelected(undefined);
+          if (!open) closeRun();
         }}
-        title="Agent telemetry record"
+        title="Agent run details"
+        className="agents-run-sheet"
       >
         {selected && (
           <>
-            {result.data?.traces &&
-              typeof selected.span_trace_id === 'string' &&
-              /^[a-fA-F0-9]{32}$/.test(selected.span_trace_id) && (
+            {mode !== 'demo' && selectedTraceId && (
+              <nav className="agents-related-links" aria-label="Run telemetry">
+                {selected.traceId &&
+                  /^[a-fA-F0-9]{32}$/.test(selected.traceId) &&
+                  result.data?.traces && (
+                    <Link
+                      className="text-link"
+                      to={href('traces', { dataset, traceId: selected.traceId })}
+                    >
+                      Open trace
+                    </Link>
+                  )}
                 <Link
                   className="text-link"
-                  to={`/traces/explore/${encodeURIComponent(dataset!)}?${new URLSearchParams({ start: bounds.startTime, end: bounds.endTime, traceId: selected.span_trace_id })}`}
+                  to={href('logs', {
+                    dataset,
+                    traceId: selectedTraceId,
+                  })}
                 >
-                  Open trace
+                  Open logs
                 </Link>
-              )}
-            <pre className="agents-record">{JSON.stringify(selected, null, 2)}</pre>
+              </nav>
+            )}
+            <AgentRunDetails run={selected} key={selected.id} />
           </>
         )}
       </Sheet>

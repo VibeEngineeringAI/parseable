@@ -32,17 +32,24 @@ test('agent dataset changes clear inspected records while the new query is pendi
     return route.fulfill({ json: {} });
   });
   await page.goto('/agents/first');
-  await expect(page.getByRole('cell', { name: 'First agent' })).toBeVisible();
-  await page.getByRole('button', { name: 'Inspect telemetry record 1' }).click();
+  await expect(
+    page.getByRole('cell', { name: 'First agent Partial telemetry', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Inspect run First agent' }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
   await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
   await page.getByLabel('Agents dataset').focus();
   await page.getByLabel('Agents dataset').selectOption('second');
-  await expect(page.getByRole('cell', { name: 'First agent' })).toHaveCount(0);
+  await expect(
+    page.getByRole('cell', { name: 'First agent Partial telemetry', exact: true }),
+  ).toHaveCount(0);
   await expect(page.getByRole('table')).toHaveCount(0);
   await expect(page.getByRole('dialog')).toHaveCount(0);
   release();
-  await expect(page.getByRole('cell', { name: 'Second agent' })).toBeVisible();
+  await expect(
+    page.getByRole('cell', { name: 'Second agent Partial telemetry', exact: true }),
+  ).toBeVisible();
 });
 
 test('cluster refresh removes obsolete nodes on permission failure', async ({ page }) => {

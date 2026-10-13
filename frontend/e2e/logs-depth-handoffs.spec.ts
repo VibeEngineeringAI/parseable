@@ -58,6 +58,13 @@ async function navigate(page: Page, path: string) {
     window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
   }, path);
 }
+async function expectLogsURL(page: Page, path: string) {
+  await expect(page).toHaveURL((url) => {
+    const current = new URL(url);
+    current.searchParams.delete('observe');
+    return current.pathname + current.search + current.hash === path;
+  });
+}
 test('legacy saved view identifiers preserve filters without blocking queries', async ({
   page,
 }) => {
@@ -71,7 +78,7 @@ test('legacy saved view identifiers preserve filters without blocking queries', 
     'saved view',
   );
   await expect(page.getByRole('button', { name: 'Clear invalid shared view' })).toHaveCount(0);
-  await expect(page).toHaveURL('/logs/explore/events');
+  await expectLogsURL(page, '/logs/explore/events');
   expect(queries.some((q) => q.query.includes('"level" = \'ERROR\''))).toBe(true);
 });
 test('native state wins over classic cleanup and is consumed once', async ({ page }) => {
@@ -87,14 +94,14 @@ test('native state wins over classic cleanup and is consumed once', async ({ pag
     'America/Chicago',
   );
   await expect(page.getByRole('heading', { name: /1 records/ })).toBeVisible();
-  await expect(page).toHaveURL('/logs/explore/events?keep=yes');
+  await expectLogsURL(page, '/logs/explore/events?keep=yes');
   expect(queries.every((q) => q.startTime === startTime && q.endTime === endTime)).toBe(true);
   await page.getByRole('textbox', { name: 'Search messages' }).fill('edited');
   await expect.poll(() => queries.some((q) => q.query.includes("'%edited%'"))).toBe(true);
   await navigate(page, '/logs/explore/events?keep=another');
   await page.goBack();
   await expect(page.getByRole('textbox', { name: 'Search messages' })).toHaveValue('edited');
-  await expect(page).toHaveURL('/logs/explore/events?keep=yes');
+  await expectLogsURL(page, '/logs/explore/events?keep=yes');
 });
 test('classic links reset timezone and close event details', async ({ page }) => {
   await fixture(page);

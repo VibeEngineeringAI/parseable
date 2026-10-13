@@ -1,5 +1,27 @@
 # Frontend validation and independent review
 
+## Agents run dashboard (2026-10-12)
+
+Implemented on `feat/agent-runs-dashboard` from `origin/main` `06030daa`. The [Mayfly Agents record](https://mayfly-celld.tail835e0d.ts.net/w/46ncdGypknzAj7dnRkJ8bQ?page=b3577b4a-031d-46d3-827a-df813856231a) lives beneath the existing native-screens page. Sol 6.1 implementation and integration reviewers, Opus 5.5 telemetry/browser/final reviewers, and Luna wiki discovery contributed to this change.
+
+The list now groups observed spans by trace ID, falling back to explicit run IDs or isolated span/record identities when trace identity is absent. A trace is the run boundary; multiple top-level invocations within one trace remain one observed run. It shows successful, failed and incomplete status, observed duration, model names, input/output usage and loaded span counts. Search/status/model filters operate on loaded runs. Details provide the parent/child tree, model calls, tool calls, error messages/exception events, captured conversation and each span's raw records.
+
+The query selects up to 100 recent trace IDs with GenAI fields, then fetches up to 1,000 related flattened records, including children without GenAI attributes. Exact half-open predicates apply to both scans using the dataset time partition, with a minute-expanded transport envelope. Event/link rows are deduplicated by span identity before usage aggregation; span-level conversation duplicated across event rows is shown once. Usage prefers model calls and avoids ancestor rollup duplication. Missing values stay distinct from zero. No evaluation scores, pricing data or cost estimates are introduced.
+
+A valid ended span with OTel UNSET status is complete. An explicitly successful outer agent can recover from errors in its own descendants; failed ancestors or separate roots still fail the observed run, and unfinished ones keep it incomplete. Child errors remain inspectable and are disclosed. Missing status/completion, absent identities/parents, malformed hierarchy and incomplete query coverage are identified. Missing end epoch zero is authoritative even when ingestion supplied a misleading timestamp or saturated zero duration. The 100-trace and 1,000-record limits have separate visible notices. Query limits conservatively mark affected result coverage as partial, and runs starting before the selected ingestion window are flagged; the dashboard does not claim a complete run inventory or full-range aggregate totals.
+
+The versioned `observe` URL context preserves captured UTC bounds, the preset label and each view's native filters across Agents, Traces and Logs. Logs keeps focused trace criteria separate from saved grouped filters; changing focus replaces the previous trace without losing AND/OR groups. Browser back/reload and dataset changes are covered. Bare trace-focused Logs bookmarks are supported. Run-specific links require a valid trace identifier. Demo rows remain synthetic and do not link to unrelated demo Logs/Traces datasets.
+
+Captured demo screenshots: [run list](parity-screenshots/agents-runs/run-list-desktop.png), [desktop details](parity-screenshots/agents-runs/run-detail-desktop.png), and [390px mobile details](parity-screenshots/agents-runs/run-detail-mobile.png).
+
+Final validation passed across the broad and focused runs:
+
+- Formatting, TypeScript and the production build pass; **2,283 unit tests across 92 files** pass (14 opt-in/existing tests skipped).
+- **537 distinct application tests** pass, with two optional screenshot-capture tests skipped. The broad run passed 535 cases; two legacy Logs URL assertions were updated to allow only the new `observe` parameter and passed in the focused rerun. The final affected Agents/navigation/handoff run passed 35 cases before exposing an intermittent rapid-filter race; that race was fixed and all 13 navigation cases then passed five consecutive repetitions (**65 executions, no retries**), followed by **16 Traces/Logs handoff tests**. The three added run-status unit regressions cover unfinished ancestors, separate roots and agent-owned descendants.
+- **22 production-build browser tests** and **232 Storybook tests** pass, including accessibility and unchanged visual baselines. Browser suites ran under the shared lock in isolated `mcr.microsoft.com/playwright:v1.63.0-noble` containers.
+
+The monolithic `npm run check` was not rerun after the final targeted corrections; its stages were verified through the full and focused runs described above. Three opt-in live tests also passed against a disposable `quay.io/parseablehq/parseable:v3.2.4` server (not rebuilt Rust): real OTLP event/link expansion and generic children, successful/recovered/failed/incomplete telemetry, missing usage, exact fractional time boundaries and exclusion of later same-trace records. The fixture dataset and container were removed. Reproduce with a disposable loopback server and `PARSEABLE_AGENTS_LIVE_URL=http://127.0.0.1:8393 npx vitest run src/lib/agents.live.test.ts`; credentials default to `fixture` / `fixture-throwaway` and can be supplied using the matching `PARSEABLE_AGENTS_LIVE_USERNAME` / `PARSEABLE_AGENTS_LIVE_PASSWORD` variables.
+
 This record distinguishes the current worktree's completed checks from the supplied earlier research. Original Prism source was not recovered; visual comparisons use actual rendered v3.2.4 assets and an independently implemented frontend. No deployed service or the reference checkout was modified.
 
 ## API key expiration (2026-10-12)

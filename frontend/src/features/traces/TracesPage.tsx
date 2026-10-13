@@ -3,6 +3,7 @@ import {
   Link,
   Navigate,
   useNavigate,
+  useLocation,
   useNavigationType,
   useParams,
   useSearchParams,
@@ -14,7 +15,13 @@ import { Button, EmptyState, Input, Select } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
 import { QueryState } from '../../components/explorer/QueryState';
 import { TimeRangePicker } from '../../components/explorer/TimeRangePicker';
-import { paramsRange, timeBounds } from '../../lib/query';
+import { timeBounds } from '../../lib/query';
+import {
+  currentObservabilitySearch,
+  observabilityRange,
+  observabilityBounds,
+  useObservabilityNavigation,
+} from '../../lib/observabilityNavigation';
 import type { DatasetInfo, TimeRange, TraceListRequest, TraceSortBy } from '../../lib/types';
 import { discoverTraceDatasets, normalizeTraceId, TRACE_PAGE_SIZE } from './helpers';
 import { TraceDetailSheet } from './TraceDetailSheet';
@@ -30,20 +37,6 @@ const sortOptions: Array<{ value: TraceSortBy; label: string }> = [
   { value: 'mostSpans', label: 'Most spans' },
   { value: 'leastSpans', label: 'Least spans' },
 ];
-
-function searchRange(params: URLSearchParams): TimeRange {
-  if (params.has('start') || params.has('end')) return paramsRange(params);
-  const preset = params.get('range');
-  if (preset) {
-    try {
-      timeBounds(preset as TimeRange);
-      return preset as TimeRange;
-    } catch {
-      /* Use the default for malformed links. */
-    }
-  }
-  return '1h';
-}
 
 export function TracesPage() {
   const { client } = useApp();
@@ -138,6 +131,7 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
   const { client } = useApp();
   const [params, setParams] = useSearchParams();
   const navigationType = useNavigationType();
+  const location = useLocation();
   // Router navigations can defer rendering. Compose rapid edits with the latest
   // draft so closing detail followed by filtering cannot restore a stale traceId.
   const draftParams = useRef(params);
@@ -170,10 +164,15 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
   const sort = sortOptions.find(({ value }) => value === params.get('sort'))?.value ?? 'mostRecent';
   const rawPage = Number(params.get('page') ?? 0);
   const page = Number.isSafeInteger(rawPage) && rawPage >= 0 && rawPage <= 1_000_000 ? rawPage : 0;
-  const rangeKey = JSON.stringify(searchRange(params));
+  const rangeKey = JSON.stringify(observabilityRange(params));
   const range = useMemo(() => JSON.parse(rangeKey) as TimeRange, [rangeKey]);
   const [refresh, setRefresh] = useState(0);
-  const bounds = useMemo(() => timeBounds(range), [range, refresh]);
+  const rawBounds = useMemo(
+    () => observabilityBounds(params, range),
+    [range, refresh, params.get('start'), params.get('end')],
+  );
+  const boundsKey = JSON.stringify(rawBounds);
+  const bounds = useMemo(() => JSON.parse(boundsKey) as typeof rawBounds, [boundsKey]);
   const [serviceInput, setServiceInput] = useState(service);
   const [lookup, setLookup] = useState(traceId);
   useEffect(() => setServiceInput(service), [service]);
@@ -183,7 +182,9 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
     resetPage = true,
     replace = false,
   ) => {
-    const next = new URLSearchParams(draftParams.current);
+    const next = new URLSearchParams(
+      currentObservabilitySearch(location.pathname, draftParams.current.toString()),
+    );
     if (resetPage) next.delete('page');
     for (const [key, value] of Object.entries(changes)) {
       if (value) next.set(key, value);
@@ -208,6 +209,16 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
   const list = useAsync(
     useCallback((signal) => client.listTraces(listRequest, signal), [client, listRequest]),
   );
+  const authorizedDataset = useRef<string | undefined>(undefined);
+  if (list.data) authorizedDataset.current = dataset;
+  const navigation = useObservabilityNavigation({
+    view: 'traces',
+    dataset,
+    range,
+    bounds,
+    params,
+    enabled: authorizedDataset.current === dataset,
+  });
   const detailRequest = useMemo(
     () => (traceId ? { dataset, traceId, ...bounds } : undefined),
     [dataset, traceId, bounds],
@@ -245,7 +256,11 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
               onChange={(next) =>
                 update(
                   typeof next === 'string'
-                    ? { range: next, start: undefined, end: undefined }
+                    ? {
+                        range: next,
+                        start: timeBounds(next).startTime,
+                        end: timeBounds(next).endTime,
+                      }
                     : { range: undefined, start: next.startTime, end: next.endTime },
                 )
               }
@@ -255,6 +270,10 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
               variant="secondary"
               size="icon"
               onClick={() => {
+                if (typeof range === 'string') {
+                  const refreshed = timeBounds(range);
+                  update({ start: refreshed.startTime, end: refreshed.endTime }, false);
+                }
                 setRefresh((value) => value + 1);
               }}
             >
@@ -389,6 +408,8 @@ function TracesExplorer({ dataset, datasets }: { dataset: string; datasets: Data
           key={`${dataset}:${traceId}`}
           client={client}
           request={detailRequest}
+          logsHref={navigation.href('logs', { dataset, traceId })}
+          agentsHref={navigation.href('agents', { dataset })}
           onClose={() => update({ traceId: undefined }, false)}
         />
       )}
