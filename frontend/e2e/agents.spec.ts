@@ -891,3 +891,52 @@ test('Codex conversation logs fill run details from the paired logs dataset', as
   await expect(page).toHaveURL(/logs=none/);
   await expect(page.getByRole('heading', { name: 'No matching runs' })).toBeVisible();
 });
+
+test('discloses the record limit from the queried rows when Codex mapping drops some', async ({
+  page,
+}) => {
+  const trace = 'f6'.repeat(16);
+  const codex = (span: Omit<SpanFixture, 'trace' | 'status'>) =>
+    spanRows({
+      ...span,
+      trace,
+      attributes: { 'service.name': 'codex-app-server', ...span.attributes },
+    });
+  const rows = [
+    codex({
+      id: 'f600000000000001',
+      name: 'session_task.turn',
+      start: base + 1000,
+      duration: 4000,
+      attributes: { model: 'gpt-6-luna', 'codex.turn.token_usage.input_tokens': '10' },
+    }),
+    codex({
+      id: 'f600000000000002',
+      parent: 'f600000000000001',
+      name: 'try_run_sampling_request',
+      start: base + 1100,
+      duration: 3000,
+      attributes: { model: 'gpt-6-luna' },
+    }),
+    // Stream spans count toward the record limit but are not shown as run spans.
+    ...Array.from({ length: 998 }, (_, index) =>
+      codex({
+        id: (index + 1).toString(16).padStart(16, '0'),
+        parent: 'f600000000000002',
+        name: 'receiving_stream',
+        start: base + 1200,
+        duration: 10,
+      }),
+    ),
+  ].flat();
+  await serveAgents(page, {
+    rows,
+    datasets: ['codex-traces'],
+    fields: [...new Set(rows.flatMap((row) => Object.keys(row)))],
+  });
+  await page.goto(`/agents/codex-traces?${range}`);
+  await expect(cell(runRow(page, 'Codex'), 'Spans')).toHaveText('2');
+  await expect(page.getByRole('status').filter({ hasText: 'record limit' })).toContainText(
+    'narrow the time range',
+  );
+});

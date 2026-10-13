@@ -44,17 +44,20 @@ const conversations = (run: AgentRun) =>
 const codexTrace = '1b1ef19838e4d610208a394b9af94384';
 const codexRuns = () =>
   buildAgentRuns(
-    mapHarnessRows('codex', [
-      span(codexTrace, 'fe5417199aa59ebf', '57d7ac8056fe8b6d', 'session_task.turn', 15.8, 4, {
-        'service.name': 'codex_exec',
-        model: 'gpt-6-luna',
-      }),
-      span(codexTrace, '67c205c2bacb4518', 'e0d1c4f0b19c5a7e', 'exec', 18, 0.2, {
-        'service.name': 'codex_exec',
-        tool_name: 'exec',
-        call_id: 'call_7b616c08bc894640a843cff3e0f7b38a',
-      }),
-    ]),
+    mapHarnessRows(
+      ['codex'],
+      [
+        span(codexTrace, 'fe5417199aa59ebf', '57d7ac8056fe8b6d', 'session_task.turn', 15.8, 4, {
+          'service.name': 'codex_exec',
+          model: 'gpt-6-luna',
+        }),
+        span(codexTrace, '67c205c2bacb4518', 'e0d1c4f0b19c5a7e', 'exec', 18, 0.2, {
+          'service.name': 'codex_exec',
+          tool_name: 'exec',
+          call_id: 'call_7b616c08bc894640a843cff3e0f7b38a',
+        }),
+      ],
+    ),
   );
 const codexLog = (fields: LogRecord): LogRecord => ({
   'service.name': 'codex_exec',
@@ -121,15 +124,18 @@ const claudeToolOutput = {
 };
 const claudeRuns = () =>
   buildAgentRuns(
-    mapHarnessRows('claude-code', [
-      claudeSpan('671ed833b6b2a759', '', 'claude_code.interaction', 9.5, 6),
-      claudeRequest('first', 9.6),
-      claudeToolSpan,
-      // Flattened span events repeat; the output is shown once.
-      claudeToolOutput,
-      { ...claudeToolOutput },
-      claudeRequest('second', 12.5),
-    ]),
+    mapHarnessRows(
+      ['claude-code'],
+      [
+        claudeSpan('671ed833b6b2a759', '', 'claude_code.interaction', 9.5, 6),
+        claudeRequest('first', 9.6),
+        claudeToolSpan,
+        // Flattened span events repeat; the output is shown once.
+        claudeToolOutput,
+        { ...claudeToolOutput },
+        claudeRequest('second', 12.5),
+      ],
+    ),
   );
 const claudeLog = (sequence: number, seconds: number, fields: LogRecord): LogRecord => ({
   'service.name': 'claude-code',

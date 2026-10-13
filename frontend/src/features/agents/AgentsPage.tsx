@@ -24,7 +24,7 @@ import {
   buildAgentRunQuery,
   discoverAgentDatasets,
 } from '../../lib/agents';
-import { AGENT_HARNESSES, detectAgentHarness, mapHarnessRows } from '../../lib/agentHarnesses';
+import { AGENT_HARNESSES, detectAgentHarnesses, mapHarnessRows } from '../../lib/agentHarnesses';
 import {
   attachHarnessConversation,
   buildHarnessLogQuery,
@@ -123,9 +123,11 @@ export function AgentsPage() {
           buildAgentRunQuery(dataset, fields, bounds, timeColumn),
           signal,
         );
-        const harness = detectAgentHarness(fields);
+        const harnesses = detectAgentHarnesses(fields);
+        // Conversation logs are joined for one harness; a mixed dataset has none yet.
+        const harness = harnesses.length === 1 ? harnesses[0] : undefined;
         return {
-          rows: mapHarnessRows(harness, rows),
+          rows: mapHarnessRows(harnesses, rows),
           limitReached: rows.length >= AGENT_RECORD_LIMIT,
           timeColumn,
           traces: info.logSourceFormats.includes('otel-traces'),
@@ -469,7 +471,7 @@ export function AgentsPage() {
                     the time range to explore them.
                   </p>
                 )}
-                {result.data.rows.length >= AGENT_RECORD_LIMIT && (
+                {result.data.limitReached && (
                   <p role="status" className="agents-warnings">
                     The record limit was reached. Runs may have additional spans or events; narrow
                     the time range to improve coverage.
