@@ -34,23 +34,35 @@ export function detectHarnessLogs(fields: string[]): AgentHarness | undefined {
   );
 }
 
-/** Logs datasets holding this harness's events, skipping datasets that cannot be read. */
+/** Recognized harness logs datasets, with operational schema failures reported separately. */
 export async function discoverHarnessLogs(
   client: ParseableClient,
-  harness: AgentHarness,
   signal?: AbortSignal,
-) {
+): Promise<{
+  datasets: { name: string; harness: AgentHarness }[];
+  unchecked: { name: string; error: string }[];
+}> {
   const datasets = await client.listDatasets(signal);
-  const matches = await mapConcurrent(datasets, 4, async ({ name }) => {
-    signal?.throwIfAborted();
-    try {
-      return detectHarnessLogs(await client.schema(name, signal)) === harness ? name : undefined;
-    } catch (error) {
-      if (signal?.aborted || (error instanceof ApiError && error.status === 401)) throw error;
-      return undefined;
-    }
-  });
-  return matches.filter((name): name is string => !!name);
+  const inspected = await mapConcurrent(
+    datasets,
+    4,
+    async ({ name }): Promise<{ name: string; harness?: AgentHarness; error?: string }> => {
+      signal?.throwIfAborted();
+      try {
+        return { name, harness: detectHarnessLogs(await client.schema(name, signal)) };
+      } catch (error) {
+        if (signal?.aborted || (error instanceof ApiError && error.status === 401)) throw error;
+        if (error instanceof ApiError && [403, 404].includes(error.status)) return { name };
+        return { name, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  );
+  return {
+    datasets: inspected.flatMap(({ name, harness }) => (harness ? [{ name, harness }] : [])),
+    unchecked: inspected.flatMap(({ name, error }) =>
+      error !== undefined ? [{ name, error }] : [],
+    ),
+  };
 }
 
 /** Prefer the logs dataset named like the traces dataset, e.g. codex-traces → codex-logs. */
@@ -77,7 +89,7 @@ export function buildHarnessLogQuery(
   const time = quoteIdentifier(timeColumn);
   const events = LOG_PROFILES[harness].events.map(quoteLiteral).join(', ');
   return {
-    sql: `SELECT * FROM ${quoteIdentifier(dataset)} WHERE ${time} >= TIMESTAMP ${quoteLiteral(exact.startTime)} AND ${time} < TIMESTAMP ${quoteLiteral(exact.endTime)} AND ${quoteIdentifier('trace_id')} IN (${ids.map(quoteLiteral).join(', ')}) AND ${quoteIdentifier('event.name')} IN (${events}) ORDER BY ${time} ASC LIMIT ${AGENT_RECORD_LIMIT}`,
+    sql: `SELECT * FROM ${quoteIdentifier(dataset)} WHERE ${time} >= TIMESTAMP ${quoteLiteral(exact.startTime)} AND ${time} < TIMESTAMP ${quoteLiteral(exact.endTime)} AND ${quoteIdentifier('trace_id')} IN (${ids.map(quoteLiteral).join(', ')}) AND ${quoteIdentifier('event.name')} IN (${events}) ORDER BY ${time} DESC LIMIT ${AGENT_RECORD_LIMIT}`,
     ...apmTransportBounds(exact),
   };
 }
@@ -124,13 +136,19 @@ export function attachHarnessConversation(
   const calls = new Map<string, AgentSpan>();
   const requests = new Map<string, AgentSpan>();
   const roots = new Map<string, AgentSpan>();
+  const turns = new Map<string, AgentSpan[]>();
   for (const run of runs) {
-    if (run.traceId)
+    if (run.traceId) {
       roots.set(run.traceId, run.roots.find((span) => span.kind === 'agent') ?? run.roots[0]);
+      turns.set(
+        run.traceId,
+        run.spans.filter((span) => span.kind === 'agent'),
+      );
+    }
     for (const span of run.spans) {
       if (run.traceId && span.spanId) spans.set(`${run.traceId}/${span.spanId}`, span);
       const call = text(span.row, 'gen_ai.tool.call.id', 'tool_use_id', 'call_id');
-      if (span.kind === 'tool' && call) calls.set(call, span);
+      if (run.traceId && span.kind === 'tool' && call) calls.set(`${run.traceId}/${call}`, span);
       const request = text(span.row, 'gen_ai.response.id', 'request_id');
       if (span.kind === 'model' && request) requests.set(request, span);
     }
@@ -143,13 +161,29 @@ export function attachHarnessConversation(
     }
     return Number.POSITIVE_INFINITY;
   };
+  const turnAt = (trace: string, time: number, prompt: boolean) => {
+    const agents = turns.get(trace) ?? [];
+    const matches = agents.filter((span) => {
+      const start = Date.parse(span.startTime ?? '');
+      // Codex logs a prompt just before its turn span starts (10 ms in the exported fixture).
+      const lead = prompt && harness === 'codex' ? 1000 : 0;
+      return (
+        span.durationMs !== undefined && time >= start - lead && time <= start + span.durationMs
+      );
+    });
+    if (matches.length === 1) return matches[0];
+    if (!matches.length && agents.length === 1) return roots.get(trace);
+  };
   for (const row of logs) {
     const trace = text(row, 'trace_id');
     if (!trace || !roots.has(trace)) continue;
     const own = spans.get(`${trace}/${text(row, 'span_id')}`);
     const event = String(row['event.name'] ?? '').replace(/^claude_code\./, '');
-    const tool = calls.get(text(row, 'tool_use_id', 'call_id') ?? '');
-    let target = own ?? roots.get(trace);
+    const time = at(row, 'event.timestamp', 'time_unix_nano', 'p_timestamp');
+    const call = text(row, 'tool_use_id', 'call_id');
+    const tool = own?.kind === 'tool' ? own : calls.get(`${trace}/${call ?? ''}`);
+    let target =
+      own ?? turnAt(trace, time, event === 'codex.user_prompt' || event === 'user_prompt');
     let entries: AgentConversationEntry[] = [];
     if (event === 'codex.user_prompt' || event === 'user_prompt') {
       entries = entry('User prompt', row.prompt ?? row.prompt_text);
@@ -177,36 +211,35 @@ export function attachHarnessConversation(
     if (entries.length)
       occurrences.push({
         // Claude Code logs a tool's input when it finishes; order it by the call's start.
-        time:
-          at(row, 'event.timestamp', 'time_unix_nano', 'p_timestamp') -
-          (event === 'tool_result' ? Number(row.duration_ms) || 0 : 0),
+        time: time - (event === 'tool_result' ? Number(row.duration_ms) || 0 : 0),
         sequence: Number(row['event.sequence'] ?? Number.POSITIVE_INFINITY),
         target,
         entries,
       });
   }
-  if (harness === 'claude-code')
+  if (harness === 'claude-code') {
+    const seen = new Set<string>();
     for (const run of runs)
       for (const span of run.spans)
         for (const row of span.rows)
-          if (row.event_name === CLAUDE_TOOL_OUTPUT)
+          if (row.event_name === CLAUDE_TOOL_OUTPUT) {
+            // Flattened span rows repeat the same event, including its timestamp.
+            const key = JSON.stringify([
+              span.id,
+              row.event_time_unix_nano_epoch ?? row.event_time_unix_nano ?? row.p_timestamp,
+              row.event_output,
+            ]);
+            if (seen.has(key)) continue;
+            seen.add(key);
             occurrences.push({
               time: at(row, 'event_time_unix_nano', 'p_timestamp'),
               sequence: Number.POSITIVE_INFINITY,
               target: span,
               entries: entry(withTool('Tool output', span.row), row.event_output),
             });
-  occurrences.sort((a, b) => a.time - b.time || a.sequence - b.sequence);
-  const seen = new Set<string>();
-  for (const { target, entries } of occurrences) {
-    if (!target) continue;
-    for (const item of entries) {
-      // Flattened span rows repeat events; keep each recorded value once per span.
-      const key = JSON.stringify([target.id, item.label, item.value]);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      target.conversation.push(item);
-    }
+          }
   }
+  occurrences.sort((a, b) => a.time - b.time || a.sequence - b.sequence);
+  for (const { target, entries } of occurrences) if (target) target.conversation.push(...entries);
   return runs;
 }
