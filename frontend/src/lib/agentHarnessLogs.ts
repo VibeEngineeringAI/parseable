@@ -1,5 +1,5 @@
 import { parseEventTimestamp } from '../components/explorer/timestamp';
-import type { AgentHarness } from './agentHarnesses';
+import { AGENT_HARNESSES, type AgentHarness } from './agentHarnesses';
 import type { AgentConversationEntry, AgentRun, AgentSpan } from './agentRuns';
 import { AGENT_RECORD_LIMIT } from './agents';
 import { ApiError } from './apiError';
@@ -23,6 +23,7 @@ const LOG_PROFILES: Record<AgentHarness, { signature: string[]; events: string[]
 };
 // Claude Code records tool output as an event on the tool span, not as a log.
 const CLAUDE_TOOL_OUTPUT = 'tool.output';
+const CODEX_PROMPT_LEAD_MS = 100;
 const REDACTED = new Set(['[REDACTED]', '<REDACTED>']);
 
 /** The harness whose logs this dataset holds; traces datasets are not logs. */
@@ -140,10 +141,10 @@ export function attachHarnessConversation(
   for (const run of runs) {
     if (run.traceId) {
       roots.set(run.traceId, run.roots.find((span) => span.kind === 'agent') ?? run.roots[0]);
-      turns.set(
-        run.traceId,
-        run.spans.filter((span) => span.kind === 'agent'),
-      );
+      // The harness's own turns; an enclosing agent span of another service is not a turn.
+      const agents = run.spans.filter((span) => span.kind === 'agent');
+      const own = agents.filter((span) => span.row.span_name === AGENT_HARNESSES[harness].runSpan);
+      turns.set(run.traceId, own.length ? own : agents);
     }
     for (const span of run.spans) {
       if (run.traceId && span.spanId) spans.set(`${run.traceId}/${span.spanId}`, span);
@@ -163,16 +164,22 @@ export function attachHarnessConversation(
   };
   const turnAt = (trace: string, time: number, prompt: boolean) => {
     const agents = turns.get(trace) ?? [];
-    const matches = agents.filter((span) => {
-      const start = Date.parse(span.startTime ?? '');
-      // Codex logs a prompt just before its turn span starts (10 ms in the exported fixture).
-      const lead = prompt && harness === 'codex' ? 1000 : 0;
-      return (
-        span.durationMs !== undefined && time >= start - lead && time <= start + span.durationMs
-      );
-    });
-    if (matches.length === 1) return matches[0];
-    if (!matches.length && agents.length === 1) return roots.get(trace);
+    // Without a time, only a trace with one loaded turn says where an event belongs.
+    if (!Number.isFinite(time)) return agents.length === 1 ? agents[0] : undefined;
+    const start = (span: AgentSpan) => Date.parse(span.startTime ?? '');
+    const inside = agents.filter(
+      (span) =>
+        span.durationMs !== undefined &&
+        time >= start(span) &&
+        time <= start(span) + span.durationMs,
+    );
+    if (inside.length) return inside.length === 1 ? inside[0] : undefined;
+    // Codex logs a prompt just before its turn span starts (10 ms in the exported
+    // fixture), so a prompt belongs to a turn starting right after it.
+    if (prompt && harness === 'codex')
+      return agents
+        .filter((span) => start(span) >= time && start(span) - time <= CODEX_PROMPT_LEAD_MS)
+        .sort((a, b) => start(a) - start(b))[0];
   };
   for (const row of logs) {
     const trace = text(row, 'trace_id');

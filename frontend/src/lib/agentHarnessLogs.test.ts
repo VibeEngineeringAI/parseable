@@ -391,6 +391,95 @@ describe('coding-agent conversation', () => {
     );
     expect(conversations(run)).toEqual([]);
   });
+  it('does not give a later turn prompt to the only loaded turn', () => {
+    // The second turn is still running, so its span has not been exported.
+    const [run] = attachHarnessConversation(codexTurns([[15.8, 4]]), 'codex', [
+      codexLog({
+        'event.name': 'codex.user_prompt',
+        'event.timestamp': stamp(25.79),
+        prompt: 'later',
+      }),
+    ]);
+    expect(conversations(run)).toEqual([]);
+  });
+  it('attributes prompts to Codex turns under an agent span of another service', () => {
+    const rows = [
+      span(codexTrace, 'orchestrator0001', '', 'orchestrate', 10, 30, {
+        'service.name': 'orchestrator',
+        'gen_ai.operation.name': 'invoke_agent',
+        'gen_ai.agent.name': 'Orchestrator',
+      }),
+      ...[15.8, 25.8].map((start, index) =>
+        span(codexTrace, `turn-${index}`, 'orchestrator0001', 'session_task.turn', start, 4, {
+          'service.name': 'codex_exec',
+        }),
+      ),
+    ];
+    const [run] = attachHarnessConversation(
+      buildAgentRuns(mapHarnessRows(['codex'], rows)),
+      'codex',
+      [15.79, 25.79].map((seconds, index) =>
+        codexLog({
+          'event.name': 'codex.user_prompt',
+          'event.timestamp': stamp(seconds),
+          prompt: `prompt ${index}`,
+        }),
+      ),
+    );
+    expect(conversations(run).map(([, items]) => items)).toEqual([
+      [['User prompt', 'prompt 0']],
+      [['User prompt', 'prompt 1']],
+    ]);
+  });
+  it('falls back to the only turn, not an enclosing span of another service', () => {
+    const rows = [
+      span(codexTrace, 'cijob00000000001', '', 'ci.job', 0, 60, { 'service.name': 'ci' }),
+      span(codexTrace, 'turn-0', 'cijob00000000001', 'session_task.turn', 15.8, 4, {
+        'service.name': 'codex_exec',
+      }),
+    ];
+    const [run] = attachHarnessConversation(
+      buildAgentRuns(mapHarnessRows(['codex'], rows)),
+      'codex',
+      [codexLog({ 'event.name': 'codex.user_prompt', prompt: 'untimed' })],
+    );
+    expect(run.spans.find((entry) => entry.spanId === 'turn-0')!.conversation).toEqual([
+      { label: 'User prompt', value: 'untimed' },
+    ]);
+  });
+  it('gives each prompt to the turn starting right after it, even for close turns', () => {
+    const prompts = (...seconds: number[]) =>
+      seconds.map((value, index) =>
+        codexLog({
+          'event.name': 'codex.user_prompt',
+          'event.timestamp': stamp(value),
+          span_id: `turn-input-${index}`,
+          prompt: `prompt ${index}`,
+        }),
+      );
+    const [close] = attachHarnessConversation(
+      codexTurns([
+        [10, 0.2],
+        [10.7, 0.2],
+      ]),
+      'codex',
+      prompts(9.99, 10.69),
+    );
+    expect(close.spans.map((span) => span.conversation)).toEqual([
+      [{ label: 'User prompt', value: 'prompt 0' }],
+      [{ label: 'User prompt', value: 'prompt 1' }],
+    ]);
+    // The prompt of an earlier, unloaded turn stays unattached.
+    const [later] = attachHarnessConversation(
+      codexTurns([
+        [10.7, 0.2],
+        [15, 0.2],
+      ]),
+      'codex',
+      prompts(9.99),
+    );
+    expect(conversations(later)).toEqual([]);
+  });
   it('leaves prompts unattached when turn ranges overlap', () => {
     const [run] = attachHarnessConversation(
       codexTurns([
