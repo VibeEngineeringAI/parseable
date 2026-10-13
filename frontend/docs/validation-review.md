@@ -10,6 +10,10 @@ Each finding received a Sol 6.1 implementation pass, a separate Sol regression r
 
 Final validation through the Swamp `blacksmith-test` workflow passed formatting, TypeScript/production build, **2,314 unit tests** (14 skipped), **95 relevant application browser tests**, and **24 production-build browser tests**. Browser tests ran with four workers and zero retries. Earlier runs exposed two test synchronization assumptions around modal closure and development StrictMode mount requests; the corrected tests retain the original behavior and exact Refresh assertions. The full application suite, Storybook and live exporter/ingestion checks were not repeated for these fixes.
 
+The subsequent full GitHub PR check passed, but the duplicate push check exposed a rapid-navigation race: an obsolete Logs handoff cleanup could replace a newer Traces route. The captured browser trace showed Traces opening, then returning to the consumed Logs URL without another click. Logs now checks the current browser pathname and search before consuming a handoff; browser-history detection also works when the component first mounts after navigation has moved on. A separate rapid-handoff test checks the final Traces route after requests settle. Sol 6.1 and Opus 5.5 independently confirmed the cause and reviewed the guard.
+
+Swamp Blacksmith validation of that follow-up passed formatting, TypeScript/build, the unit suite, **80 navigation executions** (four tests repeated 20 times), **96 relevant application browser tests**, and **24 production browser tests**, with zero browser retries.
+
 ## In-app agent telemetry setup guide (2026-10-12)
 
 Agents now has a **Set up telemetry** panel, also linked from the **Get started** connection step and the Agents empty state. It generates copyable Claude Code JSON, Codex TOML and a coding-agent brief using an editable collector base URL. Content flags default off and reset when changing providers; the guide explains that metadata and some tool snippets may still be exported. It links to collector ingestion setup, documents required span mappings and distinguishes receiving telemetry from complete run compatibility.

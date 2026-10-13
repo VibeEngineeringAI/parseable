@@ -56,6 +56,11 @@ export function LogsPage() {
   const dataset = currentDataset || datasets.data?.[0]?.name || '';
   const location = useLocation();
   const initialLocationKey = useRef(location.key);
+  // BrowserRouter initializes idx even when this render trails a newer URL;
+  // MemoryRouter previews have no browser history index to synchronize with.
+  const browserRouter = useRef(
+    typeof window !== 'undefined' && typeof window.history.state?.idx === 'number',
+  );
   const navigationType = useNavigationType();
   const [params] = useSearchParams();
   const schema = useAsync(
@@ -230,6 +235,14 @@ export function LogsPage() {
   }
   // Consume handoffs once so subsequent edits are not overwritten by navigation.
   useEffect(() => {
+    // Router renders can lag behind browser history. A pending Logs handoff
+    // must not replace a newer navigation when its consumption effect runs.
+    if (
+      browserRouter.current &&
+      (window.location.pathname !== appPath(location.pathname) ||
+        window.location.search !== location.search)
+    )
+      return;
     const classicApplied = !!link && appliedLink === link;
     const nativeApplied =
       (params.has('logView') || nativeNavigation) && appliedView === location.key && !linkError;

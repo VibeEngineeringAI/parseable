@@ -163,8 +163,12 @@ test('Traces Refresh reloads fixed list and open detail, and advances preset bou
   await expect.poll(() => new URL(page.url()).searchParams.get('range')).toBe('1h');
   await expect.poll(() => calls.lists.at(-1)?.startTime).not.toBe(bounds.startTime);
   await page.getByTestId('sidebar-logs').click();
-  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('1h');
+  await expect(page.locator('.logs-page')).toBeVisible();
+  await expect(page.locator('.logs-page').getByLabel('Time range', { exact: true })).toHaveValue(
+    '1h',
+  );
   await page.getByTestId('sidebar-traces').click();
+  await expect(page).toHaveURL(/\/traces\/explore\/events\?/);
   await expect(page.getByTestId('trace-table')).toBeVisible();
   await expect(page.getByRole('dialog', { name: 'Trace detail', exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('1h');
@@ -216,4 +220,24 @@ test('Traces Refresh reloads fixed list and open detail, and advances preset bou
     endTime: calls.lists.at(-1)!.endTime,
     traceId: STORY_TRACE_ID,
   });
+});
+
+test('rapid Logs handoffs cannot replace a newer Traces navigation', async ({ page }) => {
+  await mockNavigation(page);
+  await page.goto(
+    `/traces/explore/events?${new URLSearchParams({ start: bounds.startTime, end: bounds.endTime, service: 'api-gateway' })}`,
+  );
+  await expect(page.getByTestId('trace-table')).toBeVisible();
+  await expect.poll(() => new URL(page.url()).searchParams.has('observe')).toBe(true);
+  // Browser history changes before the outgoing Traces DOM necessarily commits.
+  // Return immediately, while Logs can still have a handoff effect pending.
+  await page.getByTestId('sidebar-logs').click();
+  await expect(page).toHaveURL(/\/logs\/explore\/events\?/);
+  await page.getByTestId('sidebar-traces').click();
+  await expect(page).toHaveURL(/\/traces\/explore\/events\?/);
+  await expect(page.getByTestId('trace-table')).toBeVisible();
+  await page.waitForLoadState('networkidle');
+  await expect(page).toHaveURL(/\/traces\/explore\/events\?/);
+  await expect(page.getByRole('button', { name: 'Refresh traces' })).toBeVisible();
+  await expect(page.locator('.logs-page')).toHaveCount(0);
 });
