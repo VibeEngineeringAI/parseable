@@ -287,15 +287,26 @@ export function createNativeKeystoneTransport(
         ),
       ),
     cancelRun: (id, run) =>
-      request(
+      request<{ status: NodeStatus }>(
         `${path(id)}/runs/${encodeURIComponent(run)}/cancel`,
         (v) => {
           const o = v as { schemaVersion?: unknown; run?: { status?: unknown } };
-          return o.schemaVersion === 1 &&
-            typeof o.run?.status === 'string' &&
-            ['completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(o.run.status)
-            ? { ok: true, value: { status: o.run.status as NodeStatus } }
-            : { ok: false, error: 'run' };
+          if (o.schemaVersion !== 1) return { ok: false, error: 'run' };
+          switch (o.run?.status) {
+            // A claimed run acknowledges cancellation before teardown finishes.
+            // Match the native running event projection; SSE retains its detailed phase.
+            case 'running':
+              return { ok: true, value: { status: 'resolving_scope' } };
+            case 'queued':
+            case 'completed':
+            case 'partial':
+            case 'failed':
+            case 'cancelled':
+            case 'interrupted':
+              return { ok: true, value: { status: o.run.status } };
+            default:
+              return { ok: false, error: 'run' };
+          }
         },
         json({}),
       ),

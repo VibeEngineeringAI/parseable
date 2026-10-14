@@ -70,16 +70,72 @@ describe('native Keystone transport', () => {
     expect(proxy).toMatchObject({ ok: false, kind: 'invalid' });
     expect(JSON.stringify(proxy)).not.toContain('Bad Gateway');
   });
-  it('preserves a completed-versus-cancel race status', async () => {
-    const fetcher = vi
-      .fn()
-      .mockResolvedValue(json({ schemaVersion: 1, run: { status: 'completed' } }));
-    const result = await createNativeKeystoneTransport(fetcher).page.cancelRun(
-      'investigation',
-      'run',
-    );
-    expect(result).toEqual({ ok: true, value: { status: 'completed' } });
-    expect(fetcher.mock.calls[0][1].credentials).toBe('include');
+  it.each([
+    ['queued', 'queued'],
+    ['running', 'resolving_scope'],
+  ] as const)(
+    'accepts a cancellation acknowledgement while the native run is still %s',
+    async (nativeStatus, browserStatus) => {
+      const fetcher = vi
+        .fn()
+        .mockResolvedValue(json({ schemaVersion: 1, run: { status: nativeStatus } }));
+      const result = await createNativeKeystoneTransport(fetcher).page.cancelRun(
+        'investigation',
+        'run',
+      );
+      // Cancellation may be acknowledged before the coordinator finishes teardown.
+      // Preserve a nonterminal result until the terminal event arrives over SSE.
+      expect(result).toEqual({ ok: true, value: { status: browserStatus } });
+      expect(fetcher.mock.calls[0][0]).toBe(
+        '/api/prism/v1/keystone/native/investigations/investigation/runs/run/cancel',
+      );
+      expect(fetcher.mock.calls[0][1]).toMatchObject({
+        method: 'POST',
+        credentials: 'include',
+      });
+    },
+  );
+  it.each(['completed', 'partial', 'failed', 'cancelled', 'interrupted'] as const)(
+    'preserves the native %s status when cancellation races with termination',
+    async (status) => {
+      const fetcher = vi.fn().mockResolvedValue(json({ schemaVersion: 1, run: { status } }));
+      const result = await createNativeKeystoneTransport(fetcher).page.cancelRun(
+        'investigation',
+        'run',
+      );
+      expect(result).toEqual({ ok: true, value: { status } });
+      expect(fetcher.mock.calls[0][1].credentials).toBe('include');
+    },
+  );
+  it.each([
+    null,
+    {},
+    { schemaVersion: 2, run: { status: 'running' } },
+    { schemaVersion: 1 },
+    { schemaVersion: 1, run: null },
+    { schemaVersion: 1, run: {} },
+    ...[
+      null,
+      1,
+      true,
+      {},
+      [],
+      '',
+      'unknown',
+      'draft',
+      'resolving_scope',
+      'awaiting_confirmation',
+      'querying',
+      'composing',
+    ].map((status) => ({
+      schemaVersion: 1,
+      run: { status },
+    })),
+  ])('rejects an invalid native cancellation response: %j', async (body) => {
+    const result = await createNativeKeystoneTransport(
+      vi.fn().mockResolvedValue(json(body)),
+    ).page.cancelRun('investigation', 'run');
+    expect(result.ok).toBe(false);
   });
   it('creates only the selected export evidence and pins server hash', async () => {
     const scope = {
