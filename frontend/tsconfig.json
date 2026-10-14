@@ -20,6 +20,7 @@
     ".storybook",
     "e2e",
     "playwright.live.config.ts",
+    "playwright.native.config.ts",
     "e2e-live",
     "playwright.prod.config.ts",
     "e2e-prod"

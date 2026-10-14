@@ -2,8 +2,9 @@
 
 The native runtime now includes optional live generation and encrypted credential entry.
 They remain unavailable until operator deployment inputs and an admin-entered credential
-are present. Automated verification uses fixtures and local TLS only. No paid call has
-validated the configured model against the privacy routing requirements below.
+are present. Automated verification uses fixtures and local TLS only. A separately authorized
+paid MiMo run completed on 2026-10-14; actual billed cost was not exposed. See the
+[live validation boundary](keystone-browser-validation.md#live-validation-boundary).
 
 `ModelProvider` and the separate advisory `DecisionProvider` receive a
 `FrozenProviderContext` verified from the server-built `PinnedContext`. The wire
@@ -116,8 +117,8 @@ that meets both requirements within the price caps. The documentation does not
 state the `zdr: true` behavior when no ZDR endpoint exists; Keystone assumes the
 request fails and never falls back. Such a run fails with the upstream rejection
 rather than sending data to a less restricted endpoint. The default model was chosen
-for price; its availability under these requirements has not been tested with a
-paid call, so no call has confirmed which endpoints serve it. Before
+for price; one controlled paid MiMo run completed on 2026-10-14. This does not
+guarantee future availability or identify every qualifying endpoint. Before
 enabling Keystone, check the model's endpoint list and run one controlled call;
 choose another model with `KEYSTONE_GENERATION_MODEL` if none qualifies.
 

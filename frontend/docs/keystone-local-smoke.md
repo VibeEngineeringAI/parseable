@@ -4,6 +4,11 @@ A recipe for running native Keystone on one development machine with synthetic d
 from any other Parseable installation. It is a local test, not a release deployment. Replace every
 `<placeholder>` with a value for your machine; nothing here is a working credential.
 
+For repeatable browser checks without credentials, use
+[`npm run test:keystone-native`](keystone-browser-validation.md#native-socket-workflow). It owns
+a fresh synthetic socket fixture and frontend build. The recipe below instead exercises the
+production runtime, authentication and query engine.
+
 ## Runtime layout
 
 Create one private runtime directory and keep everything for this instance inside it:
@@ -130,3 +135,7 @@ internal datasets such as `pstats` are never offered, and the backend rejects th
 
 Smoke artifacts (logs, screenshots, browser results) belong outside the repository, for example
 under `$RUNTIME` or a private scratch directory. They are not part of this change.
+
+Local production-runtime and paid-provider observations from 2026-10-14, including remaining
+unfixed readiness findings, are recorded in the
+[live validation boundary](keystone-browser-validation.md#live-validation-boundary).

@@ -152,6 +152,131 @@ fn access(_: &HttpRequest) -> std::result::Result<BoundAccess, ApiError> {
     Ok(BoundAccess::unchanged(owner1()))
 }
 
+/// Diagnostic model: `[diagnostic:hold]` in the frozen context delays the answer long
+/// enough to exercise real native cancellation. Dropping the future stops the wait.
+struct BrowserDiagnosticModel;
+#[async_trait]
+impl crate::keystone::providers::ModelProvider for BrowserDiagnosticModel {
+    async fn propose(
+        &self,
+        context: &crate::keystone::providers::FrozenProviderContext,
+    ) -> std::result::Result<ModelProposal, crate::keystone::providers::ProviderError> {
+        let delay = if context
+            .serialized()
+            .to_ascii_lowercase()
+            .contains("[diagnostic:hold]")
+        {
+            90
+        } else {
+            2
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        Ok(ModelProposal {
+            explanation: "Synthetic diagnostic answer from a real native run; no provider call."
+                .into(),
+        })
+    }
+}
+
+/// Opt-in socket harness, deliberately excluded from ordinary library tests.
+/// Real native routes, projections, SSE, coordinator and durable repository;
+/// synthetic fixed owner/grants, dataset metadata, rows and model. No production
+/// runtime, login middleware, query engine, credentials or provider transport.
+/// `frontend/npm run test:keystone-native` owns the frontend, socket and lifecycle.
+#[actix_web::test]
+#[ignore = "isolated browser diagnostic; launched by npm run test:keystone-native"]
+async fn native_browser_diagnostic_server() {
+    let port: u16 = std::env::var("KEYSTONE_DIAGNOSTIC_PORT")
+        .unwrap_or_else(|_| "0".into())
+        .parse()
+        .expect("diagnostic port must be a u16");
+    let lifetime: u64 = std::env::var("KEYSTONE_DIAGNOSTIC_SECONDS")
+        .unwrap_or_else(|_| "600".into())
+        .parse()
+        .expect("diagnostic lifetime must be seconds");
+    assert!((1..=1800).contains(&lifetime));
+    let temporary = tempfile::Builder::new()
+        .prefix("keystone-native-browser-")
+        .tempdir()
+        .unwrap();
+    let directory = std::env::var_os("KEYSTONE_DIAGNOSTIC_DIRECTORY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().to_owned());
+    std::fs::create_dir_all(&directory).unwrap();
+    let repo = Arc::new(NativeRepository::open(&directory).unwrap());
+    let allowed = Arc::new(AtomicBool::new(true));
+    let coordinator = Arc::new(Coordinator::new_with_reads(
+        repo.clone(),
+        Arc::new(BrowserDiagnosticModel),
+        Arc::new(Authority(allowed.clone())),
+        Arc::new(Rows),
+    ));
+    let execution: Arc<dyn ExecutionService> = Arc::new(Execution {
+        repo: repo.clone(),
+        coordinator,
+        allowed,
+    });
+    let identity = std::env::var("KEYSTONE_DIAGNOSTIC_ID")
+        .expect("launcher must supply a unique fixture identity");
+    let response_identity = identity.clone();
+    let server = actix_web::HttpServer::new(move || {
+        App::new()
+            .wrap(
+                actix_web::middleware::DefaultHeaders::new()
+                    .add(("x-keystone-native-fixture", response_identity.clone())),
+            )
+            .service(web::scope("/api/prism/v1").service(scope(
+                web::Data::new(ApiState {
+                    scope_preparer: None,
+                    repository: Some(repo.clone()),
+                    authorize: access,
+                    mode: "all",
+                    execution: Some(execution.clone()),
+                }),
+                |route| route,
+            )))
+            .route(
+                "/api/v1/logstream",
+                web::get().to(|| async { HttpResponse::Ok().json(json!([{"name":"logs"}])) }),
+            )
+            .route(
+                "/api/v1/logstream/logs/info",
+                web::get().to(|| async {
+                    HttpResponse::Ok()
+                        .json(json!({"streamType":"UserDefined","telemetryType":"logs"}))
+                }),
+            )
+            .route(
+                "/api/v1/users/{id}",
+                web::get().to(|| async {
+                    HttpResponse::Ok()
+                        .json(json!({"id":"owner1","username":"synthetic-native-diagnostic"}))
+                }),
+            )
+    })
+    .workers(1)
+    .bind(("127.0.0.1", port))
+    .expect("diagnostic loopback socket must bind");
+    let address = server.addrs()[0];
+    let server = server.run();
+    let handle = server.handle();
+    let task = actix_web::rt::spawn(server);
+    if let Some(path) = std::env::var_os("KEYSTONE_DIAGNOSTIC_READY_FILE") {
+        let path = std::path::PathBuf::from(path);
+        let pending = path.with_extension("tmp");
+        std::fs::write(
+            &pending,
+            json!({"url":format!("http://{address}"),"identity":identity}).to_string(),
+        )
+        .unwrap();
+        std::fs::rename(pending, path).unwrap();
+    }
+    eprintln!("Synthetic native browser diagnostic listening on {address}; expires in {lifetime}s");
+    tokio::time::sleep(std::time::Duration::from_secs(lifetime)).await;
+    handle.stop(true).await;
+    task.await.unwrap().unwrap();
+}
+
 #[actix_web::test]
 async fn real_routes_run_replay_branch_projection_layout_and_restart() {
     let directory = tempfile::tempdir().unwrap();

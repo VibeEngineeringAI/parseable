@@ -193,3 +193,73 @@ screenshot specs and all **60** Keystone cases. Results are in
 Screenshot comparisons are only meaningful inside the CI container. On a developer machine the
 screenshot specs may fail because of local font and rendering differences; that is not a
 regression signal, and baselines must not be refreshed from such a run.
+
+## Native socket workflow
+
+From `frontend`, run:
+
+```sh
+npm ci
+# One-time prerequisite; the launcher does not install browsers:
+npx playwright install chromium
+npm run test:keystone-native
+```
+
+The launcher requires Node 22.12 or later, this repository's Rust toolchain and its native build
+prerequisites. The launcher uses Linux/macOS process groups; Linux has been exercised locally,
+macOS remains unverified, and Windows process cleanup is not supported. Use
+`npm run test:keystone-native -- --help` for environment options. `TMPDIR` selects temporary
+storage, `CARGO_TARGET_DIR` permits reuse of compilation dependencies, and
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` selects an explicitly installed Chromium.
+
+This command typechecks and builds the actual frontend into a private temporary directory,
+builds the Rust library test harness and selects its executable from Cargo JSON output. It
+launches only the ignored native socket fixture and only `keystone-native-readiness.spec.ts`.
+Both HTTP listeners bind fresh OS-assigned loopback ports. A ready-file handshake and unique
+fixture response header are checked before browser mutations. There is no external-server URL,
+server reuse, HMR, existing `dist` dependency, native API interception or provider credential.
+The ordinary `test:live` suite excludes these cases.
+
+The fixture exercises actual Actix native routes, durable repository commits, coordinator,
+projections, native adapter and SSE. Authentication/current grants, user and dataset metadata,
+scoped sample rows and model answers are synthetic. Production login/RBAC middleware, DataFusion,
+encrypted credential storage, real provider transport and production deployment are outside this
+workflow. The explicit `[diagnostic:hold]` prompt token keeps generation composing for the cancel
+case. The cancellation response acknowledges a still-running run; terminal cancellation arrives
+through persisted progress after execution unwinds.
+
+The checks cover draft save/navigation with zero implicit runs, one explicit completion, run-link
+navigation/reload, explicit selection of one direct-parent source for a durable child draft,
+composing reload/resubscription, cancellation and terminal reload. Cursor replay is compared with
+the committed stream's tail. Reload/resubscription does not simulate packet loss or prove every
+network-disconnect recovery path.
+
+Each invocation retains stage logs, its runtime manifest, request/status logs, cancellation
+acknowledgement, SSE replay, Playwright JSON/HTML report, screenshots, videos and traces under
+`test-results/keystone-native/<unique-id>`. `KEYSTONE_NATIVE_ARTIFACTS` changes the parent folder.
+On failure, read the named stage log and open `<unique-id>/report/index.html`; traces can be opened
+with `npx playwright show-trace <trace.zip>`. Artifacts contain synthetic fixture data. Runtime
+storage and the temporary frontend build are removed on success, failure and SIGINT/SIGTERM;
+only process groups started by this invocation are stopped. No existing services are killed.
+
+The `Keystone native smoke` workflow invokes the same command automatically for relevant pull
+requests and pushes to `main` or `feat/native-only-ui`, and also supports manual dispatch. It
+uploads `test-results/keystone-native/` on success or failure for seven days. The new hosted CI
+workflow has not yet been exercised; local execution and static workflow review are separate
+validation evidence.
+
+### Live validation boundary
+
+On 2026-10-14, a separately authorized paid run using the configured default model
+`xiaomi/mimo-v2.6-flash` completed against a local production runtime with synthetic telemetry.
+The request explicitly supplied `zdr: true`, `data_collection: "deny"`,
+`allow_fallbacks: false`, `require_parameters: true`,
+`max_price: { "prompt": 0.2, "completion": 1 }`, `max_tokens: 2048`, and disabled/excluded
+reasoning. Success establishes that this request completed; it does not independently verify
+provider retention practices or identify the serving endpoint. The adapter did not expose the
+actual billed cost. This observation is
+separate from the repeatable fixture command and does not establish production readiness or
+future endpoint availability. Two independently reproduced P2 findings remain unfixed: reopening
+the encrypted credential store with a different master key can still advertise readiness, and
+execution failures can present generic messages rather than an actionable cause. Credential,
+account and private runtime details are deliberately excluded from these documents.
