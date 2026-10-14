@@ -217,6 +217,30 @@ impl Sessions {
             .collect_vec()
     }
 
+    /// Read a current credential's permissions without copying session material.
+    /// The caller holds SESSIONS; subsequent group lookups follow the RBAC lock order.
+    /// Match only this principal's unexpired keys before invoking the digest predicate.
+    pub fn permissions_matching_session(
+        &self,
+        owner_id: &str,
+        tenant_id: &str,
+        mut matches: impl FnMut(&SessionKey) -> bool,
+    ) -> Option<Vec<Permission>> {
+        for (key, (owner, tenant, permissions)) in &self.active_sessions {
+            if owner != owner_id
+                || tenant != tenant_id
+                || self.is_session_expired(key)
+                || !matches(key)
+            {
+                continue;
+            }
+            let mut permissions = permissions.clone();
+            permissions.extend(aggregate_group_permissions(owner, tenant));
+            return Some(permissions);
+        }
+        None
+    }
+
     pub fn remove_tenant_sessions(&mut self, tenant_id: &str) {
         self.active_sessions
             .retain(|_, (_, tenantid, _)| !tenant_id.eq(tenantid));
@@ -574,6 +598,103 @@ mod session_expiry_tests {
 
     fn key() -> SessionKey {
         SessionKey::SessionId(Ulid::new())
+    }
+
+    #[test]
+    fn borrowed_session_match_never_touches_other_principals_or_expired_credentials() {
+        USERS.get_or_init(Default::default);
+        let mut sessions = Sessions::default();
+        let owner = format!("scoped-owner-{}", Ulid::new());
+        let tenant = format!("scoped-tenant-{}", Ulid::new());
+        let valid = key();
+        let expired = key();
+        let other_owner = SessionKey::BasicAuth {
+            username: "fixture-other-owner".into(),
+            password: "fixture-password-never-hashed".into(),
+        };
+        let other_tenant = key();
+        for (session, user, tenant, expiry) in [
+            (
+                valid.clone(),
+                owner.clone(),
+                tenant.clone(),
+                Utc::now() + TimeDelta::minutes(5),
+            ),
+            (
+                other_owner,
+                "other-owner".into(),
+                tenant.clone(),
+                Utc::now() + TimeDelta::minutes(5),
+            ),
+            (
+                other_tenant,
+                owner.clone(),
+                "other-tenant".into(),
+                Utc::now() + TimeDelta::minutes(5),
+            ),
+            (
+                expired,
+                owner.clone(),
+                tenant.clone(),
+                Utc::now() - TimeDelta::seconds(1),
+            ),
+        ] {
+            sessions.track_new(
+                user,
+                session,
+                expiry,
+                vec![Permission::Unit(Action::Query)],
+                &Some(tenant),
+            );
+        }
+        // A false predicate visits every eligible key, so hash-map ordering
+        // cannot conceal a callback applied to another principal's credential.
+        let mut probed = 0;
+        assert!(
+            sessions
+                .permissions_matching_session(&owner, &tenant, |session| {
+                    assert_eq!(session, &valid);
+                    probed += 1;
+                    false
+                })
+                .is_none()
+        );
+        assert_eq!(probed, 1);
+        let mut touched = 0;
+        let permissions = sessions
+            .permissions_matching_session(&owner, &tenant, |session| {
+                assert_eq!(session, &valid);
+                touched += 1;
+                true
+            })
+            .unwrap();
+        assert_eq!(touched, 1);
+        assert_eq!(permissions, vec![Permission::Unit(Action::Query)]);
+        sessions
+            .user_sessions
+            .get_mut(&tenant)
+            .unwrap()
+            .get_mut(&owner)
+            .unwrap()
+            .iter_mut()
+            .find(|(key, _)| key == &valid)
+            .unwrap()
+            .1 = Utc::now() - TimeDelta::seconds(1);
+        assert!(
+            sessions
+                .permissions_matching_session(&owner, &tenant, |_| panic!(
+                    "expired credential reached digest predicate"
+                ))
+                .is_none()
+        );
+        sessions.remove_session(&valid);
+        assert!(
+            sessions
+                .permissions_matching_session(&owner, &tenant, |_| panic!(
+                    "revoked credential reached digest predicate"
+                ))
+                .is_none()
+        );
     }
 
     #[test]

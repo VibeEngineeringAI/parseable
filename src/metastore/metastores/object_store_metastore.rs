@@ -81,6 +81,10 @@ pub fn is_missing_optional_dir(err: &ObjectStorageError) -> bool {
 
 #[async_trait]
 impl Metastore for ObjectStoreMetastore {
+    fn native_read_only_catalog_storage(&self) -> Option<Arc<dyn ObjectStorage>> {
+        Some(self.storage.clone())
+    }
+
     /// Since Parseable already starts with a connection to an object store, no need to implement this
     async fn initiate_connection(&self) -> Result<(), MetastoreError> {
         unimplemented!()

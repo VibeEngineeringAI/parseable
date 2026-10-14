@@ -19,3 +19,6 @@ cache
 # Local credentials and review notes
 *.pem
 pr-*.md
+
+# Stray installs at the repository root (the frontend keeps its own)
+/node_modules/

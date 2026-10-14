@@ -223,6 +223,15 @@ async fn upload_single_parquet_file(
     })
 }
 
+/// Only canonical and per-ingestor metadata/schema objects are catalog inputs.
+pub(crate) fn native_catalog_name(name: &str) -> bool {
+    name == crate::storage::STREAM_METADATA_FILE_NAME
+        || name == crate::storage::SCHEMA_FILE_NAME
+        || name.starts_with(".ingestor.")
+            && (name.ends_with(crate::storage::STREAM_METADATA_FILE_NAME)
+                || name.ends_with(crate::storage::SCHEMA_FILE_NAME))
+}
+
 /// Updates storage-related metrics for an uploaded file
 fn update_storage_metrics(
     path: &std::path::Path,
@@ -364,6 +373,74 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
         path: &RelativePath,
         tenant_id: &Option<String>,
     ) -> Result<Bytes, ObjectStorageError>;
+    /// Dedicated bounded catalog reader for native read-only hydration. Default
+    /// cloud readers admit only small listed objects and recheck returned bytes;
+    /// get_object buffers its response, so this is not a transport byte cap.
+    /// LocalFS overrides this with an actual bounded file read.
+    async fn native_catalog_documents(
+        &self,
+        prefix: &RelativePath,
+        tenant_id: &Option<String>,
+        max_documents: usize,
+        max_document_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<(String, Bytes)>, ObjectStorageError> {
+        let listing = self
+            .list_with_delimiter(Some(object_store::path::Path::from(prefix.as_str())))
+            .await?;
+        let mut objects: Vec<_> = listing
+            .objects
+            .into_iter()
+            .filter(|object| {
+                let name = object.location.filename().unwrap_or("");
+                object
+                    .location
+                    .as_ref()
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent)
+                    == Some(prefix.as_str())
+                    && native_catalog_name(name)
+            })
+            .collect();
+        let limit = || {
+            ObjectStorageError::UnhandledError(Box::new(std::io::Error::other(
+                "native catalog byte/document budget exceeded",
+            )))
+        };
+        if objects.len() > max_documents {
+            return Err(limit());
+        }
+        objects.sort_by_key(|object| {
+            (
+                object.location.filename() != Some(crate::storage::STREAM_METADATA_FILE_NAME),
+                object.location.to_string(),
+            )
+        });
+        let mut documents = Vec::new();
+        let mut total = 0usize;
+        for object in objects {
+            if object.size > max_document_bytes as u64
+                || object.size > max_total_bytes.saturating_sub(total) as u64
+            {
+                return Err(limit());
+            }
+            let bytes = self
+                .get_object(
+                    &RelativePathBuf::from(object.location.to_string()),
+                    tenant_id,
+                )
+                .await?;
+            if bytes.len() > max_document_bytes
+                || bytes.len() > max_total_bytes.saturating_sub(total)
+            {
+                return Err(limit());
+            }
+            total += bytes.len();
+            documents.push((object.location.filename().unwrap().to_owned(), bytes));
+        }
+        Ok(documents)
+    }
+
     // TODO: make the filter function optional as we may want to get all objects
     async fn get_objects(
         &self,
@@ -1839,5 +1916,441 @@ mod manifest_ownership_tests {
             "stream/date=2026-08-13/host-a.manifest.json",
             "host-b.manifest.json"
         ));
+    }
+}
+
+#[cfg(test)]
+mod native_catalog_tests {
+    use super::*;
+    use object_store::path::Path as StorePath;
+    use std::sync::Mutex;
+
+    /// Cloud-shaped store for the default `native_catalog_documents`. The listing is
+    /// deliberately over-broad (deeper, sibling and other-tenant keys) so the parent
+    /// filter, not the fake, enforces the directory boundary.
+    #[derive(Debug, Default)]
+    struct FakeCloud {
+        /// (bucket-relative key, listed size, stored bytes)
+        objects: Vec<(String, u64, Bytes)>,
+        fail_listing: bool,
+        listed: Mutex<Vec<Option<String>>>,
+        fetched: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl FakeCloud {
+        fn with(objects: &[(&str, &[u8])]) -> Self {
+            Self {
+                objects: objects
+                    .iter()
+                    .map(|(key, bytes)| {
+                        (
+                            key.to_string(),
+                            bytes.len() as u64,
+                            Bytes::copy_from_slice(bytes),
+                        )
+                    })
+                    .collect(),
+                ..Self::default()
+            }
+        }
+        fn fetched(&self) -> Vec<(String, Option<String>)> {
+            self.fetched.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStorage for FakeCloud {
+        async fn get_buffered_reader(
+            &self,
+            _: &RelativePath,
+            _: &Option<String>,
+        ) -> Result<BufReader, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn head(
+            &self,
+            _: &RelativePath,
+            _: &Option<String>,
+        ) -> Result<ObjectMeta, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn parallel_chunked_download(
+            &self,
+            _: &RelativePath,
+            _: &Option<String>,
+            _: PathBuf,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn get_object(
+            &self,
+            path: &RelativePath,
+            tenant_id: &Option<String>,
+        ) -> Result<Bytes, ObjectStorageError> {
+            self.fetched
+                .lock()
+                .unwrap()
+                .push((path.to_string(), tenant_id.clone()));
+            self.objects
+                .iter()
+                .find(|(key, _, _)| key == path.as_str())
+                .map(|(_, _, bytes)| bytes.clone())
+                .ok_or_else(|| ObjectStorageError::NoSuchKey(path.to_string()))
+        }
+        async fn get_object_ranged(
+            &self,
+            _: &RelativePath,
+            _: &Option<String>,
+        ) -> Result<Bytes, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn get_objects(
+            &self,
+            _: Option<&RelativePath>,
+            _: Box<dyn Fn(String) -> bool + Send>,
+            _: &Option<String>,
+        ) -> Result<Vec<Bytes>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn upload_multipart(
+            &self,
+            _: &RelativePath,
+            _: &Path,
+            _: &Option<String>,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn put_object(
+            &self,
+            _: &RelativePath,
+            _: Bytes,
+            _: &Option<String>,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn delete_prefix(
+            &self,
+            _: &RelativePath,
+            _: &Option<String>,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn check(&self, _: &Option<String>) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn delete_stream(
+            &self,
+            _: &str,
+            _: &Option<String>,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn list_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn list_old_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn list_dirs(&self, _: &Option<String>) -> Result<Vec<String>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn list_dirs_relative(
+            &self,
+            _: &RelativePath,
+            _: &Option<String>,
+        ) -> Result<Vec<String>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn list_dates(
+            &self,
+            _: &str,
+            _: &Option<String>,
+        ) -> Result<Vec<String>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn list_hours(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Option<String>,
+        ) -> Result<Vec<String>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn list_minutes(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Option<String>,
+        ) -> Result<Vec<String>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn upload_file(
+            &self,
+            _: &str,
+            _: &Path,
+            _: &Option<String>,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn delete_object(
+            &self,
+            _: &RelativePath,
+            _: &Option<String>,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn get_ingestor_meta_file_paths(
+            &self,
+            _: &Option<String>,
+        ) -> Result<Vec<RelativePathBuf>, ObjectStorageError> {
+            unimplemented!()
+        }
+        async fn try_delete_node_meta(
+            &self,
+            _: String,
+            _: &Option<String>,
+        ) -> Result<(), ObjectStorageError> {
+            unimplemented!()
+        }
+        fn query_prefixes(&self, _: Vec<String>) -> Vec<ListingTableUrl> {
+            unimplemented!()
+        }
+        fn absolute_url(&self, _: &RelativePath) -> StorePath {
+            unimplemented!()
+        }
+        fn store_url(&self) -> url::Url {
+            unimplemented!()
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<StorePath>,
+        ) -> Result<ListResult, ObjectStorageError> {
+            self.listed
+                .lock()
+                .unwrap()
+                .push(prefix.as_ref().map(ToString::to_string));
+            if self.fail_listing {
+                return Err(ObjectStorageError::UnhandledError(Box::new(
+                    std::io::Error::other("listing failed"),
+                )));
+            }
+            Ok(ListResult {
+                common_prefixes: vec![StorePath::from("logs/.stream/nested")],
+                objects: self
+                    .objects
+                    .iter()
+                    .map(|(key, size, _)| ObjectMeta {
+                        location: StorePath::from(key.as_str()),
+                        last_modified: Utc::now(),
+                        size: *size,
+                        e_tag: None,
+                        version: None,
+                    })
+                    .collect(),
+            })
+        }
+        fn get_bucket_name(&self) -> String {
+            "bucket".into()
+        }
+    }
+
+    const NOISE: &[(&str, &[u8])] = &[
+        ("logs/.stream/notes.json", b"noise"),
+        ("logs/.stream/stream.json", b"noise"),
+        ("logs/.stream/.ingestor.abc.stream.json.tmp", b"noise"),
+        ("logs/.stream/nested/.stream.json", b"deeper"),
+        ("logs/.stream.bak/.stream.json", b"sibling"),
+        ("logs/.streams/.schema", b"sibling"),
+        ("logs/.stream", b"prefix-object"),
+        ("other/.stream/.stream.json", b"other-dataset"),
+    ];
+
+    fn names(documents: &[(String, Bytes)]) -> Vec<(&str, &[u8])> {
+        documents
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_ref()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_tenant_reads_only_direct_catalog_children_canonical_first() {
+        let mut objects = vec![
+            ("logs/.stream/.schema", b"schema" as &[u8]),
+            ("logs/.stream/.ingestor.abc.stream.json", b"ingestor-meta"),
+            ("logs/.stream/.ingestor.abc.schema", b"ingestor-schema"),
+            ("logs/.stream/.stream.json", b"canonical"),
+            ("acme/logs/.stream/.stream.json", b"named-tenant-decoy"),
+        ];
+        objects.extend_from_slice(NOISE);
+        let store = FakeCloud::with(&objects);
+        let documents = store
+            .native_catalog_documents(&RelativePathBuf::from("logs/.stream"), &None, 4, 64, 256)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&documents),
+            vec![
+                (".stream.json", b"canonical" as &[u8]),
+                (".ingestor.abc.schema", b"ingestor-schema"),
+                (".ingestor.abc.stream.json", b"ingestor-meta"),
+                (".schema", b"schema"),
+            ]
+        );
+        assert_eq!(
+            *store.listed.lock().unwrap(),
+            vec![Some("logs/.stream".to_string())]
+        );
+        assert_eq!(
+            store.fetched(),
+            [
+                "logs/.stream/.stream.json",
+                "logs/.stream/.ingestor.abc.schema",
+                "logs/.stream/.ingestor.abc.stream.json",
+                "logs/.stream/.schema",
+            ]
+            .map(|key| (key.to_string(), None::<String>))
+        );
+    }
+
+    #[tokio::test]
+    async fn named_tenant_reads_its_own_prefix_and_passes_tenant_through() {
+        let tenant = Some("acme".to_string());
+        let mut objects = vec![
+            ("acme/logs/.stream/.stream.json", b"acme-canonical" as &[u8]),
+            (
+                "acme/logs/.stream/.ingestor.n1.stream.json",
+                b"acme-ingestor",
+            ),
+            ("acme/logs/.stream/.schema", b"acme-schema"),
+            ("logs/.stream/.stream.json", b"default-tenant-decoy"),
+            ("logs/.stream/.schema", b"default-tenant-decoy"),
+            ("other/logs/.stream/.stream.json", b"other-tenant-decoy"),
+        ];
+        objects.extend_from_slice(NOISE);
+        let store = FakeCloud::with(&objects);
+        let prefix = RelativePathBuf::from_iter(["acme", "logs", STREAM_ROOT_DIRECTORY]);
+        let documents = store
+            .native_catalog_documents(&prefix, &tenant, 3, 64, 256)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&documents),
+            vec![
+                (".stream.json", b"acme-canonical" as &[u8]),
+                (".ingestor.n1.stream.json", b"acme-ingestor"),
+                (".schema", b"acme-schema"),
+            ]
+        );
+        assert!(store.fetched().iter().all(|(key, fetched_tenant)| {
+            key.starts_with("acme/logs/.stream/") && *fetched_tenant == tenant
+        }));
+    }
+
+    #[tokio::test]
+    async fn document_budget_fails_before_any_fetch() {
+        let store = FakeCloud::with(&[
+            ("logs/.stream/.stream.json", b"a"),
+            ("logs/.stream/.ingestor.a.stream.json", b"b"),
+            ("logs/.stream/.schema", b"c"),
+        ]);
+        assert!(
+            store
+                .native_catalog_documents(&RelativePathBuf::from("logs/.stream"), &None, 2, 64, 256)
+                .await
+                .is_err()
+        );
+        assert!(store.fetched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn listed_sizes_are_checked_before_fetching() {
+        let store = FakeCloud::with(&[
+            ("logs/.stream/.stream.json", b"0123456789"),
+            ("logs/.stream/.schema", &[b'x'; 65]),
+        ]);
+        let prefix = RelativePathBuf::from("logs/.stream");
+        // Per-document cap: the oversized schema is never fetched.
+        assert!(
+            store
+                .native_catalog_documents(&prefix, &None, 8, 64, 1024)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.fetched().len(), 1);
+        // Total cap: after ten bytes, a further ten listed bytes exceed fifteen.
+        let store = FakeCloud::with(&[
+            ("logs/.stream/.stream.json", b"0123456789"),
+            ("logs/.stream/.schema", b"0123456789"),
+        ]);
+        assert!(
+            store
+                .native_catalog_documents(&prefix, &None, 8, 64, 15)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.fetched(),
+            vec![("logs/.stream/.stream.json".to_string(), None)]
+        );
+        // Exactly at both caps is admitted.
+        let store = FakeCloud::with(&[
+            ("logs/.stream/.stream.json", b"0123456789"),
+            ("logs/.stream/.schema", b"0123456789"),
+        ]);
+        let documents = store
+            .native_catalog_documents(&prefix, &None, 2, 10, 20)
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn under_reported_listing_sizes_are_rechecked_after_fetch() {
+        let prefix = RelativePathBuf::from("logs/.stream");
+        let mut store = FakeCloud::with(&[("logs/.stream/.stream.json", &[b'x'; 100])]);
+        store.objects[0].1 = 1;
+        assert!(
+            store
+                .native_catalog_documents(&prefix, &None, 8, 64, 1024)
+                .await
+                .is_err()
+        );
+        let mut store = FakeCloud::with(&[
+            ("logs/.stream/.stream.json", &[b'x'; 40]),
+            ("logs/.stream/.schema", &[b'y'; 40]),
+        ]);
+        store.objects[1].1 = 1;
+        assert!(
+            store
+                .native_catalog_documents(&prefix, &None, 8, 64, 60)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_or_failed_listing() {
+        let prefix = RelativePathBuf::from("logs/.stream");
+        let store = FakeCloud::with(NOISE);
+        assert!(
+            store
+                .native_catalog_documents(&prefix, &None, 8, 64, 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.fetched().is_empty());
+        let store = FakeCloud {
+            fail_listing: true,
+            ..FakeCloud::with(&[("logs/.stream/.stream.json", b"a")])
+        };
+        assert!(
+            store
+                .native_catalog_documents(&prefix, &None, 8, 64, 1024)
+                .await
+                .is_err()
+        );
+        assert!(store.fetched().is_empty());
     }
 }

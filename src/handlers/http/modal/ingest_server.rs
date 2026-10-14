@@ -66,6 +66,10 @@ impl ParseableServer for IngestServer {
     fn configure_routes(config: &mut web::ServiceConfig) {
         config
             .service(
+                web::scope(&crate::handlers::http::prism_base_path())
+                    .service(crate::keystone::runtime::scope("ingest")),
+            )
+            .service(
                 // Base path "{url}/api/v1"
                 web::scope(&base_path())
                     .service(Server::get_ingest_factory().wrap(from_fn(

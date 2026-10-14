@@ -21,13 +21,14 @@ test('login has working password visibility and administrator recovery', async (
 
 test('live 401 returns to the requested application path after native sign in', async ({
   page,
+  baseURL,
 }) => {
   let signedIn = false;
   await page.route('**/api/v1/**', (route) => {
     const request = route.request();
     const url = new URL(request.url());
     if (url.pathname === '/api/v1/o/login') {
-      expect(url.searchParams.get('redirect')).toBe('http://127.0.0.1:5173/datasets?view=list');
+      expect(url.searchParams.get('redirect')).toBe(new URL('/datasets?view=list', baseURL!).href);
       signedIn = true;
       return route.fulfill({ status: 200, body: 'ok' });
     }
@@ -44,11 +45,14 @@ test('live 401 returns to the requested application path after native sign in', 
   await expect(page.getByText('server_logs', { exact: true })).toBeVisible();
 });
 
-test('OAuth is a document navigation with a safe same-origin redirect', async ({ page }) => {
+test('OAuth is a document navigation with a safe same-origin redirect', async ({
+  page,
+  baseURL,
+}) => {
   await page.route('**/api/v1/o/login?**', (route) => {
     expect(route.request().isNavigationRequest()).toBe(true);
     expect(new URL(route.request().url()).searchParams.get('redirect')).toBe(
-      'http://127.0.0.1:5173/',
+      new URL('/', baseURL!).href,
     );
     return route.fulfill({ contentType: 'text/html', body: '<h1>Identity provider handoff</h1>' });
   });

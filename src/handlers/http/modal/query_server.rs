@@ -82,6 +82,7 @@ impl ParseableServer for QueryServer {
                 web::scope(&prism_base_path())
                     .service(Server::get_prism_home())
                     .service(Server::get_llm_webscope())
+                    .service(crate::keystone::runtime::scope("query"))
                     .service(Server::get_prism_logstream())
                     .service(Server::get_prism_datasets())
                     .service(Server::get_apikeys_webscope())

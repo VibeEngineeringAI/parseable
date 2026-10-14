@@ -45,6 +45,15 @@ use crate::{
 /// need different methods for different kinds of metadata.
 #[async_trait]
 pub trait Metastore: std::fmt::Debug + Send + Sync {
+    /// Explicit authority for bounded, read-only native catalog hydration.
+    /// Custom/SQL metastores fail closed until they expose their authoritative
+    /// bounded reader; callers must never substitute a separate object store.
+    fn native_read_only_catalog_storage(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::storage::ObjectStorage>> {
+        None
+    }
+
     async fn initiate_connection(&self) -> Result<(), MetastoreError>;
     async fn get_objects(
         &self,

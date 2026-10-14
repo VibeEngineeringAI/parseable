@@ -206,6 +206,7 @@ for (const route of ['/logs', '/sql-editor', '/datasets', '/dashboards', '/team'
 
 test('native login switches from demo to live and sends backend query contracts', async ({
   page,
+  baseURL,
 }) => {
   let authenticated = false;
   let queryBody: Record<string, unknown> | undefined;
@@ -219,7 +220,7 @@ test('native login switches from demo to live and sends backend query contracts'
       const redirect = new URL(new URL(request.url()).searchParams.get('redirect')!);
       // The current Logs view may carry its preserved navigation context.
       redirect.searchParams.delete('observe');
-      expect(redirect.href).toBe('http://127.0.0.1:5173/logs');
+      expect(redirect.href).toBe(new URL('/logs', baseURL!).href);
       authenticated = true;
       return route.fulfill({ status: 200, body: 'ok' });
     }

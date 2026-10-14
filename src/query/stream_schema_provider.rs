@@ -46,7 +46,7 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
-use futures_util::{StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -99,6 +99,7 @@ impl SchemaProvider for GlobalSchemaProvider {
                 stream: name.to_owned(),
                 tenant_id: self.tenant_id.clone(),
                 hot_tier_guarded: false,
+                native: None,
             })))
         } else {
             Ok(None)
@@ -117,6 +118,41 @@ struct StandardTableProvider {
     stream: String,
     tenant_id: Option<String>,
     hot_tier_guarded: bool,
+    native: Option<NativeReadCatalog>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeReadCatalog {
+    metadata: ObjectStoreFormat,
+    storage: Arc<dyn ObjectStorage>,
+    metastore: Arc<dyn crate::metastore::metastore_traits::Metastore>,
+    local_storage: bool,
+}
+
+/// A dedicated native source captures the loader's bounded, validated catalog.
+/// It never synthesizes/publishes canonical metadata or substitutes a stale
+/// object-store catalog for another configured metastore's authority.
+pub(crate) fn native_read_only_table(
+    schema: SchemaRef,
+    stream: String,
+    tenant_id: Option<String>,
+    metadata: ObjectStoreFormat,
+    storage: Arc<dyn ObjectStorage>,
+    metastore: Arc<dyn crate::metastore::metastore_traits::Metastore>,
+    local_storage: bool,
+) -> Arc<dyn TableProvider> {
+    Arc::new(StandardTableProvider {
+        schema,
+        stream,
+        tenant_id,
+        hot_tier_guarded: false,
+        native: Some(NativeReadCatalog {
+            metadata,
+            storage,
+            metastore,
+            local_storage,
+        }),
+    })
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -148,6 +184,7 @@ pub(super) fn guarded_hot_tier_table_source(
         stream: provider.stream.clone(),
         tenant_id: provider.tenant_id.clone(),
         hot_tier_guarded: true,
+        native: provider.native.clone(),
     })))
 }
 
@@ -319,7 +356,11 @@ impl StandardTableProvider {
 
         let mut conf_builder = FileScanConfigBuilder::new(object_store_url, file_source.into())
             .with_statistics(statistics)
-            .with_batch_size(Some(PARSEABLE.options.execution_batch_size))
+            .with_batch_size(Some(if self.native.is_some() {
+                state.config_options().execution.batch_size.into()
+            } else {
+                PARSEABLE.options.execution_batch_size
+            }))
             .with_constraints(Constraints::default())
             .with_file_groups(file_groups);
 
@@ -504,19 +545,49 @@ impl StandardTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<(), DataFusionError> {
-        ListingTableBuilder::new(self.stream.to_owned())
-            .populate_via_listing(glob_storage.clone(), time_filters)
-            .and_then(|builder| async {
-                let table =
-                    builder.build(self.schema.clone(), |x| glob_storage.query_prefixes(x))?;
-                if let Some(table) = table {
-                    let plan = table.scan(state, projection, filters, limit).await?;
-                    execution_plans.push(plan);
-                }
+        let builder = if self.native.is_some() {
+            let prefix = match &self.tenant_id {
+                Some(tenant) => format!("{tenant}/{}", self.stream),
+                None => self.stream.clone(),
+            };
+            ListingTableBuilder::new(prefix)
+                .populate_native(glob_storage.clone(), time_filters)
+                .await?
+        } else {
+            ListingTableBuilder::new(self.stream.clone())
+                .populate_via_listing(glob_storage.clone(), time_filters)
+                .await?
+        };
+        async {
+            let table = builder.build(self.schema.clone(), |prefixes| {
+                // LocalFS classic mapping expects absolute paths; native
+                // discovery yields scoped relative paths under its root.
+                let prefixes = if self
+                    .native
+                    .as_ref()
+                    .is_some_and(|native| native.local_storage)
+                {
+                    prefixes
+                        .into_iter()
+                        .map(|prefix| {
+                            glob_storage
+                                .absolute_url(relative_path::RelativePath::new(&prefix))
+                                .to_string()
+                        })
+                        .collect()
+                } else {
+                    prefixes
+                };
+                glob_storage.query_prefixes(prefixes)
+            })?;
+            if let Some(table) = table {
+                let plan = table.scan(state, projection, filters, limit).await?;
+                execution_plans.push(plan);
+            }
 
-                Ok(())
-            })
-            .await?;
+            Ok::<(), DataFusionError>(())
+        }
+        .await?;
 
         Ok(())
     }
@@ -551,13 +622,14 @@ impl StandardTableProvider {
         datafusion::common::Statistics,
         bool,
     ) {
-        partitioned_files(
+        partitioned_files_with_local_storage(
             &self.schema,
             &self.tenant_id,
             manifest_files,
             target_partitions,
             _is_hot_tier,
             time_column,
+            self.native.as_ref().map(|native| native.local_storage),
         )
     }
 }
@@ -575,6 +647,31 @@ pub fn partitioned_files(
     datafusion::common::Statistics,
     bool,
 ) {
+    partitioned_files_with_local_storage(
+        schema,
+        tenant_id,
+        manifest_files,
+        target_partitions,
+        _is_hot_tier,
+        time_column,
+        None,
+    )
+}
+fn partitioned_files_with_local_storage(
+    schema: &SchemaRef,
+    tenant_id: &Option<String>,
+    manifest_files: Vec<File>,
+    target_partitions: usize,
+    _is_hot_tier: bool,
+    time_column: &str,
+    local_storage: Option<bool>,
+) -> (
+    Vec<Vec<PartitionedFile>>,
+    datafusion::common::Statistics,
+    bool,
+) {
+    #[cfg(not(windows))]
+    let _ = local_storage;
     let file_groups = balanced_file_groups(manifest_files, target_partitions);
     let output_ordered_by_time = file_groups_are_time_ordered(&file_groups, time_column);
     let mut partitioned_files = Vec::with_capacity(file_groups.len());
@@ -604,7 +701,9 @@ pub fn partitioned_files(
             // TODO: figure out an elegant solution to this
             #[cfg(windows)]
             {
-                if !_is_hot_tier && PARSEABLE.storage.name() == "drive" {
+                if !_is_hot_tier
+                    && local_storage.unwrap_or_else(|| PARSEABLE.storage.name() == "drive")
+                {
                     file_path = object_store::path::Path::from_absolute_path(file_path)
                         .unwrap()
                         .to_string();
@@ -677,6 +776,26 @@ pub async fn collect_from_snapshot(
     stream_name: &str,
     tenant_id: &Option<String>,
 ) -> Result<Vec<File>, DataFusionError> {
+    collect_from_snapshot_in(
+        PARSEABLE.metastore.as_ref(),
+        snapshot,
+        time_filters,
+        filters,
+        limit,
+        stream_name,
+        tenant_id,
+    )
+    .await
+}
+async fn collect_from_snapshot_in(
+    metastore: &dyn crate::metastore::metastore_traits::Metastore,
+    snapshot: &Snapshot,
+    time_filters: &[PartialTimeFilter],
+    filters: &[Expr],
+    limit: Option<usize>,
+    stream_name: &str,
+    tenant_id: &Option<String>,
+) -> Result<Vec<File>, DataFusionError> {
     // Manifest fetches are one object store GET each and are pure round trip
     // latency, so run them concurrently instead of serially. `buffered` keeps
     // the snapshot ordering, which the `rev()` below depends on.
@@ -689,8 +808,7 @@ pub async fn collect_from_snapshot(
                 ..
             } = manifest_item;
             async move {
-                let manifest_opt = PARSEABLE
-                    .metastore
+                let manifest_opt = metastore
                     .get_manifest(
                         stream_name,
                         time_lower_bound,
@@ -784,16 +902,23 @@ impl TableProvider for StandardTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let mut execution_plans = vec![];
-        let glob_storage = PARSEABLE.storage.get_object_store();
+        let glob_storage = self
+            .native
+            .as_ref()
+            .map(|native| native.storage.clone())
+            .unwrap_or_else(|| PARSEABLE.storage.get_object_store());
 
-        let object_store_format: ObjectStoreFormat = serde_json::from_slice(
-            &PARSEABLE
-                .metastore
-                .get_stream_json(&self.stream, false, &self.tenant_id, false)
-                .await
-                .map_err(|e| DataFusionError::Plan(e.to_string()))?,
-        )
-        .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+        let object_store_format: ObjectStoreFormat = match &self.native {
+            Some(native) => native.metadata.clone(),
+            None => serde_json::from_slice(
+                &PARSEABLE
+                    .metastore
+                    .get_stream_json(&self.stream, false, &self.tenant_id, false)
+                    .await
+                    .map_err(|e| DataFusionError::Plan(e.to_string()))?,
+            )
+            .map_err(|e| DataFusionError::Plan(e.to_string()))?,
+        };
 
         let time_partition = object_store_format.time_partition;
         let mut time_filters = extract_primary_filter(filters, &time_partition);
@@ -809,7 +934,9 @@ impl TableProvider for StandardTableProvider {
             .await?;
         };
         let mut merged_snapshot = Snapshot::default();
-        if PARSEABLE.options.mode == Mode::Query || PARSEABLE.options.mode == Mode::Prism {
+        if self.native.is_some() {
+            merged_snapshot = object_store_format.snapshot;
+        } else if PARSEABLE.options.mode == Mode::Query || PARSEABLE.options.mode == Mode::Prism {
             let obs = PARSEABLE
                 .metastore
                 .get_all_stream_jsons(&self.stream, None, &self.tenant_id, false)
@@ -850,15 +977,31 @@ impl TableProvider for StandardTableProvider {
             }
         }
 
-        let mut manifest_files = collect_from_snapshot(
-            &merged_snapshot,
-            &time_filters,
-            filters,
-            limit,
-            &self.stream,
-            &self.tenant_id,
-        )
-        .await?;
+        let mut manifest_files = match &self.native {
+            Some(native) => {
+                collect_from_snapshot_in(
+                    native.metastore.as_ref(),
+                    &merged_snapshot,
+                    &time_filters,
+                    filters,
+                    limit,
+                    &self.stream,
+                    &self.tenant_id,
+                )
+                .await?
+            }
+            None => {
+                collect_from_snapshot(
+                    &merged_snapshot,
+                    &time_filters,
+                    filters,
+                    limit,
+                    &self.stream,
+                    &self.tenant_id,
+                )
+                .await?
+            }
+        };
 
         if manifest_files.is_empty() {
             return self.final_plan(execution_plans, projection);
@@ -1346,6 +1489,7 @@ mod tests {
             stream: "logs".to_owned(),
             tenant_id: Some("other-tenant".to_owned()),
             hot_tier_guarded: false,
+            native: None,
         }));
 
         assert_eq!(
