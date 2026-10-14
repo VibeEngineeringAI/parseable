@@ -4,6 +4,7 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './e2e-live',
   testMatch: '**/*.spec.ts',
+  testIgnore: 'keystone-native-readiness.spec.ts',
   workers: 1,
   fullyParallel: false,
   timeout: 45_000,

@@ -8,8 +8,8 @@ initialized.
 > **Status: merge-readiness fixes implemented and validated.** The frontend CI pipeline and the
 > clean backend validation both passed on the final source, subject to the baseline and
 > host-toolchain notes in [validation status](#validation-status). This document makes no
-> production-readiness claim: none of these fixes has been deployed or exercised against a running
-> server or a paid provider.
+> production-readiness claim. Later local runtime and paid-provider observations, with remaining
+> readiness findings, are recorded in [native browser validation](keystone-browser-validation.md#live-validation-boundary).
 
 ## Implemented backend
 
@@ -496,11 +496,11 @@ These limits come from the merge-readiness review and remain after its fixes.
   running. Quarantined files are kept until an operator removes them, and a full quarantine leaves
   unreferenced files counting toward the store's entry cap. Request-body copies of a credential
   are not zeroized.
-- **Provider.** No paid live call has validated the configured model against the required privacy
-  routing. See [provider foundations](keystone-providers.md#privacy-routing-requirements).
-- **Not yet exercised on a running server.** The fixes in this change are covered by automated
-  tests only. They have not been deployed, no existing installation has been restarted with them,
-  and no paid inference has run against them.
+- **Provider/runtime validation.** One authorized paid MiMo run completed on 2026-10-14 against
+  synthetic telemetry in a local runtime. This does not establish future endpoint availability or
+  production readiness; billed cost was not exposed. Wrong-master-key readiness and generic
+  failure messages remain independently reproduced P2 findings. See
+  [live validation boundary](keystone-browser-validation.md#live-validation-boundary).
 - Distributed coordinators, broader tools/SQL, sharing, dashboard promotion, retention/archival,
   encrypted-store rotation, real token streaming and advisory-provider activation remain follow-up
   work, not capabilities silently enabled by this increment.

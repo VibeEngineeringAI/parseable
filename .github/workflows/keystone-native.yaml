@@ -1,0 +1,113 @@
+name: Keystone native smoke
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'frontend/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'build.rs'
+      - 'build_support/**'
+      - 'scripts/**'
+      - '.github/workflows/keystone-native.yaml'
+  workflow_dispatch:
+  # Warm reusable base-branch Rust caches; PR merge-ref caches cannot serve
+  # subsequent PRs. Keep the same relevant-file scope as the automatic PR gate.
+  push:
+    branches: ['main', 'feat/native-only-ui']
+    paths:
+      - 'src/**'
+      - 'frontend/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'build.rs'
+      - 'build_support/**'
+      - 'scripts/**'
+      - '.github/workflows/keystone-native.yaml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keystone-native-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # DataFusion debug symbols and incremental objects can exhaust runner disk.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '4'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Read repository Rust version
+        id: rust-version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          channel = tomllib.loads(Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'channel={channel}\n')
+          PY
+
+      - name: Set up pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.channel }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: keystone-native
+          cache-on-failure: true
+
+      - name: Install native build dependencies
+        # Default features exercise the native server without Kafka dependencies.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang libssl-dev
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Exercise Keystone against a fresh native server
+        # The same local command builds the UI and Rust server, runs focused
+        # browser tests, and cleans up ephemeral ports and storage. Synthetic
+        # provider responses cover the product boundary without paid calls or
+        # provider secrets; this gate does not establish real-provider readiness.
+        working-directory: frontend
+        run: npm run test:keystone-native
+
+      - name: Upload native smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keystone-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: frontend/test-results/keystone-native/
+          retention-days: 7
+          # Dependency/preflight failures can happen before a run directory exists.
+          if-no-files-found: ignore
