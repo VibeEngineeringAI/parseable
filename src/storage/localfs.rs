@@ -303,6 +303,60 @@ impl ObjectStorage for LocalFS {
         Ok(path_arr)
     }
 
+    async fn native_catalog_documents(
+        &self,
+        prefix: &RelativePath,
+        _tenant_id: &Option<String>,
+        max_documents: usize,
+        max_document_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<(String, Bytes)>, ObjectStorageError> {
+        use tokio::io::AsyncReadExt;
+        let mut entries = fs::read_dir(prefix.to_path(&self.root)).await?;
+        let mut objects = Vec::new();
+        let limit = || {
+            ObjectStorageError::UnhandledError(Box::new(std::io::Error::other(
+                "native catalog byte/document budget exceeded",
+            )))
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !crate::storage::object_storage::native_catalog_name(&name)
+                || !entry.file_type().await?.is_file()
+            {
+                continue;
+            }
+            if objects.len() >= max_documents
+                || entry.metadata().await?.len() > max_document_bytes as u64
+            {
+                return Err(limit());
+            }
+            objects.push((name, entry.path()));
+        }
+        objects.sort_by_key(|(name, _)| {
+            (
+                name != crate::storage::STREAM_METADATA_FILE_NAME,
+                name.clone(),
+            )
+        });
+        let mut documents = Vec::new();
+        let mut total = 0usize;
+        for (name, path) in objects {
+            let bound = max_document_bytes.min(max_total_bytes.saturating_sub(total));
+            let file = fs::File::open(path).await?;
+            let mut bytes = Vec::new();
+            file.take(bound.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > bound {
+                return Err(limit());
+            }
+            total += bytes.len();
+            documents.push((name, bytes.into()));
+        }
+        Ok(documents)
+    }
+
     /// currently it is not using the starts_with_pattern
     async fn get_objects(
         &self,

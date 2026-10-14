@@ -206,6 +206,7 @@ export type TimeRange =
   | '24h'
   | '3d'
   | '7d'
+  | '30d'
   | { startTime: string; endTime: string };
 export type QueryRequest = { sql: string; startTime: string; endTime: string };
 export type LogFilter = { id: string; field: string; operator: '=' | '!='; value: string };

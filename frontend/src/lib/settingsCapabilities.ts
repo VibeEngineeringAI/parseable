@@ -1,7 +1,10 @@
 /**
  * Native scope for classic enterprise screens. The checked-in Rust router has
- * /llm/tools/list and /llm/tools/call, but no provider-management or Keystone
- * handlers. Metastore methods alone are not an HTTP contract.
+ * /llm/tools/list and /llm/tools/call, and the native Keystone API under
+ * /api/prism/v1/keystone/native, whose own capability reads decide what the
+ * Keystone page offers; this page covers only the sample workspace there. It has
+ * no general provider-management handlers. Metastore methods alone are not an
+ * HTTP contract.
  * Do not infer support from a license, role, /about field or a successful SPA
  * fallback response. Add an explicit verified contract before enabling writes.
  */
@@ -11,7 +14,7 @@ export const settingsCapabilities = {
     description: 'Investigate your data with AI-powered analysis and conversations.',
     unavailable: 'Keystone analysis is unavailable in this native UI',
     explanation:
-      'This native UI does not have a supported API for Keystone investigations or conversations. Existing investigations cannot be listed or opened here.',
+      'Investigations are read from and saved to a connected Parseable server that has them enabled, and are never simulated. Existing investigations cannot be listed or opened here.',
     classicPath: '/keystone',
   },
   llm: {

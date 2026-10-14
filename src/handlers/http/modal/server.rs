@@ -123,6 +123,7 @@ impl ParseableServer for Server {
                 web::scope(&prism_base_path())
                     .service(Server::get_prism_home())
                     .service(Server::get_llm_webscope())
+                    .service(crate::keystone::runtime::scope("all"))
                     .service(Server::get_prism_logstream())
                     .service(Server::get_prism_datasets())
                     .service(Server::get_apikeys_webscope())

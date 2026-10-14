@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { serverCapabilityBodies } from '../src/features/keystone/fixtures/serverCapabilities';
 
 /** Only the preserved navigation context may remain after consuming a Logs link. */
 async function expectLogsURL(page: Page, target: string) {
@@ -172,11 +173,38 @@ test('classic paths that moved open their page here', async ({ page }) => {
     await expect(page.getByRole('alert')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
   }
+  // A classic Keystone link opens the native page, which first asks the server what it
+  // supports. A server without the native directory gets the readiness explanation,
+  // and the page reads nothing else: no investigation, dataset lookup or write.
+  const native: string[] = [];
+  await page.route('**/api/prism/v1/keystone/native/**', (route) => {
+    const path = new URL(route.request().url()).pathname;
+    native.push(`${route.request().method()} ${path}`);
+    const bodies = serverCapabilityBodies('default');
+    if (path.endsWith('/ui/capabilities')) return route.fulfill({ json: bodies.ui });
+    if (path.endsWith('/capabilities')) return route.fulfill({ json: bodies.page });
+    return route.fulfill({ status: 500, json: { error: { code: 'unexpected_request' } } });
+  });
+  const lookups: string[] = [];
+  page.on('request', (request) => {
+    if (/^\/api\/v1\/logstream\/[^/]+\/info$/.test(new URL(request.url()).pathname))
+      lookups.push(request.url());
+  });
   await page.goto('/keystone/example');
-  await expect(
-    page.getByRole('heading', { name: 'Keystone analysis is unavailable in this native UI' }),
-  ).toBeVisible();
+  await expect(page).toHaveURL('/keystone/example');
+  await expect(page.getByTestId('ks-page')).toHaveAttribute('data-view', 'investigation');
+  await expect(page.getByTestId('ks-readiness-storage')).toContainText('not enabled');
+  await expect(page.getByTestId('ks-page-denied')).toHaveCount(0);
+  await expect(page.getByTestId('ks-workspace')).toHaveCount(0);
+  // Served at the root, no classic UI sits beside this page, so none is linked.
+  await expect(page.getByTestId('ks-classic-link')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
+  // Development StrictMode may repeat a read; only which reads were made matters here.
+  expect([...new Set(native)]).toEqual([
+    'GET /api/prism/v1/keystone/native/capabilities',
+    'GET /api/prism/v1/keystone/native/ui/capabilities',
+  ]);
+  expect(lookups).toEqual([]);
 });
 
 test('a classic metric drilldown opens its metric and names the filter it drops', async ({

@@ -72,6 +72,12 @@ static DECODE_PERMITS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestCodecError {
+    #[error("manifest decode cancelled")]
+    Cancelled,
+
+    #[error("manifest exceeds the query decode budget")]
+    BudgetExceeded,
+
     #[error("failed to compress manifest: {0}")]
     Compress(std::io::Error),
 
@@ -111,6 +117,173 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ManifestCodecError> {
     }
 }
 
+/// Optional query-local policy. It is captured before dispatching to the blocking
+/// pool; no HTTP objects, credentials or task-local state enter the worker.
+/// Limits count cumulative decoded JSON bytes across all manifests in this query.
+/// They bound serialized input, not every allocation in the parsed object graph.
+pub struct ManifestDecodeBudget {
+    max_compressed_bytes: usize,
+    max_decoded_bytes: usize,
+    decoded_bytes: std::sync::atomic::AtomicUsize,
+    exceeded: std::sync::atomic::AtomicBool,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    test_hook: Option<std::sync::Arc<DecodeTestHook>>,
+}
+
+tokio::task_local! {
+    static MANIFEST_DECODE_BUDGET: std::sync::Arc<ManifestDecodeBudget>;
+}
+
+impl ManifestDecodeBudget {
+    pub fn new(max_compressed_bytes: usize, max_decoded_bytes: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            max_compressed_bytes,
+            max_decoded_bytes,
+            decoded_bytes: std::sync::atomic::AtomicUsize::new(0),
+            exceeded: std::sync::atomic::AtomicBool::new(false),
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(test)]
+            test_hook: None,
+        })
+    }
+    pub async fn scope<T>(
+        self: std::sync::Arc<Self>,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        MANIFEST_DECODE_BUDGET.scope(self, future).await
+    }
+    fn charge(&self, bytes: usize) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.decoded_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|total| *total <= self.max_decoded_bytes)
+            })
+            .map_err(|_| {
+                self.exceeded.store(true, Ordering::Release);
+                std::io::Error::other("manifest decode budget exceeded")
+            })?;
+        Ok(())
+    }
+}
+
+struct StopDecodeOnDrop {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: Option<tokio::task::AbortHandle>,
+}
+impl Drop for StopDecodeOnDrop {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Abort queued work; a running worker observes the cancellation flag.
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+}
+
+const DECODE_CHECK_BYTES: usize = 16 * 1024;
+struct CheckedDecodeRead<R> {
+    inner: R,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    budget: Option<std::sync::Arc<ManifestDecodeBudget>>,
+}
+impl<R: std::io::Read> std::io::Read for CheckedDecodeRead<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "manifest decode cancelled",
+            ));
+        }
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(|budget| budget.exceeded.load(Ordering::Acquire))
+        {
+            return Err(std::io::Error::other("manifest decode budget exceeded"));
+        }
+        let count = out.len().min(DECODE_CHECK_BYTES);
+        let bytes = self.inner.read(&mut out[..count])?;
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "manifest decode cancelled",
+            ));
+        }
+        if let Some(budget) = &self.budget {
+            budget.charge(bytes)?;
+        }
+        Ok(bytes)
+    }
+}
+
+fn parse_checked_manifest<R: std::io::Read>(
+    reader: R,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    budget: std::sync::Arc<ManifestDecodeBudget>,
+    compressed: bool,
+) -> Result<Manifest, ManifestCodecError> {
+    use std::sync::atomic::Ordering;
+    let checked = CheckedDecodeRead {
+        inner: reader,
+        cancelled: cancelled.clone(),
+        budget: Some(budget.clone()),
+    };
+    // Serde checks cancellation while parsing too: every refill passes through
+    // the checked reader. There is no intermediate decompressed Vec allocation.
+    let result = serde_json::from_reader(std::io::BufReader::with_capacity(
+        DECODE_CHECK_BYTES,
+        checked,
+    ));
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ManifestCodecError::Cancelled);
+    }
+    if budget.exceeded.load(Ordering::Acquire) {
+        return Err(ManifestCodecError::BudgetExceeded);
+    }
+    match result {
+        Err(error) if compressed && error.is_io() => {
+            Err(ManifestCodecError::Decompress(std::io::Error::other(error)))
+        }
+        Err(error) => Err(ManifestCodecError::Parse(error)),
+        Ok(manifest) => Ok(manifest),
+    }
+}
+
+fn decode_manifest_checked(
+    bytes: bytes::Bytes,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    budget: std::sync::Arc<ManifestDecodeBudget>,
+) -> Result<Manifest, ManifestCodecError> {
+    #[cfg(test)]
+    record_decode_dispatch(&bytes, DecodePath::Checked);
+    #[cfg(test)]
+    if let Some(hook) = budget.test_hook.as_ref() {
+        hook.entered.send(()).unwrap();
+        hook.resume.lock().unwrap().recv().unwrap();
+    }
+    if bytes.starts_with(&ZSTD_MAGIC) {
+        let input = CheckedDecodeRead {
+            inner: std::io::Cursor::new(bytes),
+            cancelled: cancelled.clone(),
+            budget: None,
+        };
+        let input = std::io::BufReader::with_capacity(DECODE_CHECK_BYTES, input);
+        let mut decoder = zstd::stream::read::Decoder::with_buffer(input)
+            .map_err(ManifestCodecError::Decompress)?;
+        decoder
+            .window_log_max(23) // at most 8 MiB
+            .map_err(ManifestCodecError::Decompress)?;
+        parse_checked_manifest(decoder, cancelled, budget, true)
+    } else {
+        parse_checked_manifest(std::io::Cursor::new(bytes), cancelled, budget, false)
+    }
+}
+
 /// Decode a manifest on the blocking pool.
 ///
 /// Decompressing and parsing a manifest is hundreds of milliseconds of pure
@@ -120,21 +293,85 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ManifestCodecError> {
 /// queue up behind each other and each pending GET appears to take longer and
 /// longer. Handing the work to the blocking pool lets them actually run in
 /// parallel.
+///
+/// Without a query budget in scope this is the classic path: the in-memory
+/// [`decode_manifest`], unchanged. Only a budgeted (Keystone) caller pays for
+/// the streaming checked decoder, which bounds encoded input, cumulative JSON
+/// bytes, decoder windows and concurrent workers, and stops cooperatively when
+/// the caller drops.
 pub async fn decode_manifest_blocking(bytes: bytes::Bytes) -> Result<Manifest, ManifestCodecError> {
-    // Owned permit moved into the task: dropping this future cancels the await
-    // but not the blocking work, so the permit has to outlive it to keep
-    // detached decodes counted.
+    let Ok(budget) = MANIFEST_DECODE_BUDGET.try_with(std::sync::Arc::clone) else {
+        // Owned permit moved into the task: dropping this future cancels the await
+        // but not the blocking work, so the permit has to outlive it to keep
+        // detached decodes counted.
+        let permit = DECODE_PERMITS
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("decode semaphore is never closed");
+        return tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            record_decode_dispatch(&bytes, DecodePath::Classic);
+            decode_manifest(&bytes)
+        })
+        .await?;
+    };
+    if bytes.len() > budget.max_compressed_bytes {
+        return Err(ManifestCodecError::BudgetExceeded);
+    }
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut stop = StopDecodeOnDrop {
+        cancelled: cancelled.clone(),
+        abort: None,
+    };
+    // Acquire query-local permits first, so a query cannot monopolize the
+    // process-wide permits with futures waiting for its own two worker slots.
+    let local_permit = budget
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("decode semaphore is never closed");
     let permit = DECODE_PERMITS
         .clone()
         .acquire_owned()
         .await
         .expect("decode semaphore is never closed");
-
-    tokio::task::spawn_blocking(move || {
+    let task = tokio::task::spawn_blocking(move || {
+        // Both permits and the budget live until the real worker exits, even
+        // if its caller has cancelled and released its coordinator reservation.
         let _permit = permit;
-        decode_manifest(&bytes)
-    })
-    .await?
+        let _local_permit = local_permit;
+        decode_manifest_checked(bytes, cancelled, budget)
+    });
+    stop.abort = Some(task.abort_handle());
+    task.await?
+}
+
+/// Which decoder a blocking worker ran, keyed by the address of its input
+/// buffer so parallel tests holding their own `Bytes` never see each other.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodePath {
+    Classic,
+    Checked,
+}
+#[cfg(test)]
+static DECODE_DISPATCH: std::sync::Mutex<Vec<(usize, DecodePath)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn record_decode_dispatch(bytes: &[u8], path: DecodePath) {
+    DECODE_DISPATCH
+        .lock()
+        .unwrap()
+        .push((bytes.as_ptr() as usize, path));
+}
+
+#[cfg(test)]
+struct DecodeTestHook {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 /// An entry in a manifest which points to a single file.
@@ -388,5 +625,272 @@ mod codec_tests {
             decode_manifest(b"not json, not zstd"),
             Err(ManifestCodecError::Parse(_))
         ));
+    }
+    #[tokio::test]
+    async fn query_decode_budget_bounds_compressed_plain_and_cumulative_json() {
+        let manifest = sample_manifest(16);
+        let plain = serde_json::to_vec(&manifest).unwrap();
+        let compressed = encode_manifest(&manifest).unwrap();
+        let budget = ManifestDecodeBudget::new(compressed.len() - 1, plain.len());
+        assert!(matches!(
+            budget
+                .scope(decode_manifest_blocking(compressed.clone()))
+                .await,
+            Err(ManifestCodecError::BudgetExceeded)
+        ));
+        let budget = ManifestDecodeBudget::new(plain.len(), plain.len() - 1);
+        assert!(matches!(
+            budget
+                .scope(decode_manifest_blocking(compressed.clone()))
+                .await,
+            Err(ManifestCodecError::BudgetExceeded)
+        ));
+        let budget = ManifestDecodeBudget::new(plain.len(), plain.len() - 1);
+        assert!(matches!(
+            budget
+                .scope(decode_manifest_blocking(plain.clone().into()))
+                .await,
+            Err(ManifestCodecError::BudgetExceeded)
+        ));
+        let budget = ManifestDecodeBudget::new(plain.len(), plain.len() * 2 - 1);
+        assert_eq!(
+            budget
+                .clone()
+                .scope(decode_manifest_blocking(compressed.clone()))
+                .await
+                .unwrap()
+                .files
+                .len(),
+            manifest.files.len()
+        );
+        assert!(matches!(
+            budget
+                .clone()
+                .scope(decode_manifest_blocking(compressed))
+                .await,
+            Err(ManifestCodecError::BudgetExceeded)
+        ));
+        assert!(
+            budget
+                .decoded_bytes
+                .load(std::sync::atomic::Ordering::Acquire)
+                < plain.len() * 2
+        );
+    }
+    /// Classic callers have no budget in scope and must keep the original
+    /// in-memory decoder; only budgeted calls take the streaming checked one.
+    #[tokio::test]
+    async fn blocking_decoder_uses_classic_decoder_unless_a_budget_is_in_scope() {
+        let manifest = sample_manifest(4);
+        for bytes in [
+            encode_manifest(&manifest).unwrap(),
+            serde_json::to_vec(&manifest).unwrap().into(),
+        ] {
+            let address = bytes.as_ptr() as usize;
+            // `bytes` stays alive, so no other test can record this address
+            // after the purge; earlier entries are from freed buffers.
+            DECODE_DISPATCH
+                .lock()
+                .unwrap()
+                .retain(|(recorded, _)| *recorded != address);
+            let paths = || {
+                DECODE_DISPATCH
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(recorded, _)| *recorded == address)
+                    .map(|(_, path)| *path)
+                    .collect::<Vec<_>>()
+            };
+
+            assert_eq!(
+                decode_manifest_blocking(bytes.clone())
+                    .await
+                    .unwrap()
+                    .files
+                    .len(),
+                4
+            );
+            assert_eq!(paths(), [DecodePath::Classic]);
+
+            let budget = ManifestDecodeBudget::new(1024 * 1024, 1024 * 1024);
+            assert_eq!(
+                budget
+                    .scope(decode_manifest_blocking(bytes.clone()))
+                    .await
+                    .unwrap()
+                    .files
+                    .len(),
+                4
+            );
+            assert_eq!(paths(), [DecodePath::Classic, DecodePath::Checked]);
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_decode_keeps_permit_until_the_real_worker_exits() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let mut budget = ManifestDecodeBudget::new(1024 * 1024, 1024 * 1024);
+        std::sync::Arc::get_mut(&mut budget).unwrap().test_hook =
+            Some(std::sync::Arc::new(DecodeTestHook {
+                entered: entered_tx,
+                resume: std::sync::Mutex::new(resume_rx),
+            }));
+        let bytes = encode_manifest(&sample_manifest(1)).unwrap();
+        let task = tokio::spawn(budget.clone().scope(decode_manifest_blocking(bytes)));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while entered_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(budget.permits.available_permits(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // The caller is gone but the paused real worker still owns its permit.
+        assert_eq!(budget.permits.available_permits(), 1);
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while budget.permits.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled real decoder must exit and release its permit");
+        assert_eq!(
+            budget
+                .decoded_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn query_decode_workers_are_limited_to_two_even_when_more_manifests_are_queued() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let mut budget = ManifestDecodeBudget::new(1024 * 1024, 1024 * 1024);
+        std::sync::Arc::get_mut(&mut budget).unwrap().test_hook =
+            Some(std::sync::Arc::new(DecodeTestHook {
+                entered: entered_tx,
+                resume: std::sync::Mutex::new(resume_rx),
+            }));
+        let bytes = encode_manifest(&sample_manifest(1)).unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            tasks.push(tokio::spawn(
+                budget
+                    .clone()
+                    .scope(decode_manifest_blocking(bytes.clone())),
+            ));
+        }
+        let mut started = 0;
+        let expected_starts = num_cpus::get().min(2);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while started < expected_starts {
+                if entered_rx.try_recv().is_ok() {
+                    started += 1;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while budget.permits.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(entered_rx.try_recv().is_err());
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        // The third task never entered its worker and has no unaccounted work.
+        assert_eq!(budget.permits.available_permits(), 0);
+        for _ in 0..expected_starts {
+            resume_tx.send(()).unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while budget.permits.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[test]
+    fn cancellation_checks_are_nonretryable_and_decode_read_chunks_are_bounded() {
+        use std::io::Read;
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut reader = CheckedDecodeRead {
+            inner: std::io::Cursor::new(vec![0; DECODE_CHECK_BYTES * 2]),
+            cancelled: cancelled.clone(),
+            budget: None,
+        };
+        assert_eq!(
+            reader.read(&mut [0; 32]).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        cancelled.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            reader.read(&mut vec![0; DECODE_CHECK_BYTES * 2]).unwrap(),
+            DECODE_CHECK_BYTES
+        );
+    }
+    #[tokio::test]
+    async fn query_decoder_rejects_zstd_windows_above_eight_mebibytes() {
+        use std::io::Write;
+        let manifest = Manifest {
+            version: "v".repeat(9 * 1024 * 1024),
+            files: Vec::new(),
+        };
+        let plain = serde_json::to_vec(&manifest).unwrap();
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.window_log(25).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&plain).unwrap();
+        let compressed = bytes::Bytes::from(encoder.finish().unwrap());
+        let budget = ManifestDecodeBudget::new(compressed.len(), plain.len());
+        assert!(matches!(
+            budget
+                .scope(decode_manifest_blocking(compressed.clone()))
+                .await,
+            Err(ManifestCodecError::Decompress(_))
+        ));
+        // The window cap is query policy only; classic reads keep zstd's default.
+        assert_eq!(
+            decode_manifest_blocking(compressed).await.unwrap().version,
+            manifest.version
+        );
+    }
+    #[tokio::test]
+    async fn simultaneous_decoders_share_one_cumulative_json_limit() {
+        let manifest = sample_manifest(16);
+        let plain = serde_json::to_vec(&manifest).unwrap();
+        let bytes = encode_manifest(&manifest).unwrap();
+        let budget = ManifestDecodeBudget::new(bytes.len(), plain.len() * 2 - 1);
+        let (one, two) = budget
+            .clone()
+            .scope(async {
+                tokio::join!(
+                    decode_manifest_blocking(bytes.clone()),
+                    decode_manifest_blocking(bytes)
+                )
+            })
+            .await;
+        assert!(
+            matches!(one, Err(ManifestCodecError::BudgetExceeded))
+                || matches!(two, Err(ManifestCodecError::BudgetExceeded))
+        );
+        assert!(
+            budget
+                .decoded_bytes
+                .load(std::sync::atomic::Ordering::Acquire)
+                < plain.len() * 2
+        );
     }
 }

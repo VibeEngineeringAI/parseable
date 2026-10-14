@@ -123,12 +123,42 @@ test('native setup and settings links remain inside a /next mount', async ({ pag
     'href',
     '/next/add-data',
   );
+  // Keystone reads its own capabilities. The auth middleware in front of the native
+  // routes rejects this session in plain text, which the page reports as an access
+  // problem, not an unreadable response.
+  const native: string[] = [];
+  await page.route('**/api/prism/v1/keystone/native/**', (route) => {
+    native.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`);
+    return route.fulfill({ status: 403, contentType: 'text/plain', body: 'Forbidden' });
+  });
+  const lookups: string[] = [];
+  page.on('request', (request) => {
+    if (/^\/api\/v1\/logstream\/[^/]+\/info$/.test(new URL(request.url()).pathname))
+      lookups.push(request.url());
+  });
   await page.goto('/next/keystone/investigation');
-  await expect(page.getByRole('link', { name: 'LLM settings', exact: true })).toHaveAttribute(
-    'href',
-    '/next/settings/llm-key',
-  );
+  const error = page.getByTestId('ks-page-error');
+  await expect(error).toHaveAttribute('data-kind', 'denied');
+  await expect(error).toContainText('You do not have permission for this');
+  // Provider keys are entered on the native investigations list, so the page no longer
+  // sends anyone to LLM settings.
   await expect(
-    page.getByRole('link', { name: 'Open investigation in classic UI', exact: true }),
+    page.getByTestId('ks-page').getByRole('link', { name: 'LLM settings', exact: true }),
+  ).toHaveCount(0);
+  // The classic UI owns the root, so its link leaves the mount; native links stay inside.
+  await expect(
+    page.getByRole('link', { name: 'Open this investigation in the classic UI', exact: true }),
   ).toHaveAttribute('href', '/keystone/investigation');
+  await page.getByRole('link', { name: 'All investigations', exact: true }).click();
+  await expect(page).toHaveURL(/\/next\/keystone$/);
+  await expect(page.getByTestId('ks-page-error')).toHaveAttribute('data-kind', 'denied');
+  await expect(
+    page.getByRole('link', { name: 'Open Keystone in the classic UI', exact: true }),
+  ).toHaveAttribute('href', '/keystone');
+  // Only the capability read: the denial stops before anything else. Both routes render
+  // the same mounted page, so the index reuses its result instead of reading again.
+  // Development StrictMode may add an aborted duplicate when it reaches the route.
+  expect([1, 2]).toContain(native.length);
+  expect([...new Set(native)]).toEqual(['GET /api/prism/v1/keystone/native/capabilities']);
+  expect(lookups).toEqual([]);
 });
