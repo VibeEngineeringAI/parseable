@@ -356,8 +356,14 @@ pub fn oss_read_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "get_dataset_schema",
             "Get dataset schema",
-            "Get all dataset columns and data types as compact tab-separated text with a name/type header.",
-            dataset_schema(),
+            "Get the full Arrow JSON schema by default, or request format=compact for tab-separated column names and types.",
+            object_schema(
+                json!({
+                    "dataset": string_property("Dataset name."),
+                    "format": { "type": "string", "enum": ["json", "compact"], "default": "json" }
+                }),
+                &["dataset"],
+            ),
         ),
         ToolSpec::new(
             "get_dataset_info",
@@ -1012,6 +1018,28 @@ mod tests {
                 .validate_arguments(&serde_json::json!({ "dataset": "logs" }))
                 .is_ok()
         );
+        for format in ["json", "compact"] {
+            assert!(
+                schema_tool
+                    .validate_arguments(&serde_json::json!({
+                        "dataset": "logs", "format": format
+                    }))
+                    .is_ok()
+            );
+        }
+        for format in [
+            serde_json::json!("xml"),
+            serde_json::json!(null),
+            serde_json::json!(1),
+        ] {
+            assert!(
+                schema_tool
+                    .validate_arguments(&serde_json::json!({
+                        "dataset": "logs", "format": format
+                    }))
+                    .is_err()
+            );
+        }
     }
 
     #[actix_web::test]

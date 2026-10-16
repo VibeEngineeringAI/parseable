@@ -263,6 +263,19 @@ async fn discover_datasets(
     }))
 }
 
+fn schema_tool_result(schema: &arrow_schema::Schema, arguments: &Value) -> Result<Value, String> {
+    match arguments.get("format") {
+        None => serde_json::to_value(schema).map_err(|error| error.to_string()),
+        Some(Value::String(format)) if format == "json" => {
+            serde_json::to_value(schema).map_err(|error| error.to_string())
+        }
+        Some(Value::String(format)) if format == "compact" => {
+            Ok(Value::String(logstream::compact_schema(schema)))
+        }
+        _ => Err("schema format must be `json` or `compact`".to_owned()),
+    }
+}
+
 async fn execute_dataset_metadata_tool(
     name: &str,
     arguments: &Value,
@@ -275,7 +288,7 @@ async fn execute_dataset_metadata_tool(
             let schema = logstream::get_schema_internal(dataset, context.tenant_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok(Value::String(logstream::compact_schema(&schema)))
+            schema_tool_result(&schema, arguments)
         }
         "get_dataset_info" => {
             authorize(
@@ -414,88 +427,121 @@ fn first_present_field(fields: &[String], candidates: &[&str]) -> Option<String>
         .map(|field| (*field).to_owned())
 }
 
+// Keep the explicit severity policy aligned with frontend/src/lib/errorAnalytics.ts.
+// Message text and p_log_category are intentionally not evidence of an error.
+const ERROR_SEVERITY_TEXT: &str = "'ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR', 'FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL', 'CRIT', 'ALERT', 'EMERG', 'EMERGENCY', 'PANIC', 'SEVERE'";
+const LOG_SEVERITY_FIELDS: &[&str] = &[
+    "level",
+    "log_level",
+    "severity",
+    "severity_text",
+    "severity_description",
+];
+
+fn coalesced_log_text(fields: &[String], candidates: &[&str], fallback: &str) -> String {
+    let mut expressions = candidates
+        .iter()
+        .filter(|candidate| fields.iter().any(|field| field == **candidate))
+        .map(|field| format!("NULLIF(CAST({} AS VARCHAR), '')", quote_identifier(field)))
+        .collect::<Vec<_>>();
+    if expressions.is_empty() {
+        return fallback.to_owned();
+    }
+    expressions.push(fallback.to_owned());
+    format!("COALESCE({})", expressions.join(", "))
+}
+
+fn log_text_severity_predicate(field: &str) -> String {
+    let text = format!(
+        "UPPER(TRIM(CAST({} AS VARCHAR))) IN ({ERROR_SEVERITY_TEXT})",
+        quote_identifier(field),
+    );
+    if field == "level" {
+        // Pino/Bunyan codes only apply to `level`, not OTel severity_number.
+        format!("({text} OR TRY_CAST(\"level\" AS DOUBLE) IN (50, 60))")
+    } else {
+        text
+    }
+}
+
 pub fn list_log_errors_query(
     dataset: &str,
     fields: &[String],
     limit: u64,
 ) -> Result<String, String> {
-    let service = first_present_field(fields, &["service.name", "service_name"]).map_or_else(
-        || "'unknown'".to_owned(),
-        |field| {
-            format!(
-                "COALESCE(CAST({} AS VARCHAR), 'unknown')",
-                quote_identifier(&field)
-            )
-        },
-    );
-    let severity_text = first_present_field(fields, &["severity_text", "severity_description"]);
-    let exception_type = first_present_field(
+    let service = coalesced_log_text(
         fields,
-        &["event_exception.type", "exception.type", "error.type"],
+        &["service.name", "service", "service_name"],
+        "'unknown'",
     );
-    let error_type = exception_type
-        .as_ref()
-        .or(severity_text.as_ref())
-        .map_or_else(
-            || "'error'".to_owned(),
-            |field| {
-                format!(
-                    "COALESCE(CAST({} AS VARCHAR), 'error')",
+    let severity_fields = LOG_SEVERITY_FIELDS
+        .iter()
+        .filter(|field| fields.iter().any(|candidate| candidate == **field))
+        .copied()
+        .collect::<Vec<_>>();
+    // Label the row with an error severity, not an unrelated non-error alias
+    // (for example level=info alongside severity_text=ERROR).
+    let severity = if severity_fields.is_empty() {
+        "'error'".to_owned()
+    } else {
+        format!(
+            "CASE {} ELSE 'error' END",
+            severity_fields
+                .iter()
+                .map(|field| format!(
+                    "WHEN {} THEN UPPER(TRIM(CAST({} AS VARCHAR)))",
+                    log_text_severity_predicate(field),
                     quote_identifier(field)
-                )
-            },
-        );
-    let message = first_present_field(
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let error_type = coalesced_log_text(
+        fields,
+        &[
+            "event_exception.type",
+            "exception.type",
+            "error.type",
+            "error.kind",
+            "exception_type",
+            "error_type",
+        ],
+        &severity,
+    );
+    let message = coalesced_log_text(
         fields,
         &[
             "event_exception.message",
             "exception.message",
-            "error.message",
-            "body",
             "message",
+            "msg",
+            "body",
             "log",
+            "error.message",
         ],
+        "CAST(NULL AS VARCHAR)",
     );
-    let sample_message = message.as_ref().map_or_else(
-        || "CAST(NULL AS VARCHAR)".to_owned(),
-        |field| format!("MAX(CAST({} AS VARCHAR))", quote_identifier(field)),
-    );
+    let sample_message = format!("MAX({message})");
     let last_seen = first_present_field(fields, &["p_timestamp", "time_unix_nano"]).map_or_else(
         || "CAST(NULL AS VARCHAR)".to_owned(),
         |field| format!("MAX({})", quote_identifier(&field)),
     );
-
-    let mut predicates = Vec::new();
+    let mut predicates = severity_fields
+        .iter()
+        .map(|field| log_text_severity_predicate(field))
+        .collect::<Vec<_>>();
     if fields.iter().any(|field| field == "severity_number") {
-        predicates.push("CAST(\"severity_number\" AS BIGINT) >= 17".to_owned());
-    }
-    if let Some(field) = &severity_text {
-        predicates.push(format!(
-            "UPPER(CAST({} AS VARCHAR)) IN ('ERROR', 'FATAL', 'CRITICAL')",
-            quote_identifier(field)
-        ));
-    }
-    if let Some(field) = &exception_type {
-        predicates.push(format!(
-            "{} IS NOT NULL AND CAST({} AS VARCHAR) <> ''",
-            quote_identifier(field),
-            quote_identifier(field)
-        ));
-    }
-    if predicates.is_empty()
-        && let Some(field) = &message
-    {
-        let field = quote_identifier(field);
-        predicates.push(format!(
-            "(LOWER(CAST({field} AS VARCHAR)) LIKE '%error%' OR LOWER(CAST({field} AS VARCHAR)) LIKE '%exception%' OR LOWER(CAST({field} AS VARCHAR)) LIKE '%failed%' OR LOWER(CAST({field} AS VARCHAR)) LIKE '%fatal%' OR LOWER(CAST({field} AS VARCHAR)) LIKE '%panic%')"
-        ));
-    }
-    if predicates.is_empty() {
-        return Err(
-            "log dataset has no supported severity, exception, or message field".to_owned(),
+        // DOUBLE keeps fractional and out-of-range numbers from being truncated
+        // into a valid code. Invalid text becomes NULL rather than failing a query.
+        predicates.push(
+            "TRY_CAST(\"severity_number\" AS DOUBLE) IN (17, 18, 19, 20, 21, 22, 23, 24)"
+                .to_owned(),
         );
     }
-
+    if predicates.is_empty() {
+        return Err("log dataset has no supported explicit severity field (level, log_level, severity, severity_text, severity_description, severity_number)".to_owned());
+    }
     Ok(format!(
         "SELECT {service} AS \"serviceName\", {error_type} AS \"errorType\", {sample_message} AS \"sampleMessage\", COUNT(*) AS \"occurrences\", {last_seen} AS \"lastSeen\" FROM {} WHERE ({}) GROUP BY {service}, {error_type} ORDER BY \"occurrences\" DESC LIMIT {}",
         quote_identifier(dataset),
@@ -513,7 +559,7 @@ async fn list_log_errors(arguments: &Value, context: OssToolContext<'_>) -> Resu
             .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    if !nested_string(&info, "telemetryType").is_some_and(|value| value == "logs") {
+    if nested_string(&info, "telemetryType").is_none_or(|value| value != "logs") {
         return Err(format!(
             "tool requires a logs dataset, but `{dataset}` is not logs telemetry"
         ));
@@ -1045,24 +1091,148 @@ mod tests {
 
     use super::{call_tool_registry, list_log_errors_query, normalized_log_context_bounds};
 
-    #[actix_web::test]
-    async fn log_error_query_uses_otel_severity_fields() {
-        let query = list_log_errors_query(
-            "app-logs",
-            &[
-                "p_timestamp".to_owned(),
-                "service.name".to_owned(),
-                "severity_number".to_owned(),
-                "severity_text".to_owned(),
-                "body".to_owned(),
-            ],
-            5,
-        )
-        .unwrap();
+    async fn run_log_error_fixture(fixture_sql: &str) -> Vec<Value> {
+        let context = datafusion::prelude::SessionContext::new();
+        let batches = context
+            .sql(fixture_sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let fields = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        context.register_batch("logs", batches[0].clone()).unwrap();
+        let query = list_log_errors_query("logs", &fields, 500).unwrap();
+        let results = context.sql(&query).await.unwrap().collect().await.unwrap();
+        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+        writer
+            .write_batches(&results.iter().collect::<Vec<_>>())
+            .unwrap();
+        writer.finish().unwrap();
+        serde_json::from_slice(&writer.into_inner()).unwrap()
+    }
 
-        assert!(query.contains("CAST(\"severity_number\" AS BIGINT) >= 17"));
-        assert!(query.contains("'ERROR', 'FATAL', 'CRITICAL'"));
-        assert!(query.contains("LIMIT 5"));
+    #[actix_web::test]
+    async fn log_error_query_uses_explicit_text_severity_not_message_substrings() {
+        for field in [
+            "level",
+            "log_level",
+            "severity",
+            "severity_text",
+            "severity_description",
+        ] {
+            let rows = run_log_error_fixture(&format!(
+                "SELECT severity AS \"{field}\", message FROM (VALUES
+                 ('info', '0 errors found'), (' error ', 'connection refused'),
+                 ('fatal4', 'shutdown'), ('ERROR2', 'retry exhausted'),
+                 ('warn', 'exception handled'), (NULL, 'panic not reproduced')) AS f(severity, message)"
+            )).await;
+            let mut messages = rows
+                .iter()
+                .map(|row| row["sampleMessage"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            messages.sort_unstable();
+            assert_eq!(
+                messages,
+                ["connection refused", "retry exhausted", "shutdown"],
+                "{field}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_rejects_invalid_and_fractional_numeric_severities() {
+        let rows = run_log_error_fixture(
+            "SELECT severity_number, message FROM (VALUES
+             ('17', 'error'), ('24', 'fatal'), ('25', 'out of range'),
+             ('24.9', 'fractional'), ('garbage', 'invalid'), ('-1', 'negative'),
+             ('50', 'not an otel code'), (NULL, 'unknown')) AS f(severity_number, message)",
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["occurrences"], 2);
+        let rows = run_log_error_fixture(
+            "SELECT level, message FROM (VALUES ('50', 'error'), ('60', 'fatal'),
+             ('50.9', 'fractional'), ('17', 'otel only'), ('bad', 'bad')) AS f(level, message)",
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["occurrences"] == 1));
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_checks_all_severity_columns_and_coalesces_row_aliases() {
+        let rows = run_log_error_fixture(
+            r#"SELECT level, severity_text, service_primary AS "service.name", service_name,
+                exception_primary AS "exception.type", error_type AS "error.type", message, body
+               FROM (VALUES ('info', 'ERROR', NULL, 'checkout', NULL, 'Timeout', NULL, 'refused'),
+                            ('error', NULL, '', 'checkout', '', 'Timeout', '', 'refused'))
+               AS f(level, severity_text, service_primary, service_name, exception_primary, error_type, message, body)"#
+        ).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["serviceName"], "checkout");
+        assert_eq!(rows[0]["errorType"], "Timeout");
+        assert_eq!(rows[0]["sampleMessage"], "refused");
+        assert_eq!(rows[0]["occurrences"], 2);
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_labels_the_severity_that_actually_matched() {
+        let rows = run_log_error_fixture(
+            "SELECT 'info' AS level, ' error ' AS severity_text, 'refused' AS message",
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["errorType"], "ERROR");
+        assert_eq!(rows[0]["occurrences"], 1);
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_requires_explicit_severity_and_escapes_identifiers() {
+        for fields in [
+            vec!["message"],
+            vec!["body", "exception.type", "p_log_category"],
+        ] {
+            let fields = fields.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                list_log_errors_query("logs", &fields, 5)
+                    .unwrap_err()
+                    .contains("explicit severity")
+            );
+        }
+        let query = list_log_errors_query("app\"logs", &["level".to_owned()], 999).unwrap();
+        assert!(query.contains("FROM \"app\"\"logs\""));
+        assert!(query.ends_with("LIMIT 500"));
+    }
+
+    #[actix_web::test]
+    async fn schema_tool_preserves_json_default_and_offers_compact_format() {
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "message",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]);
+        let expected = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            super::schema_tool_result(&schema, &json!({})).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::schema_tool_result(&schema, &json!({"format": "json"})).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::schema_tool_result(&schema, &json!({"format": "compact"})).unwrap(),
+            json!("name\ttype\nmessage\tUtf8\n")
+        );
+        for format in [json!("xml"), json!(null), json!(1)] {
+            assert!(super::schema_tool_result(&schema, &json!({"format": format})).is_err());
+        }
     }
 
     #[actix_web::test]
