@@ -108,6 +108,9 @@ The HTTP schema endpoint likewise defaults to JSON and accepts `?format=compact`
 `list_log_errors` and `list_trace_errors` each require `dataset`, `startTime`,
 and `endTime`; `limit` defaults to 50 and is bounded to 1–500. They enforce query
 permissions and require logs and traces telemetry, respectively.
+The log tool applies exact, half-open time bounds (start inclusive, end exclusive)
+to the dataset's configured time partition, or `p_timestamp` by default; `lastSeen`
+uses the same timestamp column. Subminute ranges retain their full precision.
 
 `list_log_errors` classifies records by explicit severity, following the native
 Errors page's policy. It checks every available `level`, `log_level`, `severity`,

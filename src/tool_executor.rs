@@ -16,7 +16,11 @@ use crate::{
     prism::logstream::get_prism_logstream_info,
     rbac::{Response, Users, map::SessionKey, role::Action},
     tool_catalog::{ToolCallRequest, ToolCallResult, oss_read_tool_specs},
-    utils::{actix::extract_session_key_from_req, get_tenant_id_from_request, time::TimeRange},
+    utils::{
+        actix::extract_session_key_from_req,
+        get_tenant_id_from_request,
+        time::{TimeRange, parse_start_time_expression, parse_time_expression, truncate_to_minute},
+    },
 };
 
 fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -420,13 +424,6 @@ async fn get_log_context(arguments: &Value, context: OssToolContext<'_>) -> Resu
     response_value(response).await
 }
 
-fn first_present_field(fields: &[String], candidates: &[&str]) -> Option<String> {
-    candidates
-        .iter()
-        .find(|candidate| fields.iter().any(|field| field == **candidate))
-        .map(|field| (*field).to_owned())
-}
-
 // Keep the explicit severity policy aligned with frontend/src/lib/errorAnalytics.ts.
 // Message text and p_log_category are intentionally not evidence of an error.
 const ERROR_SEVERITY_TEXT: &str = "'ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR', 'FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL', 'CRIT', 'ALERT', 'EMERG', 'EMERGENCY', 'PANIC', 'SEVERE'";
@@ -468,6 +465,8 @@ pub fn list_log_errors_query(
     dataset: &str,
     fields: &[String],
     limit: u64,
+    time_column: &str,
+    range: &TimeRange,
 ) -> Result<String, String> {
     let service = coalesced_log_text(
         fields,
@@ -523,10 +522,8 @@ pub fn list_log_errors_query(
         "CAST(NULL AS VARCHAR)",
     );
     let sample_message = format!("MAX({message})");
-    let last_seen = first_present_field(fields, &["p_timestamp", "time_unix_nano"]).map_or_else(
-        || "CAST(NULL AS VARCHAR)".to_owned(),
-        |field| format!("MAX({})", quote_identifier(&field)),
-    );
+    let time_column = quote_identifier(time_column);
+    let last_seen = format!("MAX({time_column})");
     let mut predicates = severity_fields
         .iter()
         .map(|field| log_text_severity_predicate(field))
@@ -543,11 +540,51 @@ pub fn list_log_errors_query(
         return Err("log dataset has no supported explicit severity field (level, log_level, severity, severity_text, severity_description, severity_number)".to_owned());
     }
     Ok(format!(
-        "SELECT {service} AS \"serviceName\", {error_type} AS \"errorType\", {sample_message} AS \"sampleMessage\", COUNT(*) AS \"occurrences\", {last_seen} AS \"lastSeen\" FROM {} WHERE ({}) GROUP BY {service}, {error_type} ORDER BY \"occurrences\" DESC LIMIT {}",
+        "SELECT {service} AS \"serviceName\", {error_type} AS \"errorType\", {sample_message} AS \"sampleMessage\", COUNT(*) AS \"occurrences\", {last_seen} AS \"lastSeen\" FROM {} WHERE ({}) AND {time_column} >= TIMESTAMP {} AND {time_column} < TIMESTAMP {} GROUP BY {service}, {error_type} ORDER BY \"occurrences\" DESC LIMIT {}",
         quote_identifier(dataset),
         predicates.join(" OR "),
+        quote_literal(&range.start.to_rfc3339()),
+        quote_literal(&range.end.to_rfc3339()),
         limit.clamp(1, 500),
     ))
+}
+
+fn log_error_query_request(
+    dataset: &str,
+    fields: &[String],
+    time_column: &str,
+    limit: u64,
+    arguments: &Value,
+    now: DateTime<Utc>,
+) -> Result<query::Query, String> {
+    let start = parse_start_time_expression(required_string(arguments, "startTime")?, now)
+        .map_err(|error| format!("invalid log error start time: {error}"))?;
+    let end = parse_time_expression(required_string(arguments, "endTime")?, now)
+        .map_err(|error| format!("invalid log error end time: {error}"))?;
+    if start >= end {
+        return Err("log error start time must be before end time".to_owned());
+    }
+    let range = TimeRange { start, end };
+    // The generic query API rounds transport bounds to minutes. Expand its
+    // envelope, while keeping exact half-open bounds in the SQL predicates.
+    let transport_end = truncate_to_minute(end)
+        .checked_add_signed(Duration::minutes(1))
+        .ok_or_else(|| "log error end time is outside the supported range".to_owned())?;
+    Ok(query::Query {
+        query: bounded_select(&list_log_errors_query(
+            dataset,
+            fields,
+            limit,
+            time_column,
+            &range,
+        )?)?,
+        start_time: truncate_to_minute(start).to_rfc3339(),
+        end_time: transport_end.to_rfc3339(),
+        send_null: true,
+        fields: false,
+        streaming: false,
+        filter_tags: None,
+    })
 }
 
 async fn list_log_errors(arguments: &Value, context: OssToolContext<'_>) -> Result<Value, String> {
@@ -573,22 +610,12 @@ async fn list_log_errors(arguments: &Value, context: OssToolContext<'_>) -> Resu
         .map(|field| field.name().to_owned())
         .collect::<Vec<_>>();
     let limit = bounded_integer(arguments, "limit", 50, 1, 500);
-    let query_text = bounded_select(&list_log_errors_query(dataset, &fields, limit)?)?;
-    let response = query::query_internal(
-        query::Query {
-            query: query_text,
-            start_time: required_string(arguments, "startTime")?.to_owned(),
-            end_time: required_string(arguments, "endTime")?.to_owned(),
-            send_null: true,
-            fields: false,
-            streaming: false,
-            filter_tags: None,
-        },
-        context.session_key,
-        context.tenant_id,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let time_column = nested_string(&info, "timePartition").unwrap_or("p_timestamp");
+    let request =
+        log_error_query_request(dataset, &fields, time_column, limit, arguments, Utc::now())?;
+    let response = query::query_internal(request, context.session_key, context.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let records = response_value(response).await?;
     let total = records.as_array().map_or(0, Vec::len);
     Ok(json!({
@@ -1089,12 +1116,24 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use serde_json::{Value, json};
 
-    use super::{call_tool_registry, list_log_errors_query, normalized_log_context_bounds};
+    use super::{
+        call_tool_registry, list_log_errors_query, log_error_query_request,
+        normalized_log_context_bounds,
+    };
+
+    fn log_error_test_range() -> crate::utils::time::TimeRange {
+        crate::utils::time::TimeRange {
+            start: "2026-10-16T00:00:00Z".parse().unwrap(),
+            end: "2026-10-17T00:00:00Z".parse().unwrap(),
+        }
+    }
 
     async fn run_log_error_fixture(fixture_sql: &str) -> Vec<Value> {
         let context = datafusion::prelude::SessionContext::new();
         let batches = context
-            .sql(fixture_sql)
+            .sql(&format!(
+                "SELECT *, TIMESTAMP '2026-10-16T12:00:00Z' AS p_timestamp FROM ({fixture_sql})"
+            ))
             .await
             .unwrap()
             .collect()
@@ -1107,7 +1146,9 @@ mod tests {
             .map(|field| field.name().clone())
             .collect::<Vec<_>>();
         context.register_batch("logs", batches[0].clone()).unwrap();
-        let query = list_log_errors_query("logs", &fields, 500).unwrap();
+        let query =
+            list_log_errors_query("logs", &fields, 500, "p_timestamp", &log_error_test_range())
+                .unwrap();
         let results = context.sql(&query).await.unwrap().collect().await.unwrap();
         let mut writer = arrow_json::ArrayWriter::new(Vec::new());
         writer
@@ -1115,6 +1156,143 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
         serde_json::from_slice(&writer.into_inner()).unwrap()
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_preserves_subminute_ranges() {
+        for time_column in ["p_timestamp", "event.time"] {
+            for (start, end) in [
+                ("2026-10-16T12:00:30Z", "2026-10-16T12:01:30Z"),
+                ("2026-10-16T12:00:10Z", "2026-10-16T12:00:50Z"),
+                ("2026-10-16T12:00:10.100Z", "2026-10-16T12:00:10.900Z"),
+            ] {
+                let start_at: DateTime<Utc> = start.parse().unwrap();
+                let end_at: DateTime<Utc> = end.parse().unwrap();
+                let inside = start_at + (end_at - start_at) / 2;
+                let late = end_at - Duration::milliseconds(1);
+                let context = datafusion::prelude::SessionContext::new();
+                let fixture = context
+                .sql(&format!(
+                    "SELECT CAST(at AS TIMESTAMP) AS \"{time_column}\", 'ERROR' AS level, kind AS error_type{}
+                     FROM (VALUES ('2026-10-16T12:00:00Z', 'before'),
+                                  ('{start}', 'at-start'),
+                                  ('{}', 'inside'),
+                                  ('{}', 'late-inside'),
+                                  ('{end}', 'at-end')) AS f(at, kind)",
+                    if time_column != "p_timestamp" {
+                        ", TIMESTAMP '2000-01-01T00:00:00Z' AS p_timestamp"
+                    } else { "" },
+                    inside.to_rfc3339(), late.to_rfc3339(),
+                ))
+                .await
+                .unwrap();
+                let fields = vec![
+                    time_column.into(),
+                    "p_timestamp".into(),
+                    "level".into(),
+                    "error_type".into(),
+                ];
+                let request = log_error_query_request(
+                    "logs",
+                    &fields,
+                    time_column,
+                    500,
+                    &json!({"startTime": start, "endTime": end}),
+                    start_at,
+                )
+                .unwrap();
+                // Match the generic query API's minute-aligned transport filtering.
+                let envelope = crate::utils::time::TimeRange::parse_human_time(
+                    &request.start_time,
+                    &request.end_time,
+                )
+                .unwrap();
+                assert!(envelope.start <= start_at && envelope.end >= end_at);
+                context
+                    .register_table("raw_logs", fixture.into_view())
+                    .unwrap();
+                let fixture = context.sql(&format!(
+                "SELECT * FROM raw_logs WHERE \"{time_column}\" >= TIMESTAMP '{}' AND \"{time_column}\" < TIMESTAMP '{}'",
+                envelope.start.to_rfc3339(), envelope.end.to_rfc3339(),
+            )).await.unwrap();
+                context.register_table("logs", fixture.into_view()).unwrap();
+                let result = context
+                    .sql(&request.query)
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+                writer
+                    .write_batches(&result.iter().collect::<Vec<_>>())
+                    .unwrap();
+                writer.finish().unwrap();
+                let rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).unwrap();
+                let mut types = rows
+                    .iter()
+                    .map(|row| row["errorType"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                types.sort_unstable();
+                assert_eq!(
+                    types,
+                    ["at-start", "inside", "late-inside"],
+                    "{time_column}: {start}..{end}"
+                );
+                let latest = rows
+                    .iter()
+                    .find(|row| row["errorType"] == "late-inside")
+                    .unwrap();
+                assert_eq!(
+                    chrono::NaiveDateTime::parse_from_str(
+                        latest["lastSeen"].as_str().unwrap(),
+                        "%Y-%m-%dT%H:%M:%S%.f",
+                    )
+                    .unwrap()
+                    .and_utc(),
+                    late
+                );
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_validates_exact_ranges_and_resolves_relative_bounds_once() {
+        let now = "2026-10-16T12:00:30.123456Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let fields = vec!["p_timestamp".into(), "level".into()];
+        let request = log_error_query_request(
+            "logs",
+            &fields,
+            "p_timestamp",
+            50,
+            &json!({"startTime": "now-15s", "endTime": "now"}),
+            now,
+        )
+        .unwrap();
+        assert!(request.query.contains("2026-10-16T12:00:15.123456+00:00"));
+        assert!(request.query.contains("2026-10-16T12:00:30.123456+00:00"));
+        assert_eq!(request.start_time, "2026-10-16T12:00:00+00:00");
+        assert_eq!(request.end_time, "2026-10-16T12:01:00+00:00");
+        for (start, end) in [
+            ("2026-10-16T12:00:30Z", "2026-10-16T12:00:30Z"),
+            ("2026-10-16T12:00:30Z", "2026-10-16T12:00:15Z"),
+            ("invalid", "now"),
+            ("now-15s", "invalid"),
+        ] {
+            assert!(
+                log_error_query_request(
+                    "logs",
+                    &fields,
+                    "p_timestamp",
+                    50,
+                    &json!({"startTime": start, "endTime": end}),
+                    now
+                )
+                .is_err()
+            );
+        }
     }
 
     #[actix_web::test]
@@ -1200,12 +1378,19 @@ mod tests {
         ] {
             let fields = fields.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(
-                list_log_errors_query("logs", &fields, 5)
+                list_log_errors_query("logs", &fields, 5, "p_timestamp", &log_error_test_range())
                     .unwrap_err()
                     .contains("explicit severity")
             );
         }
-        let query = list_log_errors_query("app\"logs", &["level".to_owned()], 999).unwrap();
+        let query = list_log_errors_query(
+            "app\"logs",
+            &["level".to_owned()],
+            999,
+            "p_timestamp",
+            &log_error_test_range(),
+        )
+        .unwrap();
         assert!(query.contains("FROM \"app\"\"logs\""));
         assert!(query.ends_with("LIMIT 500"));
     }
