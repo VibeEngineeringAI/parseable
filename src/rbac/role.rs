@@ -70,6 +70,7 @@ pub enum Action {
     ListFilter,
     GetFilter,
     CreateFilter,
+    UpdateFilter,
     DeleteFilter,
     Login,
     Metrics,
@@ -139,6 +140,7 @@ impl RoleBuilder {
                 | Action::GetFilter
                 | Action::ListFilter
                 | Action::CreateFilter
+                | Action::UpdateFilter
                 | Action::DeleteFilter
                 | Action::PutAlert
                 | Action::GetAlert
@@ -360,6 +362,7 @@ pub mod model {
                 Action::QueryLLM,
                 Action::ListLLM,
                 Action::CreateFilter,
+                Action::UpdateFilter,
                 Action::ListFilter,
                 Action::GetFilter,
                 Action::DeleteFilter,
@@ -403,6 +406,7 @@ pub mod model {
                 Action::GetFilter,
                 Action::ListFilter,
                 Action::CreateFilter,
+                Action::UpdateFilter,
                 Action::DeleteFilter,
                 Action::GetUserRoles,
                 Action::PatchUser,
@@ -426,6 +430,7 @@ pub mod model {
                 Action::ListFilter,
                 Action::GetFilter,
                 Action::CreateFilter,
+                Action::UpdateFilter,
                 Action::DeleteFilter,
                 Action::ListDashboard,
                 Action::GetDashboard,
@@ -447,5 +452,25 @@ pub mod model {
             actions: vec![Action::Ingest],
             resource_type: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod saved_filter_permission_tests {
+    use super::{Action, Permission, RoleBuilder, model::DefaultPrivilege};
+
+    #[test]
+    fn saved_filter_update_is_granted_to_existing_filter_roles() {
+        for privilege in [
+            DefaultPrivilege::Editor,
+            DefaultPrivilege::Writer { resource: None },
+            DefaultPrivilege::Reader { resource: None },
+        ] {
+            let permissions = RoleBuilder::from(&privilege).build();
+            assert!(permissions.contains(&Permission::Unit(Action::CreateFilter)));
+            assert!(permissions.contains(&Permission::Unit(Action::UpdateFilter)));
+        }
+        let permissions = RoleBuilder::from(&DefaultPrivilege::Ingestor { resource: None }).build();
+        assert!(!permissions.contains(&Permission::Unit(Action::UpdateFilter)));
     }
 }

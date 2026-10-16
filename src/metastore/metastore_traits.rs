@@ -192,9 +192,15 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         obj: &dyn MetastoreObject,
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError>;
+    /// Remove obsolete copies after the destination has been durably written.
+    async fn reconcile_filter(
+        &self,
+        filter: &Filter,
+        tenant_id: &Option<String>,
+    ) -> Result<(), MetastoreError>;
     async fn delete_filter(
         &self,
-        obj: &dyn MetastoreObject,
+        filter: &Filter,
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError>;
 

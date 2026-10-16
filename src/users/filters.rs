@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::TimeFilter;
 use crate::{
@@ -33,6 +33,9 @@ use crate::{
 };
 
 pub static FILTERS: Lazy<Filters> = Lazy::new(Filters::default);
+/// Serializes storage relocation and cache mutation within this server.
+pub static FILTER_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
+pub const SQL_FILTER_STREAM_NAME: &str = "sql";
 pub const CURRENT_FILTER_VERSION: &str = "v2";
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Filter {
@@ -117,12 +120,9 @@ pub struct Filters(RwLock<HashMap<String, Vec<Filter>>>);
 
 impl Filters {
     pub async fn load(&self) -> anyhow::Result<()> {
-        let all_filters = PARSEABLE.metastore.get_filters().await.unwrap_or_default();
-
-        let mut s = self.0.write().await;
-        for (tenant_id, filters) in all_filters {
-            s.entry(tenant_id).or_default().extend(filters);
-        }
+        let _mutation = FILTER_MUTATION_LOCK.lock().await;
+        let all_filters = PARSEABLE.metastore.get_filters().await?;
+        *self.0.write().await = all_filters;
 
         Ok(())
     }
@@ -131,15 +131,15 @@ impl Filters {
         let mut s = self.0.write().await;
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT).to_owned();
         let filters = s.entry(tenant).or_default();
-        filters.retain(|f| f.filter_id != filter.filter_id);
+        filters.retain(|f| f.filter_id != filter.filter_id || f.user_id != filter.user_id);
         filters.push(filter.clone());
     }
 
-    pub async fn delete_filter(&self, filter_id: &str, tenant_id: &Option<String>) {
+    pub async fn delete_filter(&self, filter: &Filter, tenant_id: &Option<String>) {
         let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         let mut s = self.0.write().await;
         if let Some(filters) = s.get_mut(tenant_id) {
-            filters.retain(|f| f.filter_id != Some(filter_id.to_string()));
+            filters.retain(|f| f.filter_id != filter.filter_id || f.user_id != filter.user_id);
         }
     }
 
@@ -152,13 +152,17 @@ impl Filters {
     ) -> Option<Filter> {
         let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         if let Some(filters) = self.0.read().await.get(tenant_id) {
-            filters
-                .iter()
-                .find(|f| {
-                    f.filter_id == Some(filter_id.to_string())
-                        && (f.user_id == Some(user_id.to_string()) || is_admin)
-                })
-                .cloned()
+            let mut matches = filters.iter().filter(|f| {
+                f.filter_id.as_deref() == Some(filter_id)
+                    && (f.user_id.as_deref() == Some(user_id) || is_admin)
+            });
+            let filter = matches.next()?;
+            // IDs are normally globally unique. Fail closed for an administrator
+            // if imported records make this owner-less URL ambiguous.
+            if matches.next().is_some() {
+                return None;
+            }
+            Some(filter.clone())
         } else {
             None
         }
@@ -221,4 +225,65 @@ pub fn migrate_v1_v2(mut filter_meta: Value, tenant_id: &Option<String>) -> Valu
     }
 
     filter_meta
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn saved_filter(owner: &str, tenant: &Option<String>) -> Filter {
+        serde_json::from_value(serde_json::json!({
+            "version":"v2", "user_id":owner, "filter_id":"shared-id",
+            "stream_name":"orders", "filter_name":"View", "tenant_id":tenant,
+            "query":{"filter_type":"sql","filter_query":"select * from orders","filter_builder":null},
+            "time_filter":null
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn saved_filter_cache_enforces_owner_tenant_and_preserves_same_id_other_owner() {
+        let cache = Filters::default();
+        let tenant = Some("tenant".into());
+        let owner = saved_filter("owner", &tenant);
+        let other = saved_filter("other", &tenant);
+        cache.update(&owner, &tenant).await;
+        assert!(
+            cache
+                .get_filter("shared-id", "intruder", false, &tenant)
+                .await
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_filter("shared-id", "owner", false, &None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get_filter("shared-id", "administrator", true, &tenant)
+                .await,
+            Some(owner.clone())
+        );
+        cache.update(&other, &tenant).await;
+        assert_eq!(
+            cache.get_filter("shared-id", "owner", false, &tenant).await,
+            Some(owner.clone())
+        );
+        assert_eq!(
+            cache.get_filter("shared-id", "other", false, &tenant).await,
+            Some(other.clone())
+        );
+        assert!(
+            cache
+                .get_filter("shared-id", "administrator", true, &tenant)
+                .await
+                .is_none()
+        );
+        cache.delete_filter(&owner, &tenant).await;
+        assert_eq!(
+            cache.get_filter("shared-id", "other", false, &tenant).await,
+            Some(other)
+        );
+    }
 }

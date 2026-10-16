@@ -501,6 +501,13 @@ impl Server {
                     .route(web::get().to(filters::list).authorize(Action::ListFilter)),
             )
             .service(
+                web::resource("/{filter_id}/convert-to-sql").route(
+                    web::post()
+                        .to(filters::convert_to_sql)
+                        .authorize(Action::UpdateFilter),
+                ),
+            )
+            .service(
                 web::resource("/{filter_id}")
                     .route(web::get().to(filters::get).authorize(Action::GetFilter))
                     .route(
@@ -511,7 +518,7 @@ impl Server {
                     .route(
                         web::put()
                             .to(filters::update)
-                            .authorize(Action::CreateFilter),
+                            .authorize(Action::UpdateFilter),
                     ),
             )
     }
