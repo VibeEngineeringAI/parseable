@@ -1,9 +1,10 @@
 import { useId, useState } from 'react';
-import { Button, Dialog, Input, Select } from '../../components/ui';
+import { Button, Dialog, Input, SearchableSelect, Select } from '../../components/ui';
 import { SqlEditor } from '../sql/SqlEditor';
 import { PromqlEditor } from '../../components/promql/PromqlEditor';
 import { createId } from '../../lib/ids';
 import type { DashboardVariable } from '../../lib/types';
+import { datasetOptions } from './pickerOptions';
 import { serializeVariable, setVariableType, variableDependencyError } from './variables';
 const types: Array<[DashboardVariable['type'], string]> = [
   ['promql', 'PromQL label values'],
@@ -18,6 +19,7 @@ export function VariableEditor({
   variables,
   names,
   datasets,
+  datasetsStatus,
   promqlEnabled,
   onClose,
   onApply,
@@ -28,6 +30,8 @@ export function VariableEditor({
   /** All stored names, including definitions this editor cannot read. */
   names: string[];
   datasets: string[];
+  /** Discovery state for `datasets`; omitted when the list is already final. */
+  datasetsStatus?: { loading: boolean; error?: Error; reload: () => void };
   promqlEnabled?: boolean;
   onClose: () => void;
   onApply: (variable: DashboardVariable) => void;
@@ -295,11 +299,32 @@ export function VariableEditor({
             Include All option
           </label>
         )}
-        <Input
-          label={draft.type === 'dataset' ? 'Default dataset' : 'Default value'}
-          value={draft.defaultValue ?? ''}
-          onChange={(event) => change({ defaultValue: event.target.value })}
-        />
+        {draft.type === 'dataset' ? (
+          <SearchableSelect
+            label="Default dataset"
+            value={draft.defaultValue ?? ''}
+            onValueChange={(defaultValue) => change({ defaultValue })}
+            options={datasetOptions({
+              choices: datasets,
+              selected: draft.defaultValue,
+              emptyLabel: 'No default dataset',
+              loaded: !datasetsStatus || (!datasetsStatus.loading && !datasetsStatus.error),
+            })}
+            loading={datasetsStatus?.loading}
+            onRetry={datasetsStatus?.reload}
+            error={
+              datasetsStatus?.error
+                ? 'Could not load datasets. The saved default is retained.'
+                : undefined
+            }
+          />
+        ) : (
+          <Input
+            label="Default value"
+            value={draft.defaultValue ?? ''}
+            onChange={(event) => change({ defaultValue: event.target.value })}
+          />
+        )}
         <p id={reason} className="muted">
           {validation}
         </p>

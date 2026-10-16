@@ -4,6 +4,7 @@ import './ui.css';
 export { Button, type ButtonProps } from './Button';
 export { Input, type InputProps } from './Input';
 export { Select, type SelectProps } from './Select';
+export { SearchableSelect, type SearchableSelectProps } from './SearchableSelect';
 export { Badge, type BadgeProps } from './Badge';
 export { Card, CardHeader, CardBody } from './Card';
 export { ActionsMenu, type ActionsMenuItem } from './ActionsMenu';

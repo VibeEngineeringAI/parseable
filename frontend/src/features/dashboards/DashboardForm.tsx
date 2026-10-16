@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useId, useState } from 'react';
-import { Button, Dialog, Input, InlineError, Select } from '../../components/ui';
+import { Button, Dialog, Input, InlineError, SearchableSelect } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import type { Dashboard } from '../../lib/types';
+import { datasetOptions } from './pickerOptions';
 import { dashboardError, tagsFromText } from './helpers';
 
 export function DashboardForm({
@@ -30,7 +31,6 @@ export function DashboardForm({
   const { client } = useApp();
   const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
   const [dataset, setDataset] = useState(original?.dataset ?? '');
-  const datasetNames = (datasets.data ?? []).map((entry) => entry.name);
   const [title, setTitle] = useState(original?.title ?? '');
   const [tags, setTags] = useState((original?.tags ?? []).join(', '));
   const [description, setDescription] = useState(
@@ -79,22 +79,20 @@ export function DashboardForm({
           required
           autoFocus
         />
-        <Select
+        <SearchableSelect
           label="Default dataset"
           disabled={pending}
           value={dataset}
-          onChange={(event) => setDataset(event.target.value)}
+          onValueChange={setDataset}
+          options={datasetOptions({
+            choices: (datasets.data ?? []).map((entry) => entry.name),
+            selected: dataset,
+            emptyLabel: 'No default dataset',
+            loaded: !!datasets.data,
+          })}
+          loading={datasets.loading}
+          onRetry={datasets.reload}
           hint="New tiles start with this dataset. Existing tile queries keep their datasets."
-        >
-          <option value="">No default dataset</option>
-          {dataset && !datasetNames.includes(dataset) && <option value={dataset}>{dataset}</option>}
-          {datasetNames.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </Select>
-        <InlineError
           error={
             datasets.error ? 'Could not load datasets. The saved selection is retained.' : undefined
           }

@@ -195,7 +195,8 @@ test('create SQL and PromQL tiles and variables in the native UI; verify exact c
   await variable.getByLabel('Variable name').fill('metrics_dataset');
   await variable.getByLabel('Variable label').fill('Metrics dataset');
   await variable.getByLabel('Variable type').selectOption('dataset');
-  await variable.getByLabel('Default dataset').fill(metrics);
+  await variable.getByRole('combobox', { name: 'Default dataset' }).fill(metrics);
+  await variable.getByRole('option', { name: metrics, exact: true }).click();
   await variable.locator('[data-dialog-confirm]').click();
   await page.getByRole('button', { name: 'Add variable', exact: true }).click();
   variable = page.getByRole('dialog', { name: 'Add variable', exact: true });
@@ -211,7 +212,8 @@ test('create SQL and PromQL tiles and variables in the native UI; verify exact c
   await page.getByRole('button', { name: 'Add tile', exact: true }).click();
   let editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
   await editor.getByLabel('Tile title').fill('Live log events');
-  await editor.getByLabel('Dataset', { exact: true }).selectOption(logs);
+  await editor.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await editor.getByRole('option', { name: logs, exact: true }).click();
   await editor.getByRole('textbox', { name: 'SQL query', exact: true }).fill(sql);
   await editor.getByLabel('Chart type').selectOption('table');
   await editor.getByLabel('Width (columns)').selectOption('12');
@@ -220,7 +222,8 @@ test('create SQL and PromQL tiles and variables in the native UI; verify exact c
   editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
   await editor.getByLabel('Tile title').fill('Live host load');
   await editor.getByLabel('Query language').selectOption('promql');
-  await editor.getByLabel('Dataset', { exact: true }).selectOption('$metrics_dataset');
+  await editor.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await editor.getByRole('option', { name: '$metrics_dataset', exact: true }).click();
   await editor.getByRole('textbox', { name: 'PromQL query A', exact: true }).fill(promql);
   await editor.getByLabel('Width (columns)').selectOption('12');
   await editor.locator('[data-dialog-confirm]').click();
