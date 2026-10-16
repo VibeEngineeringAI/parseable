@@ -82,14 +82,28 @@ describe('saved view HTTP contract', () => {
       status: 502,
     });
   });
-  it.each(['create', 'update'] as const)('validates %s responses', async (method) => {
+  it('converts using an authenticated bodyless POST and returns the complete canonical view', async () => {
+    const converted = { ...body, filter_id: 'id /?#', user_id: 'owner', stream_name: 'sql' };
+    const fetch = vi.fn().mockResolvedValue(json(converted));
+    vi.stubGlobal('fetch', fetch);
+    expect(await createClient({ mode: 'live' }).convertLogViewToSql('id /?#')).toEqual(converted);
+    expect(fetch.mock.calls[0]).toEqual([
+      '/api/v1/filters/id%20%2F%3F%23/convert-to-sql',
+      { method: 'POST', credentials: 'include' },
+    ]);
+  });
+  it.each(['create', 'update', 'convert'] as const)('validates %s responses', async (method) => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue(json({ ...body, time_filter: { from: 5, to: 'now' } })),
     );
     const client = createClient({ mode: 'live' });
     await expect(
-      method === 'create' ? client.createLogView(body) : client.updateLogView('id', body),
+      method === 'create'
+        ? client.createLogView(body)
+        : method === 'update'
+          ? client.updateLogView('id', body)
+          : client.convertLogViewToSql('id'),
     ).rejects.toBeInstanceOf(ApiError);
   });
   it('validates optional explorer state while retaining classic metadata', () => {
@@ -220,6 +234,20 @@ describe('demo log contracts', () => {
     });
     expect(updated.filter_id).toBe(saved.filter_id);
     expect(updated.custom).toEqual(body.custom);
+    const converted = await client.convertLogViewToSql(saved.filter_id!);
+    expect(converted).toEqual({ ...updated, stream_name: 'sql' });
+    expect(await client.convertLogViewToSql(saved.filter_id!)).toEqual(converted);
+    converted.custom = 'mutated conversion';
+    expect((await client.listLogViews())[0].custom).toEqual(body.custom);
+    expect(
+      await client.updateLogView(saved.filter_id!, { ...updated, stream_name: 'sql' }),
+    ).toEqual({ ...updated, stream_name: 'sql' });
+    await expect(client.convertLogViewToSql('missing')).rejects.toMatchObject({ status: 400 });
+    const classic = await client.createLogView({ ...body, query: { filter_type: 'search' } });
+    await expect(client.convertLogViewToSql(classic.filter_id!)).rejects.toMatchObject({
+      status: 400,
+    });
+    await client.deleteLogView(classic.filter_id!);
     await client.deleteLogView(saved.filter_id!);
     expect(await client.listLogViews()).toEqual([]);
     await expect(client.deleteLogView('missing')).rejects.toMatchObject({ status: 400 });

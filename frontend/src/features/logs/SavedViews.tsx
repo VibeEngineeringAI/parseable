@@ -9,12 +9,29 @@ import type { SavedLogView } from '../../lib/types';
 import { decodeLogView, encodeLogView, type LogViewState } from './logViewState';
 
 export function savedLogViewState(view: SavedLogView): LogViewState {
-  if (typeof view.explorer_state !== 'string')
+  if (typeof view.explorer_state !== 'string' || view.query.filter_type !== 'sql')
     throw new Error('This saved view uses a classic format and cannot be opened in this explorer.');
   const state = decodeLogView(view.explorer_state);
-  if (state.dataset !== view.stream_name)
+  if (view.stream_name !== 'sql' && state.dataset !== view.stream_name)
     throw new Error('This saved view has inconsistent dataset metadata.');
   return state;
+}
+export function savedLogViewsForDataset(views: SavedLogView[], dataset: string) {
+  return views.flatMap<{ view: SavedLogView; decoded: LogViewState | undefined }>((view) => {
+    try {
+      const decoded = savedLogViewState(view);
+      return decoded.dataset === dataset ? [{ view, decoded }] : [];
+    } catch {
+      // Classic dataset-scoped views remain visible, but canonical views need a
+      // valid explorer state to establish which dataset they belong to.
+      return view.stream_name !== 'sql' && view.stream_name === dataset
+        ? [{ view, decoded: undefined }]
+        : [];
+    }
+  });
+}
+function savedLogViewKey(view: SavedLogView): string {
+  return view.filter_id ? JSON.stringify([view.user_id ?? null, view.filter_id]) : '';
 }
 /** Ownership is a display constraint; backend authorization remains authoritative. */
 export function ownsSavedLogView(
@@ -36,7 +53,7 @@ export function savedLogViewBody(
   return {
     ...previous,
     filter_name,
-    stream_name: state.dataset,
+    stream_name: previous?.stream_name === 'sql' ? 'sql' : state.dataset,
     query: {
       ...(previous?.query ?? {}),
       filter_type: 'sql',
@@ -80,8 +97,10 @@ export function SavedViews({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const generation = useRef(0);
+  const pendingMutation = useRef<{ generation: number } | null>(null);
   useEffect(() => {
     generation.current += 1;
+    pendingMutation.current = null;
     setSelected('');
     setName('');
     setError('');
@@ -89,6 +108,7 @@ export function SavedViews({
     setBusy(false);
     return () => {
       generation.current += 1;
+      pendingMutation.current = null;
     };
   }, [client, state.dataset]);
   const views = useAsync(
@@ -98,23 +118,20 @@ export function SavedViews({
     ),
   );
   const available = useMemo(
-    () =>
-      (views.data ?? [])
-        .filter((view) => view.stream_name === state.dataset)
-        .map((view) => {
-          try {
-            return { view, decoded: savedLogViewState(view) };
-          } catch {
-            return { view, decoded: undefined };
-          }
-        }),
+    () => savedLogViewsForDataset(views.data ?? [], state.dataset),
     [views.data, state.dataset],
   );
-  const selectedView = available.find((item) => item.view.filter_id === selected);
+  const selectedView = selected
+    ? available.find((item) => savedLogViewKey(item.view) === selected)
+    : undefined;
   const view = selectedView?.view;
   const owned = ownsSavedLogView(view, ownerHash.data, mode === 'demo');
-  async function mutate(action: 'create' | 'update' | 'delete') {
+  async function mutate(action: 'create' | 'update' | 'delete' | 'convert') {
+    if (pendingMutation.current) return;
     const requestGeneration = generation.current;
+    const mutation = { generation: requestGeneration };
+    let completed = false;
+    pendingMutation.current = mutation;
     setError('');
     setNotice('');
     setBusy(true);
@@ -123,16 +140,23 @@ export function SavedViews({
         const created = await client.createLogView(
           savedLogViewBody(state, name, undefined, timestampField),
         );
+        completed = true;
         if (requestGeneration !== generation.current) return;
-        setSelected(created.filter_id ?? '');
+        setSelected(savedLogViewKey(created));
         setName(created.filter_name);
       } else {
         if (!view?.filter_id) throw new Error('Select a saved view first.');
         if (!owned)
           throw new Error(
-            'Only the owner can update or delete this saved view. Apply it or save a new copy instead.',
+            'Only the owner can change this saved view. Apply it or save a new copy instead.',
           );
-        if (action === 'update') {
+        if (action === 'convert') {
+          if (!selectedView?.decoded) throw new Error('This saved view cannot be converted here.');
+          const converted = await client.convertLogViewToSql(view.filter_id);
+          completed = true;
+          if (requestGeneration !== generation.current) return;
+          setName(converted.filter_name);
+        } else if (action === 'update') {
           // Classic views remain readable in the list but are never overwritten.
           if (!selectedView?.decoded)
             throw new Error('This saved view cannot be overwritten here.');
@@ -140,22 +164,38 @@ export function SavedViews({
             view.filter_id,
             savedLogViewBody(state, name, view, timestampField),
           );
-        } else await client.deleteLogView(view.filter_id);
+          completed = true;
+        } else {
+          await client.deleteLogView(view.filter_id);
+          completed = true;
+        }
         if (requestGeneration !== generation.current) return;
         if (action === 'delete') {
           setSelected('');
           setName('');
         }
       }
-      views.reload();
-      setNotice(action === 'delete' ? 'View deleted.' : 'View saved on the server.');
+      setNotice(
+        action === 'delete'
+          ? 'View deleted.'
+          : action === 'convert'
+            ? 'View converted to SQL. Its query and dataset were retained.'
+            : 'View saved on the server.',
+      );
     } catch (cause) {
       if (requestGeneration === generation.current)
         setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      if (requestGeneration === generation.current) setBusy(false);
+      if (pendingMutation.current === mutation) {
+        pendingMutation.current = null;
+        // A server write owns the lock across dialog generations. Confirmed
+        // writes refresh the list even when their draft and notice are stale.
+        if (completed) views.reload();
+        setBusy(false);
+      }
     }
   }
+  const editingDisabled = busy && pendingMutation.current?.generation === generation.current;
   const compatible = !!selectedView?.decoded;
   return (
     <>
@@ -165,7 +205,12 @@ export function SavedViews({
       </Button>
       <Dialog
         open={open}
-        onOpenChange={setOpen}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) {
+            generation.current += 1;
+          }
+          setOpen(nextOpen);
+        }}
         title="Saved log views"
         description="Views are saved on your Parseable server for this dataset."
       >
@@ -182,12 +227,13 @@ export function SavedViews({
             <Select
               aria-label="Saved log view"
               value={selected}
-              disabled={busy}
+              disabled={editingDisabled}
               onChange={(event) => {
-                const id = event.target.value;
-                setSelected(id);
+                const key = event.target.value;
+                setSelected(key);
                 setName(
-                  available.find((item) => item.view.filter_id === id)?.view.filter_name ?? '',
+                  available.find((item) => savedLogViewKey(item.view) === key)?.view.filter_name ??
+                    '',
                 );
                 setError('');
                 setNotice('');
@@ -197,7 +243,7 @@ export function SavedViews({
               {available
                 .filter(({ view }) => view.filter_id)
                 .map(({ view: item, decoded }) => (
-                  <option key={item.filter_id} value={item.filter_id ?? ''}>
+                  <option key={savedLogViewKey(item)} value={savedLogViewKey(item)}>
                     {item.filter_name}
                     {!decoded ? ' (classic or incompatible)' : ''}
                     {!ownsSavedLogView(item, ownerHash.data, mode === 'demo') ? ' (read only)' : ''}
@@ -217,19 +263,29 @@ export function SavedViews({
               apply it or save a new copy.
             </p>
           )}
+          {view && owned && compatible && view.stream_name !== 'sql' && (
+            <p>Convert this saved view to SQL while keeping its existing query and dataset.</p>
+          )}
           <label>
             View name
             <Input
               aria-label="Log view name"
               value={name}
               maxLength={200}
-              disabled={busy}
+              disabled={editingDisabled}
               onChange={(event) => setName(event.target.value)}
             />
           </label>
           {error && <p role="alert">{error}</p>}
           {notice && <p role="status">{notice}</p>}
           <div className="inline">
+            <Button
+              variant="secondary"
+              disabled={busy || !owned || !compatible || view?.stream_name === 'sql'}
+              onClick={() => void mutate('convert')}
+            >
+              Convert to SQL view
+            </Button>
             <Button
               disabled={busy || !compatible}
               onClick={() => {

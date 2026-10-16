@@ -126,7 +126,7 @@ for (const transition of ['AND', 'clear', 'apply', 'dataset'] as const) {
     if (transition === 'apply') {
       await page.getByRole('button', { name: 'Saved views', exact: true }).click();
       const dialog = page.getByRole('dialog', { name: 'Saved log views' });
-      await dialog.getByLabel('Saved log view').selectOption('clean');
+      await dialog.getByLabel('Saved log view').selectOption({ label: 'Clean view (read only)' });
       await dialog.getByRole('button', { name: 'Apply view', exact: true }).click();
     }
     await expect(page.getByText(notice, { exact: true })).toHaveCount(0);

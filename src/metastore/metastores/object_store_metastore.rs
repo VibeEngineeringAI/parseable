@@ -62,13 +62,211 @@ use crate::{
             to_bytes,
         },
     },
-    users::filters::{Filter, migrate_v1_v2},
+    users::filters::{Filter, FilterType, SQL_FILTER_STREAM_NAME, migrate_v1_v2},
 };
 
 /// Using PARSEABLE's storage as a metastore (default)
 #[derive(Debug)]
 pub struct ObjectStoreMetastore {
     pub storage: Arc<dyn ObjectStorage>,
+}
+
+impl ObjectStoreMetastore {
+    async fn delete_filter_path(
+        &self,
+        path: &RelativePathBuf,
+        tenant_id: &Option<String>,
+    ) -> Result<(), MetastoreError> {
+        match self.storage.delete_object(path, tenant_id).await {
+            Ok(()) => Ok(()),
+            Err(error) if is_missing_optional_dir(&error) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Enumerate only this owner's ID, never a filter belonging to another user.
+    async fn filter_aliases(
+        &self,
+        filter: &Filter,
+        tenant_id: &Option<String>,
+    ) -> Result<Vec<(RelativePathBuf, Filter)>, MetastoreError> {
+        let owner = filter
+            .user_id
+            .as_deref()
+            .expect("stored filters have an owner");
+        let id = filter
+            .filter_id
+            .as_deref()
+            .expect("stored filters have an ID");
+        let root = filter_path(owner, "", "", tenant_id);
+        let mut copies = Vec::new();
+        for stream in self.storage.list_dirs_relative(&root, tenant_id).await? {
+            let path = root.join(&stream).join(format!("{id}.json"));
+            let bytes = match self.storage.get_object(&path, tenant_id).await {
+                Ok(bytes) => bytes,
+                Err(error) if is_missing_optional_dir(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let copy: Filter = serde_json::from_slice(&bytes)?;
+            if copy.filter_id == filter.filter_id && copy.user_id == filter.user_id {
+                copies.push((path, copy));
+            }
+        }
+        copies.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(copies)
+    }
+
+    async fn load_tenant_filters(
+        &self,
+        tenant_id: &Option<String>,
+    ) -> Result<Vec<Filter>, MetastoreError> {
+        let users_dir =
+            RelativePathBuf::from_iter([tenant_id.as_deref().unwrap_or(""), USERS_ROOT_DIR]);
+        let mut grouped: BTreeMap<(String, String), Vec<(RelativePathBuf, Filter)>> =
+            BTreeMap::new();
+        for user in self
+            .storage
+            .list_dirs_relative(&users_dir, tenant_id)
+            .await?
+        {
+            let root = users_dir.join(&user).join("filters");
+            for stream in self.storage.list_dirs_relative(&root, tenant_id).await? {
+                let directory = root.join(&stream);
+                let objects = self
+                    .storage
+                    .get_objects(
+                        Some(&directory),
+                        Box::new(|name| name.ends_with(".json")),
+                        tenant_id,
+                    )
+                    .await?;
+                for bytes in objects {
+                    let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                    let is_v1 = value.get("version").and_then(|v| v.as_str()) == Some("v1");
+                    if is_v1 {
+                        value = migrate_v1_v2(value, tenant_id);
+                    }
+                    let Ok(mut filter) = serde_json::from_value::<Filter>(value) else {
+                        continue;
+                    };
+                    // The discovered tenant directory is authoritative, including
+                    // default-tenant records whose payload predates tenant metadata.
+                    filter.tenant_id = tenant_id.clone().filter(|tenant| !tenant.is_empty());
+                    let (Some(owner), Some(id)) = (&filter.user_id, &filter.filter_id) else {
+                        continue;
+                    };
+                    // Stored identity fields must remain single path components.
+                    if !safe_filter_component(owner)
+                        || !safe_filter_component(id)
+                        || !safe_filter_component(&filter.stream_name)
+                        || filter.stream_name != stream
+                        || (!is_v1 && owner != &user)
+                    {
+                        warn!(
+                            "Ignoring saved filter whose identity does not match its storage directory"
+                        );
+                        continue;
+                    }
+                    let source = directory.join(format!("{id}.json"));
+                    // get_objects returns bytes without filenames. Verify the inferred
+                    // filename before any cleanup; never delete an unrelated object.
+                    match self.storage.get_object(&source, tenant_id).await {
+                        Ok(stored) if stored == bytes => {}
+                        Ok(_) => continue,
+                        Err(error) if is_missing_optional_dir(&error) => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                    if is_v1 {
+                        // Persist before removing the original so interrupted migration is safe.
+                        self.put_filter(&filter, tenant_id).await?;
+                        if source.as_str() != filter.get_object_path() {
+                            self.delete_filter_path(&source, tenant_id).await?;
+                        }
+                    }
+                    grouped
+                        .entry((owner.clone(), id.clone()))
+                        .or_default()
+                        .push((
+                            if is_v1 {
+                                RelativePathBuf::from(filter.get_object_path())
+                            } else {
+                                source
+                            },
+                            filter,
+                        ));
+                }
+            }
+        }
+        let mut filters = Vec::new();
+        for (_, mut copies) in grouped {
+            // A v1 migration may write a hashed-owner directory that is visited
+            // later in this same scan. It is still one physical object.
+            copies.sort_by(|a, b| a.0.cmp(&b.0));
+            copies.dedup_by(|a, b| a.0 == b.0);
+            copies.sort_by(|a, b| {
+                let canonical = |filter: &Filter| {
+                    filter.query.filter_type == FilterType::SQL
+                        && filter.stream_name == SQL_FILTER_STREAM_NAME
+                };
+                canonical(&b.1).cmp(&canonical(&a.1)).then(a.0.cmp(&b.0))
+            });
+            let (canonical_path, filter) = &copies[0];
+            if filter.query.filter_type == FilterType::SQL
+                && filter.stream_name == SQL_FILTER_STREAM_NAME
+            {
+                for (path, alias) in copies.iter().skip(1) {
+                    if path != canonical_path && alias.query.filter_type == FilterType::SQL {
+                        // The canonical object is already durable. Retain it in memory
+                        // even if cleanup is temporarily unavailable; retry on restart.
+                        if let Err(error) = self.delete_filter_path(path, tenant_id).await {
+                            warn!("Failed to clean saved SQL filter alias {path}: {error}");
+                        }
+                    } else if alias.query.filter_type != FilterType::SQL {
+                        warn!(
+                            "Retaining non-SQL saved filter copy {path} with the same owner {:?} and ID {:?} as canonical SQL filter {canonical_path}",
+                            filter.user_id, filter.filter_id
+                        );
+                    }
+                }
+            }
+            if copies.len() > 1
+                && !(filter.query.filter_type == FilterType::SQL
+                    && filter.stream_name == SQL_FILTER_STREAM_NAME)
+            {
+                warn!(
+                    "Multiple saved filter copies for owner {:?}, ID {:?}; using deterministic path {canonical_path}",
+                    filter.user_id, filter.filter_id
+                );
+            }
+            filters.push(filter.clone());
+        }
+        Ok(filters)
+    }
+}
+
+fn stored_filter_path(filter: &Filter, tenant_id: &Option<String>) -> RelativePathBuf {
+    filter_path(
+        filter
+            .user_id
+            .as_deref()
+            .expect("stored filters have an owner"),
+        &filter.stream_name,
+        &format!(
+            "{}.json",
+            filter
+                .filter_id
+                .as_deref()
+                .expect("stored filters have an ID")
+        ),
+        tenant_id,
+    )
+}
+
+fn safe_filter_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains(['/', '\\'])
 }
 
 pub fn is_missing_optional_dir(err: &ObjectStorageError) -> bool {
@@ -629,113 +827,23 @@ impl Metastore for ObjectStoreMetastore {
             .await?)
     }
 
-    // for get filters, take care of migration and removal of incorrect/old filters
-    // return deserialized filter
+    // Reconcile duplicate SQL paths before exposing filters to the cache.
     async fn get_filters(&self) -> Result<HashMap<String, Vec<Filter>>, MetastoreError> {
-        let mut this = HashMap::new();
-        let base_paths = PARSEABLE.list_tenants().unwrap_or_else(|| vec!["".into()]);
-
-        for mut tenant in base_paths {
-            let users_dir = RelativePathBuf::from_iter([&tenant, USERS_ROOT_DIR]);
-            let tenant_id = &Some(tenant.clone());
-            let mut filters = Vec::new();
-            for user in self
-                .storage
-                .list_dirs_relative(&users_dir, tenant_id)
-                .await?
-            {
-                let stream_dir = users_dir.join(&user).join("filters");
-
-                for stream in self
-                    .storage
-                    .list_dirs_relative(&stream_dir, tenant_id)
-                    .await?
-                {
-                    let filters_path = stream_dir.join(&stream);
-
-                    // read filter object
-                    let filter_bytes = self
-                        .storage
-                        .get_objects(
-                            Some(&filters_path),
-                            Box::new(|file_name| file_name.ends_with(".json")),
-                            tenant_id,
-                        )
-                        .await?;
-
-                    for filter in filter_bytes {
-                        // deserialize into Value
-                        let mut filter_value =
-                            serde_json::from_slice::<serde_json::Value>(&filter)?;
-
-                        if let Some(meta) = filter_value.clone().as_object() {
-                            let version = meta.get("version").and_then(|version| version.as_str());
-
-                            if version == Some("v1") {
-                                // delete older version of the filter
-                                // get filter id to delete
-                                let filterid = meta
-                                    .get("filter_id")
-                                    .and_then(|filter_id| filter_id.as_str());
-                                if let Some(filterid) = filterid {
-                                    self.storage
-                                        .delete_object(
-                                            &filters_path.join(format!("{filterid}.json")),
-                                            tenant_id,
-                                        )
-                                        .await?;
-                                }
-                                // self.storage.delete_object(&filters_path, tenant_id).await?;
-
-                                filter_value = migrate_v1_v2(filter_value, tenant_id);
-                                let user_id = filter_value
-                                    .as_object()
-                                    .unwrap()
-                                    .get("user_id")
-                                    .and_then(|user_id| user_id.as_str());
-                                let filter_id = filter_value
-                                    .as_object()
-                                    .unwrap()
-                                    .get("filter_id")
-                                    .and_then(|filter_id| filter_id.as_str());
-                                let stream_name = filter_value
-                                    .as_object()
-                                    .unwrap()
-                                    .get("stream_name")
-                                    .and_then(|stream_name| stream_name.as_str());
-
-                                // if these values are present, create a new file
-                                if let (Some(user_id), Some(stream_name), Some(filter_id)) =
-                                    (user_id, stream_name, filter_id)
-                                {
-                                    let path = filter_path(
-                                        user_id,
-                                        stream_name,
-                                        &format!("{filter_id}.json"),
-                                        tenant_id,
-                                    );
-                                    let filter_bytes = to_bytes(&filter_value);
-                                    self.storage
-                                        .put_object(&path, filter_bytes.clone(), tenant_id)
-                                        .await?;
-                                }
-                            }
-
-                            if let Ok(filter) = serde_json::from_value::<Filter>(filter_value) {
-                                filters.retain(|f: &Filter| f.filter_id != filter.filter_id);
-                                filters.push(filter);
-                            }
-                        }
-                    }
-                }
-            }
-            if tenant.is_empty() {
-                tenant.clone_from(&DEFAULT_TENANT.to_string());
-            }
-            this.insert(tenant, filters);
+        let mut all = HashMap::new();
+        let tenants = PARSEABLE.list_tenants().unwrap_or_else(|| vec!["".into()]);
+        for tenant in tenants {
+            let tenant_id = Some(tenant.clone());
+            let filters = self.load_tenant_filters(&tenant_id).await?;
+            all.insert(
+                if tenant.is_empty() {
+                    DEFAULT_TENANT.to_owned()
+                } else {
+                    tenant
+                },
+                filters,
+            );
         }
-
-        Ok(this)
+        Ok(all)
     }
 
     /// Save a filter
@@ -753,18 +861,30 @@ impl Metastore for ObjectStoreMetastore {
             .await?)
     }
 
-    /// Delete a filter
-    async fn delete_filter(
+    async fn reconcile_filter(
         &self,
-        obj: &dyn MetastoreObject,
+        filter: &Filter,
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError> {
-        let path = obj.get_object_path();
+        let canonical = stored_filter_path(filter, tenant_id);
+        for (path, _) in self.filter_aliases(filter, tenant_id).await? {
+            if path != canonical {
+                self.delete_filter_path(&path, tenant_id).await?;
+            }
+        }
+        Ok(())
+    }
 
-        Ok(self
-            .storage
-            .delete_object(&RelativePathBuf::from(path), tenant_id)
-            .await?)
+    /// Delete aliases first. If any cleanup fails, the canonical copy remains
+    /// available for a retry instead of allowing an old alias to reappear.
+    async fn delete_filter(
+        &self,
+        filter: &Filter,
+        tenant_id: &Option<String>,
+    ) -> Result<(), MetastoreError> {
+        self.reconcile_filter(filter, tenant_id).await?;
+        self.delete_filter_path(&stored_filter_path(filter, tenant_id), tenant_id)
+            .await
     }
 
     /// Fetch an `ObjectStoreFormat` file
@@ -1406,6 +1526,290 @@ mod tests {
         fn get_object_id(&self) -> String {
             self.id.to_string()
         }
+    }
+
+    fn saved_sql(owner: &str, id: &str, stream: &str, tenant: &Option<String>) -> Filter {
+        serde_json::from_value(serde_json::json!({
+            "version": "v2", "user_id": owner, "filter_id": id,
+            "stream_name": stream, "filter_name": "Revenue", "tenant_id": tenant,
+            "query": {"filter_type": "sql", "filter_query": "select * from orders", "filter_builder": null},
+            "time_filter": null, "explorer_state": {"columns": ["amount"]},
+            "future_metadata": {"preserve": true}
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn saved_filter_conversion_persists_and_delete_cannot_resurrect() {
+        for tenant in [None, Some("tenant-a".to_owned())] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Arc::new(LocalFS::new(temp.path().to_path_buf()));
+            let store = ObjectStoreMetastore {
+                storage: storage.clone(),
+            };
+            let legacy = saved_sql("owner", "same-id", "orders", &tenant);
+            store.put_filter(&legacy, &tenant).await.unwrap();
+            // Sharing an ID with a different owner or tenant cannot remove their filter.
+            let other_owner = saved_sql("other-owner", "same-id", "orders", &tenant);
+            store.put_filter(&other_owner, &tenant).await.unwrap();
+            let mut other_id = saved_sql("owner", "different-id", "orders", &tenant);
+            other_id.query.filter_type = FilterType::Search;
+            store.put_filter(&other_id, &tenant).await.unwrap();
+            let other_tenant = saved_sql("owner", "same-id", "orders", &Some("tenant-b".into()));
+            store
+                .put_filter(&other_tenant, &other_tenant.tenant_id)
+                .await
+                .unwrap();
+            let mut canonical = legacy.clone();
+            canonical.stream_name = "sql".into();
+            for _ in 0..2 {
+                store.put_filter(&canonical, &tenant).await.unwrap();
+                store.reconcile_filter(&canonical, &tenant).await.unwrap();
+                let bytes = storage
+                    .get_object(&RelativePathBuf::from(canonical.get_object_path()), &tenant)
+                    .await
+                    .unwrap();
+                assert_eq!(serde_json::from_slice::<Filter>(&bytes).unwrap(), canonical);
+            }
+            assert!(
+                storage
+                    .get_object(&RelativePathBuf::from(legacy.get_object_path()), &tenant)
+                    .await
+                    .is_err()
+            );
+            let restarted = ObjectStoreMetastore {
+                storage: storage.clone(),
+            };
+            let loaded = restarted.load_tenant_filters(&tenant).await.unwrap();
+            assert_eq!(loaded.len(), 3);
+            assert!(loaded.contains(&canonical));
+            // Simulate a stale legacy alias left by an interrupted earlier conversion.
+            restarted.put_filter(&legacy, &tenant).await.unwrap();
+            restarted.delete_filter(&canonical, &tenant).await.unwrap();
+            restarted.delete_filter(&canonical, &tenant).await.unwrap();
+            let loaded = restarted.load_tenant_filters(&tenant).await.unwrap();
+            assert_eq!(loaded.len(), 2);
+            assert!(loaded.contains(&other_owner));
+            assert!(loaded.contains(&other_id));
+            assert_eq!(
+                restarted
+                    .load_tenant_filters(&other_tenant.tenant_id)
+                    .await
+                    .unwrap(),
+                vec![other_tenant]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_filter_startup_prefers_sql_and_keeps_untouched_legacy() {
+        for sql_first in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Arc::new(LocalFS::new(temp.path().to_path_buf()));
+            let store = ObjectStoreMetastore {
+                storage: storage.clone(),
+            };
+            let tenant = None;
+            let old = saved_sql("owner", "converted", "orders", &tenant);
+            let mut canonical = old.clone();
+            canonical.stream_name = "sql".into();
+            canonical.filter_name = "Latest name".into();
+            let untouched = saved_sql("owner", "untouched", "orders", &tenant);
+            for filter in if sql_first {
+                [&canonical, &old]
+            } else {
+                [&old, &canonical]
+            } {
+                store.put_filter(filter, &tenant).await.unwrap();
+            }
+            store.put_filter(&untouched, &tenant).await.unwrap();
+            let loaded = store.load_tenant_filters(&tenant).await.unwrap();
+            assert_eq!(loaded.len(), 2);
+            assert!(loaded.contains(&canonical));
+            assert!(loaded.contains(&untouched));
+            assert!(
+                storage
+                    .get_object(&RelativePathBuf::from(old.get_object_path()), &tenant)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.load_tenant_filters(&tenant).await.unwrap(), loaded);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_filter_startup_uses_directory_tenant_for_null_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(temp.path().to_path_buf()));
+        let store = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        let tenant = Some("tenant-a".to_owned());
+        let legacy = saved_sql("owner", "id", "orders", &tenant);
+        let mut payload = serde_json::to_value(&legacy).unwrap();
+        payload["tenant_id"] = serde_json::Value::Null;
+        let legacy_path = RelativePathBuf::from(legacy.get_object_path());
+        storage
+            .put_object(&legacy_path, to_bytes(&payload), &tenant)
+            .await
+            .unwrap();
+        let loaded = store.load_tenant_filters(&tenant).await.unwrap();
+        assert_eq!(loaded, vec![legacy.clone()]);
+        let mut canonical = loaded[0].clone();
+        canonical.stream_name = "sql".into();
+        store.put_filter(&canonical, &tenant).await.unwrap();
+        store.reconcile_filter(&canonical, &tenant).await.unwrap();
+        assert!(storage.get_object(&legacy_path, &tenant).await.is_err());
+        assert_eq!(
+            store.load_tenant_filters(&tenant).await.unwrap(),
+            vec![canonical.clone()]
+        );
+        store.delete_filter(&canonical, &tenant).await.unwrap();
+        assert!(store.load_tenant_filters(&tenant).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_filter_startup_retains_non_sql_copy_with_same_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(temp.path().to_path_buf()));
+        let store = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        let tenant = None;
+        let canonical = saved_sql("owner", "id", "sql", &tenant);
+        let mut non_sql = saved_sql("owner", "id", "orders", &tenant);
+        non_sql.query.filter_type = FilterType::Search;
+        store.put_filter(&canonical, &tenant).await.unwrap();
+        store.put_filter(&non_sql, &tenant).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                store.load_tenant_filters(&tenant).await.unwrap(),
+                vec![canonical.clone()]
+            );
+            let bytes = storage
+                .get_object(&RelativePathBuf::from(non_sql.get_object_path()), &tenant)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Filter>(&bytes).unwrap(), non_sql);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_filter_failed_cleanup_keeps_canonical_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(temp.path().to_path_buf()));
+        let store = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        let tenant = None;
+        let legacy = saved_sql("owner", "id", "orders", &tenant);
+        let mut canonical = legacy.clone();
+        canonical.stream_name = "sql".into();
+        store.put_filter(&legacy, &tenant).await.unwrap();
+        store.put_filter(&canonical, &tenant).await.unwrap();
+        let legacy_path = RelativePathBuf::from(legacy.get_object_path());
+        // An unreadable alias causes cleanup to fail after the canonical write.
+        storage
+            .put_object(&legacy_path, Bytes::from_static(b"invalid json"), &tenant)
+            .await
+            .unwrap();
+        assert!(store.reconcile_filter(&canonical, &tenant).await.is_err());
+        assert!(store.delete_filter(&canonical, &tenant).await.is_err());
+        let canonical_path = RelativePathBuf::from(canonical.get_object_path());
+        let bytes = storage.get_object(&canonical_path, &tenant).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Filter>(&bytes).unwrap(), canonical);
+        // Once the transient alias failure is repaired, both retries are safe.
+        store.put_filter(&legacy, &tenant).await.unwrap();
+        store.reconcile_filter(&canonical, &tenant).await.unwrap();
+        store.reconcile_filter(&canonical, &tenant).await.unwrap();
+        assert_eq!(
+            store.load_tenant_filters(&tenant).await.unwrap(),
+            vec![canonical.clone()]
+        );
+        store.delete_filter(&canonical, &tenant).await.unwrap();
+        assert!(store.load_tenant_filters(&tenant).await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_filter_delete_failure_reconciles_on_restart_before_delete_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(temp.path().to_path_buf()));
+        let store = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        let tenant = None;
+        let legacy = saved_sql("owner", "id", "orders", &tenant);
+        let mut canonical = legacy.clone();
+        canonical.stream_name = "sql".into();
+        store.put_filter(&legacy, &tenant).await.unwrap();
+        store.put_filter(&canonical, &tenant).await.unwrap();
+        let directory = temp.path().join(
+            RelativePathBuf::from(legacy.get_object_path())
+                .parent()
+                .unwrap()
+                .as_str(),
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root or unusual filesystems may not enforce write permissions.
+        if std::fs::write(directory.join("permission-probe"), b"probe").is_ok() {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let cleanup = store.reconcile_filter(&canonical, &tenant).await;
+        let deletion = store.delete_filter(&canonical, &tenant).await;
+        let restart = store.load_tenant_filters(&tenant).await;
+        let canonical_exists = storage
+            .get_object(&RelativePathBuf::from(canonical.get_object_path()), &tenant)
+            .await
+            .is_ok();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(cleanup.is_err());
+        assert!(deletion.is_err());
+        assert!(canonical_exists);
+        assert_eq!(restart.unwrap(), vec![canonical.clone()]);
+        assert_eq!(
+            store.load_tenant_filters(&tenant).await.unwrap(),
+            vec![canonical.clone()]
+        );
+        assert!(
+            storage
+                .get_object(&RelativePathBuf::from(legacy.get_object_path()), &tenant)
+                .await
+                .is_err()
+        );
+        store.delete_filter(&canonical, &tenant).await.unwrap();
+        assert!(store.load_tenant_filters(&tenant).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_filter_legacy_duplicates_are_deterministic_and_not_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(temp.path().to_path_buf()));
+        let store = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        let tenant = None;
+        let a = saved_sql("owner", "id", "a", &tenant);
+        let z = saved_sql("owner", "id", "z", &tenant);
+        store.put_filter(&z, &tenant).await.unwrap();
+        store.put_filter(&a, &tenant).await.unwrap();
+        assert_eq!(
+            store.load_tenant_filters(&tenant).await.unwrap(),
+            vec![a.clone()]
+        );
+        assert!(
+            storage
+                .get_object(&RelativePathBuf::from(z.get_object_path()), &tenant)
+                .await
+                .is_ok()
+        );
+        assert!(
+            storage
+                .get_object(&RelativePathBuf::from(a.get_object_path()), &tenant)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

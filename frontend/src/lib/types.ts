@@ -444,6 +444,7 @@ export interface ParseableClient {
   listLogViews(signal?: AbortSignal): Promise<SavedLogView[]>;
   createLogView(body: SavedLogView): Promise<SavedLogView>;
   updateLogView(id: string, body: SavedLogView): Promise<SavedLogView>;
+  convertLogViewToSql(id: string): Promise<SavedLogView>;
   deleteLogView(id: string): Promise<void>;
   logContext(request: LogContextRequest, signal?: AbortSignal): Promise<LogContextResponse>;
   login(username: string, password: string, returnPath?: string): Promise<void>;

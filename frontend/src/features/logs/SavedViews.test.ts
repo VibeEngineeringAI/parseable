@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { ownsSavedLogView, savedLogViewBody, savedLogViewState } from './SavedViews';
+import {
+  ownsSavedLogView,
+  savedLogViewBody,
+  savedLogViewState,
+  savedLogViewsForDataset,
+} from './SavedViews';
 import { canShowContext, contextField } from './LogContext';
 import type { LogViewState } from './logViewState';
 
@@ -43,6 +48,45 @@ describe('server saved views', () => {
     expect(next.labels).toEqual(['incident']);
     expect(next.time_filter).toBeNull();
     expect(savedLogViewState(next).wrap).toBe(true);
+  });
+  it('opens canonical SQL views using their explorer dataset and preserves conversion on update', () => {
+    const legacy = savedLogViewBody(state, 'Legacy');
+    expect(legacy.stream_name).toBe('app');
+    const canonical = { ...legacy, stream_name: 'sql', filter_id: 'same-id', user_id: 'owner' };
+    expect(savedLogViewState(canonical)).toEqual(state);
+    const updated = savedLogViewBody({ ...state, search: 'new search' }, 'New', canonical);
+    expect(updated).toMatchObject({ stream_name: 'sql', filter_id: 'same-id', user_id: 'owner' });
+    expect(savedLogViewState(updated).search).toBe('new search');
+    expect(savedLogViewBody(state, 'Copy').stream_name).toBe('app');
+  });
+  it('lists native views by their decoded dataset while retaining dataset-scoped classic entries', () => {
+    const legacy = savedLogViewBody(state, 'Legacy');
+    const canonical = { ...legacy, stream_name: 'sql', filter_name: 'Canonical' };
+    const { explorer_state: _state, ...classic } = { ...legacy, filter_name: 'Classic' };
+    const available = savedLogViewsForDataset(
+      [
+        legacy,
+        canonical,
+        classic,
+        {
+          ...canonical,
+          filter_name: 'Other dataset',
+          explorer_state: JSON.stringify({ ...state, dataset: 'other' }),
+        },
+        { ...canonical, filter_name: 'Broken JSON', explorer_state: '{' },
+        { ...canonical, filter_name: 'Invalid state', explorer_state: '{}' },
+        { ...classic, stream_name: 'sql' },
+        { ...classic, stream_name: 'other' },
+      ],
+      'app',
+    );
+    expect(available.map(({ view }) => view.filter_name)).toEqual([
+      'Legacy',
+      'Canonical',
+      'Classic',
+    ]);
+    expect(available.map(({ decoded }) => decoded?.dataset)).toEqual(['app', 'app', undefined]);
+    expect(savedLogViewsForDataset([canonical], 'sql')).toEqual([]);
   });
   it('rejects classic formats and mismatched dataset metadata', () => {
     const { explorer_state: _state, ...classic } = savedLogViewBody(state, 'Classic');

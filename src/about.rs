@@ -129,7 +129,7 @@ fn print_latest_release(latest_release: LatestRelease) {
     let time_since_latest_release = chrono::Utc::now() - latest_release.date;
     let time_since_latest_release = humanize_time(time_since_latest_release);
     let fmt_latest_version = format!(
-        " ( v{} released {} ago. Download new release from https://github.com/parseablehq/parseable/releases/latest )",
+        " ( v{} released {} ago. Download new release from https://github.com/VibeEngineeringAI/parseable/releases/latest )",
         latest_release.version, time_since_latest_release
     );
     eprint!("{}", fmt_latest_version.red());

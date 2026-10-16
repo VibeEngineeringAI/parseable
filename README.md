@@ -37,17 +37,19 @@ Some of the key highlights include:
 
 ## Quickstart
 
-Download and run the Parseable binary on your laptop:
+Download the latest published binary from this fork (`VibeEngineeringAI/parseable`).
+The installer requires a published release containing the asset for your platform;
+it will fail if one is unavailable.
 
 ```bash
-curl -fsSL https://logg.ing/install | bash
+curl -fsSL https://raw.githubusercontent.com/VibeEngineeringAI/parseable/main/scripts/download.sh | sh
 ```
 
 <details> 
 <summary>For Windows</summary>
 
 ```pwsh
-powershell -c "irm https://logg.ing/install-windows | iex"
+powershell -c "irm https://raw.githubusercontent.com/VibeEngineeringAI/parseable/main/scripts/download.ps1 | iex"
 ```
 </details>
 

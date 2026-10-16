@@ -16,7 +16,11 @@ use crate::{
     prism::logstream::get_prism_logstream_info,
     rbac::{Response, Users, map::SessionKey, role::Action},
     tool_catalog::{ToolCallRequest, ToolCallResult, oss_read_tool_specs},
-    utils::{actix::extract_session_key_from_req, get_tenant_id_from_request, time::TimeRange},
+    utils::{
+        actix::extract_session_key_from_req,
+        get_tenant_id_from_request,
+        time::{TimeRange, parse_start_time_expression, parse_time_expression, truncate_to_minute},
+    },
 };
 
 fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -263,6 +267,19 @@ async fn discover_datasets(
     }))
 }
 
+fn schema_tool_result(schema: &arrow_schema::Schema, arguments: &Value) -> Result<Value, String> {
+    match arguments.get("format") {
+        None => serde_json::to_value(schema).map_err(|error| error.to_string()),
+        Some(Value::String(format)) if format == "json" => {
+            serde_json::to_value(schema).map_err(|error| error.to_string())
+        }
+        Some(Value::String(format)) if format == "compact" => {
+            Ok(Value::String(logstream::compact_schema(schema)))
+        }
+        _ => Err("schema format must be `json` or `compact`".to_owned()),
+    }
+}
+
 async fn execute_dataset_metadata_tool(
     name: &str,
     arguments: &Value,
@@ -272,12 +289,10 @@ async fn execute_dataset_metadata_tool(
     match name {
         "get_dataset_schema" => {
             authorize(context.session_key, Action::GetSchema, Some(dataset), None)?;
-            serde_json::to_value(
-                logstream::get_schema_internal(dataset, context.tenant_id)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())
+            let schema = logstream::get_schema_internal(dataset, context.tenant_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            schema_tool_result(&schema, arguments)
         }
         "get_dataset_info" => {
             authorize(
@@ -407,6 +422,208 @@ async fn get_log_context(arguments: &Value, context: OssToolContext<'_>) -> Resu
     .await
     .map_err(|error| error.to_string())?;
     response_value(response).await
+}
+
+// Keep the explicit severity policy aligned with frontend/src/lib/errorAnalytics.ts.
+// Message text and p_log_category are intentionally not evidence of an error.
+const ERROR_SEVERITY_TEXT: &str = "'ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR', 'FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL', 'CRIT', 'ALERT', 'EMERG', 'EMERGENCY', 'PANIC', 'SEVERE'";
+const LOG_SEVERITY_FIELDS: &[&str] = &[
+    "level",
+    "log_level",
+    "severity",
+    "severity_text",
+    "severity_description",
+];
+
+fn coalesced_log_text(fields: &[String], candidates: &[&str], fallback: &str) -> String {
+    let mut expressions = candidates
+        .iter()
+        .filter(|candidate| fields.iter().any(|field| field == **candidate))
+        .map(|field| format!("NULLIF(CAST({} AS VARCHAR), '')", quote_identifier(field)))
+        .collect::<Vec<_>>();
+    if expressions.is_empty() {
+        return fallback.to_owned();
+    }
+    expressions.push(fallback.to_owned());
+    format!("COALESCE({})", expressions.join(", "))
+}
+
+fn log_text_severity_predicate(field: &str) -> String {
+    let text = format!(
+        "UPPER(TRIM(CAST({} AS VARCHAR))) IN ({ERROR_SEVERITY_TEXT})",
+        quote_identifier(field),
+    );
+    if field == "level" {
+        // Pino/Bunyan codes only apply to `level`, not OTel severity_number.
+        format!("({text} OR TRY_CAST(\"level\" AS DOUBLE) IN (50, 60))")
+    } else {
+        text
+    }
+}
+
+pub fn list_log_errors_query(
+    dataset: &str,
+    fields: &[String],
+    limit: u64,
+    time_column: &str,
+    range: &TimeRange,
+) -> Result<String, String> {
+    let service = coalesced_log_text(
+        fields,
+        &["service.name", "service", "service_name"],
+        "'unknown'",
+    );
+    let severity_fields = LOG_SEVERITY_FIELDS
+        .iter()
+        .filter(|field| fields.iter().any(|candidate| candidate == **field))
+        .copied()
+        .collect::<Vec<_>>();
+    // Label the row with an error severity, not an unrelated non-error alias
+    // (for example level=info alongside severity_text=ERROR).
+    let severity = if severity_fields.is_empty() {
+        "'error'".to_owned()
+    } else {
+        format!(
+            "CASE {} ELSE 'error' END",
+            severity_fields
+                .iter()
+                .map(|field| format!(
+                    "WHEN {} THEN UPPER(TRIM(CAST({} AS VARCHAR)))",
+                    log_text_severity_predicate(field),
+                    quote_identifier(field)
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let error_type = coalesced_log_text(
+        fields,
+        &[
+            "event_exception.type",
+            "exception.type",
+            "error.type",
+            "error.kind",
+            "exception_type",
+            "error_type",
+        ],
+        &severity,
+    );
+    let message = coalesced_log_text(
+        fields,
+        &[
+            "event_exception.message",
+            "exception.message",
+            "message",
+            "msg",
+            "body",
+            "log",
+            "error.message",
+        ],
+        "CAST(NULL AS VARCHAR)",
+    );
+    let sample_message = format!("MAX({message})");
+    let time_column = quote_identifier(time_column);
+    let last_seen = format!("MAX({time_column})");
+    let mut predicates = severity_fields
+        .iter()
+        .map(|field| log_text_severity_predicate(field))
+        .collect::<Vec<_>>();
+    if fields.iter().any(|field| field == "severity_number") {
+        // DOUBLE keeps fractional and out-of-range numbers from being truncated
+        // into a valid code. Invalid text becomes NULL rather than failing a query.
+        predicates.push(
+            "TRY_CAST(\"severity_number\" AS DOUBLE) IN (17, 18, 19, 20, 21, 22, 23, 24)"
+                .to_owned(),
+        );
+    }
+    if predicates.is_empty() {
+        return Err("log dataset has no supported explicit severity field (level, log_level, severity, severity_text, severity_description, severity_number)".to_owned());
+    }
+    Ok(format!(
+        "SELECT {service} AS \"serviceName\", {error_type} AS \"errorType\", {sample_message} AS \"sampleMessage\", COUNT(*) AS \"occurrences\", {last_seen} AS \"lastSeen\" FROM {} WHERE ({}) AND {time_column} >= TIMESTAMP {} AND {time_column} < TIMESTAMP {} GROUP BY {service}, {error_type} ORDER BY \"occurrences\" DESC LIMIT {}",
+        quote_identifier(dataset),
+        predicates.join(" OR "),
+        quote_literal(&range.start.to_rfc3339()),
+        quote_literal(&range.end.to_rfc3339()),
+        limit.clamp(1, 500),
+    ))
+}
+
+fn log_error_query_request(
+    dataset: &str,
+    fields: &[String],
+    time_column: &str,
+    limit: u64,
+    arguments: &Value,
+    now: DateTime<Utc>,
+) -> Result<query::Query, String> {
+    let start = parse_start_time_expression(required_string(arguments, "startTime")?, now)
+        .map_err(|error| format!("invalid log error start time: {error}"))?;
+    let end = parse_time_expression(required_string(arguments, "endTime")?, now)
+        .map_err(|error| format!("invalid log error end time: {error}"))?;
+    if start >= end {
+        return Err("log error start time must be before end time".to_owned());
+    }
+    let range = TimeRange { start, end };
+    // The generic query API rounds transport bounds to minutes. Expand its
+    // envelope, while keeping exact half-open bounds in the SQL predicates.
+    let transport_end = truncate_to_minute(end)
+        .checked_add_signed(Duration::minutes(1))
+        .ok_or_else(|| "log error end time is outside the supported range".to_owned())?;
+    Ok(query::Query {
+        query: bounded_select(&list_log_errors_query(
+            dataset,
+            fields,
+            limit,
+            time_column,
+            &range,
+        )?)?,
+        start_time: truncate_to_minute(start).to_rfc3339(),
+        end_time: transport_end.to_rfc3339(),
+        send_null: true,
+        fields: false,
+        streaming: false,
+        filter_tags: None,
+    })
+}
+
+async fn list_log_errors(arguments: &Value, context: OssToolContext<'_>) -> Result<Value, String> {
+    let dataset = required_string(arguments, "dataset")?;
+    authorize(context.session_key, Action::Query, Some(dataset), None)?;
+    let info = serde_json::to_value(
+        get_prism_logstream_info(dataset, context.tenant_id)
+            .await
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if nested_string(&info, "telemetryType").is_none_or(|value| value != "logs") {
+        return Err(format!(
+            "tool requires a logs dataset, but `{dataset}` is not logs telemetry"
+        ));
+    }
+    let schema = logstream::get_schema_internal(dataset, context.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().to_owned())
+        .collect::<Vec<_>>();
+    let limit = bounded_integer(arguments, "limit", 50, 1, 500);
+    let time_column = nested_string(&info, "timePartition").unwrap_or("p_timestamp");
+    let request =
+        log_error_query_request(dataset, &fields, time_column, limit, arguments, Utc::now())?;
+    let response = query::query_internal(request, context.session_key, context.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let records = response_value(response).await?;
+    let total = records.as_array().map_or(0, Vec::len);
+    Ok(json!({
+        "total": total,
+        "offset": 0,
+        "limit": limit,
+        "records": records,
+    }))
 }
 
 async fn execute_sql_tool(
@@ -563,7 +780,8 @@ async fn execute_trace_tool(
     let datasets = [required_string(arguments, "dataset")?.to_owned()];
     let start_time = required_string(arguments, "startTime")?.to_owned();
     let end_time = required_string(arguments, "endTime")?.to_owned();
-    let limit = bounded_integer(arguments, "limit", 100, 1, 500) as usize;
+    let default_limit = if name == "list_trace_errors" { 50 } else { 100 };
+    let limit = bounded_integer(arguments, "limit", default_limit, 1, 500) as usize;
     let mut results = Vec::new();
     let mut errors = Vec::new();
     for dataset in datasets {
@@ -596,7 +814,8 @@ async fn execute_trace_tool(
                     end_time: end_time.clone(),
                     sort_by: None,
                     conditions: None,
-                    options: None,
+                    options: (name == "list_trace_errors")
+                        .then_some(crate::handlers::http::traces::TraceListOption::ErrorSpans),
                     limit: Some(limit),
                     offset: Some(0),
                 },
@@ -818,13 +1037,16 @@ async fn execute_oss_tool_inner(
         }
         "sample_events" => sample_events(arguments, context).await,
         "get_log_context" => get_log_context(arguments, context).await,
+        "list_log_errors" => list_log_errors(arguments, context).await,
         "query_sql" | "explain_query" => execute_sql_tool(name, arguments, context).await,
         "list_alerts" | "get_alert" | "list_alert_tags" | "enable_alert" | "disable_alert"
         | "evaluate_alert" | "create_alert" => execute_alert_tool(name, arguments, context).await,
         "list_alert_targets" | "get_alert_target" | "create_alert_target" => {
             execute_alert_target_tool(name, arguments, context).await
         }
-        "get_traces" | "get_trace" => execute_trace_tool(name, arguments, context).await,
+        "get_traces" | "get_trace" | "list_trace_errors" => {
+            execute_trace_tool(name, arguments, context).await
+        }
         "ping"
         | "get_cluster_status"
         | "get_cluster_metrics"
@@ -894,7 +1116,309 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use serde_json::{Value, json};
 
-    use super::{call_tool_registry, normalized_log_context_bounds};
+    use super::{
+        call_tool_registry, list_log_errors_query, log_error_query_request,
+        normalized_log_context_bounds,
+    };
+
+    fn log_error_test_range() -> crate::utils::time::TimeRange {
+        crate::utils::time::TimeRange {
+            start: "2026-10-16T00:00:00Z".parse().unwrap(),
+            end: "2026-10-17T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    async fn run_log_error_fixture(fixture_sql: &str) -> Vec<Value> {
+        let context = datafusion::prelude::SessionContext::new();
+        let batches = context
+            .sql(&format!(
+                "SELECT *, TIMESTAMP '2026-10-16T12:00:00Z' AS p_timestamp FROM ({fixture_sql})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let fields = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        context.register_batch("logs", batches[0].clone()).unwrap();
+        let query =
+            list_log_errors_query("logs", &fields, 500, "p_timestamp", &log_error_test_range())
+                .unwrap();
+        let results = context.sql(&query).await.unwrap().collect().await.unwrap();
+        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+        writer
+            .write_batches(&results.iter().collect::<Vec<_>>())
+            .unwrap();
+        writer.finish().unwrap();
+        serde_json::from_slice(&writer.into_inner()).unwrap()
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_preserves_subminute_ranges() {
+        for time_column in ["p_timestamp", "event.time"] {
+            for (start, end) in [
+                ("2026-10-16T12:00:30Z", "2026-10-16T12:01:30Z"),
+                ("2026-10-16T12:00:10Z", "2026-10-16T12:00:50Z"),
+                ("2026-10-16T12:00:10.100Z", "2026-10-16T12:00:10.900Z"),
+            ] {
+                let start_at: DateTime<Utc> = start.parse().unwrap();
+                let end_at: DateTime<Utc> = end.parse().unwrap();
+                let inside = start_at + (end_at - start_at) / 2;
+                let late = end_at - Duration::milliseconds(1);
+                let context = datafusion::prelude::SessionContext::new();
+                let fixture = context
+                .sql(&format!(
+                    "SELECT CAST(at AS TIMESTAMP) AS \"{time_column}\", 'ERROR' AS level, kind AS error_type{}
+                     FROM (VALUES ('2026-10-16T12:00:00Z', 'before'),
+                                  ('{start}', 'at-start'),
+                                  ('{}', 'inside'),
+                                  ('{}', 'late-inside'),
+                                  ('{end}', 'at-end')) AS f(at, kind)",
+                    if time_column != "p_timestamp" {
+                        ", TIMESTAMP '2000-01-01T00:00:00Z' AS p_timestamp"
+                    } else { "" },
+                    inside.to_rfc3339(), late.to_rfc3339(),
+                ))
+                .await
+                .unwrap();
+                let fields = vec![
+                    time_column.into(),
+                    "p_timestamp".into(),
+                    "level".into(),
+                    "error_type".into(),
+                ];
+                let request = log_error_query_request(
+                    "logs",
+                    &fields,
+                    time_column,
+                    500,
+                    &json!({"startTime": start, "endTime": end}),
+                    start_at,
+                )
+                .unwrap();
+                // Match the generic query API's minute-aligned transport filtering.
+                let envelope = crate::utils::time::TimeRange::parse_human_time(
+                    &request.start_time,
+                    &request.end_time,
+                )
+                .unwrap();
+                assert!(envelope.start <= start_at && envelope.end >= end_at);
+                context
+                    .register_table("raw_logs", fixture.into_view())
+                    .unwrap();
+                let fixture = context.sql(&format!(
+                "SELECT * FROM raw_logs WHERE \"{time_column}\" >= TIMESTAMP '{}' AND \"{time_column}\" < TIMESTAMP '{}'",
+                envelope.start.to_rfc3339(), envelope.end.to_rfc3339(),
+            )).await.unwrap();
+                context.register_table("logs", fixture.into_view()).unwrap();
+                let result = context
+                    .sql(&request.query)
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+                writer
+                    .write_batches(&result.iter().collect::<Vec<_>>())
+                    .unwrap();
+                writer.finish().unwrap();
+                let rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).unwrap();
+                let mut types = rows
+                    .iter()
+                    .map(|row| row["errorType"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                types.sort_unstable();
+                assert_eq!(
+                    types,
+                    ["at-start", "inside", "late-inside"],
+                    "{time_column}: {start}..{end}"
+                );
+                let latest = rows
+                    .iter()
+                    .find(|row| row["errorType"] == "late-inside")
+                    .unwrap();
+                assert_eq!(
+                    chrono::NaiveDateTime::parse_from_str(
+                        latest["lastSeen"].as_str().unwrap(),
+                        "%Y-%m-%dT%H:%M:%S%.f",
+                    )
+                    .unwrap()
+                    .and_utc(),
+                    late
+                );
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_validates_exact_ranges_and_resolves_relative_bounds_once() {
+        let now = "2026-10-16T12:00:30.123456Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let fields = vec!["p_timestamp".into(), "level".into()];
+        let request = log_error_query_request(
+            "logs",
+            &fields,
+            "p_timestamp",
+            50,
+            &json!({"startTime": "now-15s", "endTime": "now"}),
+            now,
+        )
+        .unwrap();
+        assert!(request.query.contains("2026-10-16T12:00:15.123456+00:00"));
+        assert!(request.query.contains("2026-10-16T12:00:30.123456+00:00"));
+        assert_eq!(request.start_time, "2026-10-16T12:00:00+00:00");
+        assert_eq!(request.end_time, "2026-10-16T12:01:00+00:00");
+        for (start, end) in [
+            ("2026-10-16T12:00:30Z", "2026-10-16T12:00:30Z"),
+            ("2026-10-16T12:00:30Z", "2026-10-16T12:00:15Z"),
+            ("invalid", "now"),
+            ("now-15s", "invalid"),
+        ] {
+            assert!(
+                log_error_query_request(
+                    "logs",
+                    &fields,
+                    "p_timestamp",
+                    50,
+                    &json!({"startTime": start, "endTime": end}),
+                    now
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_uses_explicit_text_severity_not_message_substrings() {
+        for field in [
+            "level",
+            "log_level",
+            "severity",
+            "severity_text",
+            "severity_description",
+        ] {
+            let rows = run_log_error_fixture(&format!(
+                "SELECT severity AS \"{field}\", message FROM (VALUES
+                 ('info', '0 errors found'), (' error ', 'connection refused'),
+                 ('fatal4', 'shutdown'), ('ERROR2', 'retry exhausted'),
+                 ('warn', 'exception handled'), (NULL, 'panic not reproduced')) AS f(severity, message)"
+            )).await;
+            let mut messages = rows
+                .iter()
+                .map(|row| row["sampleMessage"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            messages.sort_unstable();
+            assert_eq!(
+                messages,
+                ["connection refused", "retry exhausted", "shutdown"],
+                "{field}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_rejects_invalid_and_fractional_numeric_severities() {
+        let rows = run_log_error_fixture(
+            "SELECT severity_number, message FROM (VALUES
+             ('17', 'error'), ('24', 'fatal'), ('25', 'out of range'),
+             ('24.9', 'fractional'), ('garbage', 'invalid'), ('-1', 'negative'),
+             ('50', 'not an otel code'), (NULL, 'unknown')) AS f(severity_number, message)",
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["occurrences"], 2);
+        let rows = run_log_error_fixture(
+            "SELECT level, message FROM (VALUES ('50', 'error'), ('60', 'fatal'),
+             ('50.9', 'fractional'), ('17', 'otel only'), ('bad', 'bad')) AS f(level, message)",
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["occurrences"] == 1));
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_checks_all_severity_columns_and_coalesces_row_aliases() {
+        let rows = run_log_error_fixture(
+            r#"SELECT level, severity_text, service_primary AS "service.name", service_name,
+                exception_primary AS "exception.type", error_type AS "error.type", message, body
+               FROM (VALUES ('info', 'ERROR', NULL, 'checkout', NULL, 'Timeout', NULL, 'refused'),
+                            ('error', NULL, '', 'checkout', '', 'Timeout', '', 'refused'))
+               AS f(level, severity_text, service_primary, service_name, exception_primary, error_type, message, body)"#
+        ).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["serviceName"], "checkout");
+        assert_eq!(rows[0]["errorType"], "Timeout");
+        assert_eq!(rows[0]["sampleMessage"], "refused");
+        assert_eq!(rows[0]["occurrences"], 2);
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_labels_the_severity_that_actually_matched() {
+        let rows = run_log_error_fixture(
+            "SELECT 'info' AS level, ' error ' AS severity_text, 'refused' AS message",
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["errorType"], "ERROR");
+        assert_eq!(rows[0]["occurrences"], 1);
+    }
+
+    #[actix_web::test]
+    async fn log_error_query_requires_explicit_severity_and_escapes_identifiers() {
+        for fields in [
+            vec!["message"],
+            vec!["body", "exception.type", "p_log_category"],
+        ] {
+            let fields = fields.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                list_log_errors_query("logs", &fields, 5, "p_timestamp", &log_error_test_range())
+                    .unwrap_err()
+                    .contains("explicit severity")
+            );
+        }
+        let query = list_log_errors_query(
+            "app\"logs",
+            &["level".to_owned()],
+            999,
+            "p_timestamp",
+            &log_error_test_range(),
+        )
+        .unwrap();
+        assert!(query.contains("FROM \"app\"\"logs\""));
+        assert!(query.ends_with("LIMIT 500"));
+    }
+
+    #[actix_web::test]
+    async fn schema_tool_preserves_json_default_and_offers_compact_format() {
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "message",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]);
+        let expected = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            super::schema_tool_result(&schema, &json!({})).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::schema_tool_result(&schema, &json!({"format": "json"})).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::schema_tool_result(&schema, &json!({"format": "compact"})).unwrap(),
+            json!("name\ttype\nmessage\tUtf8\n")
+        );
+        for format in [json!("xml"), json!(null), json!(1)] {
+            assert!(super::schema_tool_result(&schema, &json!({"format": format})).is_err());
+        }
+    }
 
     #[actix_web::test]
     async fn log_context_bounds_normalize_relative_times() {
