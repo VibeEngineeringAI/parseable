@@ -75,7 +75,8 @@ async function addBuilder(page: Page) {
   await page.getByRole('button', { name: 'Add tile', exact: true }).click();
   const editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
   await editor.getByLabel('Tile title', { exact: true }).fill('Bucket counts');
-  await editor.getByLabel('Dataset', { exact: true }).selectOption('app-logs');
+  await editor.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await editor.getByRole('option', { name: 'app-logs', exact: true }).click();
   await editor.getByLabel('Query language', { exact: true }).selectOption('builder');
   return editor;
 }

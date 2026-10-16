@@ -199,7 +199,8 @@ test('visual builder generates executable filtered SQL and survives save/reload'
   await page.getByRole('button', { name: 'Add tile', exact: true }).click();
   const editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
   await editor.getByLabel('Tile title').fill('Requests');
-  await editor.getByLabel('Dataset', { exact: true }).selectOption('app-logs');
+  await editor.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await editor.getByRole('option', { name: 'app-logs', exact: true }).click();
   await editor.getByLabel('Query language').selectOption('builder');
   await editor.getByLabel('Chart type').selectOption('table');
   await expect(editor.getByLabel('Dimension 1')).toBeVisible();

@@ -93,6 +93,7 @@ export function DashboardDialogs({
             variables={url.variables}
             names={variableNames(draft)}
             datasets={(datasets.data ?? []).map((dataset) => dataset.name)}
+            datasetsStatus={datasets}
             promqlEnabled={promqlEnabled}
             onDirty={workspace.setEditorDirty}
             onClose={closeEditor}

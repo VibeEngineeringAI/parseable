@@ -22,7 +22,8 @@ async function addSql(page: Page, title: string, dataset = 'application_logs') {
   await page.getByRole('button', { name: 'Add tile', exact: true }).click();
   const editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
   await editor.getByLabel('Tile title').fill(title);
-  await editor.getByLabel('Dataset', { exact: true }).selectOption(dataset);
+  await editor.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await editor.getByRole('option', { name: dataset, exact: true }).click();
   await editor
     .getByRole('textbox', { name: 'SQL query', exact: true })
     .fill(`SELECT COUNT(*) AS events FROM "${dataset}"`);
@@ -338,7 +339,8 @@ test('demo PromQL tile add/edit/delete and variable selection', async ({ page })
   const editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
   await editor.getByLabel('Tile title').fill('Metric stat');
   await editor.getByLabel('Query language').selectOption('promql');
-  await editor.getByLabel('Dataset', { exact: true }).selectOption('$metrics_dataset');
+  await editor.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await editor.getByRole('option', { name: '$metrics_dataset', exact: true }).click();
   await editor
     .getByRole('textbox', { name: 'PromQL query A', exact: true })
     .fill('{__name__="system.cpu.load_average.1m",host=~"$host"}');
@@ -510,11 +512,8 @@ test('PromQL capability off prevents authoring and querying without hiding store
   await expect(page.getByLabel('Host', { exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Add tile', exact: true }).click();
   await expect(page.getByLabel('Query language').locator('option[value="promql"]')).toBeDisabled();
-  await expect(
-    page
-      .getByLabel('Dataset', { exact: true })
-      .getByRole('option', { name: 'app-logs', exact: true }),
-  ).toHaveCount(1);
+  await page.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await expect(page.getByRole('option', { name: 'app-logs', exact: true })).toBeVisible();
   await page.waitForLoadState('networkidle');
   expect(server.calls.filter((call) => call.path.startsWith('/prometheus'))).toHaveLength(0);
 });
@@ -1958,10 +1957,10 @@ test('list, text and dataset variables can be authored; View query and Explore d
     await editor.getByLabel('Variable label').fill(`${type} variable`);
     await editor.getByLabel('Variable type').selectOption(type);
     if (type === 'list') await editor.getByLabel('Values (comma separated)').fill('one, two');
-    else
-      await editor
-        .getByLabel(type === 'dataset' ? 'Default dataset' : 'Default value')
-        .fill(type === 'dataset' ? 'app-logs' : 'note');
+    else if (type === 'dataset') {
+      await editor.getByRole('combobox', { name: 'Default dataset' }).fill('app-lgos');
+      await editor.getByRole('option', { name: 'app-logs', exact: true }).click();
+    } else await editor.getByLabel('Default value').fill('note');
     await editor.locator('[data-dialog-confirm]').click();
     if (type === 'text')
       await expect(page.getByLabel('text variable', { exact: true })).toHaveValue('note');
@@ -2227,7 +2226,8 @@ test('dashboard default dataset survives reload, seeds new tiles and can be chan
   await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
   const form = page.getByRole('dialog', { name: 'Create dashboard', exact: true });
   await form.getByLabel('Dashboard title').fill('Dataset scoped dashboard');
-  await form.getByLabel('Default dataset').selectOption('app-logs');
+  await form.getByRole('combobox', { name: 'Default dataset', exact: true }).click();
+  await form.getByRole('option', { name: 'app-logs', exact: true }).click();
   await form.locator('[data-dialog-confirm]').click();
   await expect(
     page.getByRole('heading', { name: 'Dataset scoped dashboard', exact: true }),
@@ -2252,7 +2252,8 @@ test('dashboard default dataset survives reload, seeds new tiles and can be chan
   await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
   const metadata = page.getByRole('dialog', { name: 'Rename and tags', exact: true });
   await expect(metadata.getByLabel('Default dataset')).toHaveValue('app-logs');
-  await metadata.getByLabel('Default dataset').selectOption('otel-metrics');
+  await metadata.getByRole('combobox', { name: 'Default dataset', exact: true }).click();
+  await metadata.getByRole('option', { name: 'otel-metrics', exact: true }).click();
   await metadata.getByRole('button', { name: 'Apply', exact: true }).click();
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
@@ -2277,14 +2278,15 @@ test('dashboard default dataset survives reload, seeds new tiles and can be chan
     .getByRole('button', { name: 'Actions for Dataset scoped dashboard', exact: true })
     .click();
   await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
-  await metadata.getByLabel('Default dataset').selectOption('');
+  await metadata.getByRole('combobox', { name: 'Default dataset', exact: true }).click();
+  await metadata.getByRole('option', { name: 'No default dataset', exact: true }).click();
   await metadata.getByRole('button', { name: 'Update dashboard', exact: true }).click();
   await expect(metadata).not.toBeVisible();
   expect(server.writes.at(-1)?.dataset).toBeNull();
   expect(server.writes.at(-1)?.tiles).toEqual(originalTiles);
   await page.getByRole('link', { name: 'Dataset scoped dashboard', exact: true }).click();
   await page.getByRole('button', { name: 'Add tile', exact: true }).click();
-  await expect(editor.getByLabel('Dataset', { exact: true })).toHaveValue('');
+  await expect(editor.getByLabel('Dataset', { exact: true })).toHaveValue('No dataset');
 });
 
 test('editing metadata retains a saved dashboard dataset unavailable to discovery', async ({
@@ -2304,4 +2306,189 @@ test('editing metadata retains a saved dashboard dataset unavailable to discover
   await expect(page.getByRole('link', { name: 'Archived health', exact: true })).toBeVisible();
   expect(server.writes.at(-1)?.dataset).toBe('archived-logs');
   expect(server.writes.at(-1)?.tiles).toEqual(classic.tiles);
+});
+
+test('dataset search is transient until a fuzzy match is selected and saved', async ({ page }) => {
+  const server = await mockServer(page, {
+    document: { ...structuredClone(classic), dataset: 'app-logs' } as Dashboard,
+  });
+  await page.goto(detail);
+  await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
+  const form = page.getByRole('dialog', { name: 'Rename and tags', exact: true });
+  const picker = form.getByRole('combobox', { name: 'Default dataset', exact: true });
+  await picker.click();
+  await expect(form.getByRole('option', { name: 'app-logs', exact: true })).toBeVisible();
+  await expect(form.getByRole('option', { name: 'otel-metrics', exact: true })).toBeVisible();
+  await picker.fill('nothing-matches-this-dataset');
+  await expect(form.getByText('No matching datasets', { exact: true })).toBeVisible();
+  await picker.press('Escape');
+  await expect(form).toBeVisible();
+  await expect(picker).toHaveValue('app-logs');
+  let discardPrompts = 0;
+  page.on('dialog', async (dialog) => {
+    discardPrompts++;
+    await dialog.dismiss();
+  });
+  await form.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(form).not.toBeVisible();
+  expect(discardPrompts).toBe(0);
+  expect(server.writes).toHaveLength(0);
+
+  await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
+  await picker.fill('otel-mterics');
+  await expect(form.getByRole('option', { name: 'otel-metrics', exact: true })).toBeVisible();
+  await picker.press('ArrowDown');
+  await picker.press('Enter');
+  await expect(picker).toHaveValue('otel-metrics');
+  await expect(form).toBeVisible();
+  await form.getByRole('button', { name: 'Apply', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  expect(server.writes.at(-1)?.dataset).toBe('otel-metrics');
+  expect(server.writes.at(-1)?.tiles).toEqual(classic.tiles);
+  await page.reload();
+  await expect(
+    page.getByText('Classic report · Dataset: otel-metrics', { exact: true }),
+  ).toBeVisible();
+});
+
+test('default dataset discovery exposes loading, failure, retry and an empty list', async ({
+  page,
+}) => {
+  await mockServer(page);
+  await page.goto('/dashboards');
+  await expect(page.getByRole('heading', { name: 'Dashboards', exact: true })).toBeVisible();
+  let release: () => void = () => {};
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let attempts = 0;
+  let failDiscovery = true;
+  await page.route('**/api/v1/logstream', async (route) => {
+    attempts++;
+    if (failDiscovery) {
+      await waiting;
+      return route.fulfill({ status: 503, body: 'Dataset discovery unavailable' });
+    }
+    return route.fulfill({ json: [] });
+  });
+  await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
+  const form = page.getByRole('dialog', { name: 'Create dashboard', exact: true });
+  const picker = form.getByRole('combobox', { name: 'Default dataset', exact: true });
+  await picker.click();
+  await expect(picker).toHaveAttribute('aria-busy', 'true');
+  await expect(form.getByRole('status')).toContainText('Loading datasets');
+  release();
+  await expect(form.getByText(/Could not load datasets/)).toBeVisible();
+  failDiscovery = false;
+  const beforeRetry = attempts;
+  await form.getByRole('button', { name: 'Retry loading datasets' }).click();
+  await expect(form.getByRole('option', { name: 'No default dataset', exact: true })).toBeVisible();
+  await expect(form.getByText(/Could not load datasets/)).toHaveCount(0);
+  await expect(form.getByRole('option')).toHaveCount(1);
+  await picker.fill('app');
+  await expect(form.getByText('No matching datasets', { exact: true })).toBeVisible();
+  expect(attempts).toBe(beforeRetry + 1);
+});
+
+test('dataset variable defaults retain unavailable values and retry discovery without exposing variable references', async ({
+  page,
+}) => {
+  const options = {
+    document: {
+      ...structuredClone(classic),
+      variables: [
+        { name: 'source', label: 'Source', type: 'dataset', defaultValue: 'archived-logs' },
+        { name: 'other_source', label: 'Other source', type: 'dataset', defaultValue: 'app-logs' },
+      ],
+    } as Dashboard,
+    denied: '/api/v1/logstream' as string | undefined,
+  };
+  const server = await mockServer(page, options);
+  await page.goto(detail);
+  await page.getByRole('button', { name: 'Actions for variable Source', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Edit variable', exact: true }).click();
+  const form = page.getByRole('dialog', { name: 'Edit variable', exact: true });
+  const picker = form.getByRole('combobox', { name: 'Default dataset', exact: true });
+  await expect(picker).toHaveValue(/archived-logs/);
+  await picker.click();
+  await expect(form.getByText(/Could not load datasets/)).toBeVisible();
+  options.denied = undefined;
+  await form.getByRole('button', { name: 'Retry loading datasets' }).click();
+  await expect(form.getByRole('option', { name: 'app-logs', exact: true })).toBeVisible();
+  await expect(form.getByRole('option', { name: /archived-logs/ })).toBeVisible();
+  await expect(form.getByRole('option', { name: /\$other_source/ })).toHaveCount(0);
+  await picker.press('Escape');
+  await form.getByLabel('Variable label').fill('Archived source');
+  await form.getByRole('button', { name: 'Apply variable', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  expect(server.writes.at(-1)?.variables).toEqual([
+    { name: 'source', label: 'Archived source', type: 'dataset', defaultValue: 'archived-logs' },
+    { name: 'other_source', label: 'Other source', type: 'dataset', defaultValue: 'app-logs' },
+  ]);
+});
+
+test('tile dataset search keeps schema and draft unchanged and PromQL choices restricted', async ({
+  page,
+}) => {
+  const server = await mockServer(page, {
+    document: { ...structuredClone(classic), dataset: 'app-logs' } as Dashboard,
+  });
+  await page.goto(detail);
+  await page.getByRole('button', { name: 'Add tile', exact: true }).click();
+  const form = page.getByRole('dialog', { name: 'Add tile', exact: true });
+  const picker = form.getByRole('combobox', { name: 'Dataset', exact: true });
+  await expect(picker).toHaveValue('app-logs');
+  await page.waitForLoadState('networkidle');
+  const schemaCalls = server.calls.filter((call) => call.path.endsWith('/schema')).length;
+  await picker.fill('otel');
+  await expect(form.getByRole('option', { name: 'otel-metrics', exact: true })).toBeVisible();
+  await picker.press('Escape');
+  await expect(picker).toHaveValue('app-logs');
+  expect(server.calls.filter((call) => call.path.endsWith('/schema'))).toHaveLength(schemaCalls);
+  await form.getByLabel('Query language').selectOption('promql');
+  await picker.click();
+  await expect(form.getByRole('option', { name: 'otel-metrics', exact: true })).toBeVisible();
+  await expect(form.getByRole('option', { name: 'app-logs', exact: true })).toHaveCount(0);
+  await expect(form.getByRole('option', { name: '$metrics_dataset', exact: true })).toBeVisible();
+  await picker.fill('mtrcs_dtst');
+  await form.getByRole('option', { name: '$metrics_dataset', exact: true }).click();
+  await expect(picker).toHaveValue('$metrics_dataset');
+});
+
+test('reselecting the current dataset does not dirty an editor or drop SQL dataset bindings', async ({
+  page,
+}) => {
+  const bindings = ['app-logs', 'otel-metrics'];
+  const server = await mockServer(page, {
+    document: {
+      ...structuredClone(classic),
+      tiles: [{ ...structuredClone(classic.tiles[1]), dbName: bindings }],
+    } as Dashboard,
+  });
+  await page.goto(detail);
+  await tileAction(page, 'Errors', 'Edit');
+  const form = page.getByRole('dialog', { name: 'Edit tile', exact: true });
+  const picker = form.getByRole('combobox', { name: 'Dataset', exact: true });
+  await picker.click();
+  await form.getByRole('option', { name: 'app-logs', exact: true }).click();
+  let discardPrompts = 0;
+  page.on('dialog', async (dialog) => {
+    discardPrompts++;
+    await dialog.dismiss();
+  });
+  await form.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(form).not.toBeVisible();
+  expect(discardPrompts).toBe(0);
+  await tileAction(page, 'Errors', 'Edit');
+  await picker.click();
+  await form.getByRole('option', { name: 'app-logs', exact: true }).click();
+  await form.getByLabel('Tile title').fill('Renamed errors');
+  await form.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  expect(server.writes.at(-1)?.tiles?.[0].dbName).toEqual(bindings);
 });

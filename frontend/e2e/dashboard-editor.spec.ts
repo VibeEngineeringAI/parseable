@@ -73,7 +73,8 @@ async function openEditor(page: Page, title: string, chart: string, sql: string)
   await page.getByRole('button', { name: 'Add tile', exact: true }).click();
   const editor = page.getByRole('dialog', { name: 'Add tile', exact: true });
   await editor.getByLabel('Tile title').fill(title);
-  await editor.getByLabel('Dataset', { exact: true }).selectOption('app-logs');
+  await editor.getByRole('combobox', { name: 'Dataset', exact: true }).click();
+  await editor.getByRole('option', { name: 'app-logs', exact: true }).click();
   await editor.getByRole('textbox', { name: 'SQL query', exact: true }).fill(sql);
   await editor.getByLabel('Chart type').selectOption({ label: chart });
   return editor;

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useState } from 'react';
-import { Button, Dialog, Input, Select } from '../../components/ui';
+import { Button, Dialog, Input, SearchableSelect, Select } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import type { QueryLimiter } from '../../lib/concurrency';
@@ -29,6 +29,7 @@ import { builderIssue } from './builder';
 import { setQueryLanguage } from './tileEditing';
 import { dashboardSections } from './sections';
 import { resolveDataset, type VariableValues } from './variables';
+import { datasetOptions } from './pickerOptions';
 
 export function TileEditor({
   original,
@@ -264,33 +265,36 @@ export function TileEditor({
           </option>
         </Select>
         {promqlEnabled === undefined && <p className="muted">Loading server capabilities…</p>}
-        <QueryState
-          loading={isPromql ? metrics.loading : datasets.loading}
-          error={isPromql ? metrics.error : datasets.error}
-          retry={isPromql ? metrics.reload : datasets.reload}
-        />
-        <Select
+        <SearchableSelect
           label="Dataset"
           value={dataset}
-          onChange={(event) =>
-            change({ dbName: isPromql ? event.target.value : [event.target.value] })
-          }
-        >
-          <option value="">Select a dataset</option>
-          {[
-            ...new Set([
+          onValueChange={(value) => change({ dbName: isPromql ? value : [value] })}
+          options={datasetOptions({
+            choices: [
               ...(isPromql ? (metrics.data?.datasets ?? []) : (datasets.data ?? [])).map(
                 (item) => item.name,
               ),
               ...variables
                 .filter((variable) => variable.type === 'dataset')
                 .map((variable) => `$${variable.name}`),
-              ...(dataset ? [dataset] : []),
-            ]),
-          ].map((name) => (
-            <option key={name}>{name}</option>
-          ))}
-        </Select>
+            ],
+            selected: dataset,
+            emptyLabel: 'No dataset',
+            // Unchecked metrics datasets may still hold metrics, so they are not marked.
+            loaded: isPromql
+              ? !!promqlEnabled && !!metrics.data && !metrics.data.unchecked.includes(dataset)
+              : !!datasets.data,
+          })}
+          loading={isPromql ? metrics.loading : datasets.loading}
+          onRetry={isPromql ? metrics.reload : datasets.reload}
+          error={
+            (isPromql ? metrics.error : datasets.error)
+              ? isPromql
+                ? 'Could not discover metrics datasets.'
+                : 'Could not load datasets.'
+              : undefined
+          }
+        />
         <Select
           label="Section"
           value={text(draft.sectionId)}
