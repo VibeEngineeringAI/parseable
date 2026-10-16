@@ -10,6 +10,14 @@ const item: SavedQuery = {
   updatedAt: '2026-01-01',
 };
 describe('saved SQL library', () => {
+  it('preserves column order and drops malformed preferences without losing SQL', () => {
+    expect(readSavedQueries(JSON.stringify([{ ...item, columns: ['b', 'a'] }]))[0].columns).toEqual(
+      ['b', 'a'],
+    );
+    for (const columns of [[], ['a', 'a'], ['a', 3], 'a']) {
+      expect(readSavedQueries(JSON.stringify([{ ...item, columns }]))).toEqual([item]);
+    }
+  });
   it('isolates server, identity, and demo and avoids an anonymous live library', () => {
     const identity = { id: 'a', username: 'a', source: 'server' as const };
     expect(sqlStorageScope('live')).toBeNull();

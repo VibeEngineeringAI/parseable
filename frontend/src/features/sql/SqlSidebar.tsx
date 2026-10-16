@@ -23,6 +23,8 @@ export interface SqlSidebarProps {
   currentName: string;
   currentSavedId?: string;
   currentChart?: unknown;
+  currentColumns?: string[];
+  currentColumnFields?: string[];
   onSaved?: (item: SavedQuery) => void;
 }
 function Schema({ name, onInsertText }: { name: string; onInsertText?: (text: string) => void }) {
@@ -102,6 +104,8 @@ export function SqlSidebar(props: SqlSidebarProps) {
       range: props.currentRange,
       datasets: [...props.selectedDatasets],
       updatedAt: new Date().toISOString(),
+      columns: props.currentColumns,
+      columnFields: props.currentColumnFields,
       ...(props.currentChart === undefined ? {} : { chart: props.currentChart }),
     };
     if (persist(saveQuery(items, item))) props.onSaved?.(item);

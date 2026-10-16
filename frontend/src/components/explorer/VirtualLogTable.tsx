@@ -1,3 +1,4 @@
+import { ColumnReorderHandle, useColumnReorder } from './ColumnReorder';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { Button, EmptyState } from '../ui';
@@ -19,6 +20,7 @@ const HEADER_HEIGHT = 36;
 export function VirtualLogTable({
   rows,
   columns,
+  onColumnsChange,
   onSelect,
   caption = 'Query results',
   wrap = false,
@@ -28,6 +30,7 @@ export function VirtualLogTable({
 }: {
   rows: LogRecord[];
   columns?: string[];
+  onColumnsChange?: (columns: string[]) => void;
   onSelect?: (row: LogRecord) => void;
   caption?: string;
   wrap?: boolean;
@@ -41,6 +44,7 @@ export function VirtualLogTable({
   const [focusedRow, setFocusedRow] = useState<number>();
   const pendingFocus = useRef<number | undefined>(undefined);
   const fields = useMemo(() => columns ?? [...new Set(rows.flatMap(Object.keys))], [columns, rows]);
+  const reorder = useColumnReorder(fields, onColumnsChange ?? (() => {}));
   const displayFields = useMemo(() => (summary ? [...fields, null] : fields), [fields, summary]);
   const ordered = useMemo(() => orderLogRows(rows, sort), [rows, sort]);
   useEffect(() => {
@@ -107,6 +111,9 @@ export function VirtualLogTable({
     );
   return (
     <div className="results-table virtual-log-table">
+      <div role="status" className="sr-only">
+        {reorder.announcement}
+      </div>
       <div
         ref={viewport}
         className="virtual-log-viewport"
@@ -187,7 +194,8 @@ export function VirtualLogTable({
                 aria-sort={
                   sort?.field === field ? (sort.descending ? 'descending' : 'ascending') : 'none'
                 }
-                key={columnWindow.start + index}
+                key={field === null ? 'summary' : `field:${field}`}
+                {...(field !== null ? reorder.targetProps(field) : {})}
                 className="virtual-log-cell"
                 style={{
                   left: detailWidth + (columnWindow.start + index) * COLUMN_WIDTH,
@@ -197,20 +205,23 @@ export function VirtualLogTable({
                 {field === null ? (
                   label(field)
                 ) : (
-                  <button
-                    className="column-sort"
-                    aria-label={`Sort ${field}`}
-                    onClick={() => {
-                      setSort({
-                        field,
-                        descending: sort?.field === field ? !sort.descending : false,
-                      });
-                      if (viewport.current) viewport.current.scrollTop = 0;
-                      setPosition((current) => ({ ...current, top: 0 }));
-                    }}
-                  >
-                    {label(field)} {sort?.field === field ? (sort.descending ? '↓' : '↑') : '↕'}
-                  </button>
+                  <div className="reorderable-column-heading">
+                    {onColumnsChange && <ColumnReorderHandle field={field} reorder={reorder} />}
+                    <button
+                      className="column-sort"
+                      aria-label={`Sort ${field}`}
+                      onClick={() => {
+                        setSort({
+                          field,
+                          descending: sort?.field === field ? !sort.descending : false,
+                        });
+                        if (viewport.current) viewport.current.scrollTop = 0;
+                        setPosition((current) => ({ ...current, top: 0 }));
+                      }}
+                    >
+                      {label(field)} {sort?.field === field ? (sort.descending ? '↓' : '↑') : '↕'}
+                    </button>
+                  </div>
                 )}
               </div>
             ))}

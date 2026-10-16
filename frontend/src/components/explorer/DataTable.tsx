@@ -1,3 +1,6 @@
+import { useColumnPreferences } from './useColumnPreferences';
+import { orderedColumns } from './columnOrder';
+import { ColumnReorderHandle, useColumnReorder } from './ColumnReorder';
 import { useState } from 'react';
 import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Button, EmptyState } from '../ui';
@@ -41,6 +44,8 @@ export function exportRecords(rows: LogRecord[], format: 'json' | 'csv') {
 export function DataTable({
   rows,
   columns,
+  onColumnsChange,
+  columnPreferenceKey,
   onSelect,
   caption = 'Query results',
   wrap = false,
@@ -51,6 +56,8 @@ export function DataTable({
 }: {
   rows: LogRecord[];
   columns?: string[];
+  onColumnsChange?: (columns: string[]) => void;
+  columnPreferenceKey?: string;
   onSelect?: (row: LogRecord) => void;
   caption?: string;
   wrap?: boolean;
@@ -61,11 +68,17 @@ export function DataTable({
 }) {
   const [page, setPage] = useState(0);
   const [sort, setSort] = useState<LogTableSort>();
+  const [preferred, setPreferred] = useColumnPreferences(columnPreferenceKey);
+  const available = columns || [...new Set(rows.flatMap(Object.keys))];
+  const fields = onColumnsChange ? available : orderedColumns(available, preferred);
+  const changeColumns = onColumnsChange ?? setPreferred;
+  const reorder = useColumnReorder(fields, changeColumns);
   if (virtualized)
     return (
       <VirtualLogTable
         rows={rows}
-        columns={columns}
+        columns={fields}
+        onColumnsChange={changeColumns}
         onSelect={onSelect}
         caption={caption}
         wrap={wrap}
@@ -76,7 +89,6 @@ export function DataTable({
     );
   const pageSize = 25;
   const effectivePage = Math.min(page, Math.max(0, Math.ceil(rows.length / pageSize) - 1));
-  const fields = columns || [...new Set(rows.flatMap(Object.keys))];
   const ordered = orderLogRows(rows, sort);
   if (!rows.length)
     return (
@@ -87,6 +99,9 @@ export function DataTable({
     );
   return (
     <div className={`results-table ${wrap ? 'rows-wrapped' : ''}`}>
+      <div role="status" className="sr-only">
+        {reorder.announcement}
+      </div>
       <div className="table-scroll">
         <table>
           <caption className="sr-only">{caption}</caption>
@@ -101,33 +116,37 @@ export function DataTable({
                 <th
                   scope="col"
                   key={field}
+                  {...reorder.targetProps(field)}
                   aria-label={columnLabel(field, timestampField, timezone, summary)}
                   aria-sort={
                     sort?.field === field ? (sort.descending ? 'descending' : 'ascending') : 'none'
                   }
                 >
-                  <button
-                    className="column-sort"
-                    aria-label={`Sort ${field}`}
-                    onClick={() => {
-                      setSort({
-                        field,
-                        descending: sort?.field === field ? !sort.descending : false,
-                      });
-                      setPage(0);
-                    }}
-                  >
-                    {columnLabel(field, timestampField, timezone, summary)}
-                    {sort?.field === field ? (
-                      sort.descending ? (
-                        <ArrowDown size={12} />
+                  <div className="reorderable-column-heading">
+                    <ColumnReorderHandle field={field} reorder={reorder} />
+                    <button
+                      className="column-sort"
+                      aria-label={`Sort ${field}`}
+                      onClick={() => {
+                        setSort({
+                          field,
+                          descending: sort?.field === field ? !sort.descending : false,
+                        });
+                        setPage(0);
+                      }}
+                    >
+                      {columnLabel(field, timestampField, timezone, summary)}
+                      {sort?.field === field ? (
+                        sort.descending ? (
+                          <ArrowDown size={12} />
+                        ) : (
+                          <ArrowUp size={12} />
+                        )
                       ) : (
-                        <ArrowUp size={12} />
-                      )
-                    ) : (
-                      <ArrowUpDown size={12} />
-                    )}
-                  </button>
+                        <ArrowUpDown size={12} />
+                      )}
+                    </button>
+                  </div>
                 </th>
               ))}
               {summary && <th scope="col">Data</th>}

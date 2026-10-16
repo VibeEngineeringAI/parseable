@@ -1,3 +1,4 @@
+import { useColumnPreferences } from '../../components/explorer/useColumnPreferences';
 import { createPortal } from 'react-dom';
 import { createId } from '../../lib/ids';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
@@ -71,7 +72,12 @@ export function LogsPage() {
   );
   const [traceFocus, setTraceFocus] = useState<{ field: string; traceId: string }>();
   const [dropped, setDropped] = useState<string[]>([]);
-  const [view, dispatchView] = useReducer(logViewReducer, dataset, initialLogView);
+  const [preferredColumns, saveColumns] = useColumnPreferences(`logs:${dataset}`);
+  const [draftView, dispatchView] = useReducer(logViewReducer, dataset, initialLogView);
+  const view = useMemo(
+    () => ({ ...draftView, columns: draftView.columns ?? preferredColumns }),
+    [draftView, preferredColumns],
+  );
   const { range, search, expression, timezone, limit, columns, wrap, showHistogram } = view;
   const editView = (patch: Partial<Omit<LogViewState, 'version' | 'dataset'>>) =>
     dispatchView({ type: 'edit', patch });
@@ -86,7 +92,10 @@ export function LogsPage() {
   };
   const setTimezone = (timezone: string) => editView({ timezone });
   const setLimit = (limit: number) => editView({ limit });
-  const setColumns = (columns: string[]) => editView({ columns });
+  const setColumns = (columns: string[]) => {
+    editView({ columns });
+    saveColumns(columns);
+  };
   const setWrap = (wrap: boolean) => editView({ wrap });
   const setShowHistogram = (showHistogram: boolean) => editView({ showHistogram });
   // Tagged with its dataset so a timer left over from the previous dataset is ignored.
@@ -690,6 +699,7 @@ export function LogsPage() {
                 <DataTable
                   rows={results.data || []}
                   columns={visibleColumns}
+                  onColumnsChange={setColumns}
                   onSelect={setRow}
                   wrap={wrap}
                   summary
