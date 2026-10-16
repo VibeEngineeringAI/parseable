@@ -7,6 +7,9 @@
 # repository, so that job runs only in parseablehq/parseable.
 # It also creates a checksum file for the artifacts and publishes it to the release page.
 # It also builds and pushes a Docker image to Docker Hub with the same version tag.
+# Linux jobs run on Blacksmith runners. The build-profile input can select the
+# experimental release-thin-lto profile; such runs upload workflow artifacts
+# only and never publish to the release page or registry.
 
 name: Release builds for Linux(64 bit, Arm), Mac(64bit, Arm), Windows and Docker
 
@@ -14,24 +17,39 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to build and publish (e.g., v3.2.5)'
+        description: 'Release tag; thin-LTO experiments may also use a branch or commit containing that profile'
         required: true
         type: string
+      build-profile:
+        description: 'Cargo profile (release-thin-lto is experimental and skips publishing)'
+        required: false
+        type: choice
+        default: release-lto
+        options:
+          - release-lto
+          - release-thin-lto
 
-# Cross preserves this absolute workspace path inside its build container.
+# Never cancel a release mid-publish; a second run for the same tag waits.
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+# Each job builds the frontend into this absolute path before cargo runs.
 env:
   NEXT_ASSETS_PATH: ${{ github.workspace }}/frontend/dist
+  RELEASE_PROFILE: ${{ inputs.build-profile || 'release-lto' }}
 
 jobs:
   build-frontend:
     name: Package frontend
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -58,6 +76,7 @@ jobs:
           if-no-files-found: error
 
       - name: Attach frontend to release
+        if: env.RELEASE_PROFILE == 'release-lto'
         uses: softprops/action-gh-release@v0.1.15
         with:
           draft: false
@@ -81,17 +100,16 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            use-cross: false
+            os: blacksmith-8vcpu-ubuntu-2404
           # A hosted runner lost contact during the cross-compiled LTO build,
           # so aarch64 builds natively on an Arm runner.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            use-cross: false
+            os: blacksmith-8vcpu-ubuntu-2404-arm
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -104,38 +122,45 @@ jobs:
         working-directory: frontend
         run: npm ci && npm run build
 
-      - uses: actions-rs/toolchain@v1
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
-          profile: minimal # minimal component installation (ie, no documentation)
-          target: ${{matrix.target}}
-          override: true
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.use-cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
-
-      - name: Build with cross
-        if: matrix.use-cross
-        run: cross build --profile release-lto --target ${{ matrix.target }}
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-default-${{ env.RELEASE_PROFILE }}
 
       # The aarch64 runner lost contact during the fat-LTO build twice, which
       # GitHub attributes to CPU or memory starvation. Free disk, add swap and
       # record the resources as annotations, which survive a lost runner.
+      # Swap is best effort because runner disk layouts differ.
       - name: Free disk and add swap
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo fallocate -l 16G /swap.release && sudo chmod 600 /swap.release
-          sudo mkswap /swap.release && sudo swapon /swap.release
+          if sudo fallocate -l 16G /swap.release && sudo chmod 600 /swap.release \
+            && sudo mkswap /swap.release && sudo swapon /swap.release; then
+            echo "Added 16G swap"
+          else
+            echo "::warning title=Swap::Could not add swap; continuing without it"
+          fi
           echo "::notice title=Runner resources::$(nproc) CPUs; $(free -h | awk '/Mem/{print $2" RAM"} /Swap/{print $2" swap"}' | paste -sd ' '); $(df -h --output=avail / | tail -1 | tr -d ' ') free on /"
 
       - name: Build native
-        if: ${{ !matrix.use-cross }}
-        run: cargo build --profile release-lto --target ${{ matrix.target }}
+        run: cargo build --profile "$RELEASE_PROFILE" --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
-          mv target/${{ matrix.target }}/release-lto/parseable Parseable_OSS_${{ matrix.target }}
+          mv target/${{ matrix.target }}/$RELEASE_PROFILE/parseable Parseable_OSS_${{ matrix.target }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
@@ -149,6 +174,7 @@ jobs:
           path: Parseable_OSS_${{ matrix.target }}
 
       - name: Publish Archive to Release Page
+        if: env.RELEASE_PROFILE == 'release-lto'
         uses: softprops/action-gh-release@v0.1.15
         with:
           draft: false
@@ -159,6 +185,7 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: write
@@ -167,7 +194,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -180,20 +207,30 @@ jobs:
         working-directory: frontend
         run: npm ci && npm run build
 
-      - name: Install latest rust toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
-          profile: minimal
-          default: true
-          override: true
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc-default-${{ env.RELEASE_PROFILE }}
 
       - name: Build
-        run: cargo build --all --profile release-lto --target x86_64-pc-windows-msvc
+        run: cargo build --all --profile ${{ env.RELEASE_PROFILE }} --target x86_64-pc-windows-msvc
 
       - name: Rename binary
         run: |
-          mv target/x86_64-pc-windows-msvc/release-lto/PARSEABLE.exe Parseable_OSS_x86_64-pc-windows-msvc.exe
+          mv target/x86_64-pc-windows-msvc/${{ env.RELEASE_PROFILE }}/PARSEABLE.exe Parseable_OSS_x86_64-pc-windows-msvc.exe
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
@@ -207,6 +244,7 @@ jobs:
           path: Parseable_OSS_x86_64-pc-windows-msvc.exe
 
       - name: Publish Archive to Release Page
+        if: env.RELEASE_PROFILE == 'release-lto'
         uses: softprops/action-gh-release@v0.1.15
         with:
           draft: false
@@ -217,6 +255,7 @@ jobs:
 
   build-mac:
     runs-on: macos-latest
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: write
@@ -230,7 +269,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -243,23 +282,32 @@ jobs:
         working-directory: frontend
         run: npm ci && npm run build
 
-      - name: Install latest rust toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
-          profile: minimal
-          target: ${{ matrix.target }}
-          default: true
-          override: true
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-default-${{ env.RELEASE_PROFILE }}
 
       - name: Build
         run: |
-          cargo build --profile release-lto --target ${{ matrix.target }}
-          strip target/${{ matrix.target }}/release-lto/Parseable
+          cargo build --profile "$RELEASE_PROFILE" --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/$RELEASE_PROFILE/Parseable
 
       - name: Rename binary
         run: |
-          mv target/${{ matrix.target }}/release-lto/Parseable Parseable_OSS_${{ matrix.target }}
+          mv target/${{ matrix.target }}/$RELEASE_PROFILE/Parseable Parseable_OSS_${{ matrix.target }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
@@ -273,6 +321,7 @@ jobs:
           path: Parseable_OSS_${{ matrix.target }}
 
       - name: Publish Archive to Release Page
+        if: env.RELEASE_PROFILE == 'release-lto'
         uses: softprops/action-gh-release@v0.1.15
         with:
           draft: false
@@ -283,7 +332,8 @@ jobs:
 
   build-kafka-linux:
     name: Build Kafka for x86_64-unknown-linux-gnu
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 90
     permissions:
       id-token: write
       contents: write
@@ -291,7 +341,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -320,10 +370,23 @@ jobs:
             libssl-dev \
             python3
 
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-kafka-${{ env.RELEASE_PROFILE }}
 
       - name: Find and fix librdkafka CMakeLists.txt
         run: |
@@ -346,11 +409,11 @@ jobs:
           CC: gcc-11
           CXX: g++-11
           LIBRDKAFKA_SSL_VENDORED: "1"
-        run: cargo build --profile release-lto --target x86_64-unknown-linux-gnu --features kafka
+        run: cargo build --profile "$RELEASE_PROFILE" --target x86_64-unknown-linux-gnu --features kafka
 
       - name: Rename binary
         run: |
-          mv target/x86_64-unknown-linux-gnu/release-lto/parseable Parseable_OSS_x86_64-unknown-linux-gnu-kafka
+          mv target/x86_64-unknown-linux-gnu/$RELEASE_PROFILE/parseable Parseable_OSS_x86_64-unknown-linux-gnu-kafka
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
@@ -364,6 +427,7 @@ jobs:
           path: Parseable_OSS_x86_64-unknown-linux-gnu-kafka
 
       - name: Publish Archive to Release Page
+        if: env.RELEASE_PROFILE == 'release-lto'
         uses: softprops/action-gh-release@v0.1.15
         with:
           draft: false
@@ -375,6 +439,7 @@ jobs:
   build-kafka-mac:
     name: Build Kafka for aarch64-apple-darwin
     runs-on: macos-latest
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: write
@@ -383,7 +448,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -406,10 +471,23 @@ jobs:
             openssl@3.0 \
             python3
 
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin-kafka-${{ env.RELEASE_PROFILE }}
 
       - name: Find and fix librdkafka CMakeLists.txt
         run: |
@@ -431,12 +509,12 @@ jobs:
         env:
           LIBRDKAFKA_SSL_VENDORED: "1"
         run: |
-          cargo build --profile release-lto --target aarch64-apple-darwin --features kafka
-          strip target/aarch64-apple-darwin/release-lto/Parseable
+          cargo build --profile "$RELEASE_PROFILE" --target aarch64-apple-darwin --features kafka
+          strip target/aarch64-apple-darwin/$RELEASE_PROFILE/Parseable
 
       - name: Rename binary
         run: |
-          mv target/aarch64-apple-darwin/release-lto/Parseable Parseable_OSS_aarch64-apple-darwin-kafka
+          mv target/aarch64-apple-darwin/$RELEASE_PROFILE/Parseable Parseable_OSS_aarch64-apple-darwin-kafka
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
@@ -450,6 +528,7 @@ jobs:
           path: Parseable_OSS_aarch64-apple-darwin-kafka
 
       - name: Publish Archive to Release Page
+        if: env.RELEASE_PROFILE == 'release-lto'
         uses: softprops/action-gh-release@v0.1.15
         with:
           draft: false
@@ -459,7 +538,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   create-checksum:
-    runs-on: ubuntu-22.04 # or ubuntu-24.04, ubuntu-20.04
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10
     needs: [build-linux, build-windows, build-mac, build-kafka-linux, build-kafka-mac]
     permissions:
       contents: write
@@ -480,6 +560,7 @@ jobs:
           path: checksum.txt
 
       - name: Publish Check Sum to Release Page
+        if: env.RELEASE_PROFILE == 'release-lto'
         uses: softprops/action-gh-release@v0.1.15
         with:
           draft: false
@@ -489,13 +570,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-push-docker-image:
-    if: github.repository == 'parseablehq/parseable'
+    if: github.repository == 'parseablehq/parseable' && (inputs.build-profile || 'release-lto') == 'release-lto'
     runs-on: self-hosted
+    timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

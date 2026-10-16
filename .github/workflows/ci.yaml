@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Include sustained load tests and Rust coverage
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      frontend: ${{ steps.paths.outputs.frontend }}
+      rust: ${{ steps.paths.outputs.rust }}
+      integration: ${{ steps.paths.outputs.integration }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: paths
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+              - 'build.rs'
+              - 'build_support/**'
+              - 'scripts/**'
+              - '.github/workflows/frontend.yaml'
+              - '.github/workflows/ci.yaml'
+            rust:
+              - 'src/**'
+              - 'resources/**'
+              - 'Cargo.*'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - 'build.rs'
+              - 'build_support/**'
+              - 'scripts/**'
+              - '.github/actions/**'
+              - '.github/workflows/coverage.yaml'
+              - '.github/workflows/ci.yaml'
+            integration:
+              - 'src/**'
+              - 'resources/**'
+              - 'Cargo.*'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - 'build.rs'
+              - 'build_support/**'
+              - 'scripts/**'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yaml'
+              - 'frontend/**'
+              - 'Dockerfile*'
+              - '.dockerignore'
+              - 'docker-compose*'
+              - '.github/workflows/integration-test.yaml'
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true' || github.event_name != 'pull_request'
+    uses: ./.github/workflows/frontend.yaml
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    uses: ./.github/workflows/coverage.yaml
+    with:
+      coverage: ${{ github.event_name == 'push' || github.event_name == 'schedule' || inputs.full == true }}
+
+  integration:
+    needs: changes
+    if: needs.changes.outputs.integration == 'true' || github.event_name != 'pull_request'
+    uses: ./.github/workflows/integration-test.yaml
+    with:
+      full: ${{ github.event_name == 'push' || github.event_name == 'schedule' || inputs.full == true }}
+
+  ci-ok:
+    name: CI passed
+    if: always()
+    needs: [changes, frontend, rust, integration]
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Check required results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          jobs = json.loads(os.environ['RESULTS'])
+          assert jobs['changes']['result'] == 'success', 'Change detection failed'
+          for name, job in jobs.items():
+              assert job['result'] in ('success', 'skipped'), f"{name}: {job['result']}"
+          PY

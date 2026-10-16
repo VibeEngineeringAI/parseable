@@ -267,3 +267,8 @@ kafka = [
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# Experimental faster release build; release-lto stays the production profile.
+[profile.release-thin-lto]
+inherits = "release"
+lto = "thin"

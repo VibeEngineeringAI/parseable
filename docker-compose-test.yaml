@@ -25,6 +25,7 @@ services:
       - parseable-internal
 
   parseable:
+    image: ${PARSEABLE_TEST_IMAGE:-parseable-test:local}
     build:
       context: .
       dockerfile: Dockerfile.debug
@@ -69,7 +70,7 @@ services:
     environment:
       - QUEST_EDITION=oss
     command: [
-      "load",
+      "${QUEST_MODE:-load}",
       "http://parseable:8000",
       "parseableadmin",
       "parseableadmin",

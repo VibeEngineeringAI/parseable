@@ -1,0 +1,6 @@
+# CI uses the same Quest functional suite, excluding its sustained k6 phases.
+services:
+  quest:
+    entrypoint: [sh, /ci/quest-smoke.sh]
+    volumes:
+      - ./scripts/ci/quest-smoke.sh:/ci/quest-smoke.sh:ro

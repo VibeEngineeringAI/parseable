@@ -1,100 +1,71 @@
+name: Rust checks and tests
 on:
-  pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "helm/**"
-      - "assets/**"
-      - "**.md"
-
-name: Lint, Test and Coverage Report
-# Cross preserves this absolute workspace path inside its build container.
+  workflow_call:
+    inputs:
+      coverage:
+        description: Collect and upload combined default and Kafka coverage.
+        type: boolean
+        default: false
+permissions:
+  contents: read
 env:
   NEXT_ASSETS_PATH: ${{ github.workspace }}/frontend/dist
 
 jobs:
   community-ui:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '24'
       - name: Test community UI overlay
         run: node --test scripts/test-community-ui.mjs
 
-  coverage:
-    runs-on: ubuntu-latest
+  clippy:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          node-version: '24'
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-key: rust-clippy
+          tools: cargo-hack
+      - name: Check all feature configurations with Clippy
+        run: cargo hack clippy --locked --verbose --each-feature --no-dev-deps -- -D warnings
 
-      - name: Build frontend
-        working-directory: frontend
-        run: npm ci && npm run build
-      - uses: dtolnay/rust-toolchain@stable
+  tests:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ runner.os }}-cargo
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-hack, cargo-llvm-cov, nextest
-
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsasl2-dev \
-            libssl-dev \
-            pkg-config \
-            build-essential
-        if: runner.os == 'Linux'
-        
-      - name: Find and fix librdkafka CMakeLists.txt
-        run: |
-          # Download the package first so it's in the registry
-          cargo fetch
-          
-          # Find the rdkafka-sys package directory
-          RDKAFKA_SYS_DIR=$(find ~/.cargo/registry/src -name "rdkafka-sys-*" -type d | head -n 1)
-          echo "Found rdkafka-sys at: $RDKAFKA_SYS_DIR"
-          
-          # Find the librdkafka CMakeLists.txt file
-          CMAKE_FILE="$RDKAFKA_SYS_DIR/librdkafka/CMakeLists.txt"
-          
-          if [ -f "$CMAKE_FILE" ]; then
-            echo "Found CMakeLists.txt at: $CMAKE_FILE"
-            
-            # Make a backup of the original file
-            cp "$CMAKE_FILE" "$CMAKE_FILE.bak"
-            
-            # Replace the minimum required version
-            sed -i 's/cmake_minimum_required(VERSION 3.2)/cmake_minimum_required(VERSION 3.5)/' "$CMAKE_FILE"
-            
-            echo "Modified CMakeLists.txt - before and after comparison:"
-            diff "$CMAKE_FILE.bak" "$CMAKE_FILE" || true
-          else
-            echo "Could not find librdkafka CMakeLists.txt file!"
-            exit 1
-          fi
-
-      - name: Check with clippy
-        run: cargo hack clippy --verbose --each-feature --no-dev-deps -- -D warnings
-
+          cache-key: rust-tests-${{ inputs.coverage && 'coverage' || 'plain' }}
+          tools: ${{ inputs.coverage && 'cargo-llvm-cov, nextest' || 'nextest' }}
       - name: Test default feature set
-        run: cargo hack llvm-cov --no-report nextest
-
-      - name: Test kafka feature
-        run: cargo hack --features kafka llvm-cov --no-report nextest --filter-expr 'test(kafka)'
-
-      - name: Generate coverage report
+        if: ${{ !inputs.coverage }}
+        run: cargo nextest run --locked
+      - name: Test Kafka feature
+        if: ${{ !inputs.coverage }}
+        run: cargo nextest run --locked --features kafka -E 'test(kafka)'
+      - name: Clear stale workspace coverage
+        if: inputs.coverage
+        run: cargo llvm-cov clean --workspace
+      - name: Test default feature set with coverage
+        if: inputs.coverage
+        run: cargo llvm-cov nextest --locked --no-report
+      - name: Test Kafka feature with coverage
+        if: inputs.coverage
+        run: cargo llvm-cov nextest --locked --features kafka --no-report --filter-expr 'test(kafka)'
+      - name: Generate combined coverage report
+        if: inputs.coverage
         run: cargo llvm-cov report --lcov --output-path coverage.lcov
+      - name: Upload coverage report
+        if: inputs.coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: coverage.lcov
+          if-no-files-found: error

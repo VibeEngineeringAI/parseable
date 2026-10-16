@@ -35,9 +35,11 @@ WORKDIR /parseable
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY build_support ./build_support
 COPY scripts/community-ui-overlay.json scripts/community-promql-capabilities.js ./scripts/
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build && rm -rf src
+
+# Embed frontend assets after compiling dependencies so UI edits reuse them.
 COPY --from=frontend /frontend/dist /parseable/frontend/dist
 ENV NEXT_ASSETS_PATH=/parseable/frontend/dist
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build && rm -rf src
 
 # Build the actual binary
 COPY src ./src
