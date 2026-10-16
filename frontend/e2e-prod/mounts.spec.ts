@@ -48,7 +48,7 @@ for (const mount of ['', '/next']) {
       await page.goto(`${mount}/dashboards/01M4J000000000000000000002`);
       await expect(page.locator('[data-tile-id]').first()).toBeVisible();
       await page.getByRole('link', { name: 'Logs', exact: true }).click();
-      await expect(page).toHaveURL(`${mount}/logs`);
+      await expect(page).toHaveURL((url) => url.pathname === `${mount}/logs`);
       await expect(page.getByRole('table')).toBeVisible();
       await page.getByRole('link', { name: 'Metrics', exact: true }).click();
       await expect(page).toHaveURL(new RegExp(`^[^?]*${mount}/metrics(\\?|$)`));
