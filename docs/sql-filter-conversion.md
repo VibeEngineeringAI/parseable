@@ -47,6 +47,12 @@ are selected deterministically without deleting the alternatives. Cleanup
 failures are logged and can be retried on the next startup or conversion; there
 is no one-time completion flag that could hide unfinished work.
 
+Older administrator edits could also leave the same filter ID under different
+owners. These records are retained independently. Each owner, including an
+administrator, can manage their own copy; an administrator without a copy can
+manage another owner's record only when the ID is unambiguous. The native
+Saved views selector distinguishes the owners' copies.
+
 A process-wide async lock serializes filter persistence and cache changes.
 This follows the existing single-query-server ownership model: it is not a
 distributed lock, and concurrent writes through multiple independent query

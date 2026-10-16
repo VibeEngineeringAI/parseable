@@ -116,6 +116,29 @@ def main():
             }
             legacy = request('POST', '/api/v1/filters', body, auth=owner)
             assert legacy['stream_name'] == dataset
+            # Creating a fresh ID must not enumerate other dataset directories.
+            # An unreadable sibling is unrelated to this new saved view.
+            legacy_files = list((root / 'data').rglob(f"{legacy['filter_id']}.json"))
+            assert len(legacy_files) == 1
+            blocked = legacy_files[0].parent.parent / 'unreadable_sibling'
+            blocked.mkdir()
+            blocked.chmod(0)
+            try:
+                before = set((blocked.parent / dataset).glob('*.json'))
+                try:
+                    created = request('POST', '/api/v1/filters', {
+                        **body, 'filter_name': 'Create beside unreadable directory',
+                    }, auth=owner)
+                except AssertionError as error:
+                    persisted = set((blocked.parent / dataset).glob('*.json')) - before
+                    raise AssertionError(
+                        f'New-filter POST failed after persisting {len(persisted)} new record(s): {error}'
+                    ) from error
+                assert created['filter_name'] == 'Create beside unreadable directory'
+                assert len(set((blocked.parent / dataset).glob('*.json')) - before) == 1
+            finally:
+                blocked.chmod(0o755)
+                blocked.rmdir()
             identifier = legacy['filter_id']
             path = f'/api/v1/filters/{identifier}'
             request('POST', path + '/convert-to-sql', auth=other, expected=None)
@@ -150,7 +173,7 @@ def main():
             start()
             assert all(view['filter_id'] != identifier for view in request('GET', '/api/v1/filters', auth=owner))
             assert not list((root / 'data').rglob(f'{identifier}.json'))
-            print('PASS: live legacy/create, owner authorization, admin ownership, conversion/retry, stale update, restart reconciliation, deletion/restart')
+            print('PASS: live legacy/create, create with unreadable sibling, owner authorization, admin ownership, conversion/retry, stale update, restart reconciliation, deletion/restart')
         finally:
             stop()
             log.close()

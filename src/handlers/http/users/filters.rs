@@ -97,10 +97,6 @@ pub async fn post(
     filter.tenant_id.clone_from(&tenant_id);
     PARSEABLE.metastore.put_filter(&filter, &tenant_id).await?;
     FILTERS.update(&filter, &tenant_id).await;
-    PARSEABLE
-        .metastore
-        .reconcile_filter(&filter, &tenant_id)
-        .await?;
 
     Ok((web::Json(filter), StatusCode::OK))
 }

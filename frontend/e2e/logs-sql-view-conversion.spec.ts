@@ -27,7 +27,12 @@ const makeView = (filter_id: string, extra: Partial<SavedLogView> = {}): SavedLo
 async function fixture(
   page: Page,
   views: SavedLogView[],
-  options: { conversionError?: boolean; waitForConversion?: Promise<void> } = {},
+  options: {
+    conversionError?: boolean;
+    conversionCleanupError?: boolean;
+    waitForConversion?: Promise<void>;
+    waitForCreate?: Promise<void> | (() => Promise<void>);
+  } = {},
 ) {
   const mutations: { method: string; path: string; body: unknown }[] = [];
   await page
@@ -55,20 +60,39 @@ async function fixture(
         await options.waitForConversion;
         if (options.conversionError)
           return route.fulfill({ status: 503, body: 'Conversion unavailable. Try again.' });
-        const view = views.find((view) => view.filter_id === path.split('/').at(-2))!;
+        const view = views.find(
+          (view) => view.filter_id === path.split('/').at(-2) && view.user_id === owner,
+        )!;
         view.stream_name = 'sql';
+        if (options.conversionCleanupError)
+          return route.fulfill({ status: 503, body: 'Cleanup unavailable. Retry conversion.' });
         return route.fulfill({ json: view });
       }
       if (request.method() === 'POST') {
-        const view = { ...request.postDataJSON(), filter_id: 'created', user_id: owner };
+        await (typeof options.waitForCreate === 'function'
+          ? options.waitForCreate()
+          : options.waitForCreate);
+        const view = {
+          ...request.postDataJSON(),
+          filter_id: views.some((view) => view.filter_id === 'created') ? 'created-2' : 'created',
+          user_id: owner,
+        };
         views.push(view);
         return route.fulfill({ json: view });
       }
       if (request.method() === 'PUT') {
         const id = path.split('/').at(-1),
-          index = views.findIndex((view) => view.filter_id === id);
+          index = views.findIndex((view) => view.filter_id === id && view.user_id === owner);
         views[index] = { ...request.postDataJSON(), filter_id: id, user_id: owner };
         return route.fulfill({ json: views[index] });
+      }
+      if (request.method() === 'DELETE') {
+        const id = path.split('/').at(-1);
+        views.splice(
+          views.findIndex((view) => view.filter_id === id && view.user_id === owner),
+          1,
+        );
+        return route.fulfill({ status: 200 });
       }
     }
     if (path.endsWith('/query')) return route.fulfill({ json: [] });
@@ -111,12 +135,12 @@ test('new views remain dataset scoped until converted, reopen from SQL storage, 
   await expect(dialog.getByRole('button', { name: 'Convert to SQL view' })).toBeDisabled();
   await page.reload();
   await page.getByRole('button', { name: 'Saved views', exact: true }).click();
-  await dialog.getByLabel('Saved log view').selectOption('created');
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'My saved view' });
   await dialog.getByRole('button', { name: 'Apply view', exact: true }).click();
   await expect(page.getByLabel('Search messages', { exact: true })).toHaveValue('saved search');
   await page.getByLabel('Search messages', { exact: true }).fill('updated search');
   await page.getByRole('button', { name: 'Saved views', exact: true }).click();
-  await dialog.getByLabel('Saved log view').selectOption('created');
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'My saved view' });
   await dialog.getByLabel('Log view name').fill('Updated SQL view');
   await dialog.getByRole('button', { name: 'Update selected' }).click();
   await expect(dialog.getByText('View saved on the server.', { exact: true })).toBeVisible();
@@ -149,23 +173,23 @@ test('SQL views stay within their explorer dataset and read-only or incompatible
   ]);
   const select = dialog.getByLabel('Saved log view');
   await expect(select.locator('option')).toHaveCount(5);
-  await expect(select.locator('option[value="other-canonical"]')).toHaveCount(0);
-  await expect(select.locator('option[value="malformed"]')).toHaveCount(0);
-  await expect(select.locator('option[value="invalid"]')).toHaveCount(0);
-  await select.selectOption('shared');
+  await expect(select.getByRole('option', { name: 'other-canonical', exact: true })).toHaveCount(0);
+  await expect(select.getByRole('option', { name: 'malformed', exact: true })).toHaveCount(0);
+  await expect(select.getByRole('option', { name: 'invalid', exact: true })).toHaveCount(0);
+  await select.selectOption({ label: 'shared (read only)' });
   await expect(dialog.getByRole('button', { name: 'Convert to SQL view' })).toBeDisabled();
   await expect(dialog.getByRole('button', { name: 'Apply view' })).toBeEnabled();
-  await select.selectOption('classic');
+  await select.selectOption({ label: 'classic (classic or incompatible)' });
   await expect(dialog.getByRole('button', { name: 'Convert to SQL view' })).toBeDisabled();
   await expect(dialog.getByRole('button', { name: 'Apply view' })).toBeDisabled();
-  await select.selectOption('canonical');
+  await select.selectOption({ label: 'canonical' });
   await expect(dialog.getByRole('button', { name: 'Convert to SQL view' })).toBeDisabled();
   await expect(dialog.getByRole('button', { name: 'Apply view' })).toBeEnabled();
   await dialog.getByRole('button', { name: 'Close dialog' }).click();
   await page.getByLabel('Dataset', { exact: true }).selectOption('other');
   await page.getByRole('button', { name: 'Saved views', exact: true }).click();
   await expect(select.locator('option')).toHaveCount(2);
-  await expect(select.locator('option[value="other-canonical"]')).toHaveCount(1);
+  await expect(select.getByRole('option', { name: 'other-canonical', exact: true })).toHaveCount(1);
   expect(mutations).toEqual([]);
 });
 
@@ -175,7 +199,7 @@ test('conversion failure retains the legacy view and explains the server error',
   const views = [makeView('owned')],
     options = { conversionError: true };
   const { dialog } = await fixture(page, views, options);
-  await dialog.getByLabel('Saved log view').selectOption('owned');
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'owned' });
   await dialog.getByRole('button', { name: 'Convert to SQL view' }).click();
   await expect(dialog.getByRole('alert')).toContainText('Conversion unavailable. Try again.');
   expect(views[0].stream_name).toBe('events');
@@ -185,6 +209,25 @@ test('conversion failure retains the legacy view and explains the server error',
   await expect(
     dialog.getByText('View converted to SQL. Its query and dataset were retained.'),
   ).toBeVisible();
+});
+
+test('conversion cleanup failure retains an enabled retry after the server writes SQL metadata', async ({
+  page,
+}) => {
+  const views = [makeView('owned')];
+  const options = { conversionCleanupError: true };
+  const { dialog, mutations } = await fixture(page, views, options);
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'owned' });
+  await dialog.getByRole('button', { name: 'Convert to SQL view' }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Cleanup unavailable. Retry conversion.');
+  expect(views[0].stream_name).toBe('sql');
+  await expect(dialog.getByRole('button', { name: 'Convert to SQL view' })).toBeEnabled();
+  options.conversionCleanupError = false;
+  await dialog.getByRole('button', { name: 'Convert to SQL view' }).click();
+  await expect(
+    dialog.getByText('View converted to SQL. Its query and dataset were retained.'),
+  ).toBeVisible();
+  expect(mutations).toHaveLength(2);
 });
 
 test('late conversion responses do not change a reopened dialog selection or name', async ({
@@ -199,20 +242,138 @@ test('late conversion responses do not change a reopened dialog selection or nam
     [makeView('converting'), makeView('other-selection')],
     { waitForConversion },
   );
-  await dialog.getByLabel('Saved log view').selectOption('converting');
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'converting' });
   await dialog.getByRole('button', { name: 'Convert to SQL view' }).click();
   await expect.poll(() => mutations.length).toBe(1);
   await dialog.getByRole('button', { name: 'Close dialog' }).click();
   await page.getByRole('button', { name: 'Saved views', exact: true }).click();
-  await dialog.getByLabel('Saved log view').selectOption('other-selection');
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'other-selection' });
   await dialog.getByLabel('Log view name').fill('Keep my draft');
   const response = page.waitForResponse('**/filters/converting/convert-to-sql');
   finish();
   await response;
-  await expect(dialog.getByLabel('Saved log view')).toHaveValue('other-selection');
+  await expect(dialog.getByLabel('Saved log view').locator('option:checked')).toHaveText(
+    'other-selection',
+  );
   await expect(dialog.getByLabel('Log view name')).toHaveValue('Keep my draft');
   await expect(
     dialog.getByText('View converted to SQL. Its query and dataset were retained.'),
   ).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Update selected' })).toBeEnabled();
+});
+
+test('saved views with the same ID across owners remain independently selectable', async ({
+  page,
+}) => {
+  const views = [
+    makeView('collision', {
+      filter_name: 'Shared view',
+      user_id: 'someone-else',
+      explorer_state: JSON.stringify({ ...state, search: 'shared search' }),
+    }),
+    makeView('collision', { filter_name: 'My owned view' }),
+  ];
+  const { dialog, mutations } = await fixture(page, views);
+  const select = dialog.getByLabel('Saved log view');
+  await select.selectOption({ label: 'Shared view (read only)' });
+  await expect(dialog.getByRole('button', { name: 'Update selected' })).toBeDisabled();
+  await dialog.getByRole('button', { name: 'Apply view', exact: true }).click();
+  await expect(page.getByLabel('Search messages', { exact: true })).toHaveValue('shared search');
+  await page.getByRole('button', { name: 'Saved views', exact: true }).click();
+  await select.selectOption({ label: 'My owned view' });
+  await expect(dialog.getByLabel('Log view name')).toHaveValue('My owned view');
+  await expect(dialog.getByRole('button', { name: 'Update selected' })).toBeEnabled();
+  await dialog.getByLabel('Log view name').fill('Updated owned view');
+  await dialog.getByRole('button', { name: 'Update selected' }).click();
+  await expect(dialog.getByText('View saved on the server.', { exact: true })).toBeVisible();
+  expect(mutations.at(-1)).toMatchObject({ method: 'PUT', path: '/api/v1/filters/collision' });
+  expect(views[0].filter_name).toBe('Shared view');
+  expect(views[1].filter_name).toBe('Updated owned view');
+  await dialog.getByRole('button', { name: 'Convert to SQL view' }).click();
+  await expect(
+    dialog.getByText('View converted to SQL. Its query and dataset were retained.'),
+  ).toBeVisible();
+  expect(views.map((view) => view.stream_name)).toEqual(['events', 'sql']);
+  await dialog.getByRole('button', { name: 'Delete selected' }).click();
+  await expect(dialog.getByText('View deleted.', { exact: true })).toBeVisible();
+  expect(views.map((view) => view.filter_name)).toEqual(['Shared view']);
+});
+
+test('a pending save stays locked across dialog close and refreshes the reopened list when complete', async ({
+  page,
+}) => {
+  let finish!: () => void;
+  const waitForCreate = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const views: SavedLogView[] = [];
+  const { dialog, mutations } = await fixture(page, views, { waitForCreate });
+  await dialog.getByLabel('Log view name').fill('First saved view');
+  await dialog.getByRole('button', { name: 'Save new view', exact: true }).click();
+  await expect.poll(() => mutations.length).toBe(1);
+  await dialog.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('button', { name: 'Saved views', exact: true }).click();
+  try {
+    await expect(dialog.getByRole('button', { name: 'Save new view', exact: true })).toBeDisabled();
+    await dialog.getByLabel('Log view name').fill('Keep this draft');
+    await expect(dialog.getByLabel('Saved log view').locator('option')).toHaveCount(1);
+  } finally {
+    finish();
+  }
+  await expect(dialog.getByLabel('Saved log view').locator('option')).toHaveCount(2);
+  await expect(dialog.getByLabel('Log view name')).toHaveValue('Keep this draft');
+  await expect(dialog.getByLabel('Saved log view')).toHaveValue('');
+  await expect(dialog.getByText('View saved on the server.', { exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: 'Save new view', exact: true })).toBeEnabled();
+  expect(mutations).toHaveLength(1);
+  expect(views).toHaveLength(1);
+});
+
+test('an old dataset save cannot unlock or overwrite a pending save in the new dataset', async ({
+  page,
+}) => {
+  let finishOld!: () => void;
+  let finishNew!: () => void;
+  const oldSave = new Promise<void>((resolve) => {
+    finishOld = resolve;
+  });
+  const newSave = new Promise<void>((resolve) => {
+    finishNew = resolve;
+  });
+  let calls = 0;
+  const views: SavedLogView[] = [];
+  const { dialog, mutations } = await fixture(page, views, {
+    waitForCreate: () => (++calls === 1 ? oldSave : newSave),
+  });
+  await dialog.getByLabel('Log view name').fill('Old dataset view');
+  await dialog.getByRole('button', { name: 'Save new view', exact: true }).click();
+  await expect.poll(() => mutations.length).toBe(1);
+  await dialog.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByLabel('Dataset', { exact: true }).selectOption('other');
+  await page.getByRole('button', { name: 'Saved views', exact: true }).click();
+  await expect(dialog.getByLabel('Log view name')).toHaveValue('');
+  await dialog.getByLabel('Log view name').fill('New dataset view');
+  await dialog.getByRole('button', { name: 'Save new view', exact: true }).click();
+  await expect.poll(() => mutations.length).toBe(2);
+  const oldResponse = page.waitForResponse(
+    (response) =>
+      response.url().endsWith('/filters') &&
+      response.request().method() === 'POST' &&
+      response.request().postDataJSON().stream_name === 'events',
+  );
+  finishOld();
+  await oldResponse;
+  try {
+    await expect(dialog.getByRole('button', { name: 'Save new view', exact: true })).toBeDisabled();
+    await expect(dialog.getByLabel('Log view name')).toHaveValue('New dataset view');
+    await expect(dialog.getByText('View saved on the server.', { exact: true })).toHaveCount(0);
+  } finally {
+    finishNew();
+  }
+  await expect(dialog.getByText('View saved on the server.', { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel('Saved log view').locator('option:checked')).toHaveText(
+    'New dataset view',
+  );
+  await expect(dialog.getByLabel('Saved log view').locator('option')).toHaveCount(2);
+  expect(views.map((view) => view.stream_name)).toEqual(['events', 'other']);
 });

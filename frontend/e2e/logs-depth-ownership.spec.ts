@@ -71,7 +71,7 @@ test('saved views allow owner-only mutations, shared apply/copy, and refresh aft
   );
   await page.getByRole('button', { name: 'Saved views', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Saved log views' });
-  await dialog.getByLabel('Saved log view').selectOption('shared');
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'Shared incidents (read only)' });
   await expect(dialog.getByText(/This view is read only/)).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Update selected' })).toBeDisabled();
   await expect(dialog.getByRole('button', { name: 'Delete selected' })).toBeDisabled();
@@ -84,7 +84,7 @@ test('saved views allow owner-only mutations, shared apply/copy, and refresh aft
   await page.getByRole('button', { name: 'Saved views', exact: true }).click();
   await expect(dialog.getByRole('option', { name: /Created in another tab/ })).toHaveCount(1);
   expect(reads).toBeGreaterThan(beforeReads);
-  await dialog.getByLabel('Saved log view').selectOption('owned');
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'My incidents' });
   await expect(dialog.getByRole('button', { name: 'Update selected' })).toBeEnabled();
   await expect(dialog.getByRole('button', { name: 'Delete selected' })).toBeEnabled();
   await dialog.getByRole('button', { name: 'Update selected' }).click();

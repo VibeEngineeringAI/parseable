@@ -30,6 +30,9 @@ export function savedLogViewsForDataset(views: SavedLogView[], dataset: string) 
     }
   });
 }
+function savedLogViewKey(view: SavedLogView): string {
+  return view.filter_id ? JSON.stringify([view.user_id ?? null, view.filter_id]) : '';
+}
 /** Ownership is a display constraint; backend authorization remains authoritative. */
 export function ownsSavedLogView(
   view: SavedLogView | undefined,
@@ -94,8 +97,10 @@ export function SavedViews({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const generation = useRef(0);
+  const pendingMutation = useRef<{ generation: number } | null>(null);
   useEffect(() => {
     generation.current += 1;
+    pendingMutation.current = null;
     setSelected('');
     setName('');
     setError('');
@@ -103,6 +108,7 @@ export function SavedViews({
     setBusy(false);
     return () => {
       generation.current += 1;
+      pendingMutation.current = null;
     };
   }, [client, state.dataset]);
   const views = useAsync(
@@ -115,11 +121,17 @@ export function SavedViews({
     () => savedLogViewsForDataset(views.data ?? [], state.dataset),
     [views.data, state.dataset],
   );
-  const selectedView = available.find((item) => item.view.filter_id === selected);
+  const selectedView = selected
+    ? available.find((item) => savedLogViewKey(item.view) === selected)
+    : undefined;
   const view = selectedView?.view;
   const owned = ownsSavedLogView(view, ownerHash.data, mode === 'demo');
   async function mutate(action: 'create' | 'update' | 'delete' | 'convert') {
+    if (pendingMutation.current) return;
     const requestGeneration = generation.current;
+    const mutation = { generation: requestGeneration };
+    let completed = false;
+    pendingMutation.current = mutation;
     setError('');
     setNotice('');
     setBusy(true);
@@ -128,8 +140,9 @@ export function SavedViews({
         const created = await client.createLogView(
           savedLogViewBody(state, name, undefined, timestampField),
         );
+        completed = true;
         if (requestGeneration !== generation.current) return;
-        setSelected(created.filter_id ?? '');
+        setSelected(savedLogViewKey(created));
         setName(created.filter_name);
       } else {
         if (!view?.filter_id) throw new Error('Select a saved view first.');
@@ -140,6 +153,7 @@ export function SavedViews({
         if (action === 'convert') {
           if (!selectedView?.decoded) throw new Error('This saved view cannot be converted here.');
           const converted = await client.convertLogViewToSql(view.filter_id);
+          completed = true;
           if (requestGeneration !== generation.current) return;
           setName(converted.filter_name);
         } else if (action === 'update') {
@@ -150,14 +164,17 @@ export function SavedViews({
             view.filter_id,
             savedLogViewBody(state, name, view, timestampField),
           );
-        } else await client.deleteLogView(view.filter_id);
+          completed = true;
+        } else {
+          await client.deleteLogView(view.filter_id);
+          completed = true;
+        }
         if (requestGeneration !== generation.current) return;
         if (action === 'delete') {
           setSelected('');
           setName('');
         }
       }
-      views.reload();
       setNotice(
         action === 'delete'
           ? 'View deleted.'
@@ -169,9 +186,16 @@ export function SavedViews({
       if (requestGeneration === generation.current)
         setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      if (requestGeneration === generation.current) setBusy(false);
+      if (pendingMutation.current === mutation) {
+        pendingMutation.current = null;
+        // A server write owns the lock across dialog generations. Confirmed
+        // writes refresh the list even when their draft and notice are stale.
+        if (completed) views.reload();
+        setBusy(false);
+      }
     }
   }
+  const editingDisabled = busy && pendingMutation.current?.generation === generation.current;
   const compatible = !!selectedView?.decoded;
   return (
     <>
@@ -184,7 +208,6 @@ export function SavedViews({
         onOpenChange={(nextOpen) => {
           if (!nextOpen) {
             generation.current += 1;
-            setBusy(false);
           }
           setOpen(nextOpen);
         }}
@@ -204,12 +227,13 @@ export function SavedViews({
             <Select
               aria-label="Saved log view"
               value={selected}
-              disabled={busy}
+              disabled={editingDisabled}
               onChange={(event) => {
-                const id = event.target.value;
-                setSelected(id);
+                const key = event.target.value;
+                setSelected(key);
                 setName(
-                  available.find((item) => item.view.filter_id === id)?.view.filter_name ?? '',
+                  available.find((item) => savedLogViewKey(item.view) === key)?.view.filter_name ??
+                    '',
                 );
                 setError('');
                 setNotice('');
@@ -219,7 +243,7 @@ export function SavedViews({
               {available
                 .filter(({ view }) => view.filter_id)
                 .map(({ view: item, decoded }) => (
-                  <option key={item.filter_id} value={item.filter_id ?? ''}>
+                  <option key={savedLogViewKey(item)} value={savedLogViewKey(item)}>
                     {item.filter_name}
                     {!decoded ? ' (classic or incompatible)' : ''}
                     {!ownsSavedLogView(item, ownerHash.data, mode === 'demo') ? ' (read only)' : ''}
@@ -248,7 +272,7 @@ export function SavedViews({
               aria-label="Log view name"
               value={name}
               maxLength={200}
-              disabled={busy}
+              disabled={editingDisabled}
               onChange={(event) => setName(event.target.value)}
             />
           </label>

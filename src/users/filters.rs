@@ -152,13 +152,20 @@ impl Filters {
     ) -> Option<Filter> {
         let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         if let Some(filters) = self.0.read().await.get(tenant_id) {
-            let mut matches = filters.iter().filter(|f| {
-                f.filter_id.as_deref() == Some(filter_id)
-                    && (f.user_id.as_deref() == Some(user_id) || is_admin)
-            });
+            if let Some(owned) = filters.iter().find(|f| {
+                f.filter_id.as_deref() == Some(filter_id) && f.user_id.as_deref() == Some(user_id)
+            }) {
+                return Some(owned.clone());
+            }
+            if !is_admin {
+                return None;
+            }
+            let mut matches = filters
+                .iter()
+                .filter(|f| f.filter_id.as_deref() == Some(filter_id));
             let filter = matches.next()?;
-            // IDs are normally globally unique. Fail closed for an administrator
-            // if imported records make this owner-less URL ambiguous.
+            // Older administrator edits can leave different owners' copies.
+            // Without an owned copy, only an unambiguous admin fallback is safe.
             if matches.next().is_some() {
                 return None;
             }
@@ -238,6 +245,43 @@ mod tests {
             "query":{"filter_type":"sql","filter_query":"select * from orders","filter_builder":null},
             "time_filter":null
         })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn saved_filter_cache_prefers_administrators_own_copy_of_shared_id() {
+        let cache = Filters::default();
+        let tenant = Some("tenant".into());
+        let original = saved_filter("original-owner", &tenant);
+        let administrator = saved_filter("administrator", &tenant);
+        // Older administrator updates persisted a second record under the same
+        // ID. Both records must remain accessible to their respective owners.
+        cache.update(&original, &tenant).await;
+        cache.update(&administrator, &tenant).await;
+        assert_eq!(
+            cache
+                .get_filter("shared-id", "administrator", true, &tenant)
+                .await,
+            Some(administrator.clone())
+        );
+        assert_eq!(
+            cache
+                .get_filter("shared-id", "original-owner", false, &tenant)
+                .await,
+            Some(original.clone())
+        );
+        assert!(
+            cache
+                .get_filter("shared-id", "unrelated-administrator", true, &tenant)
+                .await
+                .is_none()
+        );
+        cache.delete_filter(&administrator, &tenant).await;
+        assert_eq!(
+            cache
+                .get_filter("shared-id", "original-owner", false, &tenant)
+                .await,
+            Some(original)
+        );
     }
 
     #[tokio::test]

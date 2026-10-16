@@ -149,7 +149,9 @@ test('timezone share links and server saved views restore after reload', async (
   expect(saved).toHaveLength(1);
   await page.goto(url(view()));
   await page.getByRole('button', { name: 'Saved views', exact: true }).click();
-  await dialog.getByRole('combobox', { name: 'Saved log view' }).selectOption('depth-view');
+  await dialog
+    .getByRole('combobox', { name: 'Saved log view' })
+    .selectOption({ label: 'Depth view (read only)' });
   await dialog.getByRole('button', { name: 'Apply view', exact: true }).click();
   await expect(page.getByRole('combobox', { name: 'Timezone', exact: true })).toHaveValue(
     'America/Chicago',
