@@ -1,6 +1,6 @@
 #!/bin/sh
 
-DOWNLOAD_BASE_URL="https://github.com/parseablehq/parseable/releases/download"
+DOWNLOAD_BASE_URL="https://github.com/VibeEngineeringAI/parseable/releases/download"
 INSTALL_DIR="${HOME}/.parseable"
 BIN_DIR="${INSTALL_DIR}/bin"
 BIN_NAME="${BIN_DIR}/parseable"
@@ -64,15 +64,15 @@ fi
 fetch_release() {
     case "$DOWNLOADER" in
         curl)
-            curl -fsSL "https://api.github.com/repos/parseablehq/parseable/releases/latest"
+            curl -fsSL "https://api.github.com/repos/VibeEngineeringAI/parseable/releases/latest"
             ;;
         wget)
-            wget -q -O - "https://api.github.com/repos/parseablehq/parseable/releases/latest"
+            wget -q -O - "https://api.github.com/repos/VibeEngineeringAI/parseable/releases/latest"
             ;;
     esac
 }
 if ! release=$(fetch_release); then
-    printf 'Error: Could not fetch the latest release information.\n' >&2
+    printf 'Error: Could not fetch the latest release information from VibeEngineeringAI/parseable. Check that this fork has a published release.\n' >&2
     exit 1
 fi
 release_tag=$(printf '%s\n' "$release" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)

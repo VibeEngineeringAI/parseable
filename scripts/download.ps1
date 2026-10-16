@@ -107,7 +107,13 @@ function Install-Parseable {
 
     Write-Output "Fetching latest release..."
     # Get the latest release information using GitHub API
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/parseablehq/parseable/releases/latest"
+    try {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/VibeEngineeringAI/parseable/releases/latest" -ErrorAction Stop
+    } catch {
+        Write-Error "Could not fetch the latest release information from VibeEngineeringAI/parseable. Check that this fork has a published release."
+        exit 1
+    }
+    $release_tag = $release.tag_name
     # Write-Host ($release | Format-List | Out-String) # Write-Host formats the object while printing
     
     $installation_found_flag = 0
@@ -125,10 +131,16 @@ function Install-Parseable {
     Write-Output "Downloading Parseable version $release_tag, for OS: $OS, CPU architecture: $CPU_ARCH`n`n"
     # Download the binary using Invoke-WebRequest
     if ($installation_found_flag) {
-        Invoke-WebRequest -Uri $download_url -OutFile $BIN
+        try {
+            Invoke-WebRequest -Uri $download_url -OutFile $BIN -ErrorAction Stop
+        } catch {
+            Remove-Item -LiteralPath $BIN -Force -ErrorAction SilentlyContinue
+            Write-Error "Download failed: $_"
+            exit 1
+        }
     } else {
         Write-Output "Unable to find correct installation. Exiting"
-        exit
+        exit 1
     }
     
 

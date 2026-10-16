@@ -363,7 +363,69 @@ pub fn flatten_otel_logs(message: &LogsData, tenant_id: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_severity;
+    use super::{flatten_log_record, normalize_severity};
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::LogRecord;
+    use serde_json::json;
+
+    fn flatten_record(
+        number: i32,
+        text: &str,
+        body: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        flatten_log_record(&LogRecord {
+            severity_number: number,
+            severity_text: text.to_string(),
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(body.to_string())),
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn text_only_error_record_is_categorized_with_a_neutral_body() {
+        let record = flatten_record(0, "ERROR", "request completed");
+        assert_eq!(record["severity_number"], json!(17));
+        assert_eq!(record["severity_text"], json!("ERROR"));
+        assert_eq!(record["p_log_category"], json!("ERROR"));
+    }
+
+    #[test]
+    fn invalid_positive_and_negative_severity_numbers_do_not_panic() {
+        for number in [25, i32::MAX, -1, i32::MIN] {
+            let record = flatten_record(number, "", "request completed");
+            assert_eq!(record["severity_number"], json!(number));
+            assert_eq!(record["severity_text"], json!("UNSPECIFIED"));
+            assert_eq!(record["p_log_category"], json!("UNSPECIFIED"));
+
+            let record = flatten_record(number, "custom", "ERROR: request failed");
+            assert_eq!(record["severity_text"], json!("custom"));
+            assert_eq!(record["p_log_category"], json!("ERROR"));
+        }
+    }
+
+    #[test]
+    fn explicit_number_wins_over_contradictory_text_and_body_for_category() {
+        let record = flatten_record(9, "ERROR", "fatal request failure");
+        assert_eq!(record["severity_number"], json!(9));
+        assert_eq!(record["severity_text"], json!("ERROR"));
+        assert_eq!(record["p_log_category"], json!("INFO"));
+
+        let record = flatten_record(0, "INFO", "fatal request failure");
+        assert_eq!(record["severity_number"], json!(9));
+        assert_eq!(record["p_log_category"], json!("INFO"));
+    }
+
+    #[test]
+    fn unspecified_severity_retains_body_fallback() {
+        for text in ["", "UNSPECIFIED", " unspecified "] {
+            let record = flatten_record(0, text, "Error: request failed");
+            assert_eq!(record["severity_number"], json!(0));
+            assert_eq!(record["severity_text"], json!("UNSPECIFIED"));
+            assert_eq!(record["p_log_category"], json!("ERROR"));
+        }
+    }
 
     #[test]
     fn derives_severity_text_from_number_when_missing() {

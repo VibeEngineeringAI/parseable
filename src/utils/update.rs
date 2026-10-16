@@ -21,8 +21,6 @@ use std::time::Duration;
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 
-use crate::{about, parseable::PARSEABLE};
-
 use super::uid;
 
 #[derive(Debug, Clone)]
@@ -31,18 +29,18 @@ pub struct LatestRelease {
     pub date: DateTime<Utc>,
 }
 
-pub async fn get_latest(deployment_id: &uid::Uid) -> Result<LatestRelease, anyhow::Error> {
-    let send_analytics = PARSEABLE.options.send_analytics;
+pub async fn get_latest(_deployment_id: &uid::Uid) -> Result<LatestRelease, anyhow::Error> {
     let agent = reqwest::ClientBuilder::new()
-        .user_agent(about::user_agent(deployment_id, send_analytics))
+        .user_agent(concat!("Parseable/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(8))
         .build()
         .expect("client can be built on this system");
 
     let json: serde_json::Value = agent
-        .get("https://download.parseable.io/latest-version")
+        .get("https://api.github.com/repos/VibeEngineeringAI/parseable/releases/latest")
         .send()
         .await?
+        .error_for_status()?
         .json()
         .await?;
     let version = json["tag_name"]
