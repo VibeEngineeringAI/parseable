@@ -106,6 +106,7 @@ export function RecordSheet({
                                     variant="ghost"
                                     size="icon"
                                     aria-label={`Include ${key} in filter`}
+                                    title="Filter to events with this field value"
                                     onClick={() => {
                                       onFilter(key, value);
                                       onClose();
@@ -117,6 +118,7 @@ export function RecordSheet({
                                     variant="ghost"
                                     size="icon"
                                     aria-label={`Exclude ${key} from filter`}
+                                    title="Exclude events with this field value"
                                     onClick={() => {
                                       onFilter(key, value, '!=');
                                       onClose();
@@ -130,6 +132,7 @@ export function RecordSheet({
                                 variant="ghost"
                                 size="icon"
                                 aria-label={`Copy key value pair ${key}`}
+                                title="Copy field name and value"
                                 onClick={async () => {
                                   const { id } = session;
                                   try {
