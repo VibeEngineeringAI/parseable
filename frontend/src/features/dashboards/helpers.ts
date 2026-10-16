@@ -43,9 +43,11 @@ export function metadataPatch(
   title: string,
   tags: string[],
   description: string,
+  dataset: string | null | undefined = original.dataset,
 ): Partial<Dashboard> {
   const currentDescription = typeof original.description === 'string' ? original.description : '';
   return {
+    ...(dataset !== original.dataset ? { dataset } : {}),
     ...(title !== original.title ? { title } : {}),
     ...(JSON.stringify(tags) !== JSON.stringify(original.tags ?? []) ? { tags } : {}),
     ...(description !== currentDescription ? { description } : {}),
@@ -56,8 +58,9 @@ export function editDashboardMetadata(
   title: string,
   tags: string[],
   description: string,
+  dataset: string | null | undefined = original.dataset,
 ): Dashboard {
-  return { ...original, ...metadataPatch(original, title, tags, description) };
+  return { ...original, ...metadataPatch(original, title, tags, description, dataset) };
 }
 /** True when someone else changed a field that `patch` also changes. */
 export function patchConflicts(loaded: Dashboard, latest: Dashboard, patch: Partial<Dashboard>) {

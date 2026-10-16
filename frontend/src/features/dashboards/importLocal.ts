@@ -32,6 +32,7 @@ export function localImportBody(item: ImportItem, tileId: string): DashboardRequ
   const { local, title } = item;
   return {
     title,
+    dataset: local.dataset,
     description: local.description,
     tags: [],
     variables: [],

@@ -30,6 +30,7 @@ describe('browser-local import', () => {
     expect(planLocalImport(inputs, titles, ids)).toEqual(plan);
     expect(localImportBody(plan.create[0], '01M4J000000000000000000041')).toMatchObject({
       title: 'Title (3)',
+      dataset: 'app"logs',
       description: 'Keep description',
       tiles: [
         {

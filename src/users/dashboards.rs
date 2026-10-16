@@ -59,6 +59,13 @@ pub struct Tile {
 pub struct Dashboard {
     pub version: Option<String>,
     pub title: String,
+    /// Default dataset for new tiles; existing tiles retain their own queries.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_dataset",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dataset: Option<String>,
     pub author: Option<String>,
     pub dashboard_id: Option<Ulid>,
     pub created: Option<DateTime<Utc>>,
@@ -71,6 +78,19 @@ pub struct Dashboard {
     /// all other fields are variable and can be added as needed
     #[serde(flatten)]
     pub other_fields: Option<serde_json::Map<String, Value>>,
+}
+
+// Dataset was previously an arbitrary flattened field. Ignore unsupported legacy
+// shapes instead of dropping the entire dashboard when loading stored documents.
+fn deserialize_dataset<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::trim)
+        .filter(|dataset| !dataset.is_empty())
+        .map(str::to_owned))
 }
 
 impl MetastoreObject for Dashboard {
@@ -120,6 +140,10 @@ impl Dashboard {
             "title".to_string(),
             serde_json::Value::String(self.title.clone()),
         );
+
+        if let Some(dataset) = &self.dataset {
+            map.insert("dataset".to_string(), Value::String(dataset.clone()));
+        }
 
         if let Some(author) = &self.author {
             map.insert(
@@ -530,5 +554,53 @@ impl Dashboards {
                     "Dashboard does not exist or you do not have permission to access it",
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dashboard;
+    use serde_json::json;
+
+    #[test]
+    fn dataset_survives_metadata_and_storage_round_trip() {
+        let mut dashboard: Dashboard = serde_json::from_value(json!({
+            "title": "Application health",
+            "dataset": "application_logs",
+            "customSetting": { "enabled": true }
+        }))
+        .unwrap();
+        dashboard.set_metadata("owner", None);
+
+        let stored = serde_json::to_vec(&dashboard).unwrap();
+        let loaded: Dashboard = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(loaded.dataset.as_deref(), Some("application_logs"));
+        assert_eq!(loaded.to_summary()["dataset"], "application_logs");
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap()["customSetting"],
+            json!({ "enabled": true })
+        );
+    }
+
+    #[test]
+    fn legacy_and_unbound_dashboards_need_no_dataset() {
+        for document in [
+            json!({ "title": "Legacy dashboard" }),
+            json!({ "title": "Unbound dashboard", "dataset": null }),
+            json!({ "title": "Blank dataset", "dataset": "  " }),
+            json!({ "title": "Legacy number", "dataset": 5 }),
+            json!({ "title": "Legacy object", "dataset": { "name": "logs" } }),
+            json!({ "title": "Legacy array", "dataset": ["logs"] }),
+        ] {
+            let dashboard: Dashboard = serde_json::from_value(document).unwrap();
+            assert!(dashboard.dataset.is_none());
+            assert!(!dashboard.to_summary().contains_key("dataset"));
+            assert!(
+                serde_json::to_value(&dashboard)
+                    .unwrap()
+                    .get("dataset")
+                    .is_none()
+            );
+        }
     }
 }

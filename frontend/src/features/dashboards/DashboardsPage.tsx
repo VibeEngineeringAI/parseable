@@ -174,15 +174,19 @@ export function DashboardsPage() {
             setForm(undefined);
             mutation.reset();
           }}
-          onSubmit={(title, tags, description) =>
+          onSubmit={(title, tags, description, dataset) =>
             void mutation.run(async () => {
               if (form.original)
-                await save(form.original, metadataPatch(form.original, title, tags, description));
+                await save(
+                  form.original,
+                  metadataPatch(form.original, title, tags, description, dataset),
+                );
               else {
                 const created = await client.createDashboard({
                   title,
                   tags,
                   description,
+                  dataset,
                   tiles: [],
                   variables: [],
                   sections: [],

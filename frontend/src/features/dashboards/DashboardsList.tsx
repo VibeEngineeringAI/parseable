@@ -126,6 +126,7 @@ export function DashboardsList({
                     </Link>
                   </div>
                   <div className="dashboards-tags">
+                    {row.dataset && <Badge>Dataset: {row.dataset}</Badge>}
                     {[...new Set(row.tags ?? [])].map((value) => (
                       <Badge key={value}>{value}</Badge>
                     ))}

@@ -66,6 +66,7 @@ export function DashboardDialogs({
         {dialog?.kind === 'tile' && (
           <TileEditor
             original={dialog.tile}
+            defaultDataset={draft.dataset ?? undefined}
             tiles={draft.tiles ?? []}
             sections={draft.sections}
             variables={url.variables}
@@ -112,9 +113,9 @@ export function DashboardDialogs({
           draftOnly
           onDirtyChange={workspace.setEditorDirty}
           onClose={closeEditor}
-          onSubmit={(title, tags, description) => {
+          onSubmit={(title, tags, description, dataset) => {
             workspace.changeDraft(
-              (current) => editDashboardMetadata(current, title, tags, description),
+              (current) => editDashboardMetadata(current, title, tags, description, dataset),
               'Dashboard details applied. Save to keep this change.',
             );
             workspace.setEditorDirty(false);

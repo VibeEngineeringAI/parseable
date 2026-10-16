@@ -26,6 +26,9 @@ describe('dashboard wire guards', () => {
     expect(dashboard({ ...classic, tiles: null })).toBe(true);
   });
   it('validates known metadata and required snake-case tile IDs', () => {
+    expect(dashboard({ ...classic, dataset: 'application_logs' })).toBe(true);
+    expect(dashboard({ ...classic, dataset: null })).toBe(true);
+    expect(dashboard({ ...classic, dataset: ['application_logs'] })).toBe(false);
     expect(dashboard({ ...classic, tiles: [{ tileId: classic.tiles[0].tile_id }] })).toBe(false);
     expect(dashboardSummary({ ...classic, tags: 'x' })).toBe(false);
     expect(dashboardSummary({ ...classic, isFavorite: 'true' })).toBe(false);

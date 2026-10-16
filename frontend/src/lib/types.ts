@@ -372,6 +372,7 @@ export type ApiKey = {
 // intact and patch it; a narrower editor model must never become the PUT body.
 export type DashboardTile = { tile_id: string; [key: string]: unknown };
 export type DashboardSummary = {
+  dataset?: string | null;
   dashboardId: string;
   title: string;
   author?: string | null;
@@ -382,6 +383,7 @@ export type DashboardSummary = {
   [key: string]: unknown;
 };
 export type DashboardRequest = {
+  dataset?: string | null;
   title: string;
   tiles?: DashboardTile[] | null;
   tags?: string[] | null;

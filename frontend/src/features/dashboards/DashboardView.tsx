@@ -112,7 +112,11 @@ function DashboardFields({ original }: { original: Dashboard }) {
         </nav>
         <PageHeader
           title={draft.title}
-          description={text(draft.description) || undefined}
+          description={
+            [text(draft.description), draft.dataset ? `Dataset: ${draft.dataset}` : '']
+              .filter(Boolean)
+              .join(' · ') || undefined
+          }
           actions={
             <>
               {writable && (

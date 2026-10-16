@@ -7,6 +7,7 @@ import { sectionGroups } from './layout';
 /** The classic portable export deliberately omits server metadata, title and timeRange. */
 export function exportDashboard(dashboard: Dashboard) {
   return structuredClone({
+    ...(dashboard.dataset ? { dataset: dashboard.dataset } : {}),
     tags: dashboard.tags ?? [],
     variables: dashboard.variables ?? [],
     sections: dashboard.sections ?? [],
@@ -24,6 +25,8 @@ export function importDashboard(json: string, title: string): DashboardRequest {
     throw new Error('A dashboard must contain a tiles array (which may be empty).');
   if (value.tags != null && !strings(value.tags))
     throw new Error('Tags must be an array of strings.');
+  if (value.dataset != null && typeof value.dataset !== 'string')
+    throw new Error('Default dataset must be a string.');
   if (value.sections != null && !Array.isArray(value.sections))
     throw new Error('Sections must be an array.');
   if (

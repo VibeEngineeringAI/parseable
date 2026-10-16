@@ -171,6 +171,7 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
           .map(
             ({
               title,
+              dataset,
               author,
               dashboardId,
               created,
@@ -179,6 +180,7 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
               isFavorite,
             }): DashboardSummary => ({
               title,
+              ...(dataset == null ? {} : { dataset }),
               author,
               dashboardId,
               created,
