@@ -33,7 +33,9 @@ jobs:
           cache-key: rust-clippy
           tools: cargo-hack
       - name: Check all feature configurations with Clippy
-        run: cargo hack clippy --locked --verbose --each-feature --no-dev-deps -- -D warnings
+        # cargo-hack temporarily removes dev dependencies and updates Cargo.lock;
+        # --locked would reject that temporary manifest before Clippy can run.
+        run: cargo hack clippy --verbose --each-feature --no-dev-deps -- -D warnings
 
   tests:
     runs-on: blacksmith-8vcpu-ubuntu-2404
