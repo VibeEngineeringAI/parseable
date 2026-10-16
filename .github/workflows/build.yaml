@@ -4,7 +4,7 @@ on:
   # Temporarily pause automatic builds for the release target matrix.
   workflow_dispatch:
 
-# Cross preserves this absolute workspace path inside its build container.
+# Each job builds the frontend into this absolute path before cargo runs.
 env:
   NEXT_ASSETS_PATH: ${{ github.workspace }}/frontend/dist
 
@@ -13,27 +13,24 @@ jobs:
   build-default:
     name: Build Default ${{matrix.target}}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux builds - x86_64 native, aarch64 cross-compile
-          - os: ubuntu-latest
+          # Linux builds - both native, matching the release workflow
+          - os: blacksmith-8vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
-            use_cross: false
-          - os: ubuntu-latest
+          - os: blacksmith-8vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
-            use_cross: true
 
           # macOS build - aarch64 only (M1/M2)
           - os: macos-latest
             target: aarch64-apple-darwin
-            use_cross: false
 
           # Windows build
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -49,9 +46,17 @@ jobs:
         working-directory: frontend
         run: npm ci && npm run build
 
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - name: Install GCC 11 on Linux
@@ -60,27 +65,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-11 g++-11
 
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-default-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build with cross
-        if: matrix.use_cross
-        env:
-          CROSS_NO_WARNINGS: "0"
-        run: cross build --target ${{ matrix.target }} --release
+          key: ${{ matrix.target }}-default-release
 
       - name: Build native
-        if: ${{ !matrix.use_cross }}
         env:
           CC: ${{ runner.os == 'Linux' && 'gcc-11' || '' }}
           CXX: ${{ runner.os == 'Linux' && 'g++-11' || '' }}
@@ -89,7 +79,8 @@ jobs:
   # Kafka build for x86_64 Linux only
   build-kafka:
     name: Build Kafka x86_64-unknown-linux-gnu
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -121,19 +112,23 @@ jobs:
             libsasl2-dev \
             python3
 
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: x86_64-unknown-linux-gnu
 
-      - name: Cache dependencies
-        uses: actions/cache@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-x86_64-unknown-linux-gnu-kafka-${{ hashFiles('**/Cargo.lock') }}
+          key: x86_64-unknown-linux-gnu-kafka-release
 
       - name: Find and fix librdkafka CMakeLists.txt
         run: |
@@ -163,6 +158,7 @@ jobs:
   build-kafka-mac:
     name: Build Kafka aarch64-apple-darwin
     runs-on: macos-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -188,19 +184,23 @@ jobs:
             cyrus-sasl \
             python3
 
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          echo "channel=${channel:-stable}" >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: aarch64-apple-darwin
 
-      - name: Cache dependencies
-        uses: actions/cache@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-aarch64-apple-darwin-kafka-${{ hashFiles('**/Cargo.lock') }}
+          key: aarch64-apple-darwin-kafka-release
 
       - name: Find and fix librdkafka CMakeLists.txt
         run: |

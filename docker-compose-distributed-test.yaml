@@ -26,6 +26,7 @@ services:
       - parseable-internal
   # query server
   parseable-query:
+    image: ${PARSEABLE_TEST_IMAGE:-parseable-test:local}
     build:
       context: .
       dockerfile: Dockerfile.debug
@@ -64,6 +65,7 @@ services:
         max_attempts: 3
   # ingest server one
   parseable-ingest-one:
+    image: ${PARSEABLE_TEST_IMAGE:-parseable-test:local}
     build:
       context: .
       dockerfile: Dockerfile.debug
@@ -113,7 +115,7 @@ services:
       - QUEST_EDITION=oss
     command:
       [
-        "load",
+        "${QUEST_MODE:-load}",
         "http://parseable-query:8000",
         "parseableadmin",
         "parseableadmin",

@@ -1,0 +1,55 @@
+name: Set up Rust CI
+description: Build frontend assets and prepare the pinned Rust toolchain and Kafka dependencies.
+inputs:
+  cache-key:
+    description: Separate compiler artifacts by CI workload.
+    required: true
+  tools:
+    description: Cargo tools to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
+    - name: Build frontend
+      shell: bash
+      working-directory: frontend
+      run: npm ci && npm run build
+    - name: Read pinned Rust toolchain
+      id: toolchain
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import os, tomllib
+        with open('rust-toolchain.toml', 'rb') as source:
+            channel = tomllib.load(source)['toolchain']['channel']
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+            print(f'channel={channel}', file=output)
+        PY
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.toolchain.outputs.channel }}
+        components: clippy, llvm-tools-preview
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: ${{ inputs.tools }}
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libsasl2-dev libssl-dev pkg-config build-essential
+    - name: Patch librdkafka CMake compatibility
+      shell: bash
+      run: |
+        cargo fetch --locked
+        RDKAFKA_SYS_DIR=$(find ~/.cargo/registry/src -name 'rdkafka-sys-*' -type d | head -n 1)
+        CMAKE_FILE="$RDKAFKA_SYS_DIR/librdkafka/CMakeLists.txt"
+        test -f "$CMAKE_FILE"
+        sed -i 's/cmake_minimum_required(VERSION 3.2)/cmake_minimum_required(VERSION 3.5)/' "$CMAKE_FILE"

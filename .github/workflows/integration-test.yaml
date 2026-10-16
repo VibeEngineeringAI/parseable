@@ -1,35 +1,86 @@
 name: Integration Tests with Quest
 on:
-  pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "helm/**"
-      - "assets/**"
-      - "**.md"
+  workflow_call:
+    inputs:
+      full:
+        description: Include sustained Quest load tests
+        type: boolean
+        default: false
+permissions:
+  contents: read
 
 jobs:
-
-  docker-compose-test:
-    name: Quest Smoke and Load Tests for Standalone deployments
-    runs-on: ubuntu-latest
+  build-image:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Start compose
-        run: docker compose -f docker-compose-test.yaml up --build --exit-code-from quest
+      - uses: actions/checkout@v4
+      - name: Set up cached Docker builder
+        uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: parseable-integration
+      - name: Build integration image once
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: Dockerfile.debug
+          platforms: linux/amd64
+          tags: parseable-ci:${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/parseable-ci.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: integration-image
+          path: ${{ runner.temp }}/parseable-ci.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  quest:
+    name: Quest ${{ matrix.deployment }} (${{ inputs.full && 'full' || 'smoke' }})
+    needs: build-image
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - deployment: standalone
+            compose: docker-compose-test.yaml
+            server: parseable
+          - deployment: distributed
+            compose: docker-compose-distributed-test.yaml
+            server: parseable-query
+    env:
+      PARSEABLE_TEST_IMAGE: parseable-ci:${{ github.sha }}
+      COMPOSE_FILE: ${{ matrix.compose }}
+      QUEST_MODE: ${{ inputs.full && 'load' || 'smoke' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: integration-image
+          path: ${{ runner.temp }}
+      - name: Load shared integration image
+        run: docker load --input "$RUNNER_TEMP/parseable-ci.tar"
+      - name: Select functional suite for PRs
+        if: ${{ !inputs.full }}
+        run: echo "COMPOSE_FILE=$COMPOSE_FILE:docker-compose-ci-smoke.yaml" >> "$GITHUB_ENV"
+      - name: Start services and test embedded frontend
+        env:
+          SERVER: ${{ matrix.server }}
+        run: |
+          docker compose up --no-build --wait --wait-timeout 180 "$SERVER"
+          docker compose exec -T "$SERVER" sh -ec 'curl --fail --silent --show-error --location http://localhost:8000/next/ | grep -q "Parseable · Observability"'
+      - name: Run Quest
+        run: docker compose up --no-build --exit-code-from quest
+      - name: Capture service logs
+        if: failure()
+        run: docker compose logs --no-color > quest-services.log
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: quest-${{ matrix.deployment }}-logs
+          path: quest-services.log
       - name: Stop compose
         if: always()
-        run: docker compose -f docker-compose-test.yaml down -v
-
-  docker-compose-distributed-test:
-    name: Quest Smoke and Load Tests for Distributed deployments
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Start compose
-        run: docker compose -f docker-compose-distributed-test.yaml up --build --exit-code-from quest
-      - name: Stop compose
-        if: always()
-        run: docker compose -f docker-compose-distributed-test.yaml down -v
-        
+        run: docker compose down -v

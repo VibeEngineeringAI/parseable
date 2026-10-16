@@ -80,6 +80,26 @@ For production deployments, refer to the [installation guide ↗︎](https://www
 
 ## Contributing
 
+Pull requests use the [CI workflow](.github/workflows/ci.yaml) on Blacksmith
+8-vCPU Ubuntu 24.04 runners. It selects frontend, Rust, and integration jobs from
+the changed paths and reports one aggregate `CI passed` check. Frontend changes
+still exercise the embedded UI through the integration image; Rust-only changes
+skip the browser suite. A newer PR commit cancels its superseded CI run.
+
+Browser tests run in four shards alongside production and Storybook checks.
+Clippy runs alongside Rust tests. Integration builds one cached Docker image and
+shares it between standalone and distributed Quest jobs. PRs keep Quest's
+functional tests but exclude its six sustained k6 tests. Pushes to `main` and the
+nightly run (06:17 UTC) run the full Quest load suite and upload Rust coverage.
+Manual CI runs can select `full` to exercise those checks before merging.
+
+Release builds cache Rust dependencies per target, feature set, and profile.
+The manual release workflow defaults to the existing fat-LTO profile. Its
+`release-thin-lto` option is an experiment that only uploads workflow artifacts;
+it accepts a tag, branch, or commit containing that Cargo profile and never
+publishes release assets or images. Compare build times and runtime benchmarks
+on the same source revision before changing the production profile.
+
 <a href="https://github.com/parseablehq/parseable/graphs/contributors"><img src="https://contrib.rocks/image?repo=parseablehq/parseable" alt="Contributors" /></a>
 
 [Contribution guide ↗︎](https://github.com/parseablehq/parseable/blob/main/CONTRIBUTING.md)
