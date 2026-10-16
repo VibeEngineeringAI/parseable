@@ -1,0 +1,210 @@
+name: Candidate CI latency validation
+
+# Candidate-only validation; application source and warm-cache namespace are fixed.
+# The deliberate request-file trigger bootstraps workflow_dispatch on this branch.
+# Paid timeout ceiling: 5*8*$0.016 + 8*$0.032 + 2*8*$0.008 = $1.024.
+# Faster health polling is an unmeasured latency hypothesis until this run completes.
+on:
+  push:
+    branches: [analysis/blacksmith-runner-sizing]
+    paths: [.github/candidate-benchmark-request.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-latency-candidate
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'VibeEngineeringAI/parseable' && github.ref == 'refs/heads/analysis/blacksmith-runner-sizing'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      source-ref: ${{ steps.request.outputs.source-ref }}
+      cache-namespace: ${{ steps.request.outputs.cache-namespace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read fixed candidate request
+        id: request
+        run: |
+          python3 - <<'PYCODE'
+          import json, os
+          request = json.load(open('.github/candidate-benchmark-request.json'))
+          assert request['source_sha'] == '2e69c80f8fa411057baae1efd4cc2e30109d6b07'
+          assert request['cache_namespace'] == 'ci-latency-v1'
+          assert request['quest_run_id'] == 38961913773
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print('source-ref=' + request['source_sha'], file=out)
+              print('cache-namespace=' + request['cache_namespace'], file=out)
+          print(json.dumps(request))
+          PYCODE
+      - uses: actions/checkout@v4
+        with:
+          ref: 2e69c80f8fa411057baae1efd4cc2e30109d6b07
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --test scripts/test-community-ui.mjs
+
+  frontend:
+    needs: prepare
+    uses: ./.github/workflows/benchmark-frontend.yaml
+    with:
+      source-ref: ${{ needs.prepare.outputs.source-ref }}
+      ui-shards: 8
+
+  rust:
+    needs: prepare
+    uses: ./.github/workflows/benchmark-rust.yaml
+    with:
+      source-ref: ${{ needs.prepare.outputs.source-ref }}
+      cache-namespace: ${{ needs.prepare.outputs.cache-namespace }}
+      timeout-minutes: 8
+
+  image-candidate:
+    needs: prepare
+    uses: ./.github/workflows/benchmark-image.yaml
+    with:
+      source-ref: ${{ needs.prepare.outputs.source-ref }}
+      cache-namespace: ${{ needs.prepare.outputs.cache-namespace }}
+      timeout-minutes: 8
+      variant: cpu16-debug0
+      runner: blacksmith-16vcpu-ubuntu-2404
+      debug: '0'
+
+  quest:
+    needs: [prepare, image-candidate]
+    name: Quest ${{ matrix.deployment }} (candidate)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        deployment: [standalone, distributed]
+    env:
+      PARSEABLE_TEST_IMAGE: parseable-benchmark:${{ github.sha }}-cpu16-debug0
+      QUEST_MODE: smoke
+      QUEST_IMAGE: quay.io/parseablehq/quest@sha256:f3d1e7c363df3dc0bd4f6987db7cade490e8ef6ab1cc72b451da02d37230f768
+      MINIO_IMAGE: quay.io/parseablehq/minio@sha256:88276d0a028d758ffaf80d65dd80071386e91b4114251a3dda101eadf000faeb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-cpu16-debug0
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: quest-binaries
+          path: .benchmark/quest-binaries
+          run-id: 38961913773
+          github-token: ${{ github.token }}
+      - name: Load application and select isolated Quest binary
+        env:
+          VARIANT: candidate
+          DEPLOYMENT: ${{ matrix.deployment }}
+        run: |
+          nproc
+          free -b
+          docker load --input "$RUNNER_TEMP/parseable-benchmark.tar"
+          chmod +x ".benchmark/quest-binaries/$VARIANT/quest.test"
+          python3 scripts/ci/benchmark-compose.py \
+            --binary ".benchmark/quest-binaries/$VARIANT/quest.test" \
+            --quest-image "$QUEST_IMAGE" --minio-image "$MINIO_IMAGE" \
+            --output .benchmark/override.json
+          if [ "$DEPLOYMENT" = standalone ]; then
+            echo 'COMPOSE_FILE=docker-compose-test.yaml:docker-compose-ci-smoke.yaml:.benchmark/override.json' >> "$GITHUB_ENV"
+            echo 'SERVER=parseable' >> "$GITHUB_ENV"
+          else
+            echo 'COMPOSE_FILE=docker-compose-distributed-test.yaml:docker-compose-ci-smoke.yaml:.benchmark/override.json' >> "$GITHUB_ENV"
+            echo 'SERVER=parseable-query' >> "$GITHUB_ENV"
+          fi
+          # Only poll cadence and retry budget change; Compose merges the
+          # existing healthcheck command and 20-second timeout from the base.
+          python3 - <<'PYCODE'
+          import json, os
+          path = '.benchmark/override.json'
+          override = json.load(open(path))
+          services = ['minio', 'parseable'] if os.environ['DEPLOYMENT'] == 'standalone' else ['minio', 'parseable-query', 'parseable-ingest-one']
+          for service in services:
+              override['services'].setdefault(service, {})['healthcheck'] = {'interval': '2s', 'retries': 45}
+          with open(path, 'w') as out:
+              json.dump(override, out, indent=2)
+          PYCODE
+      - name: Verify resolved Compose configuration before starting containers
+        run: |
+          python3 - <<'PYCODE'
+          import copy, json, os, subprocess
+          override = json.load(open('.benchmark/override.json'))
+          original = copy.deepcopy(override)
+          changed = [name for name, service in original['services'].items() if 'healthcheck' in service]
+          for name in changed:
+              del original['services'][name]['healthcheck']
+          with open('.benchmark/original.json', 'w') as out:
+              json.dump(original, out)
+          files = os.environ['COMPOSE_FILE'].split(':')
+          def resolve(paths):
+              command = ['docker', 'compose']
+              for path in paths:
+                  command += ['-f', path]
+              return json.loads(subprocess.check_output(command + ['config', '--format', 'json']))
+          before = resolve(files[:-1] + ['.benchmark/original.json'])
+          after = resolve(files)
+          for name in changed:
+              health = after['services'][name]['healthcheck']
+              assert health['interval'] == '2s' and health['retries'] == 45
+              assert health['test'] == before['services'][name]['healthcheck']['test']
+              assert health['timeout'] == before['services'][name]['healthcheck']['timeout'] == '20s'
+              health['interval'] = before['services'][name]['healthcheck']['interval']
+              health['retries'] = before['services'][name]['healthcheck']['retries']
+          assert before == after, 'Unexpected Compose change outside health polling'
+          print('Verified health tests, timeout, dependencies, mounts and every other field unchanged')
+          PYCODE
+      - name: Start services and check embedded frontend
+        run: |
+          docker compose up --no-build --wait --wait-timeout 180 "$SERVER"
+          docker compose exec -T "$SERVER" sh -ec 'curl --fail --silent --show-error --location http://localhost:8000/next/ | grep -q "Parseable · Observability"'
+      - name: Run unchanged functional scope
+        run: docker compose up --no-build --exit-code-from quest
+      - name: Capture all service logs and status
+        if: always()
+        run: |
+          docker compose logs --no-color > quest-services.log
+          docker compose ps -a --format json > quest-status.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: candidate-quest-${{ matrix.deployment }}-logs
+          path: |
+            quest-services.log
+            quest-status.json
+          retention-days: 1
+      - name: Stop isolated services
+        if: always()
+        run: docker compose down -v
+
+  experiment-ok:
+    if: always()
+    needs: [prepare, frontend, rust, image-candidate, quest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Require every experiment result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          print(json.dumps(results, indent=2))
+          assert all(job['result'] == 'success' for job in results.values())
+          PY

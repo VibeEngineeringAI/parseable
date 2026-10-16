@@ -5,6 +5,10 @@ on:
       source-ref:
         required: true
         type: string
+      ui-shards:
+        description: UI shards (4 by default; 8 uses two workers per runner).
+        type: number
+        default: 4
 permissions:
   contents: read
 defaults:
@@ -39,20 +43,7 @@ jobs:
     container: mcr.microsoft.com/playwright:v1.63.0-noble
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - suite: ui-1
-            command: npm run test:ui -- --shard=1/4 --workers=4
-          - suite: ui-2
-            command: npm run test:ui -- --shard=2/4 --workers=4
-          - suite: ui-3
-            command: npm run test:ui -- --shard=3/4 --workers=4
-          - suite: ui-4
-            command: npm run test:ui -- --shard=4/4 --workers=4
-          - suite: production
-            command: npm run test:prod -- --workers=4
-          - suite: storybook
-            command: npm run test:stories
+      matrix: ${{ fromJSON(inputs.ui-shards == 8 && '{"include":[{"suite":"ui-1","command":"npm run test:ui -- --shard=1/8 --workers=2"},{"suite":"ui-2","command":"npm run test:ui -- --shard=2/8 --workers=2"},{"suite":"ui-3","command":"npm run test:ui -- --shard=3/8 --workers=2"},{"suite":"ui-4","command":"npm run test:ui -- --shard=4/8 --workers=2"},{"suite":"ui-5","command":"npm run test:ui -- --shard=5/8 --workers=2"},{"suite":"ui-6","command":"npm run test:ui -- --shard=6/8 --workers=2"},{"suite":"ui-7","command":"npm run test:ui -- --shard=7/8 --workers=2"},{"suite":"ui-8","command":"npm run test:ui -- --shard=8/8 --workers=2"},{"suite":"production","command":"npm run test:prod -- --workers=4"},{"suite":"storybook","command":"npm run test:stories"}]}' || '{"include":[{"suite":"ui-1","command":"npm run test:ui -- --shard=1/4 --workers=4"},{"suite":"ui-2","command":"npm run test:ui -- --shard=2/4 --workers=4"},{"suite":"ui-3","command":"npm run test:ui -- --shard=3/4 --workers=4"},{"suite":"ui-4","command":"npm run test:ui -- --shard=4/4 --workers=4"},{"suite":"production","command":"npm run test:prod -- --workers=4"},{"suite":"storybook","command":"npm run test:stories"}]}') }}
     steps:
       - uses: actions/checkout@v4
         with:

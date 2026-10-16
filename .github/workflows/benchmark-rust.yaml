@@ -16,6 +16,10 @@ on:
         type: string
         default: ci-latency-v1
 
+      timeout-minutes:
+        description: Maximum minutes per paid job.
+        type: number
+        default: 12
 permissions:
   contents: read
 
@@ -26,7 +30,7 @@ jobs:
   clippy:
     name: Clippy (${{ matrix.group }})
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 12
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +52,7 @@ jobs:
   default-tests:
     name: Default tests
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 12
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,7 +68,7 @@ jobs:
   kafka-tests:
     name: Kafka tests
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 12
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@v4
         with:

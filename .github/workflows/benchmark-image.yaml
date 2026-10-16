@@ -17,13 +17,17 @@ on:
       debug:
         required: true
         type: string
+      timeout-minutes:
+        description: Maximum minutes per paid job.
+        type: number
+        default: 12
 permissions:
   contents: read
 jobs:
   image:
     name: Image (${{ inputs.variant }})
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 12
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@v4
         with:
