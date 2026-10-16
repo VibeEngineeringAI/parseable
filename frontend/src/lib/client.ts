@@ -232,6 +232,8 @@ export function createClient({
     },
     createLogView: (body) => readLogView(`${base}/filters`, jsonBody('POST', body)),
     updateLogView: (id, body) => readLogView(logViewPath(id), jsonBody('PUT', body)),
+    convertLogViewToSql: (id) =>
+      readLogView(`${logViewPath(id)}/convert-to-sql`, { method: 'POST' }),
     deleteLogView: (id) => mutate(logViewPath(id), { method: 'DELETE' }),
     async logContext(body, signal) {
       const endpoint = `${base}/query/context`;

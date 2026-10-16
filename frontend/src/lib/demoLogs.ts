@@ -161,7 +161,12 @@ export function createDemoLogMethods(
   listDatasets: ParseableClient['listDatasets'],
 ): Pick<
   ParseableClient,
-  'listLogViews' | 'createLogView' | 'updateLogView' | 'deleteLogView' | 'logContext'
+  | 'listLogViews'
+  | 'createLogView'
+  | 'updateLogView'
+  | 'convertLogViewToSql'
+  | 'deleteLogView'
+  | 'logContext'
 > {
   const views = new Map<string, SavedLogView>();
   const clone = <T>(value: T): T => structuredClone(value);
@@ -172,7 +177,9 @@ export function createDemoLogMethods(
   };
   const validate = async (body: SavedLogView) => {
     if (!savedLogView(body)) fail('Invalid saved log view');
-    if (!(await listDatasets()).some((dataset) => dataset.name === body.stream_name))
+    if (body.stream_name === 'sql') {
+      if (body.query.filter_type !== 'sql') fail('SQL views require a SQL query');
+    } else if (!(await listDatasets()).some((dataset) => dataset.name === body.stream_name))
       fail('Stream not found');
   };
   const find = (id: string) => {
@@ -211,6 +218,14 @@ export function createDemoLogMethods(
     async deleteLogView(id) {
       find(id);
       views.delete(id);
+    },
+    async convertLogViewToSql(id) {
+      find(id);
+      const previous = views.get(id)!;
+      if (previous.query.filter_type !== 'sql') fail('Only SQL saved views can be converted');
+      const view = { ...previous, stream_name: 'sql' };
+      views.set(id, view);
+      return clone(view);
     },
     async logContext(request, signal) {
       await ready(signal);
