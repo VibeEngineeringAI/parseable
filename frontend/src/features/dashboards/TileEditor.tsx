@@ -118,6 +118,12 @@ export function TileEditor({
   const queries = promqlQueries(draft),
     dataset = tileDatasets(draft)[0] ?? '',
     isPromql = tileType(draft) === 'promql';
+  const datasetVariables = variables
+    .filter((variable) => variable.type === 'dataset')
+    .map((variable) => variable.name);
+  const reference = /^\$(?:(\w+)|\{(\w+)\})$/.exec(dataset);
+  // A saved `${name}` reference is as valid as the listed `$name` form.
+  const referencesVariable = !!reference && datasetVariables.includes(reference[1] ?? reference[2]);
   const schema = useAsync(
     useCallback(
       (signal) =>
@@ -274,9 +280,8 @@ export function TileEditor({
               ...(isPromql ? (metrics.data?.datasets ?? []) : (datasets.data ?? [])).map(
                 (item) => item.name,
               ),
-              ...variables
-                .filter((variable) => variable.type === 'dataset')
-                .map((variable) => `$${variable.name}`),
+              ...datasetVariables.map((name) => `$${name}`),
+              ...(referencesVariable ? [dataset] : []),
             ],
             selected: dataset,
             emptyLabel: 'No dataset',

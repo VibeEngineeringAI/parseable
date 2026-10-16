@@ -2492,3 +2492,24 @@ test('reselecting the current dataset does not dirty an editor or drop SQL datas
   await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
   expect(server.writes.at(-1)?.tiles?.[0].dbName).toEqual(bindings);
 });
+
+test('braced dataset variable references are not labelled unavailable in the tile picker', async ({
+  page,
+}) => {
+  await mockServer(page, {
+    document: {
+      ...structuredClone(classic),
+      variables: [{ name: 'source', label: 'Source', type: 'dataset', defaultValue: 'app-logs' }],
+      tiles: [{ ...structuredClone(classic.tiles[1]), dbName: ['${source}'] }],
+    } as Dashboard,
+  });
+  await page.goto(detail);
+  await tileAction(page, 'Errors', 'Edit');
+  const form = page.getByRole('dialog', { name: 'Edit tile', exact: true });
+  const picker = form.getByRole('combobox', { name: 'Dataset', exact: true });
+  await picker.click();
+  await expect(form.getByRole('option', { name: 'app-logs', exact: true })).toBeVisible();
+  await expect(form.getByRole('option', { name: /unavailable/ })).toHaveCount(0);
+  await picker.press('Escape');
+  await expect(picker).toHaveValue('${source}');
+});
