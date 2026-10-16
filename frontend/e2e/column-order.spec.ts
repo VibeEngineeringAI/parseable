@@ -116,6 +116,36 @@ for (const virtual of [false, true]) {
   });
 }
 
+test('keyboard reordering follows a column across virtual windows in both directions', async ({
+  page,
+}) => {
+  await demo(page);
+  await page.getByRole('button', { name: 'Add columns', exact: true }).click();
+  const picker = page.getByRole('dialog', { name: 'Add columns' });
+  const checkboxes = picker.getByRole('checkbox');
+  const count = await checkboxes.count();
+  for (const checkbox of await checkboxes.all()) await checkbox.check();
+  await picker.getByRole('button', { name: 'Done', exact: true }).click();
+  await page.getByLabel('Result limit', { exact: true }).selectOption('1000');
+  const handle = table(page).getByRole('button', { name: 'Move p_timestamp', exact: true });
+  const viewport = page.locator('.virtual-log-viewport');
+  await handle.focus();
+  for (const key of ['ArrowRight', 'ArrowLeft']) {
+    for (let index = 1; index < count; index++) {
+      await page.keyboard.press(key);
+      await expect(handle).toBeFocused();
+      await expect
+        .poll(async () => {
+          const grip = await handle.boundingBox();
+          const view = await viewport.boundingBox();
+          return !!grip && !!view && grip.x >= view.x && grip.x + grip.width <= view.x + view.width;
+        })
+        .toBe(true);
+    }
+  }
+  await expect.poll(() => viewport.evaluate((node) => node.scrollLeft)).toBe(0);
+});
+
 test('column picker drag and buttons preserve order across datasets and fresh visits', async ({
   page,
 }) => {

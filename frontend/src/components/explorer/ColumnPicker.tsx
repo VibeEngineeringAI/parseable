@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ArrowDown, ArrowUp, Columns3 } from 'lucide-react';
 import { Button, Dialog, Input } from '../ui';
 import { ColumnReorderHandle, useColumnReorder } from './ColumnReorder';
+import { orderedColumns } from './columnOrder';
 export function ColumnPicker({
   fields,
   selected,
@@ -13,11 +14,26 @@ export function ColumnPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const reorder = useColumnReorder(selected, onChange);
-  const ordered = [...selected, ...fields.filter((field) => !selected.includes(field))];
+  const [rowOrder, setRowOrder] = useState<string[]>([]);
+  const groupedOrder = (selection: string[]) => [
+    ...selection,
+    ...fields.filter((field) => !selection.includes(field)),
+  ];
+  const reorder = useColumnReorder(selected, (next) => {
+    setRowOrder(groupedOrder(next));
+    onChange(next);
+  });
+  const ordered = orderedColumns([...new Set([...selected, ...fields])], rowOrder);
   return (
     <>
-      <Button variant="ghost" size="sm" onClick={() => setOpen(true)}>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => {
+          setRowOrder(groupedOrder(selected));
+          setOpen(true);
+        }}
+      >
         <Columns3 size={14} />
         Add columns
       </Button>
@@ -33,7 +49,9 @@ export function ColumnPicker({
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
-        <p className="column-order-help">Selected fields appear first, in table order.</p>
+        <p className="column-order-help">
+          Fields keep their place while you choose. Reopen to group selected fields in table order.
+        </p>
         <div role="status" className="sr-only">
           {reorder.announcement}
         </div>
@@ -43,11 +61,14 @@ export function ColumnPicker({
             .map((field) => (
               <div
                 className="column-option-row"
+                style={{ minHeight: 38 }}
                 key={field}
                 {...(selected.includes(field) ? reorder.targetProps(field) : {})}
               >
-                {selected.includes(field) && (
+                {selected.includes(field) ? (
                   <ColumnReorderHandle field={field} reorder={reorder} />
+                ) : (
+                  <span aria-hidden="true" style={{ flex: '0 0 20px' }} />
                 )}
                 <label>
                   <input
@@ -64,7 +85,7 @@ export function ColumnPicker({
                   />
                   {field}
                 </label>
-                {selected.includes(field) && (
+                {selected.includes(field) ? (
                   <>
                     <Button
                       variant="ghost"
@@ -85,6 +106,8 @@ export function ColumnPicker({
                       <ArrowDown size={14} />
                     </Button>
                   </>
+                ) : (
+                  <span aria-hidden="true" style={{ flex: '0 0 74px' }} />
                 )}
               </div>
             ))}
