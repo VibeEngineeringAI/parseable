@@ -841,13 +841,35 @@ impl Stream {
         init_signal: bool,
         shutdown_signal: bool,
     ) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        self.arrow_files_grouped_with_creation_time(
+            exclude,
+            group_minute,
+            init_signal,
+            shutdown_signal,
+            |path| {
+                path.metadata()
+                    .ok()
+                    .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok())
+            },
+        )
+    }
+
+    fn arrow_files_grouped_with_creation_time(
+        &self,
+        exclude: SystemTime,
+        group_minute: u128,
+        init_signal: bool,
+        shutdown_signal: bool,
+        creation_time: impl Fn(&Path) -> Option<SystemTime>,
+    ) -> Vec<(PathBuf, Vec<PathBuf>)> {
         if init_signal {
             // Startup owns only this one-time snapshot of processing files.
             // Root Arrow files are left for regular sync so startup never
             // races a live writer or a periodic cycle for the same file.
             self.group_inprocess_arrow_files(&Ulid::new().to_string())
         } else {
-            let arrow_files = self.fetch_arrow_files_for_conversion(exclude, shutdown_signal);
+            let arrow_files =
+                self.fetch_arrow_files_for_conversion(exclude, shutdown_signal, creation_time);
             if arrow_files.is_empty() {
                 return Vec::new();
             }
@@ -930,17 +952,15 @@ impl Stream {
         &self,
         exclude: SystemTime,
         shutdown_signal: bool,
+        creation_time: impl Fn(&Path) -> Option<SystemTime>,
     ) -> Vec<PathBuf> {
         let mut arrow_files = self.arrow_files();
         if !shutdown_signal {
             arrow_files.retain(|path| {
-                path.metadata()
-                    .ok()
-                    .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok())
-                    .is_some_and(|creation| {
-                        // Compare if creation time is actually from previous minute
-                        minute_from_system_time(creation) < minute_from_system_time(exclude)
-                    })
+                creation_time(path).is_some_and(|creation| {
+                    // Compare if creation time is actually from previous minute
+                    minute_from_system_time(creation) < minute_from_system_time(exclude)
+                })
             });
         }
         arrow_files
@@ -2956,14 +2976,13 @@ fn lexsort_to_indices_rows(
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, sync::Barrier, thread::spawn, time::Duration};
+    use std::{io::Write, sync::Barrier, thread::spawn};
 
     use arrow_array::{Int32Array, StringArray, TimestampMillisecondArray};
     use arrow_ipc::writer::StreamWriter as ArrowStreamWriter;
     use arrow_schema::{DataType, Field, TimeUnit};
     use chrono::{NaiveDate, TimeDelta, Utc};
     use temp_dir::TempDir;
-    use tokio::time::sleep;
 
     use super::*;
 
@@ -3606,6 +3625,10 @@ mod tests {
             .checked_sub_signed(TimeDelta::minutes(mins))
             .unwrap()
             .naive_utc();
+        write_log_at(staging, schema, time);
+    }
+
+    fn write_log_at(staging: &StreamRef, schema: &Schema, time: NaiveDateTime) {
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
             vec![
@@ -4032,8 +4055,8 @@ mod tests {
         assert!(Stream::is_parquet_part_file(&legacy_parquet_part));
     }
 
-    #[tokio::test]
-    async fn miss_current_arrow_file_when_converting_to_parquet() {
+    #[test]
+    fn miss_current_arrow_file_when_converting_to_parquet() {
         let temp_dir = TempDir::new().unwrap();
         let stream_name = "test_stream";
         let options = Arc::new(Options {
@@ -4060,13 +4083,28 @@ mod tests {
             Field::new("value", DataType::Utf8, false),
         ]);
 
-        // 2 logs in the previous minutes
-        for i in 0..2 {
-            write_log(&staging, &schema, i);
+        // Use fixed event and filesystem creation timestamps: eligibility uses
+        // filesystem birth time (mtime only as a fallback), not event time.
+        let current = NaiveDate::from_ymd_opt(2026, 10, 16)
+            .unwrap()
+            .and_hms_opt(12, 30, 0)
+            .unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(current.and_utc().timestamp() as u64);
+        let mut creation_times = HashMap::new();
+        for minutes_ago in [2, 1, 0] {
+            let event_time = current - TimeDelta::minutes(minutes_ago);
+            write_log_at(&staging, &schema, event_time);
+            let path = staging.data_path.join(staging.filename_by_partition(
+                "abc",
+                event_time,
+                &HashMap::new(),
+            ));
+            creation_times.insert(path, now - Duration::from_secs(minutes_ago as u64 * 60));
         }
-        sleep(Duration::from_secs(60)).await;
-
-        write_log(&staging, &schema, 0);
+        let current_arrow =
+            staging
+                .data_path
+                .join(staging.filename_by_partition("abc", current, &HashMap::new()));
 
         // verify the arrow files exist in staging
         assert_eq!(staging.arrow_files().len(), 3);
@@ -4080,8 +4118,23 @@ mod tests {
             None,
             &None,
         );
+        let groups = staging.arrow_files_grouped_with_creation_time(
+            now,
+            minute_from_system_time(now) - 1,
+            false,
+            false,
+            |path| creation_times.get(path).copied(),
+        );
         let result = staging
-            .convert_disk_files_to_parquet(None, None, false, false, &None)
+            .convert_arrow_file_groups_to_parquet(
+                groups,
+                None,
+                None,
+                &None,
+                ArrowGroupExecution::Parallel,
+            )
+            .unwrap()
+            .into_result()
             .unwrap();
 
         assert!(result.is_some());
@@ -4091,6 +4144,7 @@ mod tests {
         // Verify parquet files were created and the arrow file left
         assert_eq!(staging.parquet_files().len(), 2);
         assert_eq!(staging.arrow_files().len(), 1);
+        assert_eq!(staging.arrow_files(), vec![current_arrow]);
     }
 
     fn create_test_file(dir: &TempDir, filename: &str) -> PathBuf {

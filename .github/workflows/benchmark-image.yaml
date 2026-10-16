@@ -1,0 +1,58 @@
+name: Benchmark application image
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        required: true
+        type: string
+      cache-namespace:
+        required: true
+        type: string
+      variant:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      debug:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  image:
+    name: Image (${{ inputs.variant }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Record actual machine and derive benchmark Dockerfile
+        run: |
+          nproc
+          free -b
+          df -h
+          python3 scripts/ci/benchmark-image.py --output "$RUNNER_TEMP/Dockerfile.benchmark"
+      - uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: ${{ inputs.cache-namespace }}-image-${{ inputs.variant }}
+      - name: Compile and export the same source revision
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: ${{ runner.temp }}/Dockerfile.benchmark
+          platforms: linux/amd64
+          tags: parseable-benchmark:${{ github.sha }}-${{ inputs.variant }}
+          build-args: |
+            CARGO_PROFILE_DEV_DEBUG=${{ inputs.debug }}
+            SOURCE_REBUILD=${{ github.run_id }}-${{ github.run_attempt }}
+          outputs: type=docker,dest=${{ runner.temp }}/parseable-benchmark.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ inputs.variant }}
+          path: ${{ runner.temp }}/parseable-benchmark.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error

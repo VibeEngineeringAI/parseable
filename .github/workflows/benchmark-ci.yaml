@@ -1,0 +1,217 @@
+name: CI latency experiment
+
+# A branch-only, path-gated trigger bootstraps workflow_dispatch without adding
+# an untested workflow to main. Change the request file deliberately for each run.
+on:
+  push:
+    branches: [analysis/blacksmith-runner-sizing]
+    paths: [.github/benchmark-request.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-latency-experiment
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'VibeEngineeringAI/parseable' && github.ref == 'refs/heads/analysis/blacksmith-runner-sizing'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      source-ref: ${{ steps.request.outputs.source-ref }}
+      cache-namespace: ${{ steps.request.outputs.cache-namespace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read bounded experiment request
+        id: request
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          request = json.load(open('.github/benchmark-request.json'))
+          namespace = request['cache_namespace']
+          assert re.fullmatch(r'ci-latency-v[0-9]+', namespace), namespace
+          assert isinstance(request['round'], int) and 1 <= request['round'] <= 2
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print('source-ref=' + os.environ['SOURCE_SHA'], file=out)
+              print('cache-namespace=' + namespace, file=out)
+          print(json.dumps(request))
+          PY
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --test scripts/test-community-ui.mjs
+
+  frontend:
+    needs: prepare
+    uses: ./.github/workflows/benchmark-frontend.yaml
+    with:
+      source-ref: ${{ needs.prepare.outputs.source-ref }}
+
+  rust:
+    needs: prepare
+    uses: ./.github/workflows/benchmark-rust.yaml
+    with:
+      source-ref: ${{ needs.prepare.outputs.source-ref }}
+      cache-namespace: ${{ needs.prepare.outputs.cache-namespace }}
+
+  image-candidate:
+    needs: prepare
+    uses: ./.github/workflows/benchmark-image.yaml
+    with:
+      source-ref: ${{ needs.prepare.outputs.source-ref }}
+      cache-namespace: ${{ needs.prepare.outputs.cache-namespace }}
+      variant: cpu16-debug0
+      runner: blacksmith-16vcpu-ubuntu-2404
+      debug: '0'
+
+  image-controls:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu8-debug2
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - variant: cpu16-debug2
+            runner: blacksmith-16vcpu-ubuntu-2404
+    uses: ./.github/workflows/benchmark-image.yaml
+    with:
+      source-ref: ${{ needs.prepare.outputs.source-ref }}
+      cache-namespace: ${{ needs.prepare.outputs.cache-namespace }}
+      variant: ${{ matrix.variant }}
+      runner: ${{ matrix.runner }}
+      debug: '2'
+
+  quest-binaries:
+    needs: prepare
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: parseablehq/quest
+          ref: f4a026eecde1badde8776ff366a743f9bbca2e67
+          path: .quest-benchmark-src
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .quest-benchmark-src/go.mod
+          cache-dependency-path: .quest-benchmark-src/go.sum
+      - name: Compile unmodified Quest control
+        working-directory: .quest-benchmark-src
+        run: |
+          mkdir -p "$RUNNER_TEMP/quest-binaries/control" "$RUNNER_TEMP/quest-binaries/candidate"
+          go test ./tests/integration/clients/...
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/quest-binaries/control/quest.test" ./tests/integration
+      - name: Apply pinned readiness patch
+        run: bash scripts/ci/prepare-quest-benchmark.sh --verify .quest-benchmark-src
+      - name: Compile Quest with bounded readiness checks
+        working-directory: .quest-benchmark-src
+        run: |
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/quest-binaries/candidate/quest.test" ./tests/integration
+          sha256sum "$RUNNER_TEMP/quest-binaries/"*/quest.test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quest-binaries
+          path: ${{ runner.temp }}/quest-binaries/
+          retention-days: 1
+          if-no-files-found: error
+
+  quest:
+    needs: [prepare, image-candidate, quest-binaries]
+    name: Quest ${{ matrix.deployment }} (${{ matrix.variant }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [control, candidate]
+        deployment: [standalone, distributed]
+    env:
+      PARSEABLE_TEST_IMAGE: parseable-benchmark:${{ github.sha }}-cpu16-debug0
+      QUEST_MODE: smoke
+      QUEST_IMAGE: quay.io/parseablehq/quest@sha256:f3d1e7c363df3dc0bd4f6987db7cade490e8ef6ab1cc72b451da02d37230f768
+      MINIO_IMAGE: quay.io/parseablehq/minio@sha256:88276d0a028d758ffaf80d65dd80071386e91b4114251a3dda101eadf000faeb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-cpu16-debug0
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: quest-binaries
+          path: .benchmark/quest-binaries
+      - name: Load application and select isolated Quest binary
+        env:
+          VARIANT: ${{ matrix.variant }}
+          DEPLOYMENT: ${{ matrix.deployment }}
+        run: |
+          nproc
+          free -b
+          docker load --input "$RUNNER_TEMP/parseable-benchmark.tar"
+          chmod +x ".benchmark/quest-binaries/$VARIANT/quest.test"
+          python3 scripts/ci/benchmark-compose.py \
+            --binary ".benchmark/quest-binaries/$VARIANT/quest.test" \
+            --quest-image "$QUEST_IMAGE" --minio-image "$MINIO_IMAGE" \
+            --output .benchmark/override.json
+          if [ "$DEPLOYMENT" = standalone ]; then
+            echo 'COMPOSE_FILE=docker-compose-test.yaml:docker-compose-ci-smoke.yaml:.benchmark/override.json' >> "$GITHUB_ENV"
+            echo 'SERVER=parseable' >> "$GITHUB_ENV"
+          else
+            echo 'COMPOSE_FILE=docker-compose-distributed-test.yaml:docker-compose-ci-smoke.yaml:.benchmark/override.json' >> "$GITHUB_ENV"
+            echo 'SERVER=parseable-query' >> "$GITHUB_ENV"
+          fi
+      - name: Start services and check embedded frontend
+        run: |
+          docker compose up --no-build --wait --wait-timeout 180 "$SERVER"
+          docker compose exec -T "$SERVER" sh -ec 'curl --fail --silent --show-error --location http://localhost:8000/next/ | grep -q "Parseable · Observability"'
+      - name: Run unchanged functional scope
+        run: docker compose up --no-build --exit-code-from quest
+      - name: Capture all service logs and status
+        if: always()
+        run: |
+          docker compose logs --no-color > quest-services.log
+          docker compose ps -a --format json > quest-status.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quest-${{ matrix.deployment }}-${{ matrix.variant }}-logs
+          path: |
+            quest-services.log
+            quest-status.json
+          retention-days: 1
+      - name: Stop isolated services
+        if: always()
+        run: docker compose down -v
+
+  experiment-ok:
+    if: always()
+    needs: [prepare, frontend, rust, image-candidate, image-controls, quest-binaries, quest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Require every experiment result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          print(json.dumps(results, indent=2))
+          assert all(job['result'] == 'success' for job in results.values())
+          PY

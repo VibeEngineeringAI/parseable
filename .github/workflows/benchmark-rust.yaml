@@ -1,0 +1,78 @@
+name: Benchmark parallel Rust checks
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Commit or ref to benchmark from this repository.
+        required: true
+        type: string
+      runner:
+        description: Runner label for every independent Rust job.
+        type: string
+        default: blacksmith-8vcpu-ubuntu-2404
+      cache-namespace:
+        description: Isolated experiment compiler cache namespace.
+        type: string
+        default: ci-latency-v1
+
+permissions:
+  contents: read
+
+env:
+  NEXT_ASSETS_PATH: ${{ github.workspace }}/frontend/dist
+
+jobs:
+  clippy:
+    name: Clippy (${{ matrix.group }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [all, base-hotpath, features]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          cache-key: ${{ inputs.cache-namespace }}-clippy-${{ matrix.group }}
+          tools: cargo-hack
+      - name: Check feature configurations with Clippy
+        env:
+          CLIPPY_GROUP: ${{ matrix.group }}
+        run: bash scripts/ci/benchmark-clippy.sh "$CLIPPY_GROUP"
+
+  default-tests:
+    name: Default tests
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          cache-key: ${{ inputs.cache-namespace }}-tests-default
+          tools: nextest
+      - name: Test default feature set
+        run: cargo nextest run --locked
+
+  kafka-tests:
+    name: Kafka tests
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          cache-key: ${{ inputs.cache-namespace }}-tests-kafka
+          tools: nextest
+      - name: Test Kafka feature
+        run: cargo nextest run --locked --features kafka -E 'test(kafka)'

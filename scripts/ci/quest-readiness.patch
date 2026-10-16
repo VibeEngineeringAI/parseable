@@ -1,0 +1,1196 @@
+Quest readiness waits: replace fixed sleeps in TestIntegrity (180s),
+TestSmokeIngestAndQuery (120s) and TestSmokeAlertLifecycle (120s) with
+bounded polling, and run the new readiness unit tests in the image build.
+
+Base: https://github.com/parseablehq/quest/commit/f4a026eecde1badde8776ff366a743f9bbca2e67
+Apply only with scripts/ci/prepare-quest-benchmark.sh, which verifies the base.
+
+diff --git a/Dockerfile b/Dockerfile
+index ca547f5b1f3e92e5edf3c11ba02faa1f954053cd..84d67f6032dcbe4ddb2aa013a57ddd6676f0463d 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -8,7 +8,7 @@ COPY . .
+ 
+ COPY --from=telemetrygen /telemetrygen /usr/local/bin/telemetrygen
+ 
+-RUN go test ./tests/integration/clients/... \
++RUN go test ./tests/integration/clients/... ./tests/integration/readiness/... \
+     && go test -c -o quest.test ./tests/integration \
+     && apt -y update \
+     && apt -y install wget \
+diff --git a/tests/integration/alert_test.go b/tests/integration/alert_test.go
+index e4f674093ecc3dc11e15219d4608cda17b2c452d..ba4e718d9ab3c2bc2fcb288ddd9004f088a8b2ff 100644
+--- a/tests/integration/alert_test.go
++++ b/tests/integration/alert_test.go
+@@ -18,6 +18,7 @@ package main
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/url"
+@@ -26,6 +27,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/stretchr/testify/require"
++	"quest/tests/integration/readiness"
+ )
+ 
+ type testTargetResponse struct {
+@@ -323,6 +325,88 @@ func waitForTestAlertState(t *testing.T, alertID, expectedState string) testAler
+ 	return alert
+ }
+ 
++type testAlertQueryConfig struct {
++	Query      string `json:"query"`
++	EvalConfig struct {
++		RollingWindow struct {
++			EvalStart string `json:"evalStart"`
++		} `json:"rollingWindow"`
++	} `json:"evalConfig"`
++}
++
++// queryAlertValue runs an alert's query over its rolling evaluation window and
++// returns the single aggregate value it produces.
++func queryAlertValue(ctx context.Context, query string, window time.Duration) (float64, error) {
++	endTime := time.Now()
++	status, body, err := postQueryFeatureContext(ctx, "api/v1/query", map[string]string{
++		"query":     query,
++		"startTime": endTime.Add(-window).Format(time.RFC3339Nano),
++		"endTime":   endTime.Format(time.RFC3339Nano),
++	})
++	if err != nil {
++		return 0, err
++	}
++	if err := readiness.HTTPStatus("alert query", status, string(body)); err != nil {
++		return 0, err
++	}
++	var rows []map[string]any
++	if err := json.Unmarshal(body, &rows); err != nil {
++		return 0, fmt.Errorf("decode alert query response %s: %w", body, err)
++	}
++	if len(rows) != 1 || len(rows[0]) != 1 {
++		return 0, fmt.Errorf("alert query returned %s, want one row with one value", body)
++	}
++	for _, value := range rows[0] {
++		if number, ok := value.(float64); ok {
++			return number, nil
++		}
++	}
++	return 0, fmt.Errorf("alert query returned non-numeric value: %s", body)
++}
++
++// waitForAlertQueryValue waits until the query in alertBody returns expected
++// over the alert's rolling window. On timeout it logs and returns so the
++// evaluation and state assertions report the failure as before; permanent
++// errors fail at once.
++func waitForAlertQueryValue(t *testing.T, alertBody string, expected float64, timeout, interval, attemptTimeout time.Duration) {
++	t.Helper()
++	var config testAlertQueryConfig
++	require.NoError(t, json.Unmarshal([]byte(alertBody), &config))
++	window, err := time.ParseDuration(config.EvalConfig.RollingWindow.EvalStart)
++	require.NoErrorf(t, err, "unsupported alert evalStart %q", config.EvalConfig.RollingWindow.EvalStart)
++
++	lastReason := ""
++	opts := readiness.Options{
++		Timeout:        timeout,
++		Interval:       interval,
++		AttemptTimeout: attemptTimeout,
++		OnRetry: func(attempt int, err error) {
++			if reason := err.Error(); reason != lastReason {
++				t.Logf("alert query not ready (attempt %d): %s", attempt, reason)
++				lastReason = reason
++			}
++		},
++	}
++	attempts, err := readiness.Wait(context.Background(), opts, func(ctx context.Context) error {
++		value, err := queryAlertValue(ctx, config.Query, window)
++		if err != nil {
++			return err
++		}
++		if value != expected {
++			return fmt.Errorf("alert query returned %v, want %v", value, expected)
++		}
++		return nil
++	})
++	if readiness.IsPermanent(err) {
++		t.Fatalf("alert query readiness check failed permanently: %v", err)
++	}
++	if err != nil {
++		t.Logf("continuing to alert evaluation after readiness wait: %v", err)
++		return
++	}
++	t.Logf("alert query ready after %d attempts", attempts)
++}
++
+ func TestSmokeSetTarget(t *testing.T) {
+ 	// Verifies that a webhook target can be created, read, and updated.
+ 	t.Parallel()
+@@ -417,7 +501,11 @@ func TestSmokeAlertLifecycle(t *testing.T) {
+ 
+ 	muteTestAlertNotifications(t, alertID)
+ 	ingestAlertFixture(t, stream)
+-	time.Sleep(120 * time.Second)
++	// Wait, within the bound of the fixed sleep this replaces (plus at most
++	// one 30s attempt in flight at the deadline), until the alert's own query
++	// sees the fixture over its evaluation window, so the single manual
++	// evaluation below has the data it needs.
++	waitForAlertQueryValue(t, testAlertRequestBody(stream, targetID, updatedTitle, metricName), 1, 120*time.Second, 5*time.Second, 30*time.Second)
+ 	evaluateTestAlert(t, alertID)
+ 	alert = waitForTestAlertState(t, alertID, "triggered")
+ 	require.NotEmpty(t, alert.LastTriggeredAt)
+diff --git a/tests/integration/integrity_test.go b/tests/integration/integrity_test.go
+index dd0be2a3eb5830e44daf25897f3b4fe880680888..53b82a961ce7819cc1e9f342d396443d07cc703e 100644
+--- a/tests/integration/integrity_test.go
++++ b/tests/integration/integrity_test.go
+@@ -19,6 +19,7 @@ package main
+ import (
+ 	"bufio"
+ 	"bytes"
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+@@ -34,6 +35,7 @@ import (
+ 
+ 	"github.com/minio/minio-go"
+ 	"github.com/stretchr/testify/require"
++	"quest/tests/integration/readiness"
+ 
+ 	"github.com/xitongsys/parquet-go-source/local"
+ 	"github.com/xitongsys/parquet-go/reader"
+@@ -65,7 +67,13 @@ type ParquetFlog struct {
+ 	Referer   *string `parquet:"name=referer, type=BYTE_ARRAY, convertedtype=UTF8, encoding=PLAIN_DICTIONARY"`
+ }
+ 
+-func (flog *ParquetFlog) Deref() Flog {
++// Deref fails, rather than panicking, on rows with missing fields.
++func (flog *ParquetFlog) Deref() (Flog, error) {
++	if flog.Host == nil || flog.UserId == nil || flog.Timestamp == nil || flog.Method == nil ||
++		flog.Request == nil || flog.Protocol == nil || flog.Status == nil || flog.ByteCount == nil ||
++		flog.Referer == nil {
++		return Flog{}, fmt.Errorf("parquet row has null fields: %+v", *flog)
++	}
+ 	return Flog{
+ 		Host:      *flog.Host,
+ 		UserId:    *flog.UserId,
+@@ -76,7 +84,7 @@ func (flog *ParquetFlog) Deref() Flog {
+ 		Status:    *flog.Status,
+ 		ByteCount: *flog.ByteCount,
+ 		Referer:   *flog.Referer,
+-	}
++	}, nil
+ }
+ 
+ func TestIntegrity(t *testing.T) {
+@@ -88,13 +96,24 @@ func TestIntegrity(t *testing.T) {
+ 	iterations := 1
+ 	flogsPerIteration := 100
+ 
+-	parseableSyncWait := 3 * time.Minute // NOTE: This needs to be in sync with Parseable's.
++	// Parseable converts staged events to Parquet and uploads them on its sync
++	// intervals. This bound matches the fixed sleep it replaces and needs to stay
++	// in sync with Parseable's.
++	parseableSyncWait := 3 * time.Minute
++	pollInterval := 5 * time.Second
++	// Bounds each listing/download pass through its context. The wait may
++	// overrun parseableSyncWait by this much while its final attempt runs,
++	// plus up to minio-go's 30s retry backoff (DefaultRetryCap), which sleeps
++	// without checking the context after a retryable failure. Worst case is
++	// therefore about 3m + 30s + 30s = 4m.
++	attemptTimeout := 30 * time.Second
+ 
+ 	// - Generate log files using `flog`
+ 	// - Load them into `Flog` structs
+ 	// - Ingest them into Parseable
+ 
+ 	flogs := make([]Flog, 0, iterations*flogsPerIteration)
++	var actualFlogs []Flog
+ 
+ 	for i := 0; i < iterations; i++ {
+ 		flogsFile := filepath.Join(workDir, fmt.Sprintf("%d.log", i))
+@@ -118,29 +137,77 @@ func TestIntegrity(t *testing.T) {
+ 
+ 		flogs = append(flogs, loadedFlogs...)
+ 
+-		slog.Info("ingested logs, sleeping...",
++		slog.Info("ingested logs, waiting for them to be persisted...",
+ 			"iteration", i+1,
+ 			"log_count", len(loadedFlogs))
+ 
+-		// Wait for the events to be sync'd.
+-		time.Sleep(parseableSyncWait)
++		// Wait until every event ingested so far is readable from Parquet in
++		// object storage. Missing, partially uploaded or unreadable objects are
++		// retried until the bound.
++		actualFlogs = waitForPersistedFlogs(t, stream, NewGlob.MinIoConfig, workDir, flogs, parseableSyncWait, pollInterval, attemptTimeout)
+ 	}
+ 
+-	parquetFiles := downloadParquetFiles(stream, NewGlob.MinIoConfig, workDir)
+-	actualFlogs := loadFlogsFromParquetFiles(parquetFiles)
+-
+ 	rowCount := len(actualFlogs)
++	require.GreaterOrEqual(t, rowCount, len(flogs), "persisted Parquet rows")
+ 
+ 	for i, expectedFlog := range flogs {
+ 		// The rows in parquet written by Parseable will be latest first, so we
+ 		// compare the first of ours with the last of what we got from Parseable's
+ 		// store.
+-		actualFlog := actualFlogs[rowCount-i-1].Deref()
++		actualFlog := actualFlogs[rowCount-i-1]
+ 		require.Equal(t, actualFlog, expectedFlog)
+ 	}
+ 
+ }
+ 
++// waitForPersistedFlogs polls object storage until every expected flog is
++// present in the stream's Parquet files, then returns all persisted rows in
++// the order `downloadParquetFiles` and the Parquet reader produce them.
++func waitForPersistedFlogs(t *testing.T, stream string, config MinIoConfig, workDir string, expected []Flog, timeout, interval, attemptTimeout time.Duration) []Flog {
++	t.Helper()
++	var persisted []Flog
++	lastReason := ""
++	opts := readiness.Options{
++		Timeout:        timeout,
++		Interval:       interval,
++		AttemptTimeout: attemptTimeout,
++		OnRetry: func(attempt int, err error) {
++			if reason := err.Error(); reason != lastReason {
++				t.Logf("integrity: persisted data not ready (attempt %d): %s", attempt, reason)
++				lastReason = reason
++			}
++		},
++	}
++	attempts, err := readiness.Wait(context.Background(), opts, func(ctx context.Context) error {
++		attemptDir, err := os.MkdirTemp(workDir, "parquet-")
++		if err != nil {
++			return readiness.Permanent(err)
++		}
++		defer os.RemoveAll(attemptDir)
++
++		parquetFiles, err := downloadParquetFiles(ctx, stream, config, attemptDir)
++		if err != nil {
++			return err
++		}
++		if len(parquetFiles) == 0 {
++			return fmt.Errorf("no parquet files under %s/%s yet", config.Bucket, stream)
++		}
++		rows, err := loadFlogsFromParquetFiles(parquetFiles)
++		if err != nil {
++			return err
++		}
++		if missing := readiness.Missing(expected, rows); len(missing) > 0 {
++			return fmt.Errorf("%d of %d expected records missing from %d persisted rows in %d parquet files",
++				len(missing), len(expected), len(rows), len(parquetFiles))
++		}
++		persisted = rows
++		return nil
++	})
++	require.NoErrorf(t, err, "ingested records were not persisted to Parquet within %s (+%s attempt grace)", timeout, attemptTimeout)
++	t.Logf("integrity: all %d records persisted after %d attempts", len(expected), attempts)
++	return persisted
++}
++
+ func ingestFlogs(flogs []Flog, stream string) error {
+ 	payload, _ := json.Marshal(flogs)
+ 	if NewGlob.IngestorUrl.String() == "" {
+@@ -170,11 +237,50 @@ func ingestFlogs(flogs []Flog, stream string) error {
+ 	return nil
+ }
+ 
+-func downloadParquetFiles(stream string, config MinIoConfig, downloadDir string) []string {
++// minIOPermanentCodes are S3 errors that retrying cannot fix.
++var minIOPermanentCodes = map[string]bool{
++	"AccessDenied":          true,
++	"InvalidAccessKeyId":    true,
++	"SignatureDoesNotMatch": true,
++}
++
++func minIOError(what string, err error) error {
++	wrapped := fmt.Errorf("%s: %w", what, err)
++	if minIOPermanentCodes[minio.ToErrorResponse(err).Code] {
++		return readiness.Permanent(wrapped)
++	}
++	return wrapped
++}
++
++// contextTransport binds every request a MinIO client makes to ctx. The
++// pinned minio-go v6 issues listing and bucket-location requests with
++// context.Background(), so this is the only way to bound them. A done ctx
++// fails requests with ctx.Err(), which minio-go does not retry. One limit
++// remains: after a retryable failure (for example a 503 or a dropped
++// connection) minio-go's retry timer sleeps up to DefaultRetryCap (30s)
++// without watching ctx, so a pass can outlast ctx by that much.
++type contextTransport struct {
++	ctx  context.Context
++	base *http.Transport
++}
++
++func (t contextTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	if err := t.ctx.Err(); err != nil {
++		return nil, err
++	}
++	return t.base.RoundTrip(req.WithContext(t.ctx))
++}
++
++// downloadParquetFiles downloads every Parquet object under the stream
++// prefix. All MinIO requests, including response bodies, end when ctx does.
++func downloadParquetFiles(ctx context.Context, stream string, config MinIoConfig, downloadDir string) ([]string, error) {
+ 	client, err := minio.New(config.Url, config.User, config.Pass, false)
+ 	if err != nil {
+-		slog.Error("couldn't create MinIO client", "error", err)
++		return nil, readiness.Permanent(fmt.Errorf("couldn't create MinIO client: %w", err))
+ 	}
++	transport := http.DefaultTransport.(*http.Transport).Clone()
++	defer transport.CloseIdleConnections()
++	client.SetCustomTransport(contextTransport{ctx: ctx, base: transport})
+ 
+ 	downloadedFileNames := make([]string, 0, 10)
+ 
+@@ -182,7 +288,24 @@ func downloadParquetFiles(stream string, config MinIoConfig, downloadDir string)
+ 		"bucket", config.Bucket,
+ 		"stream", stream)
+ 
+-	for objectInfo := range client.ListObjectsV2(config.Bucket, stream, true, nil) {
++	// Closing doneCh stops minio-go's listing goroutine on early return.
++	doneCh := make(chan struct{})
++	defer close(doneCh)
++	objects := client.ListObjectsV2(config.Bucket, stream, true, doneCh)
++	for {
++		var objectInfo minio.ObjectInfo
++		var ok bool
++		select {
++		case <-ctx.Done():
++			return nil, fmt.Errorf("listing objects: %w", ctx.Err())
++		case objectInfo, ok = <-objects:
++		}
++		if !ok {
++			break
++		}
++		if objectInfo.Err != nil {
++			return nil, minIOError("couldn't list objects", objectInfo.Err)
++		}
+ 		key := objectInfo.Key
+ 
+ 		if !isParquetFile(key) {
+@@ -190,24 +313,12 @@ func downloadParquetFiles(stream string, config MinIoConfig, downloadDir string)
+ 			continue
+ 		}
+ 
+-		parquetObject, err := client.GetObject(config.Bucket, key, minio.GetObjectOptions{})
+-		if err != nil {
+-			slog.Error("couldn't get object", "key", key, "error", err)
+-		}
+-
+-		// Write the MinIO Object we got, into `downloadPath`.
+-
+ 		fileName := filepath.Join(downloadDir, strings.ReplaceAll(key, "/", "."))
+-		f, _ := os.Create(fileName)
+-		_, err = io.Copy(f, parquetObject)
+-
+-		if err != nil {
+-			slog.Error("couldn't copy", "fileName", fileName, "error", err)
++		if err := downloadObject(ctx, client, config.Bucket, key, fileName); err != nil {
++			return nil, err
+ 		}
+ 
+ 		downloadedFileNames = append(downloadedFileNames, fileName)
+-
+-		f.Close()
+ 	}
+ 
+ 	// Reverse the filenames, because we want latest files first (only if there are multiple files)
+@@ -219,43 +330,79 @@ func downloadParquetFiles(stream string, config MinIoConfig, downloadDir string)
+ 
+ 	slog.Info("downloaded files", "paths", downloadedFileNames)
+ 
+-	return downloadedFileNames
++	return downloadedFileNames, nil
+ }
+ 
+-func loadFlogsFromParquetFile(path string) []ParquetFlog {
+-	fr, err := local.NewLocalFileReader(path)
+-	slog.Info("reading parquet file", "path", path)
++// downloadObject writes a MinIO object to fileName. MinIO only reports most
++// object errors, such as a key removed after listing, once it is read.
++func downloadObject(ctx context.Context, client *minio.Client, bucket, key, fileName string) error {
++	parquetObject, err := client.GetObjectWithContext(ctx, bucket, key, minio.GetObjectOptions{})
+ 	if err != nil {
+-		slog.Error("can't create local file reader", "error", err)
++		return minIOError(fmt.Sprintf("couldn't get object %s", key), err)
+ 	}
++	defer parquetObject.Close()
+ 
++	f, err := os.Create(fileName)
++	if err != nil {
++		return readiness.Permanent(err)
++	}
++	if _, err := io.Copy(f, parquetObject); err != nil {
++		f.Close()
++		return minIOError(fmt.Sprintf("couldn't copy %s", key), err)
++	}
++	return f.Close()
++}
++
++func loadFlogsFromParquetFile(path string) (flogs []Flog, err error) {
++	slog.Info("reading parquet file", "path", path)
++	fr, err := local.NewLocalFileReader(path)
++	if err != nil {
++		return nil, fmt.Errorf("can't create local file reader for %s: %w", path, err)
++	}
+ 	defer fr.Close()
+ 
++	// parquet-go panics on some malformed input instead of returning an error.
++	defer func() {
++		if r := recover(); r != nil {
++			flogs, err = nil, fmt.Errorf("can't read parquet file %s: %v", path, r)
++		}
++	}()
++
+ 	pr, err := reader.NewParquetReader(fr, new(ParquetFlog), 4)
+ 	if err != nil {
+-		slog.Error("can't create parquet reader", "error", err)
++		return nil, fmt.Errorf("can't create parquet reader for %s: %w", path, err)
+ 	}
+-
+ 	defer pr.ReadStop()
+ 
+-	flogs := make([]ParquetFlog, pr.GetNumRows())
+-
+-	if err = pr.Read(&flogs); err != nil {
+-		slog.Error("can't read parquet file", "error", err)
++	rows := make([]ParquetFlog, pr.GetNumRows())
++	if err = pr.Read(&rows); err != nil {
++		return nil, fmt.Errorf("can't read parquet file %s: %w", path, err)
+ 	}
+ 
+-	return flogs
++	flogs = make([]Flog, 0, len(rows))
++	for i := range rows {
++		flog, err := rows[i].Deref()
++		if err != nil {
++			return nil, fmt.Errorf("row %d of %s: %w", i, path, err)
++		}
++		flogs = append(flogs, flog)
++	}
++	return flogs, nil
+ }
+ 
+-func loadFlogsFromParquetFiles(parquetFiles []string) []ParquetFlog {
++func loadFlogsFromParquetFiles(parquetFiles []string) ([]Flog, error) {
+ 	slog.Info("loading flogs from parquet files", "paths", parquetFiles, "count", len(parquetFiles))
+-	flogs := make([]ParquetFlog, 0, len(parquetFiles)*10)
++	flogs := make([]Flog, 0, len(parquetFiles)*10)
+ 
+ 	for _, parquetFile := range parquetFiles {
+-		flogs = append(flogs, loadFlogsFromParquetFile(parquetFile)...)
++		loaded, err := loadFlogsFromParquetFile(parquetFile)
++		if err != nil {
++			return nil, err
++		}
++		flogs = append(flogs, loaded...)
+ 	}
+ 
+-	return flogs
++	return flogs, nil
+ }
+ 
+ func isParquetFile(path string) bool {
+diff --git a/tests/integration/query_test.go b/tests/integration/query_test.go
+index 711d5c208b37d0c1c64805d2c9dfd5f0250e0e91..56ae70dcfa60226ea588ef772ccc394f44fc2536 100644
+--- a/tests/integration/query_test.go
++++ b/tests/integration/query_test.go
+@@ -18,11 +18,17 @@ package main
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"encoding/json"
++	"fmt"
++	"io"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/stretchr/testify/require"
++	"quest/tests/integration/clients/pb"
++	"quest/tests/integration/readiness"
+ )
+ 
+ type queryWithFieldsResponse struct {
+@@ -46,6 +52,12 @@ type datasetFieldStats struct {
+ }
+ 
+ func postQueryFeature(path string, payload any) (int, []byte, error) {
++	return postQueryFeatureContext(context.Background(), path, payload)
++}
++
++// postQueryFeatureContext is postQueryFeature bounded by ctx, including the
++// response body read.
++func postQueryFeatureContext(ctx context.Context, path string, payload any) (int, []byte, error) {
+ 	encoded, err := json.Marshal(payload)
+ 	if err != nil {
+ 		return 0, nil, err
+@@ -54,12 +66,110 @@ func postQueryFeature(path string, payload any) (int, []byte, error) {
+ 	if err != nil {
+ 		return 0, nil, err
+ 	}
+-	response, err := NewGlob.QueryClient.Do(req)
++	response, err := NewGlob.QueryClient.Do(req.WithContext(ctx))
+ 	if err != nil {
+ 		return 0, nil, err
+ 	}
+ 	defer response.Body.Close()
+-	return response.StatusCode, []byte(readAsString(response.Body)), nil
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		return 0, nil, err
++	}
++	return response.StatusCode, body, nil
++}
++
++// countStreamWithPB runs the same count query as QueryLogStreamCount, but
++// returns failures so callers can retry them.
++func countStreamWithPB(ctx context.Context, client pb.PBClient, stream string) (uint64, error) {
++	endTime := time.Now().Add(time.Second).Format(time.RFC3339Nano)
++	startTime := time.Now().Add(-30 * time.Minute).Format(time.RFC3339Nano)
++	var rows []PBCountRow
++	result, err := client.RunJSON(ctx, &rows,
++		"sql", "run", "select count(*) as count from "+stream,
++		"--from", startTime,
++		"--to", endTime,
++	)
++	if err != nil {
++		return 0, readiness.CommandFailure("pb sql run", err, result.Stdout, result.Stderr)
++	}
++	if len(rows) != 1 {
++		return 0, fmt.Errorf("count query for %s returned %d rows", stream, len(rows))
++	}
++	return rows[0].Count, nil
++}
++
++// countPersistedEvents sums the counts API buckets, which Parseable computes
++// from object-storage manifests, so only persisted events are included.
++func countPersistedEvents(ctx context.Context, stream string) (uint64, error) {
++	status, body, err := postQueryFeatureContext(ctx, "api/v1/counts", map[string]any{
++		"stream":    stream,
++		"startTime": time.Now().Add(-30 * time.Minute).Format(time.RFC3339Nano),
++		"endTime":   time.Now().Add(time.Second).Format(time.RFC3339Nano),
++		"numBins":   10,
++	})
++	if err != nil {
++		return 0, err
++	}
++	if err := readiness.HTTPStatus("counts for "+stream, status, string(body)); err != nil {
++		return 0, err
++	}
++	var result countsResponse
++	if err := json.Unmarshal(body, &result); err != nil {
++		return 0, fmt.Errorf("decode counts for %s: %w", stream, err)
++	}
++	var total uint64
++	for _, record := range result.Records {
++		total += record.Count
++	}
++	return total, nil
++}
++
++// waitForStreamsQueryable waits until every stream returns the expected count
++// from both SQL and the persisted counts API. On timeout it logs the last
++// state and returns, leaving the test's own assertions to report the failure
++// exactly as they did after the fixed sleep; permanent errors fail at once.
++func waitForStreamsQueryable(t *testing.T, client pb.PBClient, streams []string, expected uint64, timeout, interval, attemptTimeout time.Duration) {
++	t.Helper()
++	lastReason := ""
++	opts := readiness.Options{
++		Timeout:        timeout,
++		Interval:       interval,
++		AttemptTimeout: attemptTimeout,
++		OnRetry: func(attempt int, err error) {
++			if reason := err.Error(); reason != lastReason {
++				t.Logf("streams not queryable yet (attempt %d): %s", attempt, reason)
++				lastReason = reason
++			}
++		},
++	}
++	attempts, err := readiness.Wait(context.Background(), opts, func(ctx context.Context) error {
++		var pending []string
++		for _, stream := range streams {
++			sqlCount, err := countStreamWithPB(ctx, client, stream)
++			if err != nil {
++				return err
++			}
++			persistedCount, err := countPersistedEvents(ctx, stream)
++			if err != nil {
++				return err
++			}
++			if sqlCount != expected || persistedCount != expected {
++				pending = append(pending, fmt.Sprintf("%s: sql=%d persisted=%d", stream, sqlCount, persistedCount))
++			}
++		}
++		if len(pending) > 0 {
++			return fmt.Errorf("want %d events per stream; %s", expected, strings.Join(pending, ", "))
++		}
++		return nil
++	})
++	if readiness.IsPermanent(err) {
++		t.Fatalf("stream readiness check failed permanently: %v", err)
++	}
++	if err != nil {
++		t.Logf("continuing to assertions after readiness wait: %v", err)
++		return
++	}
++	t.Logf("streams %v queryable after %d attempts", streams, attempts)
+ }
+ 
+ func TestSmokeIngestAndQuery(t *testing.T) {
+@@ -80,8 +190,10 @@ func TestSmokeIngestAndQuery(t *testing.T) {
+ 
+ 	// Parseable persists ingested events in a two-minute batch. Both streams are
+ 	// populated before this wait so all ingestion and query assertions can share
+-	// the same batch window.
+-	time.Sleep(120 * time.Second)
++	// the same batch window. Polling stops once both streams are fully visible
++	// to SQL and persisted; the bound matches the fixed sleep it replaces, plus
++	// at most one 30s attempt in flight at the deadline.
++	waitForStreamsQueryable(t, NewGlob.PBClient, []string{stream1, stream2}, 50, 120*time.Second, 5*time.Second, 30*time.Second)
+ 
+ 	t.Run("IngestEventsToStream", func(t *testing.T) {
+ 		t.Parallel()
+diff --git a/tests/integration/readiness/readiness.go b/tests/integration/readiness/readiness.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..feff9295e7097e05bc775f1bd895e2e89fc1dd09
+--- /dev/null
++++ b/tests/integration/readiness/readiness.go
+@@ -0,0 +1,239 @@
++// Copyright (c) 2023 Cloudnatively Services Pvt Ltd
++//
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++// Package readiness replaces fixed sleeps with bounded polling. A check
++// reports why it is not ready yet, or wraps the error with Permanent to stop
++// waiting immediately (for example, rejected credentials).
++package readiness
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// Check returns nil once ready. Any other error is retried until the
++// deadline, unless it is wrapped with Permanent. Checks must pass ctx to all
++// I/O they perform: it carries the per-attempt deadline.
++type Check func(ctx context.Context) error
++
++type Options struct {
++	// Timeout bounds when attempts may start. The final attempt starts at the
++	// deadline, so polling never gives up earlier than an equivalent fixed
++	// sleep followed by a single check.
++	Timeout  time.Duration
++	Interval time.Duration
++	// AttemptTimeout bounds each attempt through its context, including one
++	// that is still in flight at the deadline. A wait therefore takes at most
++	// Timeout + AttemptTimeout; that grace is what lets the final attempt run
++	// at the deadline instead of being cut short by it.
++	AttemptTimeout time.Duration
++	// OnRetry, when set, is called after each not-ready attempt.
++	OnRetry func(attempt int, err error)
++
++	now   func() time.Time
++	sleep func(ctx context.Context, d time.Duration) error
++}
++
++type permanentError struct{ err error }
++
++func (e *permanentError) Error() string { return e.err.Error() }
++func (e *permanentError) Unwrap() error { return e.err }
++
++// Permanent marks err as non-retryable.
++func Permanent(err error) error {
++	if err == nil {
++		return nil
++	}
++	return &permanentError{err: err}
++}
++
++func IsPermanent(err error) bool {
++	var permanent *permanentError
++	return errors.As(err, &permanent)
++}
++
++// TimeoutError reports the last reason the check was not ready.
++type TimeoutError struct {
++	Attempts int
++	Elapsed  time.Duration
++	Last     error
++}
++
++func (e *TimeoutError) Error() string {
++	return fmt.Sprintf("not ready after %d attempts in %s: %v", e.Attempts, e.Elapsed.Round(time.Millisecond), e.Last)
++}
++
++func (e *TimeoutError) Unwrap() error { return e.Last }
++
++// Wait runs check until it succeeds, returns a permanent error, ctx is done,
++// or opts.Timeout elapses. It returns the number of attempts made. An attempt
++// that ends because its own AttemptTimeout expired is retried like any other
++// not-ready result.
++func Wait(ctx context.Context, opts Options, check Check) (int, error) {
++	if opts.Timeout <= 0 || opts.Interval <= 0 || opts.AttemptTimeout <= 0 {
++		return 0, errors.New("readiness: Timeout, Interval and AttemptTimeout must be positive")
++	}
++	now := opts.now
++	if now == nil {
++		now = time.Now
++	}
++	sleep := opts.sleep
++	if sleep == nil {
++		sleep = sleepContext
++	}
++
++	start := now()
++	deadline := start.Add(opts.Timeout)
++	for attempt := 1; ; attempt++ {
++		attemptCtx, cancel := context.WithTimeout(ctx, opts.AttemptTimeout)
++		err := check(attemptCtx)
++		cancel()
++		if err == nil {
++			return attempt, nil
++		}
++		if IsPermanent(err) {
++			return attempt, err
++		}
++		if ctx.Err() != nil {
++			return attempt, fmt.Errorf("readiness wait cancelled after %d attempts: %w (last: %v)", attempt, ctx.Err(), err)
++		}
++		current := now()
++		if !current.Before(deadline) {
++			return attempt, &TimeoutError{Attempts: attempt, Elapsed: current.Sub(start), Last: err}
++		}
++		if opts.OnRetry != nil {
++			opts.OnRetry(attempt, err)
++		}
++		delay := opts.Interval
++		if remaining := deadline.Sub(current); remaining < delay {
++			delay = remaining
++		}
++		if err := sleep(ctx, delay); err != nil {
++			return attempt, fmt.Errorf("readiness wait cancelled after %d attempts: %w", attempt, err)
++		}
++	}
++}
++
++func sleepContext(ctx context.Context, d time.Duration) error {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++// HTTPStatus converts a non-200 response into a readiness error. Rejected
++// credentials or permissions are permanent; anything else may be transient
++// while data is being synced.
++func HTTPStatus(what string, status int, body string) error {
++	if status == http.StatusOK {
++		return nil
++	}
++	err := fmt.Errorf("%s returned HTTP %d: %s", what, status, truncate(body))
++	if status == http.StatusUnauthorized || status == http.StatusForbidden {
++		return Permanent(err)
++	}
++	return err
++}
++
++// pbErrorEnvelope is the error pb prints with `-o json`, for example
++// {"error":{"code":"AUTH_FAILED","http_status":401,...}}.
++type pbErrorEnvelope struct {
++	Error *pbError `json:"error"`
++}
++
++type pbError struct {
++	Code       string `json:"code"`
++	HTTPStatus int    `json:"http_status"`
++}
++
++var pbPermanentCodes = map[string]bool{"AUTH_FAILED": true, "PERMISSION_DENIED": true}
++
++// Bare status codes are not matched: generated stream names may contain them.
++var authFailureMarkers = []string{"unauthorized", "forbidden"}
++
++// CommandFailure converts a failed pb invocation into a readiness error,
++// treating authentication or authorization failures as permanent.
++func CommandFailure(what string, err error, stdout, stderr string) error {
++	if err == nil {
++		return nil
++	}
++	wrapped := fmt.Errorf("%s failed: %w (stdout=%q, stderr=%q)", what, err, truncate(stdout), truncate(stderr))
++	for _, output := range []string{stdout, stderr} {
++		if envelope, ok := parsePBError(output); ok {
++			if pbPermanentCodes[envelope.Code] ||
++				envelope.HTTPStatus == http.StatusUnauthorized || envelope.HTTPStatus == http.StatusForbidden {
++				return Permanent(wrapped)
++			}
++			return wrapped
++		}
++	}
++	output := strings.ToLower(stdout + "\n" + stderr)
++	for _, marker := range authFailureMarkers {
++		if strings.Contains(output, marker) {
++			return Permanent(wrapped)
++		}
++	}
++	return wrapped
++}
++
++// parsePBError decodes the first JSON object in output, skipping any
++// progress-spinner text pb writes before it.
++func parsePBError(output string) (pbError, bool) {
++	start := strings.Index(output, "{")
++	if start < 0 {
++		return pbError{}, false
++	}
++	var envelope pbErrorEnvelope
++	if err := json.NewDecoder(strings.NewReader(output[start:])).Decode(&envelope); err != nil || envelope.Error == nil {
++		return pbError{}, false
++	}
++	return *envelope.Error, true
++}
++
++// Missing returns the expected items that are absent from actual, treating
++// both slices as multisets so duplicated expected items must all be present.
++func Missing[T comparable](expected, actual []T) []T {
++	available := make(map[T]int, len(actual))
++	for _, item := range actual {
++		available[item]++
++	}
++	var missing []T
++	for _, item := range expected {
++		if available[item] > 0 {
++			available[item]--
++			continue
++		}
++		missing = append(missing, item)
++	}
++	return missing
++}
++
++func truncate(s string) string {
++	const limit = 512
++	if len(s) <= limit {
++		return s
++	}
++	return s[:limit] + "..."
++}
+diff --git a/tests/integration/readiness/readiness_test.go b/tests/integration/readiness/readiness_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..57730355b810042b983e7a12da5cda17669ea0e7
+--- /dev/null
++++ b/tests/integration/readiness/readiness_test.go
+@@ -0,0 +1,285 @@
++// Copyright (c) 2023 Cloudnatively Services Pvt Ltd
++//
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++package readiness
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// fakeClock advances only when the poller sleeps.
++type fakeClock struct {
++	current time.Time
++	sleeps  []time.Duration
++}
++
++func (c *fakeClock) options(timeout, interval time.Duration) Options {
++	return Options{
++		Timeout:        timeout,
++		Interval:       interval,
++		AttemptTimeout: time.Minute,
++		now:            func() time.Time { return c.current },
++		sleep: func(ctx context.Context, d time.Duration) error {
++			if err := ctx.Err(); err != nil {
++				return err
++			}
++			c.sleeps = append(c.sleeps, d)
++			c.current = c.current.Add(d)
++			return nil
++		},
++	}
++}
++
++func newFakeClock() *fakeClock {
++	return &fakeClock{current: time.Unix(1_700_000_000, 0)}
++}
++
++func TestWaitReturnsOnceReady(t *testing.T) {
++	// Verifies polling stops at the first successful check.
++	clock := newFakeClock()
++	calls := 0
++	var retried []int
++	opts := clock.options(time.Minute, 5*time.Second)
++	opts.OnRetry = func(attempt int, err error) { retried = append(retried, attempt) }
++
++	attempts, err := Wait(context.Background(), opts, func(context.Context) error {
++		calls++
++		if calls < 3 {
++			return fmt.Errorf("only %d of 100 records", calls*10)
++		}
++		return nil
++	})
++
++	require.NoError(t, err)
++	require.Equal(t, 3, attempts)
++	require.Equal(t, []int{1, 2}, retried)
++	require.Equal(t, []time.Duration{5 * time.Second, 5 * time.Second}, clock.sleeps)
++}
++
++func TestWaitStopsOnPermanentError(t *testing.T) {
++	// Verifies permanent failures such as rejected credentials are not retried.
++	clock := newFakeClock()
++	calls := 0
++	rejected := errors.New("401 unauthorized")
++
++	attempts, err := Wait(context.Background(), clock.options(time.Minute, time.Second), func(context.Context) error {
++		calls++
++		return Permanent(rejected)
++	})
++
++	require.ErrorIs(t, err, rejected)
++	require.True(t, IsPermanent(err))
++	require.Equal(t, 1, attempts)
++	require.Equal(t, 1, calls)
++	require.Empty(t, clock.sleeps)
++}
++
++func TestWaitMakesFinalAttemptAtDeadline(t *testing.T) {
++	// Verifies the wait never gives up before the bound an equivalent fixed sleep used.
++	clock := newFakeClock()
++	start := clock.current
++	var attemptTimes []time.Duration
++	notReady := errors.New("count is 49, want 50")
++
++	attempts, err := Wait(context.Background(), clock.options(120*time.Second, 50*time.Second), func(context.Context) error {
++		attemptTimes = append(attemptTimes, clock.current.Sub(start))
++		return notReady
++	})
++
++	var timeout *TimeoutError
++	require.ErrorAs(t, err, &timeout)
++	require.ErrorIs(t, err, notReady)
++	require.False(t, IsPermanent(err))
++	require.Equal(t, 4, attempts)
++	require.Equal(t, timeout.Attempts, attempts)
++	require.Equal(t, 120*time.Second, timeout.Elapsed)
++	require.Equal(t, []time.Duration{0, 50 * time.Second, 100 * time.Second, 120 * time.Second}, attemptTimes)
++	require.Equal(t, []time.Duration{50 * time.Second, 50 * time.Second, 20 * time.Second}, clock.sleeps)
++}
++
++func TestWaitSucceedsOnFinalAttempt(t *testing.T) {
++	// Verifies data that becomes ready exactly at the deadline is accepted.
++	clock := newFakeClock()
++	start := clock.current
++
++	attempts, err := Wait(context.Background(), clock.options(180*time.Second, 60*time.Second), func(context.Context) error {
++		if clock.current.Sub(start) < 180*time.Second {
++			return errors.New("not yet persisted")
++		}
++		return nil
++	})
++
++	require.NoError(t, err)
++	require.Equal(t, 4, attempts)
++}
++
++func TestWaitHonoursCancellation(t *testing.T) {
++	// Verifies a cancelled context ends the wait instead of polling to the deadline.
++	clock := newFakeClock()
++	ctx, cancel := context.WithCancel(context.Background())
++	calls := 0
++
++	_, err := Wait(ctx, clock.options(time.Hour, time.Second), func(context.Context) error {
++		calls++
++		if calls == 2 {
++			cancel()
++		}
++		return errors.New("not ready")
++	})
++
++	require.ErrorIs(t, err, context.Canceled)
++	require.Equal(t, 2, calls)
++}
++
++func TestWaitRejectsInvalidOptions(t *testing.T) {
++	// Verifies a missing bound cannot silently skip the check or leave it unbounded.
++	for _, opts := range []Options{
++		{Interval: time.Second, AttemptTimeout: time.Second},
++		{Timeout: time.Second, AttemptTimeout: time.Second},
++		{Timeout: time.Second, Interval: time.Second},
++	} {
++		_, err := Wait(context.Background(), opts, func(context.Context) error { return nil })
++		require.Error(t, err, "%+v", opts)
++	}
++}
++
++func TestWaitWithRealClock(t *testing.T) {
++	// Verifies the default timer-based sleep respects the bound.
++	startedAt := time.Now()
++	attempts, err := Wait(context.Background(), Options{Timeout: 30 * time.Millisecond, Interval: 10 * time.Millisecond, AttemptTimeout: time.Second}, func(context.Context) error {
++		return errors.New("never ready")
++	})
++	require.Error(t, err)
++	require.GreaterOrEqual(t, attempts, 2)
++	require.GreaterOrEqual(t, time.Since(startedAt), 30*time.Millisecond)
++}
++
++func TestWaitBoundsStalledAttempts(t *testing.T) {
++	// Verifies each attempt gets a deadline, so stalled I/O that honours its
++	// context is retried, and the whole wait ends within Timeout + AttemptTimeout.
++	const timeout, attemptTimeout = 150 * time.Millisecond, 40 * time.Millisecond
++	startedAt := time.Now()
++	attempts := 0
++	_, err := Wait(context.Background(), Options{Timeout: timeout, Interval: 10 * time.Millisecond, AttemptTimeout: attemptTimeout}, func(ctx context.Context) error {
++		attempts++
++		deadline, ok := ctx.Deadline()
++		require.True(t, ok)
++		require.LessOrEqual(t, time.Until(deadline), attemptTimeout)
++		<-ctx.Done() // a request that never answers
++		return ctx.Err()
++	})
++	elapsed := time.Since(startedAt)
++
++	var timeoutErr *TimeoutError
++	require.ErrorAs(t, err, &timeoutErr)
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++	require.False(t, IsPermanent(err))
++	require.GreaterOrEqual(t, attempts, 3)
++	require.GreaterOrEqual(t, elapsed, timeout)
++	require.Less(t, elapsed, timeout+attemptTimeout+100*time.Millisecond)
++}
++
++func TestWaitFinalAttemptRunsPastDeadline(t *testing.T) {
++	// Verifies the attempt starting at the deadline gets its full AttemptTimeout.
++	const timeout = 60 * time.Millisecond
++	startedAt := time.Now()
++	attempts, err := Wait(context.Background(), Options{Timeout: timeout, Interval: time.Hour, AttemptTimeout: time.Second}, func(ctx context.Context) error {
++		if time.Since(startedAt) < timeout {
++			return errors.New("not yet")
++		}
++		select {
++		case <-time.After(50 * time.Millisecond): // slow but within its own bound
++			return nil
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	})
++	require.NoError(t, err)
++	require.Equal(t, 2, attempts)
++}
++
++func TestHTTPStatus(t *testing.T) {
++	// Verifies only credential and permission failures are permanent.
++	require.NoError(t, HTTPStatus("counts", 200, ""))
++
++	for _, status := range []int{401, 403} {
++		err := HTTPStatus("counts", status, "denied")
++		require.Error(t, err)
++		require.True(t, IsPermanent(err), "status %d", status)
++	}
++
++	for _, status := range []int{400, 404, 500, 502, 503} {
++		err := HTTPStatus("counts", status, "stream not found")
++		require.Error(t, err)
++		require.False(t, IsPermanent(err), "status %d", status)
++		require.Contains(t, err.Error(), fmt.Sprint(status))
++	}
++}
++
++func TestCommandFailure(t *testing.T) {
++	// Verifies pb authentication failures stop polling while other failures retry.
++	cause := errors.New("exit status 1")
++	require.NoError(t, CommandFailure("pb sql run", nil, "", ""))
++
++	err := CommandFailure("pb sql run", cause, "", "Error: 401 Unauthorized")
++	require.ErrorIs(t, err, cause)
++	require.True(t, IsPermanent(err))
++
++	err = CommandFailure("pb sql run", cause, "request failed: 403 Forbidden", "")
++	require.True(t, IsPermanent(err))
++
++	// pb v1.0.1 prints a JSON envelope after its progress spinner.
++	spinner := "| fetching...\x1b[K"
++	for _, permanent := range []string{
++		`{"error":{"code":"AUTH_FAILED","message":"query failed: server returned 401 Unauthorized","http_status":401,"retryable":false}}`,
++		`{"error":{"code":"PERMISSION_DENIED","message":"query failed: server returned 403 Forbidden","http_status":403,"retryable":false}}`,
++	} {
++		err = CommandFailure("pb sql run", cause, spinner+permanent, "")
++		require.True(t, IsPermanent(err), permanent)
++	}
++	// A dataset the querier has not synced yet is retried even though pb
++	// itself reports it as non-retryable.
++	for _, transient := range []string{
++		`{"error":{"code":"NOT_FOUND","message":"query failed: server returned 404 Not Found","http_status":404,"retryable":false}}`,
++		`{"error":{"code":"SERVER_ERROR","message":"query failed: server returned 500 Internal Server Error","http_status":500,"retryable":true}}`,
++		`{"error":{"code":"QUERY_FAILED","message":"Forbidden is a word in this table name","http_status":400}}`,
++	} {
++		err = CommandFailure("pb sql run", cause, "", spinner+transient)
++		require.False(t, IsPermanent(err), transient)
++	}
++
++	// Generated stream names may contain digit runs that look like status codes.
++	err = CommandFailure("pb sql run", cause, "", "table 'ci4013a403' not found")
++	require.ErrorIs(t, err, cause)
++	require.False(t, IsPermanent(err))
++}
++
++func TestMissing(t *testing.T) {
++	// Verifies record matching treats partial, duplicated and extra rows as multisets.
++	expected := []string{"a", "b", "b", "c"}
++
++	require.Equal(t, expected, Missing(expected, nil))
++	require.Equal(t, []string{"b", "c"}, Missing(expected, []string{"b", "a"}))
++	require.Equal(t, []string{"b"}, Missing(expected, []string{"c", "b", "a", "a"}))
++	require.Empty(t, Missing(expected, []string{"c", "b", "z", "a", "b"}))
++	require.Empty(t, Missing[string](nil, []string{"a"}))
++}

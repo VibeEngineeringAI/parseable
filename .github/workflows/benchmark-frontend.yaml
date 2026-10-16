@@ -1,0 +1,74 @@
+name: Benchmark frontend on GitHub
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        required: true
+        type: string
+permissions:
+  contents: read
+defaults:
+  run:
+    working-directory: frontend
+jobs:
+  checks:
+    name: Format, build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run build
+      - run: npm test
+
+  browser:
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    # Keep screenshot fonts, Chromium and OS identical to the reviewed baselines.
+    # Update together with @playwright/test in frontend/package-lock.json.
+    container: mcr.microsoft.com/playwright:v1.63.0-noble
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: ui-1
+            command: npm run test:ui -- --shard=1/4 --workers=4
+          - suite: ui-2
+            command: npm run test:ui -- --shard=2/4 --workers=4
+          - suite: ui-3
+            command: npm run test:ui -- --shard=3/4 --workers=4
+          - suite: ui-4
+            command: npm run test:ui -- --shard=4/4 --workers=4
+          - suite: production
+            command: npm run test:prod -- --workers=4
+          - suite: storybook
+            command: npm run test:stories
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: ${{ matrix.command }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: benchmark-frontend-results-${{ matrix.suite }}
+          path: |
+            frontend/playwright-report
+            frontend/test-results
