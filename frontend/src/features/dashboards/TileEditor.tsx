@@ -1,4 +1,4 @@
-import { useCallback, useId, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useState } from 'react';
 import { Button, Dialog, Input, Select } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
@@ -32,6 +32,7 @@ import { resolveDataset, type VariableValues } from './variables';
 
 export function TileEditor({
   original,
+  defaultDataset,
   sections,
   tiles,
   variables,
@@ -46,6 +47,7 @@ export function TileEditor({
   onDirty,
 }: {
   original?: DashboardTile;
+  defaultDataset?: string;
   sections?: unknown;
   tiles: DashboardTile[];
   variables: DashboardVariable[];
@@ -60,7 +62,7 @@ export function TileEditor({
   onDirty: (dirty: boolean) => void;
 }) {
   const { client } = useApp();
-  const [initial] = useState(() => original ?? newTile(tiles));
+  const [initial] = useState(() => original ?? newTile(tiles, defaultDataset));
   const [draft, setDraft] = useState(() => structuredClone(initial));
   const [invalidFields, setInvalidFields] = useState<Set<string>>(() => new Set());
   const onValidity = useCallback((key: string, valid: boolean) => {
@@ -134,6 +136,22 @@ export function TileEditor({
       [client, promqlEnabled, isPromql],
     ),
   );
+  useEffect(() => {
+    if (
+      original ||
+      !defaultDataset ||
+      (isPromql && !metrics.data?.datasets.some((entry) => entry.name === defaultDataset))
+    )
+      return;
+    setDraft((current) =>
+      !tileDatasets(current).some(Boolean)
+        ? {
+            ...current,
+            dbName: tileType(current) === 'promql' ? defaultDataset : [defaultDataset],
+          }
+        : current,
+    );
+  }, [original, isPromql, defaultDataset, metrics.data]);
   const metadata = useMemo(
     () =>
       metadataEnabled

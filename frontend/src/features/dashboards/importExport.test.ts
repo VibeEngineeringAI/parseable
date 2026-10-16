@@ -3,6 +3,14 @@ import classic from './__fixtures__/classic.json';
 import { exportDashboard, importDashboard } from './importExport';
 import { ulid } from '../../lib/dashboardsContract';
 describe('classic portable JSON', () => {
+  it('retains a default dataset through portable export and import', () => {
+    const exported = exportDashboard({ ...classic, dataset: 'application_logs' });
+    const imported = importDashboard(JSON.stringify(exported), 'Imported');
+    expect(imported.dataset).toBe('application_logs');
+    expect(imported.tiles?.map((tile) => tile.dbName)).toEqual(
+      classic.tiles.map((tile) => tile.dbName),
+    );
+  });
   it('exports exactly the classic keys and removes only tile IDs', () => {
     const result = exportDashboard(classic);
     expect(Object.keys(result)).toEqual(['tags', 'variables', 'sections', 'tiles']);
@@ -42,6 +50,7 @@ describe('classic portable JSON', () => {
     '{}',
     '{"tiles":[null]}',
     '{"tiles":[],"tags":"bad"}',
+    '{"tiles":[],"dataset":["logs"]}',
     '{"tiles":[],"variables":[{"type":"promql_query"}]}',
   ])('rejects invalid imports: %s', (json) =>
     expect(() => importDashboard(json, 'Title')).toThrow(),

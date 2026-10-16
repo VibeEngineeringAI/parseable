@@ -142,3 +142,19 @@ describe('dashboard helpers', () => {
     expect(dashboardRange(new URLSearchParams('start=bad&end=now'), classic.timeRange)).toBe('1h');
   });
 });
+
+it('changes the dashboard dataset without rewriting existing tiles', () => {
+  const original = { ...classic, dataset: 'logs' };
+  const updated = editDashboardMetadata(
+    original,
+    original.title,
+    original.tags,
+    original.description,
+    'metrics',
+  );
+  expect(updated.dataset).toBe('metrics');
+  expect(updated.tiles).toEqual(original.tiles);
+  expect(
+    metadataPatch(original, original.title, original.tags, original.description, null),
+  ).toEqual({ dataset: null });
+});

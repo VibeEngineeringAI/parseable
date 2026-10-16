@@ -115,7 +115,7 @@ export function chartConfig(chartType: string) {
     },
   };
 }
-export function newTile(tiles: DashboardTile[]): DashboardTile {
+export function newTile(tiles: DashboardTile[], dataset?: string): DashboardTile {
   return {
     tile_id: createUlid(),
     title: '',
@@ -123,7 +123,7 @@ export function newTile(tiles: DashboardTile[]): DashboardTile {
     tileType: 'code',
     chartType: 'timeseries',
     chartQuery: '',
-    dbName: [],
+    dbName: dataset ? [dataset] : [],
     layout: appendLayout(tiles),
     config: chartConfig('timeseries'),
   };

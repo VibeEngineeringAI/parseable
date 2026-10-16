@@ -297,3 +297,10 @@ describe('classic tile helpers', () => {
     expect(sqlChart([], { tile_id: 'x' })).toMatchObject({ categorical: false, timestamps: [] });
   });
 });
+
+it('starts new tiles with the dashboard default dataset and retains legacy empty defaults', () => {
+  expect(newTile([], 'application_logs').dbName).toEqual(['application_logs']);
+  expect(newTile([]).dbName).toEqual([]);
+  const builder = setQueryLanguage(newTile([], 'application_logs'), 'builder');
+  expect(builder.dbName).toEqual(['application_logs']);
+});

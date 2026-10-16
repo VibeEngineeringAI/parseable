@@ -1,5 +1,7 @@
-import { useEffect, useId, useState } from 'react';
-import { Button, Dialog, Input, InlineError } from '../../components/ui';
+import { useCallback, useEffect, useId, useState } from 'react';
+import { Button, Dialog, Input, InlineError, Select } from '../../components/ui';
+import { useApp } from '../../app/AppProvider';
+import { useAsync } from '../../hooks/useAsync';
 import type { Dashboard } from '../../lib/types';
 import { dashboardError, tagsFromText } from './helpers';
 
@@ -17,9 +19,18 @@ export function DashboardForm({
   pending: boolean;
   error?: string;
   onClose: () => void;
-  onSubmit: (title: string, tags: string[], description: string) => void;
+  onSubmit: (
+    title: string,
+    tags: string[],
+    description: string,
+    dataset: string | null | undefined,
+  ) => void;
   onDirtyChange: (dirty: boolean) => void;
 }) {
+  const { client } = useApp();
+  const datasets = useAsync(useCallback((signal) => client.listDatasets(signal), [client]));
+  const [dataset, setDataset] = useState(original?.dataset ?? '');
+  const datasetNames = (datasets.data ?? []).map((entry) => entry.name);
   const [title, setTitle] = useState(original?.title ?? '');
   const [tags, setTags] = useState((original?.tags ?? []).join(', '));
   const [description, setDescription] = useState(
@@ -27,6 +38,7 @@ export function DashboardForm({
   );
   const reason = useId();
   const dirty =
+    dataset !== (original?.dataset ?? '') ||
     title !== (original?.title ?? '') ||
     tags !== (original?.tags ?? []).join(', ') ||
     description !== (typeof original?.description === 'string' ? original.description : '');
@@ -55,6 +67,7 @@ export function DashboardForm({
                 ? (original?.tags ?? [])
                 : tagsFromText(tags),
               description === original?.description ? description : description.trim(),
+              dataset || (original?.dataset == null ? original?.dataset : null),
             );
         }}
       >
@@ -65,6 +78,26 @@ export function DashboardForm({
           onChange={(event) => setTitle(event.target.value)}
           required
           autoFocus
+        />
+        <Select
+          label="Default dataset"
+          disabled={pending}
+          value={dataset}
+          onChange={(event) => setDataset(event.target.value)}
+          hint="New tiles start with this dataset. Existing tile queries keep their datasets."
+        >
+          <option value="">No default dataset</option>
+          {dataset && !datasetNames.includes(dataset) && <option value={dataset}>{dataset}</option>}
+          {datasetNames.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </Select>
+        <InlineError
+          error={
+            datasets.error ? 'Could not load datasets. The saved selection is retained.' : undefined
+          }
         />
         <Input
           label="Tags"

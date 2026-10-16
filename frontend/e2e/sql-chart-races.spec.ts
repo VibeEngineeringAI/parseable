@@ -308,6 +308,7 @@ for (const target of ['new', 'existing'] as const) {
     } else {
       expect(write.body).toMatchObject({
         title: 'SQL analysis',
+        dataset: 'app-logs',
         tags: [],
         variables: [],
         sections: [],

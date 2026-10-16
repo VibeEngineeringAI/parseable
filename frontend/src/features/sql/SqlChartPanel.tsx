@@ -172,6 +172,7 @@ export function SqlChartPanel({
                 if (destination === 'new')
                   result = await client.createDashboard({
                     title: title.trim(),
+                    dataset,
                     tiles: [tile],
                     tags: [],
                     variables: [],
