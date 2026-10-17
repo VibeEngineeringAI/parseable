@@ -1,3 +1,4 @@
+import { readColumnOrder } from '../../components/explorer/columnOrder';
 import { readSqlChartConfig } from './sqlChart';
 import type { SessionIdentity, TimeRange } from '../../lib/types';
 export type SavedQuery = {
@@ -9,6 +10,8 @@ export type SavedQuery = {
   datasets: string[];
   updatedAt: string;
   chart?: unknown;
+  columns?: string[];
+  columnFields?: string[];
 };
 export function sqlStorageScope(
   mode: 'live' | 'demo',
@@ -53,6 +56,13 @@ export function readSavedQueries(raw: string | null): SavedQuery[] {
         !validRange
       )
         return false;
+      for (const key of ['columns', 'columnFields'] as const) {
+        if (v[key] !== undefined) {
+          const columns = readColumnOrder(v[key]);
+          if (columns) v[key] = columns;
+          else delete v[key];
+        }
+      }
       // Chart data is optional; a malformed config must not prevent opening SQL.
       if (v.chart !== undefined) {
         const chart = readSqlChartConfig(v.chart);

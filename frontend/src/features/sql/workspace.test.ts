@@ -13,6 +13,8 @@ describe('SQL workspace identity hydration', () => {
     const stored = createQueryTab('Stored', 'SELECT 1');
     stored.savedId = 'saved-query';
     stored.datasets = ['events'];
+    stored.columns = ['b', 'a'];
+    stored.columnFields = ['a', 'hidden', 'b'];
     const other = createQueryTab('Other stored draft', 'SELECT 2');
     const first = createQueryTab('URL placeholder', 'SELECT 1');
     first.rows = [{ value: 1 }];
@@ -26,6 +28,8 @@ describe('SQL workspace identity hydration', () => {
         savedId: stored.savedId,
         datasets: stored.datasets,
         chart: stored.chart,
+        columns: stored.columns,
+        columnFields: stored.columnFields,
       },
       second,
     ]);

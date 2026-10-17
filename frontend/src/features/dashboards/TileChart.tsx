@@ -34,8 +34,10 @@ export function TileChart({
   end,
   height,
   onZoomRange,
+  columnPreferenceKey,
 }: {
   tile: DashboardTile;
+  columnPreferenceKey?: string;
   result: TileResults;
   start: number;
   end: number;
@@ -194,7 +196,11 @@ export function TileChart({
             The x values are not timestamps, so the results are shown as a table.
           </p>
         )}
-        <DataTable rows={rows} caption={`${tileTitle(tile)} results`} />
+        <DataTable
+          rows={rows}
+          caption={`${tileTitle(tile)} results`}
+          columnPreferenceKey={columnPreferenceKey}
+        />
       </div>
     );
   if (tile.chartType === 'query-value') {

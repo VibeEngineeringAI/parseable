@@ -1,0 +1,60 @@
+.reorderable-column-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.reorderable-column-heading .column-sort {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.column-reorder-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  width: 20px;
+  height: 22px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--color-muted);
+  cursor: grab;
+}
+.column-reorder-handle:active {
+  cursor: grabbing;
+}
+.column-reorder-handle:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+.column-reorder-handle:hover {
+  color: var(--color-text);
+  background: var(--color-surface-hover);
+}
+.column-reorder-handle:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -2px;
+}
+[data-column-drop-target] {
+  box-shadow: inset 3px 0 var(--color-primary);
+  background: var(--color-surface-hover);
+}
+.column-option-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px;
+}
+.column-option-row label {
+  flex: 1;
+  min-width: 0;
+}
+.column-option-row .ui-button {
+  flex-shrink: 0;
+}
+.column-order-help {
+  color: var(--color-muted);
+  font-size: 12px;
+}

@@ -330,6 +330,7 @@ export function DashboardTile({
             {(result || (results.loading && lastResult?.client === client)) && (
               <TileChart
                 tile={tile}
+                columnPreferenceKey={`dashboard:${JSON.stringify([dashboardId, tile.tile_id])}`}
                 result={result?.result ?? {}}
                 start={Date.parse((result?.bounds ?? effectiveBounds).startTime) / 1000}
                 end={Date.parse((result?.bounds ?? effectiveBounds).endTime) / 1000}

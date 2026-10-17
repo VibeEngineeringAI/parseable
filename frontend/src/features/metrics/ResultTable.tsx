@@ -1,3 +1,6 @@
+import { ColumnReorderHandle, useColumnReorder } from '../../components/explorer/ColumnReorder';
+import { useColumnPreferences } from '../../components/explorer/useColumnPreferences';
+import { orderedColumns } from '../../components/explorer/columnOrder';
 import { useState } from 'react';
 import { ArrowDown, ArrowUp, ArrowUpDown, Download } from 'lucide-react';
 import { Button, EmptyState, Spinner } from '../../components/ui';
@@ -20,6 +23,9 @@ export function ResultTable({
   /** Requests are still pending and nothing has arrived yet, so "empty" would be misleading. */
   loading?: boolean;
 }) {
+  const [preferred, setPreferred] = useColumnPreferences(`metrics:${title}`);
+  const fields = orderedColumns(columns, preferred);
+  const reorder = useColumnReorder(fields, setPreferred);
   const [sort, setSort] = useState<{ field: string; descending: boolean }>();
   const ordered = sort
     ? [...rows].sort((left, right) => {
@@ -38,6 +44,9 @@ export function ResultTable({
   const currentPage = Math.min(page, pages - 1);
   return (
     <section className="metrics-table-section" aria-label={title}>
+      <div role="status" className="sr-only">
+        {reorder.announcement}
+      </div>
       <div className="panel-heading">
         <div>
           <h2>{title}</h2>
@@ -81,10 +90,12 @@ export function ResultTable({
               <caption className="sr-only">{title}</caption>
               <thead>
                 <tr>
-                  {columns.map((field) => (
+                  {fields.map((field) => (
                     <th
                       scope="col"
+                      aria-label={field}
                       key={field}
+                      {...reorder.targetProps(field)}
                       aria-sort={
                         sort?.field === field
                           ? sort.descending
@@ -93,28 +104,31 @@ export function ResultTable({
                           : 'none'
                       }
                     >
-                      <button
-                        className="column-sort"
-                        aria-label={`Sort ${field}`}
-                        onClick={() => {
-                          setSort({
-                            field,
-                            descending: sort?.field === field ? !sort.descending : false,
-                          });
-                          setPage(0);
-                        }}
-                      >
-                        {field}
-                        {sort?.field === field ? (
-                          sort.descending ? (
-                            <ArrowDown size={12} aria-hidden="true" />
+                      <div className="reorderable-column-heading">
+                        <ColumnReorderHandle field={field} reorder={reorder} />
+                        <button
+                          className="column-sort"
+                          aria-label={`Sort ${field}`}
+                          onClick={() => {
+                            setSort({
+                              field,
+                              descending: sort?.field === field ? !sort.descending : false,
+                            });
+                            setPage(0);
+                          }}
+                        >
+                          {field}
+                          {sort?.field === field ? (
+                            sort.descending ? (
+                              <ArrowDown size={12} aria-hidden="true" />
+                            ) : (
+                              <ArrowUp size={12} aria-hidden="true" />
+                            )
                           ) : (
-                            <ArrowUp size={12} aria-hidden="true" />
-                          )
-                        ) : (
-                          <ArrowUpDown size={12} aria-hidden="true" />
-                        )}
-                      </button>
+                            <ArrowUpDown size={12} aria-hidden="true" />
+                          )}
+                        </button>
+                      </div>
                     </th>
                   ))}
                 </tr>
@@ -124,7 +138,7 @@ export function ResultTable({
                   .slice(currentPage * pageSize, (currentPage + 1) * pageSize)
                   .map((row, index) => (
                     <tr key={index}>
-                      {columns.map((field) => (
+                      {fields.map((field) => (
                         <td
                           key={field}
                           className={`mono ${field === 'Series' ? 'metrics-series-cell' : ''}`}

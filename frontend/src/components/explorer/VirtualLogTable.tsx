@@ -1,3 +1,4 @@
+import { ColumnReorderHandle, useColumnReorder } from './ColumnReorder';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { Button, EmptyState } from '../ui';
@@ -19,6 +20,7 @@ const HEADER_HEIGHT = 36;
 export function VirtualLogTable({
   rows,
   columns,
+  onColumnsChange,
   onSelect,
   caption = 'Query results',
   wrap = false,
@@ -28,6 +30,7 @@ export function VirtualLogTable({
 }: {
   rows: LogRecord[];
   columns?: string[];
+  onColumnsChange?: (columns: string[]) => void;
   onSelect?: (row: LogRecord) => void;
   caption?: string;
   wrap?: boolean;
@@ -39,8 +42,10 @@ export function VirtualLogTable({
   const [position, setPosition] = useState({ top: 0, left: 0, width: 960, height: 480 });
   const [sort, setSort] = useState<LogTableSort>();
   const [focusedRow, setFocusedRow] = useState<number>();
+  const [focusedField, setFocusedField] = useState<string | null>();
   const pendingFocus = useRef<number | undefined>(undefined);
   const fields = useMemo(() => columns ?? [...new Set(rows.flatMap(Object.keys))], [columns, rows]);
+  const reorder = useColumnReorder(fields, onColumnsChange ?? (() => {}));
   const displayFields = useMemo(() => (summary ? [...fields, null] : fields), [fields, summary]);
   const ordered = useMemo(() => orderLogRows(rows, sort), [rows, sort]);
   useEffect(() => {
@@ -67,6 +72,18 @@ export function VirtualLogTable({
     pendingFocus.current = undefined;
   }, [focusedRow, position.top]);
   const detailWidth = onSelect ? DETAILS_WIDTH : 0;
+  const focusedColumn = focusedField === undefined ? -1 : displayFields.indexOf(focusedField);
+  useLayoutEffect(() => {
+    const node = viewport.current;
+    if (!node || focusedColumn < 0) return;
+    const left = detailWidth + focusedColumn * COLUMN_WIDTH;
+    if (left < node.scrollLeft + detailWidth) node.scrollLeft = left - detailWidth;
+    else if (left + COLUMN_WIDTH > node.scrollLeft + node.clientWidth)
+      node.scrollLeft = left + COLUMN_WIDTH - node.clientWidth;
+    setPosition((current) =>
+      current.left === node.scrollLeft ? current : { ...current, left: node.scrollLeft },
+    );
+  }, [focusedColumn, detailWidth]);
   const rowWindow = virtualWindow(
     rows.length,
     Math.max(0, position.top - HEADER_HEIGHT),
@@ -82,6 +99,15 @@ export function VirtualLogTable({
     2,
   );
   const visibleFields = displayFields.slice(columnWindow.start, columnWindow.end);
+  const headerIndices = Array.from(
+    { length: columnWindow.end - columnWindow.start },
+    (_, index) => columnWindow.start + index,
+  );
+  // Keep the focused header mounted while its new position scrolls into view.
+  if (focusedColumn >= 0 && !headerIndices.includes(focusedColumn)) {
+    headerIndices.push(focusedColumn);
+    headerIndices.sort((a, b) => a - b);
+  }
   const visibleRows = virtualWindow(
     rows.length,
     Math.max(0, position.top),
@@ -107,6 +133,9 @@ export function VirtualLogTable({
     );
   return (
     <div className="results-table virtual-log-table">
+      <div role="status" className="sr-only">
+        {reorder.announcement}
+      </div>
       <div
         ref={viewport}
         className="virtual-log-viewport"
@@ -179,41 +208,53 @@ export function VirtualLogTable({
                 <span className="sr-only">Details</span>
               </div>
             )}
-            {visibleFields.map((field, index) => (
-              <div
-                role="columnheader"
-                aria-label={label(field)}
-                aria-colindex={columnWindow.start + index + 1 + (onSelect ? 1 : 0)}
-                aria-sort={
-                  sort?.field === field ? (sort.descending ? 'descending' : 'ascending') : 'none'
-                }
-                key={columnWindow.start + index}
-                className="virtual-log-cell"
-                style={{
-                  left: detailWidth + (columnWindow.start + index) * COLUMN_WIDTH,
-                  width: COLUMN_WIDTH,
-                }}
-              >
-                {field === null ? (
-                  label(field)
-                ) : (
-                  <button
-                    className="column-sort"
-                    aria-label={`Sort ${field}`}
-                    onClick={() => {
-                      setSort({
-                        field,
-                        descending: sort?.field === field ? !sort.descending : false,
-                      });
-                      if (viewport.current) viewport.current.scrollTop = 0;
-                      setPosition((current) => ({ ...current, top: 0 }));
-                    }}
-                  >
-                    {label(field)} {sort?.field === field ? (sort.descending ? '↓' : '↑') : '↕'}
-                  </button>
-                )}
-              </div>
-            ))}
+            {headerIndices.map((index) => {
+              const field = displayFields[index];
+              return (
+                <div
+                  role="columnheader"
+                  aria-label={label(field)}
+                  aria-colindex={index + 1 + (onSelect ? 1 : 0)}
+                  onFocusCapture={() => setFocusedField(field)}
+                  onBlurCapture={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget))
+                      setFocusedField(undefined);
+                  }}
+                  aria-sort={
+                    sort?.field === field ? (sort.descending ? 'descending' : 'ascending') : 'none'
+                  }
+                  key={field === null ? 'summary' : `field:${field}`}
+                  {...(field !== null ? reorder.targetProps(field) : {})}
+                  className="virtual-log-cell"
+                  style={{
+                    left: detailWidth + index * COLUMN_WIDTH,
+                    width: COLUMN_WIDTH,
+                  }}
+                >
+                  {field === null ? (
+                    label(field)
+                  ) : (
+                    <div className="reorderable-column-heading">
+                      {onColumnsChange && <ColumnReorderHandle field={field} reorder={reorder} />}
+                      <button
+                        className="column-sort"
+                        aria-label={`Sort ${field}`}
+                        onClick={() => {
+                          setSort({
+                            field,
+                            descending: sort?.field === field ? !sort.descending : false,
+                          });
+                          if (viewport.current) viewport.current.scrollTop = 0;
+                          setPosition((current) => ({ ...current, top: 0 }));
+                        }}
+                      >
+                        {label(field)} {sort?.field === field ? (sort.descending ? '↓' : '↑') : '↕'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
           {rowIndices.map((rowIndex) => {
             const row = ordered[rowIndex];

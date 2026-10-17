@@ -13,6 +13,7 @@ export type QueryTab = {
   loading: boolean;
   error?: Error;
   columns?: string[];
+  columnFields?: string[];
   wrap: boolean;
   view: 'results' | 'chart';
   chart: SqlChartConfig;
@@ -56,6 +57,8 @@ export function hydrateQueryTabs(
           savedId: stored.savedId,
           datasets: stored.datasets,
           chart: stored.chart,
+          columns: stored.columns,
+          columnFields: stored.columnFields,
         };
   });
   return [...remaining, ...hydrated];

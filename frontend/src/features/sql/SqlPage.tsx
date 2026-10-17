@@ -10,6 +10,7 @@ import { useSearchParams } from 'react-router-dom';
 import { Play, Download, WrapText, Plus, X, Pencil, Square } from 'lucide-react';
 import { Button, Card, EmptyState, Input } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
+import { reconcileSelectedColumns } from '../../components/explorer/columnOrder';
 import { ColumnPicker } from '../../components/explorer/ColumnPicker';
 import { DataTable, exportRecords } from '../../components/explorer/DataTable';
 import { QueryState } from '../../components/explorer/QueryState';
@@ -33,6 +34,8 @@ function restoreDrafts(scope: string | null): QueryTab[] {
     return readSavedQueries(sessionStorage.getItem(`${scope}:drafts`)).map((item) => {
       const restored = createQueryTab(item.name, item.sql, item.range);
       restored.savedId = item.savedId;
+      restored.columns = item.columns;
+      restored.columnFields = item.columnFields;
       restored.datasets = item.datasets;
       restored.chart = readSqlChartConfig(item.chart) || restored.chart;
       return restored;
@@ -54,6 +57,8 @@ function writeDrafts(scope: string, tabs: QueryTab[]) {
           range: item.range,
           datasets: item.datasets,
           chart: item.chart,
+          columns: item.columns,
+          columnFields: item.columnFields,
           updatedAt: new Date().toISOString(),
         })),
       ),
@@ -124,7 +129,7 @@ function SqlWorkspace() {
     const existing = tabs.find((item) => item.id === id);
     if (
       existing &&
-      ['name', 'query', 'range', 'datasets', 'chart', 'savedId'].some(
+      ['name', 'query', 'range', 'datasets', 'chart', 'savedId', 'columns'].some(
         (key) =>
           key in value &&
           JSON.stringify(existing[key as keyof QueryTab]) !==
@@ -251,7 +256,6 @@ function SqlWorkspace() {
       request,
       loading: true,
       error: undefined,
-      columns: undefined,
       rows: [],
       elapsed: undefined,
       canceled: false,
@@ -259,7 +263,20 @@ function SqlWorkspace() {
     try {
       const rows = await client.query(request, controller.signal);
       if (!controller.signal.aborted && requests.current.get(id) === controller)
-        patch(id, { rows, loading: false, elapsed: performance.now() - start });
+        setTabs((items) =>
+          items.map((item) => {
+            if (item.id !== id) return item;
+            const available = [...new Set(rows.flatMap(Object.keys))];
+            return {
+              ...item,
+              rows,
+              loading: false,
+              elapsed: performance.now() - start,
+              columns: reconcileSelectedColumns(available, item.columns, item.columnFields),
+              columnFields: available.length ? available : item.columnFields,
+            };
+          }),
+        );
     } catch (error) {
       if (!controller.signal.aborted && requests.current.get(id) === controller)
         patch(id, {
@@ -341,6 +358,11 @@ function SqlWorkspace() {
     target.addEventListener('pointercancel', stop);
   };
   const fields = [...new Set(tab.rows.flatMap(Object.keys))];
+  const setColumns = (columns: string[]) =>
+    patch(tab.id, {
+      columns,
+      columnFields: fields.length ? fields : tab.columnFields,
+    });
   return (
     <div className="page sql-page sql-workspace">
       <div className="sql-tabs">
@@ -464,6 +486,8 @@ function SqlWorkspace() {
           currentRange={tab.range}
           currentName={tab.name}
           currentChart={tab.chart}
+          currentColumns={tab.columns}
+          currentColumnFields={tab.columnFields}
           currentSavedId={tab.savedId}
           onSaved={(item) => patch(tab.id, { savedId: item.id, name: item.name })}
           onGenerateQuery={() => newQuery(datasetQuery(tab.datasets), tab.datasets)}
@@ -479,6 +503,8 @@ function SqlWorkspace() {
             const next = createQueryTab(item.name, item.sql, item.range);
             next.datasets = item.datasets;
             next.savedId = item.id;
+            next.columns = item.columns;
+            next.columnFields = item.columnFields;
             next.chart = readSqlChartConfig(item.chart) || next.chart;
             setTabs((items) => [...items, next]);
             setActiveId(next.id);
@@ -628,7 +654,7 @@ function SqlWorkspace() {
                   <ColumnPicker
                     fields={fields}
                     selected={tab.columns || fields}
-                    onChange={(columns) => patch(tab.id, { columns })}
+                    onChange={setColumns}
                   />
                   <Button
                     variant="ghost"
@@ -674,6 +700,7 @@ function SqlWorkspace() {
                         key={tab.id}
                         rows={tab.rows}
                         columns={tab.columns}
+                        onColumnsChange={setColumns}
                         onSelect={setRow}
                         wrap={tab.wrap}
                       />

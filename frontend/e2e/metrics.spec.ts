@@ -791,7 +791,9 @@ test('a failing dataset info warns without blocking metrics and is reused until 
   let broken = true;
   let infoRequests = 0;
   await page.route('**/api/v1/logstream/*/info', (route) => {
-    infoRequests++;
+    // Logs independently requests web_logs metadata when visiting it below.
+    // Count the other datasets so that request cannot look like a discovery rescan.
+    if (!route.request().url().includes('/web_logs/')) infoRequests++;
     return broken && route.request().url().includes('/metrics_b/')
       ? route.fulfill({ status: 500, body: 'Dataset info unavailable' })
       : route.fallback();
@@ -810,7 +812,7 @@ test('a failing dataset info warns without blocking metrics and is reused until 
   await page.getByRole('button', { name: 'Check again', exact: true }).click();
   await expect(page.getByLabel('Metrics dataset').locator('option')).toHaveCount(2);
   await expect(warning).toHaveCount(0);
-  expect(infoRequests).toBe(scanned + 4);
+  expect(infoRequests).toBe(scanned + 3);
 });
 
 test('a malformed PromQL success is a readable query error', async ({ page }) => {

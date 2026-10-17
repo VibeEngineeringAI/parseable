@@ -104,10 +104,19 @@ for (const name of [
   'loading',
 ]) {
   test(`WCAG accessibility smoke: ${name}`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
     await story(page, name);
+    // Axe must inspect settled colors, not the sheet/overlay entrance animation.
+    await page.addStyleTag({
+      content:
+        '*, *::before, *::after { animation: none !important; transition: none !important; }',
+    });
     if (name === 'modal')
       await page.getByRole('button', { name: 'Save view', exact: true }).click();
     if (name === 'detail-sheet') await page.getByRole('button', { name: 'Inspect record' }).click();
+    await page.evaluate(async () => {
+      await Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+    });
     const result = await new AxeBuilder({ page })
       .withTags(['wcag2a', 'wcag2aa', 'wcag21aa'])
       .analyze();
