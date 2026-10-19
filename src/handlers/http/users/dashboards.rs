@@ -25,7 +25,7 @@ use crate::{
     users::{
         dashboard_patch::{self, DashboardPatchRequest},
         dashboard_service::{self, DashboardActor, DashboardMutation, DashboardWriteOptions},
-        dashboards::{Dashboard, validate_dashboard_id},
+        dashboards::{Dashboard, Tile, validate_dashboard_id},
     },
     utils::{get_hash, get_tenant_id_from_request, get_user_and_tenant_from_request, is_admin},
 };
@@ -257,22 +257,23 @@ pub async fn get_dashboard_internal(
 
 pub async fn create_dashboard(
     req: HttpRequest,
-    Json(document): Json<Value>,
+    Json(document): Json<Dashboard>,
 ) -> Result<HttpResponse, DashboardError> {
-    if document.get("title").and_then(Value::as_str) == Some("") {
+    if document.title.is_empty() {
         return Err(DashboardError::Metadata("Title must be provided"));
     }
     let (actor, tenant) = actor(&req)?;
-    let result = dashboard_service::create_json(&actor, &tenant, document, &write_options(&req)?)
-        .await
-        .map_err(|error| legacy_error(error, LegacyOperation::Create))?;
+    let result =
+        dashboard_service::create_legacy_json(&actor, &tenant, document, &write_options(&req)?)
+            .await
+            .map_err(|error| legacy_error(error, LegacyOperation::Create))?;
     Ok(document_response(result["dashboard"].clone()))
 }
 
 pub async fn update_dashboard(
     req: HttpRequest,
     id: Path<String>,
-    body: Option<Json<Value>>,
+    body: Option<Json<Dashboard>>,
 ) -> Result<HttpResponse, DashboardError> {
     let (actor, tenant) = actor(&req)?;
     let query = web::Query::<HashMap<String, String>>::from_query(req.query_string())
@@ -300,7 +301,7 @@ pub async fn update_dashboard(
             .ok_or(DashboardError::Metadata("Request body is required"))?
             .into_inner();
         validate_legacy_tiles(&document)?;
-        DashboardMutation::Replace(document)
+        DashboardMutation::Replace(serde_json::to_value(document)?)
     };
     let result = dashboard_service::mutate_legacy_json(
         &actor,
@@ -314,19 +315,13 @@ pub async fn update_dashboard(
     Ok(document_response(result["dashboard"].clone()))
 }
 
-fn validate_legacy_tiles(document: &Value) -> Result<(), DashboardError> {
-    if let Some(tiles) = document["tiles"].as_array() {
-        let ids = tiles
-            .iter()
-            .filter_map(|tile| tile["tile_id"].as_str())
-            .collect::<Vec<_>>();
-        if ids
-            .iter()
-            .any(|id| ulid::Ulid::from_string(id).is_ok_and(|id| id.is_nil()))
-        {
+fn validate_legacy_tiles(document: &Dashboard) -> Result<(), DashboardError> {
+    let mut ids = std::collections::HashSet::new();
+    for tile in document.tiles.iter().flatten() {
+        if tile.tile_id.is_nil() {
             return Err(DashboardError::Metadata("Tile ID must be provided"));
         }
-        if ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len() {
+        if !ids.insert(tile.tile_id) {
             return Err(DashboardError::Metadata("Tile IDs must be unique"));
         }
     }
@@ -403,14 +398,17 @@ pub async fn delete_dashboard(
 pub async fn add_tile(
     req: HttpRequest,
     id: Path<String>,
-    Json(tile): Json<Value>,
+    Json(tile): Json<Tile>,
 ) -> Result<HttpResponse, DashboardError> {
+    if tile.tile_id.is_nil() {
+        return Err(DashboardError::Metadata("Tile ID must be provided"));
+    }
     let (actor, tenant) = actor(&req)?;
-    let result = dashboard_service::mutate_json(
+    let result = dashboard_service::mutate_legacy_json(
         &actor,
         validate_dashboard_id(id.into_inner())?,
         &tenant,
-        DashboardMutation::AddTile(tile),
+        DashboardMutation::AddTile(serde_json::to_value(tile)?),
         &write_options(&req)?,
     )
     .await
@@ -571,6 +569,113 @@ mod compatibility_tests {
     }
 
     #[actix_web::test]
+    async fn malformed_legacy_typed_requests_keep_extractor_400_errors() {
+        use actix_web::{App, test};
+        let app = test::init_service(
+            App::new()
+                .route("/dashboards", web::post().to(create_dashboard))
+                .route("/dashboards/{id}/tile", web::post().to(add_tile)),
+        )
+        .await;
+        for document in [
+            json!({}),
+            json!({"title":42}),
+            json!({"title":"Typed","tags":[false]}),
+            json!({"title":"Typed","isFavorite":"yes"}),
+            json!({"title":"Typed","dashboardType":"unknown"}),
+            json!({"title":"Typed","created":"yesterday"}),
+            json!({"title":"Typed","tiles":[{"tile_id":"invalid"}]}),
+            json!({"title":"Typed","tiles":[{}]}),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/dashboards")
+                    .set_json(document)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = test::read_body(response).await;
+            assert!(
+                std::str::from_utf8(&body)
+                    .unwrap()
+                    .contains("Json deserialize error")
+            );
+        }
+        for tile in [
+            json!({}),
+            json!({"tile_id":42}),
+            json!({"tile_id":"invalid"}),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/dashboards/{}/tile", ulid::Ulid::new()))
+                    .set_json(tile)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = test::read_body(response).await;
+            assert!(
+                std::str::from_utf8(&body)
+                    .unwrap()
+                    .contains("Json deserialize error")
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn legacy_put_optional_typed_body_keeps_legacy_extraction_semantics() {
+        use actix_web::{App, test};
+        // Match the original PUT's optional extractor: malformed typed input
+        // becomes no body, which the handler reports as a legacy 400.
+        let app = test::init_service(App::new().route(
+            "/typed",
+            web::put().to(|body: Option<Json<Dashboard>>| async move {
+                match body {
+                    Some(body) => HttpResponse::Ok().json(body.into_inner()),
+                    None => DashboardError::Metadata("Request body is required").error_response(),
+                }
+            }),
+        ))
+        .await;
+        let document = json!({"title":"Legacy","tiles":[{"tile_id":ulid::Ulid::new().to_string(),
+            "tileType":"ai","layout":"arbitrary","future":{"keep":true}}]});
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/typed")
+                .set_json(&document)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Value = test::read_body_json(response).await;
+        assert_eq!(decoded["tiles"], document["tiles"]);
+        for document in [
+            json!({"title":42}),
+            json!({"title":"Bad","tags":[42]}),
+            json!({"title":"Bad","tiles":[{}]}),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::put()
+                    .uri("/typed")
+                    .set_json(document)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                test::read_body(response).await.as_ref(),
+                b"Cannot perform this operation: Request body is required"
+            );
+        }
+    }
+
+    #[actix_web::test]
     async fn legacy_errors_keep_plaintext_status_and_body() {
         for (operation, status, message) in [
             (
@@ -606,7 +711,7 @@ mod compatibility_tests {
             let response = error.error_response();
             assert_eq!(response.status().as_u16(), status);
             assert_eq!(
-                response.headers()["content-type"],
+                response.headers().get("content-type").unwrap(),
                 "text/plain; charset=utf-8"
             );
             assert_eq!(
