@@ -154,14 +154,17 @@ impl LocalFS {
         + Send
         + 'static,
     ) -> Result<T, ConditionalMetadataError> {
-        self.metadata_with_lock_mode(path, true, operation).await
+        self.metadata_with_lock_mode(path, true, move |path, lock| {
+            operation(path, lock.expect("exclusive metadata lock"))
+        })
+        .await
     }
 
     async fn metadata_with_lock_mode<T: Send + 'static>(
         &self,
         path: &RelativePath,
         exclusive: bool,
-        operation: impl FnOnce(&Path, &mut std::fs::File) -> Result<T, ConditionalMetadataError>
+        operation: impl FnOnce(&Path, Option<&mut std::fs::File>) -> Result<T, ConditionalMetadataError>
         + Send
         + 'static,
     ) -> Result<T, ConditionalMetadataError> {
@@ -173,28 +176,35 @@ impl LocalFS {
                 .ok_or_else(|| ObjectStorageError::Custom("metadata path has no parent".into()))?;
             if exclusive {
                 std::fs::create_dir_all(parent).map_err(ObjectStorageError::from)?;
+                std::fs::create_dir_all(lock_path.parent().expect("private lock directory"))
+                    .map_err(ObjectStorageError::from)?;
             }
-            std::fs::create_dir_all(lock_path.parent().expect("private lock directory"))
-                .map_err(ObjectStorageError::from)?;
-            let mut lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-                .map_err(ObjectStorageError::from)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            if exclusive {
+                options.create(true).truncate(false).write(true);
+            }
+            let mut lock = match options.open(&lock_path) {
+                Ok(lock) => lock,
+                Err(error) if !exclusive && error.kind() == std::io::ErrorKind::NotFound => {
+                    return operation(&path, None);
+                }
+                Err(error) => return Err(ObjectStorageError::from(error).into()),
+            };
             if exclusive {
                 lock.lock().map_err(ObjectStorageError::from)?;
-                // Persist the private directory and lock entry before allowing a
-                // mutation. Another opener may have created either entry but not
-                // synced it yet. Never replace or remove this lock inode.
-                sync_metadata_parent(&lock_path)?;
-                sync_metadata_parent(lock_path.parent().expect("private lock directory"))?;
+                if read_metadata_generation(&mut lock)? == [0; 16] {
+                    // Persist both entries BEFORE the first nonzero generation.
+                    // Another opener may have created them without syncing. A
+                    // valid nonzero generation proves this initialization ran.
+                    sync_metadata_parent(&lock_path)?;
+                    sync_metadata_parent(lock_path.parent().expect("private lock directory"))?;
+                }
             } else {
                 lock.lock_shared().map_err(ObjectStorageError::from)?;
             }
             // The lock is released even if operation returns an error or panics.
-            operation(&path, &mut lock)
+            operation(&path, Some(&mut lock))
         })
         .await
         .map_err(ObjectStorageError::from)?
@@ -287,8 +297,9 @@ impl ObjectStorage for LocalFS {
         path: &RelativePath,
         _tenant_id: &Option<String>,
     ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
-        // Open/create the same stable lock even for a missing object: an absent
-        // lockfile fallback could mix a new generation with old content.
+        // Reads never create locks. Without one, pin generation zero before
+        // reading content: a concurrent first writer durably rotates away from
+        // zero before mutation, so this read can only cause a false conflict.
         self.metadata_with_lock_mode(path, false, read_local_metadata)
             .await
     }
@@ -301,7 +312,7 @@ impl ObjectStorage for LocalFS {
         _tenant_id: &Option<String>,
     ) -> Result<MetadataVersion, ConditionalMetadataError> {
         self.metadata_with_lock(path, move |path, lock| {
-            let current = read_local_metadata(path, lock)?;
+            let current = read_local_metadata(path, Some(lock))?;
             match condition {
                 MetadataWriteCondition::Create if current.is_some() => {
                     return Err(ConditionalMetadataError::Conflict);
@@ -315,7 +326,7 @@ impl ObjectStorage for LocalFS {
             }
             rotate_metadata_generation(lock)?;
             atomic_metadata_write(path, &bytes)?;
-            Ok(read_local_metadata(path, lock)?
+            Ok(read_local_metadata(path, Some(lock))?
                 .expect("just wrote metadata under exclusive lock")
                 .version)
         })
@@ -329,7 +340,7 @@ impl ObjectStorage for LocalFS {
         _tenant_id: &Option<String>,
     ) -> Result<(), ConditionalMetadataError> {
         self.metadata_with_lock(path, move |path, lock| {
-            if read_local_metadata(path, lock)?
+            if read_local_metadata(path, Some(lock))?
                 .as_ref()
                 .map(|entry| &entry.version)
                 != Some(&version)
@@ -1159,11 +1170,14 @@ fn rotate_metadata_generation(lock: &mut std::fs::File) -> Result<(), ObjectStor
 
 fn read_local_metadata(
     path: &Path,
-    lock: &mut std::fs::File,
+    lock: Option<&mut std::fs::File>,
 ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let generation = read_metadata_generation(lock)?;
+    let generation = match lock {
+        Some(lock) => read_metadata_generation(lock)?,
+        None => [0; 16],
+    };
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1174,7 +1188,8 @@ fn read_local_metadata(
     file.read_to_end(&mut bytes)
         .map_err(ObjectStorageError::from)?;
     // The durable generation prevents ABA even when bytes, inode and timestamps
-    // all repeat. The caller holds the same lock across generation/content reads.
+    // all repeat. With an existing lock the caller holds it across both reads;
+    // without one, generation zero cannot match a concurrent first mutation.
     let mut digest = Sha256::new();
     digest.update(generation);
     digest.update(&bytes);
@@ -1523,6 +1538,170 @@ mod conditional_metadata_tests {
     }
 
     #[tokio::test]
+    async fn reading_unknown_ids_and_titles_creates_no_files_or_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = [
+            ".users/.dashboard-locations/01ARZ3NDEKTSV4RRFFQ69G5FAV.json",
+            ".users/.dashboard-titles/unknown-title.json",
+            ".users/owner/dashboards/01ARZ3NDEKTSV4RRFFQ69G5FAV.json",
+        ];
+        let root = directory.path().join("absent-root");
+        let storage = LocalFS::new(root.clone());
+        for path in paths {
+            assert!(
+                storage
+                    .get_metadata_versioned(RelativePath::new(path), &None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(!root.exists());
+        std::fs::create_dir(&root).unwrap();
+        for path in paths {
+            assert!(
+                storage
+                    .get_metadata_versioned(RelativePath::new(path), &None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let locks = root.join(METADATA_LOCK_DIRECTORY);
+        std::fs::create_dir(&locks).unwrap();
+        for path in paths {
+            assert!(
+                storage
+                    .get_metadata_versioned(RelativePath::new(path), &None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&locks).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preexisting_readonly_metadata_and_locks_have_stable_versions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = LocalFS::new(directory.path().to_path_buf());
+        let path = RelativePath::new(".users/owner/dashboards/readonly.json");
+        let object_path = storage.path_in_root(path);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"existing").unwrap();
+        std::fs::set_permissions(&object_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let lock_path = storage.metadata_lock_path(path);
+        // Exercise no lock, an empty legacy lock, and a durable generation.
+        for format in 0..3 {
+            if format != 0 {
+                std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+                let mut lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap();
+                if format == 2 {
+                    rotate_metadata_generation(&mut lock).unwrap();
+                }
+                std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444))
+                    .unwrap();
+                std::fs::set_permissions(
+                    lock_path.parent().unwrap(),
+                    std::fs::Permissions::from_mode(0o555),
+                )
+                .unwrap();
+            }
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let first = storage.get_metadata_versioned(path, &None).await;
+            let second = storage.get_metadata_versioned(path, &None).await;
+            // Restore directory permissions before assertions/TempDir cleanup.
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            if format != 0 {
+                std::fs::set_permissions(
+                    lock_path.parent().unwrap(),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            let first = first.unwrap().unwrap();
+            let second = second.unwrap().unwrap();
+            assert_eq!(first.bytes, b"existing"[..]);
+            assert_eq!(first.version, second.version);
+            assert_eq!(lock_path.exists(), format != 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_without_lock_rejects_stale_version_after_concurrent_first_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let reader = LocalFS::new(directory.path().to_path_buf());
+        let writer = LocalFS::new(directory.path().to_path_buf());
+        let path = RelativePath::new(".users/owner/dashboards/first-writer.json");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reading = tokio::spawn(async move {
+            reader
+                .metadata_with_lock_mode(path, false, move |path, lock| {
+                    assert!(lock.is_none());
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    // Force content from the first writer to pair with zero,
+                    // never its new generation, after observing no lock.
+                    read_local_metadata(path, lock)
+                })
+                .await
+        });
+        ready_rx.await.unwrap();
+        let written = writer
+            .put_metadata_conditional(
+                path,
+                Bytes::from_static(b"first content"),
+                MetadataWriteCondition::Create,
+                &None,
+            )
+            .await;
+        release_tx.send(()).unwrap();
+        let stale = reading.await.unwrap().unwrap().unwrap();
+        let written = written.unwrap();
+        assert_eq!(stale.bytes, b"first content"[..]);
+        assert_ne!(stale.version, written);
+        assert!(matches!(
+            writer
+                .put_metadata_conditional(
+                    path,
+                    Bytes::from_static(b"stale update"),
+                    MetadataWriteCondition::Update(stale.version.clone()),
+                    &None,
+                )
+                .await,
+            Err(ConditionalMetadataError::Conflict)
+        ));
+        assert!(matches!(
+            writer
+                .delete_metadata_conditional(path, stale.version, &None)
+                .await,
+            Err(ConditionalMetadataError::Conflict)
+        ));
+        let current = writer
+            .get_metadata_versioned(path, &None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, written);
+        assert_eq!(current.bytes, stale.bytes);
+    }
+
+    #[tokio::test]
     async fn empty_legacy_lock_migrates_and_interrupted_mutation_only_invalidates_version() {
         let directory = tempfile::tempdir().unwrap();
         let storage = LocalFS::new(directory.path().to_path_buf());
@@ -1530,7 +1709,27 @@ mod conditional_metadata_tests {
         let object_path = storage.path_in_root(path);
         std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
         std::fs::write(&object_path, b"old content").unwrap();
-        // No lock exists yet; versioned reads must create/open the stable lock.
+        // An existing empty lock must still exclude the first mutation.
+        let lock_path = storage.metadata_lock_path(path);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::File::create(&lock_path).unwrap();
+        storage
+            .metadata_with_lock_mode(path, false, move |_, lock| {
+                let lock = lock.expect("existing empty lock");
+                let contender = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+                    .unwrap();
+                assert!(matches!(
+                    contender.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+                assert_eq!(read_metadata_generation(lock)?, [0; 16]);
+                Ok(())
+            })
+            .await
+            .unwrap();
         let old = storage
             .get_metadata_versioned(path, &None)
             .await
@@ -1675,6 +1874,7 @@ mod conditional_metadata_tests {
         let expected = storage
             .metadata_with_lock_mode(path, false, move |path, lock| {
                 // Independent writers cannot rotate the generation between these reads.
+                let lock = lock.expect("existing generation lock");
                 let contender = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -1685,7 +1885,7 @@ mod conditional_metadata_tests {
                     Err(std::fs::TryLockError::WouldBlock)
                 ));
                 let generation = read_metadata_generation(lock)?;
-                let read = read_local_metadata(path, lock)?.unwrap();
+                let read = read_local_metadata(path, Some(lock))?.unwrap();
                 assert_eq!(read_metadata_generation(lock)?, generation);
                 Ok(read)
             })
