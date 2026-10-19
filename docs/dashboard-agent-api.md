@@ -219,6 +219,18 @@ protocol. Unsupported conditional storage fails explicitly. Rolling back to old
 binaries while tombstones exist is unsupported. Tombstones/locators/title records
 are metadata, not a separately deployed service.
 
+LocalFS upgrades require stopping all writers and restarting them on the new
+binary; mixed old and new writers are unsupported. Stable private lock files
+retain checksummed generations across identical rewrites and delete/recreate
+cycles. Never remove or replace those lock files. Reads open existing locks
+read-only and create no directories or files. Before the first lock exists,
+reads use generation zero; a concurrent first mutation can cause a safe revision
+conflict, requiring a fresh read. The first generation initialization syncs the
+lock directory and storage root before persisting a nonzero generation. Later
+mutations still sync each new generation before changing object content, without
+repeating those two directory syncs. Corrupt generation records fail closed and
+require operator recovery.
+
 Legacy dashboard discovery runs once per tenant and server process, with
 singleflight initialization. Unknown IDs still check their canonical locator,
 so new dashboards created by another server remain visible. Cached legacy title
