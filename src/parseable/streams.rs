@@ -23,7 +23,7 @@ use arrow::{
 };
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{ArrowError, Field, Fields, Schema, SortOptions};
-use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
 use derive_more::derive::{Deref, DerefMut};
 use itertools::Itertools;
 use once_cell::sync::{Lazy, OnceCell};
@@ -724,20 +724,20 @@ impl Stream {
                 }
             }
         };
+        let filename =
+            self.filename_by_partition(schema_key, parsed_timestamp, custom_partition_values);
         if self.options.mode != Mode::Query || stream_type == StreamType::Internal {
-            let filename =
-                self.filename_by_partition(schema_key, parsed_timestamp, custom_partition_values);
             let range = TimeRange::granularity_range(
                 parsed_timestamp.and_local_timezone(Utc).unwrap(),
                 OBJECT_STORE_DATA_GRANULARITY,
             );
             let file_path = self.data_path.join(&filename);
 
-            guard.push_disk(filename, record, file_path, range)?;
+            guard.push_disk(filename.clone(), record, file_path, range)?;
         }
 
         if let Some(mem) = guard.mem.as_mut() {
-            mem.push(schema_key, record)?;
+            mem.push_for_file(filename, schema_key, record)?;
         }
 
         Ok(())
@@ -1166,6 +1166,14 @@ impl Stream {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn flush(&self, forced: bool) -> Result<(), StagingError> {
+        self.flush_with_clock(forced, Utc::now)
+    }
+
+    fn flush_with_clock(
+        &self,
+        forced: bool,
+        clock: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<(), StagingError> {
         let _span = info_span!("flush", stream_name = %self.stream_name, forced).entered();
         // Swap out stale writers under the lock, drop them after releasing it.
         // DiskWriter::Drop does I/O (IPC finish + file rename) so dropping
@@ -1178,10 +1186,7 @@ impl Stream {
                 )))
             })?;
 
-            if let Some(mem) = writer.mem.as_mut() {
-                mem.clear();
-            }
-            writer.take_flushable_disk(forced)
+            writer.take_flushable_disk_at(forced, clock())
         };
         // DiskWriter::Drop I/O happens here, outside the lock
         drop(stale_writers);
@@ -2966,6 +2971,148 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
+
+    #[test]
+    fn current_minute_query_visibility_query_mode_flushes_ownerless_memory() {
+        let dir = TempDir::new().unwrap();
+        let staging = Stream::new(
+            Arc::new(Options {
+                local_staging_path: dir.path().to_path_buf(),
+                mode: Mode::Query,
+                ..Default::default()
+            }),
+            "query-memory",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        staging
+            .push(
+                "id-schema",
+                &batch,
+                now.naive_utc(),
+                &HashMap::new(),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
+        assert_eq!(
+            staging.recordbatches_cloned(&schema).unwrap()[0].num_rows(),
+            1
+        );
+        staging.flush_with_clock(false, || now).unwrap();
+        assert!(staging.recordbatches_cloned(&schema).unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_minute_query_visibility_survives_nonforced_flush() {
+        // A fixed reference clock tests the production push/flush/query path without
+        // relying on a wall-clock minute boundary or retrying the test.
+        let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let dir = TempDir::new().unwrap();
+        let staging = Stream::new(
+            Arc::new(Options {
+                local_staging_path: dir.path().to_path_buf(),
+                ..Default::default()
+            }),
+            "visibility",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        for (id, timestamp, partition) in [
+            (1, now - TimeDelta::minutes(2), "past"),
+            (2, now, "a"),
+            (3, now, "b"),
+            (4, now + TimeDelta::minutes(2), "future"),
+        ] {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![id]))])
+                    .unwrap();
+            staging
+                .push(
+                    "id-schema",
+                    &batch,
+                    timestamp.naive_utc(),
+                    &HashMap::from([("tenant".to_owned(), partition.to_owned())]),
+                    StreamType::UserDefined,
+                )
+                .unwrap();
+        }
+        let ids = || {
+            let mut ids = staging
+                .recordbatches_cloned(&schema)
+                .unwrap()
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(), vec![1, 2, 3, 4]);
+        staging.flush_with_clock(false, || now).unwrap();
+        assert_eq!(staging.writer.lock().unwrap().disk.len(), 2);
+        assert_eq!(
+            ids(),
+            vec![2, 3],
+            "attached current writers must remain queryable"
+        );
+        staging.flush_with_clock(false, || now).unwrap();
+        assert_eq!(
+            ids(),
+            vec![2, 3],
+            "a second flush must neither lose nor duplicate rows"
+        );
+        staging.clear().unwrap();
+        assert!(ids().is_empty());
+        assert_eq!(staging.writer.lock().unwrap().disk.len(), 2);
+        let next = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![5]))])
+            .unwrap();
+        staging
+            .push(
+                "id-schema",
+                &next,
+                now.naive_utc(),
+                &HashMap::from([("tenant".to_owned(), "a".to_owned())]),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+        assert_eq!(ids(), vec![5]);
+        staging.flush_with_clock(true, || now).unwrap();
+        assert!(ids().is_empty());
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
+        // A late append for a previously detached file starts a fresh segment.
+        staging
+            .push(
+                "id-schema",
+                &next,
+                (now - TimeDelta::minutes(2)).naive_utc(),
+                &HashMap::from([("tenant".to_owned(), "past".to_owned())]),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+        assert_eq!(ids(), vec![5]);
+        staging.flush_with_clock(false, || now).unwrap();
+        assert!(ids().is_empty());
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
+    }
 
     #[test]
     fn parallel_metric_writer_creates_valid_ordered_row_groups() {
