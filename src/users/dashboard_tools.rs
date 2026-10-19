@@ -42,7 +42,7 @@ fn tool(
 }
 fn operations() -> Value {
     static OPERATION_SCHEMA: std::sync::LazyLock<Value> =
-        std::sync::LazyLock::new(|| dashboard_patch::operation_item_schema());
+        std::sync::LazyLock::new(dashboard_patch::operation_item_schema);
     json!({"type":"array","minItems":1,"maxItems":256,"items":&*OPERATION_SCHEMA,"description":"Atomic Parseable operations addressed by stable tile, section and variable identifiers."})
 }
 
@@ -257,6 +257,7 @@ pub async fn execute(req: &HttpRequest, name: &str, args: &Value) -> Result<Valu
                             .contains(&query)
                 })
                 .collect::<Vec<_>>();
+            matching.sort_by(|a, b| a["dashboardId"].as_str().cmp(&b["dashboardId"].as_str()));
             let more = matching.len() > limit;
             matching.truncate(limit);
             let next = more.then(|| {

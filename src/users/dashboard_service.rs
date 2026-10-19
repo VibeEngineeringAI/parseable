@@ -91,6 +91,17 @@ pub async fn mutate_json(
         .mutate_json(actor, id, tenant, mutation, options)
         .await
 }
+pub async fn mutate_legacy_json(
+    actor: &DashboardActor,
+    id: Ulid,
+    tenant: &Option<String>,
+    mutation: DashboardMutation,
+    options: &DashboardWriteOptions,
+) -> Result<Value, DashboardError> {
+    SERVICE
+        .mutate_legacy_json(actor, id, tenant, mutation, options)
+        .await
+}
 pub async fn get_json(id: Ulid, tenant: &Option<String>) -> Result<Value, DashboardError> {
     SERVICE.get_json(id, tenant).await
 }
@@ -450,7 +461,10 @@ impl DashboardService {
         validate_scope(tenant, None)?;
         let mut documents = Vec::new();
         for bytes in self.metastore.get_tenant_dashboards(tenant).await? {
-            let mut document: Value = serde_json::from_slice(&bytes)?;
+            let Ok(mut document) = serde_json::from_slice::<Value>(&bytes) else {
+                tracing::warn!("Skipping malformed dashboard JSON in listing");
+                continue;
+            };
             if deleted(&document) {
                 continue;
             }
@@ -661,6 +675,34 @@ impl DashboardService {
         )
     }
 
+    /// Legacy PUT may omit a revision. Capture a source version once and use
+    /// the normal CAS path; never retry a full replacement against newer data.
+    /// PATCH/tools retain their explicit revision requirement.
+    pub async fn mutate_legacy_json(
+        &self,
+        actor: &DashboardActor,
+        id: Ulid,
+        tenant: &Option<String>,
+        mutation: DashboardMutation,
+        options: &DashboardWriteOptions,
+    ) -> Result<Value, DashboardError> {
+        let mut options = options.clone();
+        if let DashboardMutation::Replace(document) = &mutation
+            && options.expected_revision.is_none()
+            && document.get("revision").and_then(Value::as_str).is_none()
+            && options.idempotency_key.is_none()
+        {
+            let base = self.stored(id, tenant).await?;
+            authorize(actor, &base.document)?;
+            if deleted(&base.document) {
+                return Err(not_found());
+            }
+            options.expected_revision = Some(base.revision);
+        }
+        self.mutate_json(actor, id, tenant, mutation, &options)
+            .await
+    }
+
     pub async fn mutate_json(
         &self,
         actor: &DashboardActor,
@@ -741,20 +783,20 @@ impl DashboardService {
         options: &DashboardWriteOptions,
     ) -> Result<Value, DashboardError> {
         let mut effective_options = options.clone();
-        if let DashboardMutation::Replace(document) = mutation {
-            if effective_options.expected_revision.is_none() {
-                effective_options.expected_revision = document
-                    .get("revision")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
+        if let DashboardMutation::Replace(document) = mutation
+            && effective_options.expected_revision.is_none()
+        {
+            effective_options.expected_revision = document
+                .get("revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
         }
         let options = &effective_options;
         validate_scope(tenant, Some(&actor.user_id))?;
         validate_options(options)?;
         let base = self.stored(id, tenant).await?;
         authorize(actor, &base.document)?;
-        let request_hash = fingerprint(&mutation_request(&mutation)?);
+        let request_hash = fingerprint(&mutation_request(mutation)?);
         if let Some(result) = replay(
             &base.document,
             &base.revision,
@@ -1118,6 +1160,7 @@ impl DashboardService {
             }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn claim_title(
         &self,
         title: &str,
@@ -1277,24 +1320,23 @@ impl DashboardService {
                     });
                 }
                 Err(error) => {
-                    if let Some((ours, version)) = self.read(&path, tenant).await? {
-                        if ours.get("dashboardId") == proposed.get("dashboardId")
-                            && ours.get("operation") == proposed.get("operation")
-                            && ours.get("sourceVersion") == proposed.get("sourceVersion")
-                            && matches!(
-                                ours.get("state").and_then(Value::as_str),
-                                Some("pending" | "active")
-                            )
-                        {
-                            let acquired =
-                                options.idempotency_key.is_none() && ours["state"] == "pending";
-                            return Ok(TitleClaim {
-                                path,
-                                version,
-                                document: ours,
-                                acquired,
-                            });
-                        }
+                    if let Some((ours, version)) = self.read(&path, tenant).await?
+                        && ours.get("dashboardId") == proposed.get("dashboardId")
+                        && ours.get("operation") == proposed.get("operation")
+                        && ours.get("sourceVersion") == proposed.get("sourceVersion")
+                        && matches!(
+                            ours.get("state").and_then(Value::as_str),
+                            Some("pending" | "active")
+                        )
+                    {
+                        let acquired =
+                            options.idempotency_key.is_none() && ours["state"] == "pending";
+                        return Ok(TitleClaim {
+                            path,
+                            version,
+                            document: ours,
+                            acquired,
+                        });
                     }
                     if is_conflict(&error) {
                         continue;
@@ -1326,10 +1368,9 @@ impl DashboardService {
                 tenant,
             )
             .await
+            && !is_conflict(&error)
         {
-            if !is_conflict(&error) {
-                tracing::warn!(%error,"Dashboard saved; title reservation activation needs recovery");
-            }
+            tracing::warn!(%error,"Dashboard saved; title reservation activation needs recovery");
         }
     }
 
@@ -1344,10 +1385,9 @@ impl DashboardService {
                     tenant,
                 )
                 .await
+                && !is_conflict(&error)
             {
-                if !is_conflict(&error) {
-                    tracing::warn!(%error,"Dashboard title rollback needs recovery");
-                }
+                tracing::warn!(%error,"Dashboard title rollback needs recovery");
             }
         }
     }
@@ -1364,10 +1404,9 @@ impl DashboardService {
                 tenant,
             )
             .await
+            && !is_conflict(&error)
         {
-            if !is_conflict(&error) {
-                tracing::warn!(%error,"Dashboard saved; obsolete title cleanup needs recovery");
-            }
+            tracing::warn!(%error,"Dashboard saved; obsolete title cleanup needs recovery");
         }
     }
 }
@@ -1641,10 +1680,10 @@ fn normalize_revision(expected: &str) -> Result<&str, DashboardError> {
     ))
 }
 fn check_revision(options: &DashboardWriteOptions, actual: &str) -> Result<(), DashboardError> {
-    if let Some(expected) = options.expected_revision.as_deref() {
-        if normalize_revision(expected)? != actual {
-            return Err(conflict(actual));
-        }
+    if let Some(expected) = options.expected_revision.as_deref()
+        && normalize_revision(expected)? != actual
+    {
+        return Err(conflict(actual));
     }
     Ok(())
 }
@@ -2263,6 +2302,97 @@ mod tests {
             json!({"op":"add","target":{"type":"dashboard"},"path":path,"value":value}),
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_replacement_without_revision_uses_cas_and_cannot_lose_a_concurrent_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let (first, second) = services(directory.path());
+        let owner = actor();
+        let created = first
+            .create_json(
+                &owner,
+                &None,
+                json!({"title":"Legacy PUT"}),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let id = id(&created);
+        let paused = Arc::new(PausedStorage::new(
+            directory.path(),
+            dashboard_path(&None, &owner.user_id, id),
+        ));
+        let legacy = DashboardService::new(Arc::new(ObjectStoreMetastore {
+            storage: paused.clone(),
+        }));
+        let caller = tokio::spawn({
+            let owner = owner.clone();
+            async move {
+                legacy
+                    .mutate_legacy_json(
+                        &owner,
+                        id,
+                        &None,
+                        DashboardMutation::Replace(json!({"title":"Legacy PUT","legacy":true})),
+                        &Default::default(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), paused.entered.notified())
+            .await
+            .unwrap();
+        second
+            .mutate_json(&owner, id, &None, metadata(true), &Default::default())
+            .await
+            .unwrap();
+        paused.released.notify_one();
+        assert!(matches!(
+            caller.await.unwrap(),
+            Err(DashboardError::Api { status: 412, .. })
+        ));
+        let current = first.get_json(id, &None).await.unwrap();
+        assert_eq!(current["isFavorite"], true);
+        assert!(current.get("legacy").is_none());
+        let result = first
+            .mutate_legacy_json(
+                &owner,
+                id,
+                &None,
+                DashboardMutation::Replace(json!({"title":"Legacy PUT","legacy":true})),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["dashboard"]["legacy"], true);
+    }
+
+    #[tokio::test]
+    async fn listing_skips_corrupt_json_and_invalid_legacy_shapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (first, _) = services(directory.path());
+        let owner = actor();
+        first
+            .create_json(
+                &owner,
+                &None,
+                json!({"title":"Valid","tags":["healthy"]}),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let storage = LocalFS::new(directory.path().to_path_buf());
+        for bytes in ["{", "[]", "{\"title\":1}"] {
+            let path = dashboard_path(&None, &owner.user_id, Ulid::new());
+            storage
+                .put_object(RelativePath::new(&path), Bytes::from(bytes), &None)
+                .await
+                .unwrap();
+        }
+        let rows = first.list_json(&None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tags"], json!(["healthy"]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
