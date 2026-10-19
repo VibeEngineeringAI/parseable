@@ -79,12 +79,20 @@ pub struct CommonAttributes {
 }
 
 pub trait RouteExt {
+    /// Authenticate a multiplexed endpoint whose handler authorizes each operation.
+    fn authenticate(self) -> Self;
     fn authorize(self, action: Action) -> Self;
     fn authorize_for_resource(self, action: Action) -> Self;
     fn authorize_for_user(self, action: Action) -> Self;
 }
 
 impl RouteExt for Route {
+    fn authenticate(self) -> Self {
+        self.wrap(Auth {
+            action: Action::Query,
+            method: auth_session_only,
+        })
+    }
     fn authorize(self, action: Action) -> Self {
         self.wrap(Auth {
             action,
@@ -633,6 +641,24 @@ pub fn auth_no_context(req: &mut ServiceRequest, action: Action) -> Result<rbac:
     };
     // let creds = extract_session_key(req);
     creds.map(|key| Users.authorize(key, action, None, None))
+}
+
+fn auth_session_only(req: &mut ServiceRequest, _action: Action) -> Result<rbac::Response, Error> {
+    let cached = { req.extensions().get::<SessionKey>().cloned() };
+    let key = match cached {
+        Some(key) => key,
+        None => extract_session_key(req)?,
+    };
+    if !Users.session_exists(&key) {
+        // Basic credentials are verified and lazily registered by authorize.
+        // Its resource decision is intentionally left to the selected tool.
+        let _ = Users.authorize(key.clone(), Action::GetAbout, None, None);
+    }
+    Ok(if Users.session_exists(&key) {
+        rbac::Response::Authorized
+    } else {
+        rbac::Response::ReloadRequired
+    })
 }
 
 pub fn auth_resource_context(

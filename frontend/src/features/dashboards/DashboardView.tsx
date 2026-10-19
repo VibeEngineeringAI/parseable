@@ -99,7 +99,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
       );
   }
   return (
-    <DashboardRefreshProvider onRefresh={url.refresh}>
+    <DashboardRefreshProvider onRefresh={url.refresh} savedInterval={draft.refreshInterval}>
       <div
         ref={page}
         className={`page dashboards-page${presentation.presenting ? ' dashboard-presentation' : ''}`}
@@ -215,6 +215,16 @@ function DashboardFields({ original }: { original: Dashboard }) {
             }}
           />
           <DashboardRefreshControls
+            savedInterval={draft.refreshInterval}
+            onSaveDefault={
+              editing
+                ? (refreshInterval) =>
+                    workspace.changeDraft(
+                      (current) => ({ ...current, refreshInterval }),
+                      'Refresh default updated. Save to keep this change.',
+                    )
+                : undefined
+            }
             onManualRefresh={() =>
               workspace.announce(
                 `Refreshing ${(draft.tiles ?? []).length} ${(draft.tiles ?? []).length === 1 ? 'tile' : 'tiles'}.`,

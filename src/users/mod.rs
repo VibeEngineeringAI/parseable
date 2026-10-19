@@ -16,6 +16,7 @@
  *
  */
 
+pub mod dashboard_patch;
 pub mod dashboards;
 pub mod filters;
 
@@ -26,3 +27,9 @@ pub struct TimeFilter {
     to: String,
     from: String,
 }
+
+pub mod dashboard_service;
+
+pub mod dashboard_tools;
+
+pub mod dashboard_runtime;

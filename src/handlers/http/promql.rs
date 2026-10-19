@@ -28,6 +28,10 @@ const MAX_QUERY_BYTES: usize = 16 * 1024;
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 static REQUEST_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(32)));
 static QUERY_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
+/// Previews have a separate request queue and may occupy at most two of the
+/// four shared evaluator slots, leaving capacity for interactive queries.
+static PREVIEW_REQUEST_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(8)));
+static PREVIEW_QUERY_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(2)));
 /// Alerts evaluate in their own slots so dashboard load cannot starve them.
 static ALERT_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(2)));
 
@@ -500,6 +504,81 @@ async fn handle(
     tokio::time::timeout(Duration::from_millis(timeout_ms as u64), work)
         .await
         .map_err(|_| ApiError::unavailable("timeout", "PromQL query timed out"))?
+}
+
+/// In-process dashboard preview. Shares authorization and bounded evaluation
+/// with the public endpoints, with separate admission and a two-slot budget.
+pub(crate) async fn dashboard_query(
+    req: &HttpRequest,
+    dataset: &str,
+    query: &str,
+    start: i64,
+    end: i64,
+    step: Option<i64>,
+) -> Result<Value, ApiError> {
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(ApiError::bad("query exceeds 16 KiB"));
+    }
+    if start < 0 || end < start || end > 253_402_300_799_000 || end - start > MAX_RANGE_MS {
+        return Err(ApiError::bad("range must be ordered and at most 31d"));
+    }
+    if step.is_some_and(|step| step <= 0 || (end - start) / step + 1 > promql::MAX_STEPS as i64) {
+        return Err(ApiError::bad("invalid step or too many evaluation steps"));
+    }
+    let plan = QueryPlan::parse(query).map_err(|e| match e {
+        promql::PromqlError::Unsupported(_) => ApiError::execution(e.to_string()),
+        _ => ApiError::bad(e.to_string()),
+    })?;
+    if plan.required_history_ms() > MAX_RANGE_MS {
+        return Err(ApiError::bad("selector history exceeds 31d"));
+    }
+    let dataset = dataset_from_request(req, &HashMap::from([("stream".into(), dataset.into())]))?;
+    let _request_permit = PREVIEW_REQUEST_SLOTS
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::unavailable("unavailable", "PromQL preview request queue is full")
+        })?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tenant = get_tenant_id_from_request(req);
+        authorize_dataset(req, &dataset, &tenant).await?;
+        let preview_permit = PREVIEW_QUERY_SLOTS
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                ApiError::unavailable("unavailable", "PromQL preview service unavailable")
+            })?;
+        execute_query(
+            &QUERY_SLOTS,
+            plan,
+            &dataset,
+            &tenant,
+            start,
+            end,
+            step,
+            move |data| {
+                // The finish closure moves into the blocking evaluator. Keep
+                // this permit there too, so a caller timeout cannot release
+                // preview capacity while its CPU work still occupies a slot.
+                let _preview_permit = preview_permit;
+                let result = data.into_json();
+                if serde_json::to_vec(&result)
+                    .map_err(|e| ApiError::execution(e.to_string()))?
+                    .len()
+                    > 1024 * 1024
+                {
+                    return Err(ApiError::execution(
+                        "preview result exceeds 1 MiB; narrow the query",
+                    ));
+                }
+                Ok(result)
+            },
+        )
+        .await
+    })
+    .await
+    .map_err(|_| ApiError::unavailable("timeout", "PromQL query timed out"))?
 }
 
 /// Shared storage/evaluation worker. Callers authorize the concrete dataset,
@@ -1011,6 +1090,37 @@ fn finish_series(grouped: BTreeMap<Labels, Vec<Sample>>) -> Result<Vec<Series>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn saturated_preview_admission_preserves_browser_request_capacity() {
+        let preview_requests = PREVIEW_REQUEST_SLOTS
+            .clone()
+            .try_acquire_many_owned(8)
+            .unwrap();
+        let browser_requests = REQUEST_SLOTS.clone().try_acquire_many_owned(32).unwrap();
+        let req = actix_web::test::TestRequest::default().to_http_request();
+        let error = dashboard_query(&req, "metrics", "up", 0, 0, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "PromQL preview request queue is full");
+        drop(browser_requests);
+        drop(preview_requests);
+    }
+
+    #[test]
+    fn preview_evaluation_budget_leaves_interactive_and_alert_capacity() {
+        let previews = PREVIEW_QUERY_SLOTS
+            .clone()
+            .try_acquire_many_owned(2)
+            .unwrap();
+        assert!(PREVIEW_QUERY_SLOTS.clone().try_acquire_owned().is_err());
+        let preview_workers = QUERY_SLOTS.clone().try_acquire_many_owned(2).unwrap();
+        // Even with every permitted preview executing, two browser evaluations
+        // and the independent alert pool remain available.
+        let browser_workers = QUERY_SLOTS.clone().try_acquire_many_owned(2).unwrap();
+        let alerts = ALERT_SLOTS.clone().try_acquire_many_owned(2).unwrap();
+        drop((alerts, browser_workers, preview_workers, previews));
+    }
 
     #[test]
     fn ingestion_window_bounds_scan_by_delay() {

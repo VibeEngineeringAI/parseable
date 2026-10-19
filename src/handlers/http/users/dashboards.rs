@@ -22,249 +22,315 @@ use crate::{
     handlers::http::rbac::RBACError,
     metastore::MetastoreError,
     storage::ObjectStorageError,
-    users::dashboards::{DASHBOARDS, Dashboard, Tile, validate_dashboard_id},
+    users::{
+        dashboard_patch::{self, DashboardPatchRequest},
+        dashboard_service::{self, DashboardActor, DashboardMutation, DashboardWriteOptions},
+        dashboards::{Dashboard, validate_dashboard_id},
+    },
     utils::{get_hash, get_tenant_id_from_request, get_user_and_tenant_from_request, is_admin},
 };
-use actix_web::http::StatusCode;
 use actix_web::{
     HttpRequest, HttpResponse, Responder,
-    http::header::ContentType,
+    http::{
+        StatusCode,
+        header::{ETAG, IF_MATCH},
+    },
     web::{self, Json, Path},
 };
 use serde_json::Error as SerdeError;
-use serde_json::Value;
+use serde_json::{Value, json};
+
+pub fn actor(req: &HttpRequest) -> Result<(DashboardActor, Option<String>), DashboardError> {
+    let (user_id, tenant) = get_user_and_tenant_from_request(req)?;
+    Ok((
+        DashboardActor {
+            user_id: get_hash(&user_id),
+            is_admin: is_admin(req).map_err(|e| DashboardError::Custom(e.to_string()))?,
+        },
+        tenant,
+    ))
+}
+
+pub fn write_options(req: &HttpRequest) -> Result<DashboardWriteOptions, DashboardError> {
+    let header = |name: &str| -> Result<Option<String>, DashboardError> {
+        req.headers()
+            .get(name)
+            .map(|v| {
+                v.to_str().map(str::to_owned).map_err(|_| {
+                    DashboardError::api(
+                        400,
+                        "INVALID_HEADER",
+                        format!("{name} must be UTF-8"),
+                        json!({}),
+                    )
+                })
+            })
+            .transpose()
+    };
+    Ok(DashboardWriteOptions {
+        expected_revision: header(IF_MATCH.as_str())?,
+        idempotency_key: header("idempotency-key")?,
+        dry_run: false,
+    })
+}
+
+fn document_response(document: Value) -> HttpResponse {
+    let revision = document
+        .get("revision")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    HttpResponse::Ok()
+        .insert_header((ETAG, format!("\"{revision}\"")))
+        .insert_header(("Cache-Control", "private, no-cache"))
+        .json(document)
+}
 
 pub async fn list_dashboards(req: HttpRequest) -> Result<impl Responder, DashboardError> {
-    let tenant_id = get_tenant_id_from_request(&req);
-    let query_map = web::Query::<HashMap<String, String>>::from_query(req.query_string())
-        .map_err(|_| DashboardError::InvalidQueryParameter)?;
-    let mut dashboard_limit = 0;
-    if !query_map.is_empty() {
-        if let Some(limit) = query_map.get("limit") {
-            if let Ok(parsed_limit) = limit.parse::<usize>() {
-                dashboard_limit = parsed_limit;
-            } else {
-                return Err(DashboardError::Metadata("Invalid limit value"));
-            }
-        }
-
-        if let Some(tags) = query_map.get("tags") {
-            let tags: Vec<String> = tags
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if tags.is_empty() {
-                return Err(DashboardError::Metadata("Tags cannot be empty"));
-            }
-            let dashboard_summaries = list_dashboards_internal(0, Some(tags), &tenant_id).await;
-            return Ok((web::Json(dashboard_summaries), StatusCode::OK));
-        }
+    let query = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .map_err(|_| DashboardError::InvalidQueryParameter)?
+        .into_inner();
+    let limit = query
+        .get("limit")
+        .map(|s| s.parse::<usize>())
+        .transpose()
+        .map_err(|_| DashboardError::Metadata("Invalid limit value"))?
+        .unwrap_or(0);
+    let tags = query.get("tags").map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    let mut rows = list_dashboards_internal(0, tags, &get_tenant_id_from_request(&req)).await?;
+    if let Some(search) = query.get("query") {
+        let search = search.to_lowercase();
+        rows.retain(|d| {
+            d["title"]
+                .as_str()
+                .is_some_and(|s| s.to_lowercase().contains(&search))
+        });
     }
-    let dashboard_summaries = list_dashboards_internal(dashboard_limit, None, &tenant_id).await;
-
-    Ok((web::Json(dashboard_summaries), StatusCode::OK))
+    if let Some(after) = query.get("after") {
+        rows.retain(|d| {
+            d["dashboardId"]
+                .as_str()
+                .is_some_and(|id| id > after.as_str())
+        });
+    }
+    if limit > 0 {
+        rows.truncate(limit.min(500));
+    }
+    Ok(web::Json(rows))
 }
 
 pub async fn list_dashboards_internal(
     limit: usize,
     tags: Option<Vec<String>>,
-    tenant_id: &Option<String>,
-) -> Vec<Value> {
-    let dashboards = if let Some(tags) = tags {
-        DASHBOARDS.list_dashboards_by_tags(tags, tenant_id).await
-    } else {
-        DASHBOARDS.list_dashboards(limit, tenant_id).await
-    };
-    dashboards
-        .iter()
-        .map(|dashboard| Value::Object(dashboard.to_summary()))
-        .collect()
+    tenant: &Option<String>,
+) -> Result<Vec<Value>, DashboardError> {
+    let mut rows = dashboard_service::list_json(tenant).await?;
+    if let Some(tags) = tags {
+        rows.retain(|d| {
+            d["tags"].as_array().is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|v| v.as_str().is_some_and(|v| tags.iter().any(|tag| tag == v)))
+            })
+        });
+    }
+    rows.sort_by(|a, b| a["dashboardId"].as_str().cmp(&b["dashboardId"].as_str()));
+    if limit > 0 {
+        rows.truncate(limit);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|d| {
+            let keys = [
+                "dashboardId",
+                "title",
+                "description",
+                "dataset",
+                "author",
+                "created",
+                "modified",
+                "tags",
+                "isFavorite",
+                "revision",
+            ];
+            Value::Object(
+                keys.into_iter()
+                    .filter_map(|k| d.get(k).map(|v| (k.to_owned(), v.clone())))
+                    .collect(),
+            )
+        })
+        .collect())
 }
 
 pub async fn get_dashboard(
     req: HttpRequest,
-    dashboard_id: Path<String>,
-) -> Result<impl Responder, DashboardError> {
-    let dashboard_id = validate_dashboard_id(dashboard_id.into_inner())?;
-    let tenant_id = get_tenant_id_from_request(&req);
-    let dashboard = get_dashboard_internal(dashboard_id, &tenant_id).await?;
-
-    Ok((web::Json(dashboard), StatusCode::OK))
+    id: Path<String>,
+) -> Result<HttpResponse, DashboardError> {
+    Ok(document_response(
+        dashboard_service::get_json(
+            validate_dashboard_id(id.into_inner())?,
+            &get_tenant_id_from_request(&req),
+        )
+        .await?,
+    ))
 }
 
 pub async fn get_dashboard_internal(
-    dashboard_id: ulid::Ulid,
-    tenant_id: &Option<String>,
+    id: ulid::Ulid,
+    tenant: &Option<String>,
 ) -> Result<Dashboard, DashboardError> {
-    DASHBOARDS
-        .get_dashboard(dashboard_id, tenant_id)
-        .await
-        .ok_or(DashboardError::Metadata("Dashboard does not exist"))
+    Ok(serde_json::from_value(
+        dashboard_service::get_json(id, tenant).await?,
+    )?)
 }
 
 pub async fn create_dashboard(
     req: HttpRequest,
-    Json(mut dashboard): Json<Dashboard>,
-) -> Result<impl Responder, DashboardError> {
-    if dashboard.title.is_empty() {
-        return Err(DashboardError::Metadata("Title must be provided"));
-    }
-    let (user_id, tenant_id) = get_user_and_tenant_from_request(&req)?;
-    dashboard.tenant_id.clone_from(&tenant_id);
-    let user_id = get_hash(&user_id);
-
-    DASHBOARDS
-        .create(&user_id, &mut dashboard, &tenant_id)
-        .await?;
-    Ok((web::Json(dashboard), StatusCode::OK))
+    Json(document): Json<Value>,
+) -> Result<HttpResponse, DashboardError> {
+    let (actor, tenant) = actor(&req)?;
+    let result =
+        dashboard_service::create_json(&actor, &tenant, document, &write_options(&req)?).await?;
+    Ok(document_response(result["dashboard"].clone()))
 }
 
 pub async fn update_dashboard(
     req: HttpRequest,
-    dashboard_id: Path<String>,
-    dashboard: Option<Json<Dashboard>>,
-) -> Result<impl Responder, DashboardError> {
-    let (user_id, tenant_id) = get_user_and_tenant_from_request(&req)?;
-    let user_id = get_hash(&user_id);
-    let dashboard_id = validate_dashboard_id(dashboard_id.into_inner())?;
-    let is_admin = is_admin(&req).map_err(|e| DashboardError::Custom(e.to_string()))?;
-    let mut existing_dashboard = DASHBOARDS
-        .get_dashboard_by_user(dashboard_id, &user_id, is_admin, &tenant_id)
-        .await
-        .ok_or(DashboardError::Metadata(
-            "Dashboard does not exist or user is not authorized",
-        ))?;
-
-    let query_map = web::Query::<HashMap<String, String>>::from_query(req.query_string())
-        .map_err(|_| DashboardError::InvalidQueryParameter)?;
-
-    // Validate: either query params OR body, not both
-    let has_query_params = !query_map.is_empty();
-    let has_body_update = dashboard.is_some();
-
-    if has_query_params && has_body_update {
-        return Err(DashboardError::Metadata(
-            "Cannot use both query parameters and request body for updates",
-        ));
-    }
-
-    let mut final_dashboard = if has_query_params {
-        // Apply partial updates from query parameters
-        if let Some(is_favorite) = query_map.get("isFavorite") {
-            existing_dashboard.is_favorite = Some(is_favorite == "true");
+    id: Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<HttpResponse, DashboardError> {
+    let (actor, tenant) = actor(&req)?;
+    let query = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .map_err(|_| DashboardError::InvalidQueryParameter)?
+        .into_inner();
+    let mutation = if !query.is_empty() {
+        if body.is_some() {
+            return Err(DashboardError::Metadata(
+                "Cannot use both query parameters and request body for updates",
+            ));
         }
-        if let Some(tags) = query_map.get("tags") {
-            let parsed_tags: Vec<String> = tags
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
-            existing_dashboard.tags = if parsed_tags.is_empty() {
-                None
-            } else {
-                Some(parsed_tags)
-            };
-        }
-        if let Some(rename_to) = query_map.get("renameTo") {
-            let trimmed = rename_to.trim();
-            if trimmed.is_empty() {
-                return Err(DashboardError::Metadata("Rename to cannot be empty"));
-            }
-            existing_dashboard.title = trimmed.to_string();
-        }
-        existing_dashboard
+        DashboardMutation::Metadata(query)
     } else {
-        let dashboard = dashboard
-            .ok_or(DashboardError::Metadata("Request body is required"))?
-            .into_inner();
-        if let Some(tiles) = &dashboard.tiles {
-            if tiles.iter().any(|tile| tile.tile_id.is_nil()) {
-                return Err(DashboardError::Metadata("Tile ID must be provided"));
-            }
-
-            // Check if tile_id are unique
-            let unique_tiles: Vec<_> = tiles
-                .iter()
-                .map(|tile| tile.tile_id)
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            if unique_tiles.len() != tiles.len() {
-                return Err(DashboardError::Metadata("Tile IDs must be unique"));
-            }
-        }
-
-        dashboard
+        DashboardMutation::Replace(
+            body.ok_or(DashboardError::Metadata("Request body is required"))?
+                .into_inner(),
+        )
     };
+    let result = dashboard_service::mutate_json(
+        &actor,
+        validate_dashboard_id(id.into_inner())?,
+        &tenant,
+        mutation,
+        &write_options(&req)?,
+    )
+    .await?;
+    Ok(document_response(result["dashboard"].clone()))
+}
 
-    DASHBOARDS
-        .update(&user_id, dashboard_id, &mut final_dashboard, &tenant_id)
-        .await?;
+pub async fn patch_dashboard(
+    req: HttpRequest,
+    id: Path<String>,
+    Json(patch): Json<DashboardPatchRequest>,
+) -> Result<HttpResponse, DashboardError> {
+    let (actor, tenant) = actor(&req)?;
+    let mut options = write_options(&req)?;
+    options.dry_run = patch.dry_run;
+    if options.expected_revision.is_none() {
+        options.expected_revision = patch.revision;
+    }
+    let result = dashboard_service::mutate_json(
+        &actor,
+        validate_dashboard_id(id.into_inner())?,
+        &tenant,
+        DashboardMutation::Patch(patch.operations),
+        &options,
+    )
+    .await?;
+    let mut response = HttpResponse::Ok();
+    if let Some(rev) = result["revision"].as_str() {
+        response.insert_header((ETAG, format!("\"{rev}\"")));
+    }
+    Ok(response.json(result))
+}
 
-    Ok((web::Json(final_dashboard), StatusCode::OK))
+pub async fn validate_dashboard(
+    req: HttpRequest,
+    Json(document): Json<Value>,
+) -> Result<HttpResponse, DashboardError> {
+    let _ = actor(&req)?;
+    Ok(HttpResponse::Ok().json(dashboard_patch::validate_dashboard(&document, None)))
+}
+
+pub async fn validate_dashboard_changes(
+    req: HttpRequest,
+    id: Path<String>,
+    Json(mut patch): Json<DashboardPatchRequest>,
+) -> Result<HttpResponse, DashboardError> {
+    patch.dry_run = true;
+    patch_dashboard(req, id, Json(patch)).await
+}
+
+pub async fn dashboard_capabilities(req: HttpRequest) -> Result<HttpResponse, DashboardError> {
+    let mut result =
+        crate::users::dashboard_tools::execute(&req, "get_dashboard_capabilities", &json!({}))
+            .await?;
+    result["concurrency"] = json!({"revision":"opaque ETag","requireRevisionForPatch":true,"conflictStatus":412,"atomicBatch":true});
+    Ok(HttpResponse::Ok().json(result))
 }
 
 pub async fn delete_dashboard(
     req: HttpRequest,
-    dashboard_id: Path<String>,
+    id: Path<String>,
 ) -> Result<HttpResponse, DashboardError> {
-    let (user_id, tenant_id) = get_user_and_tenant_from_request(&req)?;
-    let user_id = get_hash(&user_id);
-    let is_admin = is_admin(&req).map_err(|e| DashboardError::Custom(e.to_string()))?;
-
-    let dashboard_id = validate_dashboard_id(dashboard_id.into_inner())?;
-
-    DASHBOARDS
-        .delete_dashboard(&user_id, dashboard_id, is_admin, &tenant_id)
-        .await?;
-
+    let (actor, tenant) = actor(&req)?;
+    dashboard_service::delete_json(
+        &actor,
+        validate_dashboard_id(id.into_inner())?,
+        &tenant,
+        &write_options(&req)?,
+    )
+    .await?;
     Ok(HttpResponse::Ok().finish())
 }
 
 pub async fn add_tile(
     req: HttpRequest,
-    dashboard_id: Path<String>,
-    Json(tile): Json<Tile>,
-) -> Result<impl Responder, DashboardError> {
-    if tile.tile_id.is_nil() {
-        return Err(DashboardError::Metadata("Tile ID must be provided"));
-    }
-
-    let (user_id, tenant_id) = get_user_and_tenant_from_request(&req)?;
-    let user_id = get_hash(&user_id);
-    let dashboard_id = validate_dashboard_id(dashboard_id.into_inner())?;
-    let is_admin = is_admin(&req).map_err(|e| DashboardError::Custom(e.to_string()))?;
-
-    let mut dashboard = DASHBOARDS
-        .get_dashboard_by_user(dashboard_id, &user_id, is_admin, &tenant_id)
-        .await
-        .ok_or(DashboardError::Unauthorized)?;
-
-    let tiles = dashboard.tiles.get_or_insert_with(Vec::new);
-
-    // check if the tile already exists
-    if tiles.iter().any(|t| t.tile_id == tile.tile_id) {
-        return Err(DashboardError::Metadata("Tile already exists"));
-    }
-    tiles.push(tile);
-
-    DASHBOARDS
-        .update(&user_id, dashboard_id, &mut dashboard, &tenant_id)
-        .await?;
-
-    Ok((web::Json(dashboard), StatusCode::OK))
+    id: Path<String>,
+    Json(tile): Json<Value>,
+) -> Result<HttpResponse, DashboardError> {
+    let (actor, tenant) = actor(&req)?;
+    let result = dashboard_service::mutate_json(
+        &actor,
+        validate_dashboard_id(id.into_inner())?,
+        &tenant,
+        DashboardMutation::AddTile(tile),
+        &write_options(&req)?,
+    )
+    .await?;
+    Ok(document_response(result["dashboard"].clone()))
 }
 
 pub async fn list_tags(req: HttpRequest) -> Result<impl Responder, DashboardError> {
-    let tags = list_tags_internal(&get_tenant_id_from_request(&req)).await;
-    Ok((web::Json(tags), StatusCode::OK))
+    Ok(web::Json(
+        list_tags_internal(&get_tenant_id_from_request(&req)).await?,
+    ))
 }
 
-pub async fn list_tags_internal(tenant_id: &Option<String>) -> Vec<String> {
-    DASHBOARDS.list_tags(tenant_id).await
+pub async fn list_tags_internal(tenant: &Option<String>) -> Result<Vec<String>, DashboardError> {
+    let mut tags = dashboard_service::list_json(tenant)
+        .await?
+        .into_iter()
+        .flat_map(|d| d["tags"].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -285,30 +351,57 @@ pub enum DashboardError {
     InvalidQueryParameter,
     #[error(transparent)]
     MetastoreError(#[from] MetastoreError),
+    #[error("{message}")]
+    Api {
+        status: u16,
+        code: &'static str,
+        message: String,
+        details: Value,
+    },
 }
-
+impl DashboardError {
+    pub fn api(
+        status: u16,
+        code: &'static str,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self::Api {
+            status,
+            code,
+            message: message.into(),
+            details,
+        }
+    }
+    pub fn detail(&self) -> Value {
+        match self {
+            Self::Api {
+                code,
+                message,
+                details,
+                ..
+            } => json!({"code":code,"message":message,"details":details}),
+            _ => json!({"code":"DASHBOARD_ERROR","message":self.to_string()}),
+        }
+    }
+}
 impl actix_web::ResponseError for DashboardError {
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::ObjectStorage(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Serde(_) => StatusCode::BAD_REQUEST,
-            Self::Metadata(_) => StatusCode::BAD_REQUEST,
+            Self::ObjectStorage(_) | Self::Custom(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Serde(_) | Self::Metadata(_) | Self::InvalidQueryParameter => {
+                StatusCode::BAD_REQUEST
+            }
             Self::UserDoesNotExist(_) => StatusCode::NOT_FOUND,
-            Self::Custom(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::InvalidQueryParameter => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::FORBIDDEN,
             Self::MetastoreError(e) => e.status_code(),
+            Self::Api { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
     }
-
-    fn error_response(&self) -> actix_web::HttpResponse<actix_web::body::BoxBody> {
-        match self {
-            DashboardError::MetastoreError(e) => {
-                actix_web::HttpResponse::build(self.status_code()).json(e.to_detail())
-            }
-            _ => actix_web::HttpResponse::build(self.status_code())
-                .insert_header(ContentType::plaintext())
-                .body(self.to_string()),
-        }
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::build(self.status_code())
+            .json(json!({"error":self.detail(),"message":self.to_string()}))
     }
 }

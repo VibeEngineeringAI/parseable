@@ -6,6 +6,7 @@ import type {
   ParseableClient,
 } from '../../lib/types';
 import { createUlid } from '../../lib/ids';
+import { ApiError } from '../../lib/apiError';
 
 export const dashboardError = (error?: string) =>
   error?.replace(/^Cannot perform this operation: /, '');
@@ -27,7 +28,21 @@ export function dashboardDate(value: string | null | undefined) {
   return Number.isFinite(date) ? new Date(date).toISOString() : undefined;
 }
 function hasConflict(loaded: Dashboard, latest: Dashboard): boolean {
+  if (loaded.revision && latest.revision) return loaded.revision !== latest.revision;
   return loaded.modified !== latest.modified;
+}
+/** A rejected conditional write is shown with the freshly observed server copy. */
+export async function saveDashboardDocument(
+  client: ParseableClient,
+  document: Dashboard,
+  signal: AbortSignal,
+): Promise<{ saved: Dashboard; conflict?: never } | { saved?: never; conflict: Dashboard }> {
+  try {
+    return { saved: await client.updateDashboard(document.dashboardId, document) };
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 412) throw error;
+    return { conflict: await client.getDashboard(document.dashboardId, signal) };
+  }
 }
 export async function checkDashboardConflict(
   client: ParseableClient,
@@ -80,7 +95,8 @@ export function duplicateDashboard(
   titles: Iterable<string>,
 ): DashboardRequest & { tiles: DashboardTile[] } {
   const body = structuredClone(source);
-  for (const key of ['dashboardId', 'author', 'created', 'modified', 'tenantId']) delete body[key];
+  for (const key of ['dashboardId', 'author', 'created', 'modified', 'tenantId', 'revision'])
+    delete body[key];
   return {
     ...body,
     title: availableTitle(`${source.title} (Copy)`, new Set(titles)),

@@ -46,6 +46,10 @@ use crate::{
     storage::SETTINGS_ROOT_DIRECTORY,
 };
 
+use super::object_storage::{
+    ConditionalMetadataError, MetadataVersion, MetadataWriteCondition, VersionedMetadata,
+};
+
 use super::{
     ALERTS_ROOT_DIRECTORY, ObjectStorage, ObjectStorageError, ObjectStorageProvider,
     PARSEABLE_ROOT_DIRECTORY, STREAM_METADATA_FILE_NAME, STREAM_ROOT_DIRECTORY,
@@ -89,6 +93,20 @@ impl ObjectStorageProvider for FSConfig {
     }
 }
 
+const METADATA_LOCK_DIRECTORY: &str = ".parseable-metadata-locks";
+
+fn is_dashboard_metadata(path: &RelativePath) -> bool {
+    let normalized = path.normalize();
+    let parts = normalized.as_str().split('/').collect::<Vec<_>>();
+    let Some(users) = parts.iter().position(|part| *part == USERS_ROOT_DIR) else {
+        return false;
+    };
+    matches!(
+        parts.get(users + 1),
+        Some(&".dashboard-locations" | &".dashboard-titles")
+    ) || parts.get(users + 2) == Some(&"dashboards")
+}
+
 #[derive(Debug)]
 pub struct LocalFS {
     // absolute path of the data directory
@@ -102,6 +120,60 @@ impl LocalFS {
 
     pub fn path_in_root(&self, path: &RelativePath) -> PathBuf {
         path.to_path(&self.root)
+    }
+
+    fn checked_metadata_path(&self, path: &RelativePath) -> Result<PathBuf, ObjectStorageError> {
+        if path.as_str().starts_with('/')
+            || path
+                .components()
+                .any(|part| matches!(part, relative_path::Component::ParentDir))
+        {
+            return Err(ObjectStorageError::PathTraversal {
+                attempted: self.path_in_root(path),
+                root: self.root.clone(),
+            });
+        }
+        Ok(self.path_in_root(path))
+    }
+
+    pub(crate) fn metadata_lock_path(&self, path: &RelativePath) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let normalized = path.normalize();
+        self.root.join(METADATA_LOCK_DIRECTORY).join(format!(
+            "{}.lock",
+            hex::encode(Sha256::digest(normalized.as_str().as_bytes()))
+        ))
+    }
+
+    /// Stable private lock files coordinate independent instances/processes.
+    /// Never unlink them: replacing a lock inode permits two writers.
+    async fn metadata_with_lock<T: Send + 'static>(
+        &self,
+        path: &RelativePath,
+        operation: impl FnOnce(&Path) -> Result<T, ConditionalMetadataError> + Send + 'static,
+    ) -> Result<T, ConditionalMetadataError> {
+        let lock_path = self.metadata_lock_path(path);
+        let path = self.checked_metadata_path(path)?;
+        tokio::task::spawn_blocking(move || {
+            let parent = path
+                .parent()
+                .ok_or_else(|| ObjectStorageError::Custom("metadata path has no parent".into()))?;
+            std::fs::create_dir_all(parent).map_err(ObjectStorageError::from)?;
+            std::fs::create_dir_all(lock_path.parent().expect("private lock directory"))
+                .map_err(ObjectStorageError::from)?;
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .map_err(ObjectStorageError::from)?;
+            lock.lock().map_err(ObjectStorageError::from)?;
+            // The lock is released even if operation returns an error or panics.
+            operation(&path)
+        })
+        .await
+        .map_err(ObjectStorageError::from)?
     }
 }
 
@@ -184,6 +256,68 @@ impl ObjectStorage for LocalFS {
             }
             Err(e) => Err(ObjectStorageError::IoError(e)),
         }
+    }
+
+    async fn get_metadata_versioned(
+        &self,
+        path: &RelativePath,
+        _tenant_id: &Option<String>,
+    ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
+        // Atomic rename keeps an opened file stable throughout the read. Read
+        // metadata from that same handle and avoid taking any writer lock.
+        let path = self.checked_metadata_path(path)?;
+        tokio::task::spawn_blocking(move || read_local_metadata(&path))
+            .await
+            .map_err(ObjectStorageError::from)?
+    }
+
+    async fn put_metadata_conditional(
+        &self,
+        path: &RelativePath,
+        bytes: Bytes,
+        condition: MetadataWriteCondition,
+        _tenant_id: &Option<String>,
+    ) -> Result<MetadataVersion, ConditionalMetadataError> {
+        self.metadata_with_lock(path, move |path| {
+            let current = read_local_metadata(path)?;
+            match condition {
+                MetadataWriteCondition::Create if current.is_some() => {
+                    return Err(ConditionalMetadataError::Conflict);
+                }
+                MetadataWriteCondition::Update(expected)
+                    if current.as_ref().map(|entry| &entry.version) != Some(&expected) =>
+                {
+                    return Err(ConditionalMetadataError::Conflict);
+                }
+                _ => {}
+            }
+            atomic_metadata_write(path, &bytes)?;
+            Ok(read_local_metadata(path)?
+                .expect("just wrote metadata under exclusive lock")
+                .version)
+        })
+        .await
+    }
+
+    async fn delete_metadata_conditional(
+        &self,
+        path: &RelativePath,
+        version: MetadataVersion,
+        _tenant_id: &Option<String>,
+    ) -> Result<(), ConditionalMetadataError> {
+        self.metadata_with_lock(path, move |path| {
+            if read_local_metadata(path)?
+                .as_ref()
+                .map(|entry| &entry.version)
+                != Some(&version)
+            {
+                return Err(ConditionalMetadataError::Conflict);
+            }
+            std::fs::remove_file(path).map_err(ObjectStorageError::from)?;
+            sync_metadata_parent(path)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn get_object(
@@ -389,13 +523,23 @@ impl ObjectStorage for LocalFS {
         resource: Bytes,
         tenant_id: &Option<String>,
     ) -> Result<(), ObjectStorageError> {
-        let path = self.path_in_root(path);
         let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        let res = fs::write(path, resource).await;
+        let res = if is_dashboard_metadata(path) {
+            self.metadata_with_lock(path, move |path| {
+                atomic_metadata_write(path, &resource)?;
+                Ok(())
+            })
+            .await
+            .map_err(local_metadata_error)
+        } else {
+            let path = self.path_in_root(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(path, resource)
+                .await
+                .map_err(ObjectStorageError::from)
+        };
         if res.is_ok() {
             // Record single file written successfully
             increment_files_scanned_in_object_store_calls_by_date(
@@ -449,10 +593,20 @@ impl ObjectStorage for LocalFS {
             });
         }
 
-        let path = self.path_in_root(path);
         let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-
-        let result = tokio::fs::remove_file(path).await;
+        let result = if is_dashboard_metadata(path) {
+            self.metadata_with_lock(path, |path| {
+                std::fs::remove_file(path).map_err(ObjectStorageError::from)?;
+                sync_metadata_parent(path)?;
+                Ok(())
+            })
+            .await
+            .map_err(local_metadata_error)
+        } else {
+            tokio::fs::remove_file(self.path_in_root(path))
+                .await
+                .map_err(ObjectStorageError::from)
+        };
         if result.is_ok() {
             // Record single file deleted successfully
             increment_files_scanned_in_object_store_calls_by_date(
@@ -528,6 +682,7 @@ impl ObjectStorage for LocalFS {
 
     async fn list_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
         let ignore_dir = &[
+            METADATA_LOCK_DIRECTORY,
             "lost+found",
             DEFAULT_TENANT,
             PARSEABLE_ROOT_DIRECTORY,
@@ -567,6 +722,7 @@ impl ObjectStorage for LocalFS {
 
     async fn list_old_streams(&self) -> Result<HashSet<LogStream>, ObjectStorageError> {
         let ignore_dir = &[
+            METADATA_LOCK_DIRECTORY,
             "lost+found",
             DEFAULT_TENANT,
             PARSEABLE_ROOT_DIRECTORY,
@@ -897,6 +1053,9 @@ async fn dir_with_stream(
 }
 
 async fn dir_name(entry: DirEntry) -> Result<Option<String>, ObjectStorageError> {
+    if entry.file_name() == METADATA_LOCK_DIRECTORY {
+        return Ok(None);
+    }
     if entry.file_type().await?.is_dir() {
         let dir_name = entry
             .path()
@@ -914,5 +1073,333 @@ async fn dir_name(entry: DirEntry) -> Result<Option<String>, ObjectStorageError>
 impl From<fs_extra::error::Error> for ObjectStorageError {
     fn from(e: fs_extra::error::Error) -> Self {
         ObjectStorageError::UnhandledError(Box::new(e))
+    }
+}
+
+fn local_metadata_error(error: ConditionalMetadataError) -> ObjectStorageError {
+    match error {
+        ConditionalMetadataError::Storage(error) => error,
+        error => ObjectStorageError::Custom(error.to_string()),
+    }
+}
+
+fn read_local_metadata(path: &Path) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ObjectStorageError::from(error).into()),
+    };
+    let metadata = file.metadata().map_err(ObjectStorageError::from)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(ObjectStorageError::from)?;
+    // Include file identity/time as well as content so replacing identical bytes
+    // does not revive a precondition from a deleted/recreated dashboard.
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    digest.update(format!("{:?}{:?}", metadata.modified(), metadata.created()).as_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        digest.update(metadata.dev().to_le_bytes());
+        digest.update(metadata.ino().to_le_bytes());
+        digest.update(metadata.ctime().to_le_bytes());
+        digest.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    Ok(Some(VersionedMetadata {
+        bytes: bytes.into(),
+        version: MetadataVersion {
+            e_tag: Some(hex::encode(digest.finalize())),
+            version: None,
+        },
+    }))
+}
+
+fn sync_metadata_parent(path: &Path) -> Result<(), ObjectStorageError> {
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().expect("metadata parent"))?.sync_all()?;
+    Ok(())
+}
+
+fn atomic_metadata_write(path: &Path, bytes: &[u8]) -> Result<(), ObjectStorageError> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ObjectStorageError::Custom("metadata path has no parent".into()))?;
+    let temporary = parent.join(format!(".metadata-{}.tmp", ulid::Ulid::new()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        sync_metadata_parent(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod conditional_metadata_tests {
+    use super::*;
+    use crate::metastore::{
+        metastore_traits::Metastore, metastores::object_store_metastore::ObjectStoreMetastore,
+    };
+
+    fn service(root: &Path) -> Arc<ObjectStoreMetastore> {
+        Arc::new(ObjectStoreMetastore {
+            storage: Arc::new(LocalFS::new(root.to_path_buf())),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_metastores_have_one_winner_for_create_and_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = service(directory.path());
+        let second = service(directory.path());
+        let path = "tenant-a/users/owner/dashboards/shared.json";
+        let tenant = Some("tenant-a".to_string());
+        let (a, b) = tokio::join!(
+            first.put_dashboard_conditional(
+                path,
+                Bytes::from_static(b"original"),
+                MetadataWriteCondition::Create,
+                &tenant
+            ),
+            second.put_dashboard_conditional(
+                path,
+                Bytes::from_static(b"original"),
+                MetadataWriteCondition::Create,
+                &tenant
+            ),
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        assert!(matches!(
+            if a.is_err() { a } else { b },
+            Err(ConditionalMetadataError::Conflict)
+        ));
+        let original = first
+            .get_dashboard_versioned(path, &tenant)
+            .await
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(24));
+        let mut writes = tokio::task::JoinSet::new();
+        for index in 0..24 {
+            let current = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let version = original.version.clone();
+            let barrier = barrier.clone();
+            let tenant = tenant.clone();
+            writes.spawn(async move {
+                barrier.wait().await;
+                current
+                    .put_dashboard_conditional(
+                        path,
+                        Bytes::from(format!("winner-{index}")),
+                        MetadataWriteCondition::Update(version),
+                        &tenant,
+                    )
+                    .await
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = writes.join_next().await {
+            match result.unwrap() {
+                Ok(_) => winners += 1,
+                Err(ConditionalMetadataError::Conflict) => {}
+                Err(error) => panic!("unexpected storage error: {error}"),
+            }
+        }
+        assert_eq!(winners, 1);
+        let stored = second
+            .get_dashboard_versioned(path, &tenant)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.bytes.starts_with(b"winner-"));
+        assert_ne!(stored.version, original.version);
+        assert!(
+            first
+                .get_dashboard_versioned(
+                    "tenant-b/users/owner/dashboards/shared.json",
+                    &Some("tenant-b".into())
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrelated_dashboard_does_not_wait_for_held_object_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Arc::new(LocalFS::new(directory.path().to_path_buf()));
+        let second = LocalFS::new(directory.path().to_path_buf());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = tokio::spawn(async move {
+            first
+                .metadata_with_lock(RelativePath::new("a.json"), move |_| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        ready_rx.await.unwrap();
+        let independent = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            second.put_metadata_conditional(
+                RelativePath::new("b.json"),
+                Bytes::from_static(b"different dashboard"),
+                MetadataWriteCondition::Create,
+                &None,
+            ),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        independent
+            .expect("another dashboard was blocked by a global lock")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_delete_and_recreated_identical_content_do_not_reuse_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = LocalFS::new(directory.path().to_path_buf());
+        let second = LocalFS::new(directory.path().to_path_buf());
+        let path = RelativePath::new(".users/owner/dashboards/dashboard.json");
+        let bytes = Bytes::from_static(b"same content");
+        let original = first
+            .put_metadata_conditional(path, bytes.clone(), MetadataWriteCondition::Create, &None)
+            .await
+            .unwrap();
+        // Legacy writes share the same lock and atomically replace the file.
+        second
+            .put_object(path, Bytes::from_static(b"legacy update"), &None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first
+                .delete_metadata_conditional(path, original.clone(), &None)
+                .await,
+            Err(ConditionalMetadataError::Conflict)
+        ));
+        second.delete_object(path, &None).await.unwrap();
+        let recreated = second
+            .put_metadata_conditional(path, bytes, MetadataWriteCondition::Create, &None)
+            .await
+            .unwrap();
+        assert_ne!(original, recreated);
+        assert!(matches!(
+            first
+                .put_metadata_conditional(
+                    path,
+                    Bytes::from_static(b"stale"),
+                    MetadataWriteCondition::Update(original),
+                    &None
+                )
+                .await,
+            Err(ConditionalMetadataError::Conflict)
+        ));
+        second
+            .delete_metadata_conditional(path, recreated, &None)
+            .await
+            .unwrap();
+        assert!(
+            first
+                .get_metadata_versioned(path, &None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_objects_avoid_metadata_lock_overhead_and_listing_filters_see_only_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = LocalFS::new(directory.path().to_path_buf());
+        for path in [
+            "stream/date=2026-10-17/data.parquet",
+            ".schema.json",
+            ".ingestor-node.json",
+        ] {
+            storage
+                .put_object(RelativePath::new(path), Bytes::from_static(b"{}"), &None)
+                .await
+                .unwrap();
+        }
+        assert!(!directory.path().join(METADATA_LOCK_DIRECTORY).exists());
+        let dashboard = RelativePath::new(".users/owner/dashboards/test.json");
+        storage
+            .put_object(
+                dashboard,
+                Bytes::from_static(b"{\"title\":\"Example\"}"),
+                &None,
+            )
+            .await
+            .unwrap();
+        let locks = directory.path().join(METADATA_LOCK_DIRECTORY);
+        assert!(locks.is_dir());
+        assert!(storage.metadata_lock_path(dashboard).is_file());
+        assert_eq!(
+            storage.metadata_lock_path(dashboard),
+            storage.metadata_lock_path(RelativePath::new("./.users/owner/dashboards/test.json"))
+        );
+        assert!(
+            !directory
+                .path()
+                .join(".users/owner/dashboards/test.json.metadata.lock")
+                .exists()
+        );
+        for needle in [".schema", ".ingestor"] {
+            let needle = needle.to_owned();
+            let objects = storage
+                .get_objects(None, Box::new(move |name| name.contains(&needle)), &None)
+                .await
+                .unwrap();
+            assert_eq!(objects.len(), 1);
+            assert_eq!(objects[0], Bytes::from_static(b"{}"));
+        }
+        let dashboards = storage
+            .get_objects(
+                Some(RelativePath::new(".users/owner/dashboards")),
+                Box::new(|name| name.ends_with(".json")),
+                &None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dashboards.len(), 1);
+        assert!(!dashboards[0].is_empty());
+        assert!(
+            !storage
+                .list_dirs(&None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|name| name == METADATA_LOCK_DIRECTORY)
+        );
+        storage.delete_object(dashboard, &None).await.unwrap();
+        assert!(storage.metadata_lock_path(dashboard).is_file());
+        storage
+            .delete_object(
+                RelativePath::new("stream/date=2026-10-17/data.parquet"),
+                &None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(locks).unwrap().count(), 1);
     }
 }

@@ -65,8 +65,21 @@ describe('dashboard helpers', () => {
     getDashboard.mockRejectedValue(new Error('Denied'));
     await expect(checkDashboardConflict(client, classic, signal)).rejects.toThrow('Denied');
   });
+  it('detects revision changes even when modified timestamps are unchanged', async () => {
+    const loaded = { ...classic, revision: 'r1' };
+    const latest = { ...classic, revision: 'r2' };
+    const getDashboard = vi.fn().mockResolvedValue(latest);
+    const client = { getDashboard } as unknown as ParseableClient;
+    expect(await checkDashboardConflict(client, loaded, new AbortController().signal)).toEqual(
+      latest,
+    );
+    getDashboard.mockResolvedValue({ ...loaded, modified: 'Different display timestamp' });
+    expect(
+      await checkDashboardConflict(client, loaded, new AbortController().signal),
+    ).toBeUndefined();
+  });
   it('duplicates all extras with fresh tile ULIDs and no old metadata', () => {
-    const result = duplicateDashboard(classic, [classic.title]);
+    const result = duplicateDashboard({ ...classic, revision: 'r1' }, [classic.title]);
     expect(result.title).toBe('Service health (Copy)');
     expect(result.isFavorite).toBe(false);
     expect(result.tiles.every((tile) => ulid(tile.tile_id))).toBe(true);
@@ -78,6 +91,7 @@ describe('dashboard helpers', () => {
     expect(result.timeRange).toEqual(classic.timeRange);
     expect(result.future).toEqual(classic.future);
     expect(result.dashboardId).toBeUndefined();
+    expect(result).not.toHaveProperty('revision');
     expect(result).not.toHaveProperty('tenantId');
     expect(result.dashboardType).toBe('Report');
   });

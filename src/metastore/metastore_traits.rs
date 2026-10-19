@@ -39,6 +39,10 @@ use crate::{
     users::filters::Filter,
 };
 
+pub use crate::storage::object_storage::{
+    ConditionalMetadataError, MetadataVersion, MetadataWriteCondition, VersionedMetadata,
+};
+
 /// A metastore is a logically separated compartment to store metadata for Parseable.
 ///
 /// Before this, the object store (be it S3, local store, azure) was being used as a metastore. With this trait, we do not
@@ -158,7 +162,53 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         policy: &AlertTargetPolicyConfig,
     ) -> Result<(), MetastoreError>;
     /// dashboards
+    /// The caller constructs this tenant-prefixed path from trusted server fields.
+    async fn get_dashboard_versioned(
+        &self,
+        _path: &str,
+        _tenant_id: &Option<String>,
+    ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported(
+            "versioned dashboard GET".into(),
+        ))
+    }
+    async fn put_dashboard_conditional(
+        &self,
+        _path: &str,
+        _bytes: Bytes,
+        _condition: MetadataWriteCondition,
+        _tenant_id: &Option<String>,
+    ) -> Result<MetadataVersion, ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported(
+            "conditional dashboard PUT".into(),
+        ))
+    }
+    async fn delete_dashboard_conditional(
+        &self,
+        _path: &str,
+        _version: MetadataVersion,
+        _tenant_id: &Option<String>,
+    ) -> Result<(), ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported(
+            "conditional dashboard DELETE".into(),
+        ))
+    }
     async fn get_dashboards(&self) -> Result<HashMap<String, Vec<Bytes>>, MetastoreError>;
+    async fn get_tenant_dashboards(
+        &self,
+        tenant_id: &Option<String>,
+    ) -> Result<Vec<Bytes>, MetastoreError> {
+        Ok(self
+            .get_dashboards()
+            .await?
+            .remove(
+                tenant_id
+                    .as_deref()
+                    .unwrap_or(crate::parseable::DEFAULT_TENANT),
+            )
+            .unwrap_or_default())
+    }
+
     async fn put_dashboard(
         &self,
         obj: &dyn MetastoreObject,

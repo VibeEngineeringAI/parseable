@@ -16,20 +16,17 @@
  *
  */
 
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use relative_path::RelativePathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
 use ulid::Ulid;
 
 use crate::{
     handlers::http::users::{DASHBOARDS_DIR, USERS_ROOT_DIR, dashboards::DashboardError},
     metastore::metastore_traits::MetastoreObject,
-    parseable::{DEFAULT_TENANT, PARSEABLE},
+    parseable::PARSEABLE,
 };
 
 pub static DASHBOARDS: Lazy<Dashboards> = Lazy::new(Dashboards::default);
@@ -189,6 +186,13 @@ impl Dashboard {
             serde_json::Value::Bool(self.is_favorite.unwrap_or(false)),
         );
 
+        if let Some(revision) = self
+            .other_fields
+            .as_ref()
+            .and_then(|fields| fields.get("revision"))
+        {
+            map.insert("revision".into(), revision.clone());
+        }
         map
     }
 }
@@ -201,101 +205,40 @@ pub fn validate_dashboard_id(dashboard_id: String) -> Result<Ulid, DashboardErro
         .map_err(|_| DashboardError::Metadata("Invalid dashboard ID format - must be a valid ULID"))
 }
 
+/// Compatibility facade. Authoritative state and all writes live in the shared
+/// dashboard service; no in-memory snapshot is used to authorize or persist.
 #[derive(Default, Debug)]
-pub struct Dashboards(RwLock<HashMap<String, Vec<Dashboard>>>);
+pub struct Dashboards;
 
 impl Dashboards {
-    /// Load all dashboards from the object store
-    /// and store them in memory
-    /// This function is called on server start
     pub async fn load(&self) -> anyhow::Result<()> {
-        let mut this: HashMap<String, Vec<Dashboard>> = HashMap::new();
-
-        let all_dashboards = PARSEABLE.metastore.get_dashboards().await?;
-
-        for (tenant_id, dashboards) in all_dashboards {
-            let mut tenant_dbs = Vec::new();
-
-            if dashboards.is_empty() {
-                continue;
-            }
-
-            for dashboard in dashboards {
-                let dashboard_value = match serde_json::from_slice::<serde_json::Value>(&dashboard)
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!("Failed to parse dashboard JSON: {}", err);
-                        continue;
-                    }
-                };
-
-                if let Ok(dashboard) = serde_json::from_value::<Dashboard>(dashboard_value.clone())
-                {
-                    tenant_dbs.retain(|d: &Dashboard| d.dashboard_id != dashboard.dashboard_id);
-                    tenant_dbs.push(dashboard);
-                } else {
-                    tracing::warn!("Failed to deserialize dashboard: {:?}", dashboard_value);
-                }
-            }
-
-            this.entry(tenant_id).or_default().extend(tenant_dbs);
-        }
-
-        let mut s = self.0.write().await;
-        // s.append(&mut this);
-        s.clone_from(&this);
-
+        // Keep the startup connectivity check without retaining a stale copy of
+        // documents that other query nodes/agents can subsequently modify.
+        PARSEABLE.metastore.get_dashboards().await?;
         Ok(())
     }
 
-    /// Save the dashboard to the object store
-    /// This function is called when creating or updating a dashboard
-    async fn save_dashboard(
-        &self,
-        // user_id: &str,
-        dashboard: &Dashboard,
-        tenant_id: &Option<String>,
-    ) -> Result<(), DashboardError> {
-        PARSEABLE
-            .metastore
-            .put_dashboard(dashboard, tenant_id)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Create a new dashboard
-    /// This function is called when creating a new dashboard
-    /// add dashboard in memory and save it to the object store
     pub async fn create(
         &self,
         user_id: &str,
         dashboard: &mut Dashboard,
         tenant_id: &Option<String>,
     ) -> Result<(), DashboardError> {
-        dashboard.created = Some(Utc::now());
-        dashboard.set_metadata(user_id, None);
-        let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let mut dashboards = self.0.write().await;
-
-        let dbs = dashboards.entry(tenant.to_owned()).or_default();
-        let has_duplicate = dbs
-            .iter()
-            .any(|d| d.title == dashboard.title && d.dashboard_id != dashboard.dashboard_id);
-        if has_duplicate {
-            return Err(DashboardError::Metadata("Dashboard title must be unique"));
-        }
-        self.save_dashboard(dashboard, tenant_id).await?;
-
-        dbs.push(dashboard.clone());
-
+        let actor = super::dashboard_service::DashboardActor {
+            user_id: user_id.to_owned(),
+            is_admin: false,
+        };
+        let result = super::dashboard_service::create_json(
+            &actor,
+            tenant_id,
+            serde_json::to_value(&*dashboard)?,
+            &Default::default(),
+        )
+        .await?;
+        *dashboard = serde_json::from_value(result["dashboard"].clone())?;
         Ok(())
     }
 
-    /// Update an existing dashboard
-    /// This function is called when updating a dashboard
-    /// update dashboard in memory and save it to the object store
     pub async fn update(
         &self,
         user_id: &str,
@@ -303,57 +246,30 @@ impl Dashboards {
         dashboard: &mut Dashboard,
         tenant_id: &Option<String>,
     ) -> Result<(), DashboardError> {
-        let mut dashboards = self.0.write().await;
-        let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        if let Some(dbs) = dashboards.get_mut(tenant) {
-            let existing_dashboard = dbs
-                .iter()
-                .find(|d| {
-                    d.dashboard_id == Some(dashboard_id) && d.author == Some(user_id.to_string())
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    DashboardError::Metadata(
-                        "Dashboard does not exist or you do not have permission to access it",
-                    )
-                })?;
-            dashboard.set_metadata(user_id, Some(dashboard_id));
-            dashboard.created = existing_dashboard.created;
-
-            let has_duplicate = dbs
-                .iter()
-                .any(|d| d.title == dashboard.title && d.dashboard_id != dashboard.dashboard_id);
-
-            if has_duplicate {
-                return Err(DashboardError::Metadata("Dashboard title must be unique"));
-            }
-
-            self.save_dashboard(dashboard, tenant_id).await?;
-
-            dbs.retain(|d| d.dashboard_id != Some(dashboard_id));
-            dbs.push(dashboard.clone());
-        } else {
-            return Err(DashboardError::Metadata(
-                "Dashboard does not exist or you do not have permission to access it",
-            ));
+        let actor = super::dashboard_service::DashboardActor {
+            user_id: user_id.to_owned(),
+            is_admin: false,
         };
-
-        // let existing_dashboard = dashboards
-        //     .iter()
-        //     .find(|d| d.dashboard_id == Some(dashboard_id) && d.author == Some(user_id.to_string()))
-        //     .cloned()
-        //     .ok_or_else(|| {
-        //         DashboardError::Metadata(
-        //             "Dashboard does not exist or you do not have permission to access it",
-        //         )
-        //     })?;
-
+        let document = serde_json::to_value(&*dashboard)?;
+        let options = super::dashboard_service::DashboardWriteOptions {
+            expected_revision: document
+                .get("revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            ..Default::default()
+        };
+        let result = super::dashboard_service::mutate_json(
+            &actor,
+            dashboard_id,
+            tenant_id,
+            super::dashboard_service::DashboardMutation::Replace(document),
+            &options,
+        )
+        .await?;
+        *dashboard = serde_json::from_value(result["dashboard"].clone())?;
         Ok(())
     }
 
-    /// Delete a dashboard
-    /// This function is called when deleting a dashboard
-    /// delete dashboard in memory and from the object store
     pub async fn delete_dashboard(
         &self,
         user_id: &str,
@@ -361,55 +277,28 @@ impl Dashboards {
         is_admin: bool,
         tenant_id: &Option<String>,
     ) -> Result<(), DashboardError> {
-        let obj = self
-            .ensure_dashboard_ownership(dashboard_id, user_id, is_admin, tenant_id)
-            .await?;
-
-        {
-            // validation has happened, dashboard exists and can be deleted by the user
-            PARSEABLE
-                .metastore
-                .delete_dashboard(&obj, tenant_id)
-                .await?;
-        }
-
-        // delete from in-memory
-        self.0
-            .write()
+        let actor = super::dashboard_service::DashboardActor {
+            user_id: user_id.to_owned(),
+            is_admin,
+        };
+        super::dashboard_service::delete_json(&actor, dashboard_id, tenant_id, &Default::default())
             .await
-            .get_mut(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-            .map(|dashboards| dashboards.retain(|d| d.dashboard_id != Some(dashboard_id)))
-            .iter()
-            .for_each(drop);
-
-        Ok(())
     }
 
-    /// Get a dashboard by ID
-    /// fetch dashboard from memory
     pub async fn get_dashboard(
         &self,
         dashboard_id: Ulid,
         tenant_id: &Option<String>,
     ) -> Option<Dashboard> {
-        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let dashboards = self.0.read().await;
-        if let Some(dashboards) = dashboards.get(tenant_id) {
-            dashboards
-                .iter()
-                .find(|d| {
-                    d.dashboard_id
-                        .as_ref()
-                        .is_some_and(|id| *id == dashboard_id)
-                })
-                .cloned()
-        } else {
-            None
+        match super::dashboard_service::get_json(dashboard_id, tenant_id).await {
+            Ok(document) => serde_json::from_value(document).ok(),
+            Err(error) => {
+                tracing::debug!(%error,"Dashboard compatibility lookup failed");
+                None
+            }
         }
     }
 
-    /// Get a dashboard by ID and user ID
-    /// fetch dashboard from memory
     pub async fn get_dashboard_by_user(
         &self,
         dashboard_id: Ulid,
@@ -417,143 +306,65 @@ impl Dashboards {
         is_admin: bool,
         tenant_id: &Option<String>,
     ) -> Option<Dashboard> {
-        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let dashboards = self.0.read().await;
-        if let Some(dashboards) = dashboards.get(tenant_id) {
-            dashboards
-                .iter()
-                .find(|d| {
-                    d.dashboard_id
-                        .as_ref()
-                        .is_some_and(|id| *id == dashboard_id)
-                        && (d.author == Some(user_id.to_string()) || is_admin)
-                })
-                .cloned()
-        } else {
-            None
-        }
-        // self.0
-        //     .read()
-        //     .await
-        //     .iter()
-        //     .find(|d| {
-        //         d.dashboard_id
-        //             .as_ref()
-        //             .is_some_and(|id| *id == dashboard_id)
-        //             && (d.author == Some(user_id.to_string()) || is_admin)
-        //     })
-        //     .cloned()
+        self.get_dashboard(dashboard_id, tenant_id)
+            .await
+            .filter(|dashboard| is_admin || dashboard.author.as_deref() == Some(user_id))
     }
 
-    /// List all dashboards
-    /// fetch all dashboards from memory
     pub async fn list_dashboards(
         &self,
         limit: usize,
         tenant_id: &Option<String>,
     ) -> Vec<Dashboard> {
-        // limit the number of dashboards returned in order of modified date
-        // if limit is 0, return all dashboards
-        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let dashboards = self.0.read().await;
-
-        let mut sorted_dashboards = if let Some(dashboards) = dashboards.get(tenant_id) {
-            dashboards
-                .iter()
-                .filter(|d| d.dashboard_id.is_some())
-                .cloned()
-                .collect::<Vec<Dashboard>>()
-        } else {
-            vec![]
+        let mut dashboards = match super::dashboard_service::list_json(tenant_id).await {
+            Ok(documents) => documents
+                .into_iter()
+                .filter_map(|document| serde_json::from_value(document).ok())
+                .collect::<Vec<Dashboard>>(),
+            Err(error) => {
+                tracing::warn!(%error,"Dashboard compatibility listing failed");
+                Vec::new()
+            }
         };
-
-        // let mut sorted_dashboards = dashboards
-        //     .iter()
-        //     .filter(|d| d.dashboard_id.is_some())
-        //     .cloned()
-        //     .collect::<Vec<Dashboard>>();
-        sorted_dashboards.sort_by_key(|d| std::cmp::Reverse(d.modified));
+        dashboards.sort_by_key(|dashboard| std::cmp::Reverse(dashboard.modified));
         if limit > 0 {
-            sorted_dashboards.truncate(limit);
+            dashboards.truncate(limit);
         }
-        sorted_dashboards
+        dashboards
     }
 
-    /// List tags from all dashboards
-    /// This function returns a list of unique tags from all dashboards
     pub async fn list_tags(&self, tenant_id: &Option<String>) -> Vec<String> {
-        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let dashboards = self.0.read().await;
-        let mut tags = if let Some(dashboards) = dashboards.get(tenant_id) {
-            dashboards
-                .iter()
-                .filter_map(|d| d.tags.as_ref())
-                .flat_map(|t| t.iter().cloned())
-                .collect::<Vec<String>>()
-        } else {
-            vec![]
-        };
-        // let mut tags = dashboards
-        //     .iter()
-        //     .filter_map(|d| d.tags.as_ref())
-        //     .flat_map(|t| t.iter().cloned())
-        //     .collect::<Vec<String>>();
+        let mut tags = self
+            .list_dashboards(0, tenant_id)
+            .await
+            .into_iter()
+            .filter_map(|dashboard| dashboard.tags)
+            .flatten()
+            .collect::<Vec<_>>();
         tags.sort();
         tags.dedup();
         tags
     }
 
-    /// List dashboards by tag
-    /// This function returns a list of dashboards that match any of the provided tags
-    /// If no tags are provided, it returns an empty list
     pub async fn list_dashboards_by_tags(
         &self,
         tags: Vec<String>,
         tenant_id: &Option<String>,
     ) -> Vec<Dashboard> {
-        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let dashboards = self.0.read().await;
-        if let Some(dashboards) = dashboards.get(tenant_id) {
-            dashboards
-                .iter()
-                .filter(|d| {
-                    if let Some(dashboard_tags) = &d.tags {
-                        dashboard_tags
-                            .iter()
-                            .any(|dashboard_tag| tags.contains(dashboard_tag))
-                    } else {
-                        false
-                    }
-                })
-                .cloned()
-                .collect()
-        } else {
-            vec![]
-        }
+        self.list_dashboards(0, tenant_id)
+            .await
+            .into_iter()
+            .filter(|dashboard| {
+                dashboard
+                    .tags
+                    .as_ref()
+                    .is_some_and(|stored| stored.iter().any(|tag| tags.contains(tag)))
+            })
+            .collect()
     }
 
     pub async fn delete_tenant(&self, tenant_id: &str) {
-        self.0.write().await.remove(tenant_id);
-    }
-
-    /// Ensure the user is the owner of the dashboard
-    /// This function is called when updating or deleting a dashboard
-    /// check if the user is the owner of the dashboard
-    /// if the user is not the owner, return an error
-    async fn ensure_dashboard_ownership(
-        &self,
-        dashboard_id: Ulid,
-        user_id: &str,
-        is_admin: bool,
-        tenant_id: &Option<String>,
-    ) -> Result<Dashboard, DashboardError> {
-        self.get_dashboard_by_user(dashboard_id, user_id, is_admin, tenant_id)
-            .await
-            .ok_or_else(|| {
-                DashboardError::Metadata(
-                    "Dashboard does not exist or you do not have permission to access it",
-                )
-            })
+        super::dashboard_service::forget_tenant(tenant_id);
     }
 }
 

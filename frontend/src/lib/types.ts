@@ -372,6 +372,8 @@ export type ApiKey = {
 // intact and patch it; a narrower editor model must never become the PUT body.
 export type DashboardTile = { tile_id: string; [key: string]: unknown };
 export type DashboardSummary = {
+  /** Opaque server revision. Older servers may omit it. */
+  revision?: string;
   dataset?: string | null;
   dashboardId: string;
   title: string;
@@ -383,6 +385,9 @@ export type DashboardSummary = {
   [key: string]: unknown;
 };
 export type DashboardRequest = {
+  revision?: string;
+  /** Saved auto refresh default, in milliseconds; absent means off. */
+  refreshInterval?: number;
   dataset?: string | null;
   title: string;
   tiles?: DashboardTile[] | null;
@@ -460,7 +465,7 @@ export interface ParseableClient {
   updateDashboard(id: string, body: DashboardRequest): Promise<Dashboard>;
   /** Bodyless partial PUT: the server skips tile validation and keeps the stored document. */
   setDashboardFavorite(id: string, isFavorite: boolean): Promise<Dashboard>;
-  deleteDashboard(id: string): Promise<void>;
+  deleteDashboard(id: string, revision?: string): Promise<void>;
   listAlerts(signal?: AbortSignal): Promise<AlertSummary[]>;
   getAlert(id: string, signal?: AbortSignal): Promise<Alert>;
   createAlert(alert: AlertRequest): Promise<Alert>;
