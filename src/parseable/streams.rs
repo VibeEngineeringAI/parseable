@@ -724,20 +724,21 @@ impl Stream {
                 }
             }
         };
-        let filename =
-            self.filename_by_partition(schema_key, parsed_timestamp, custom_partition_values);
         if self.options.mode != Mode::Query || stream_type == StreamType::Internal {
+            let filename =
+                self.filename_by_partition(schema_key, parsed_timestamp, custom_partition_values);
             let range = TimeRange::granularity_range(
                 parsed_timestamp.and_local_timezone(Utc).unwrap(),
                 OBJECT_STORE_DATA_GRANULARITY,
             );
             let file_path = self.data_path.join(&filename);
 
-            guard.push_disk(filename.clone(), record, file_path, range)?;
-        }
-
-        if let Some(mem) = guard.mem.as_mut() {
-            mem.push_for_file(filename, schema_key, record)?;
+            guard.push_disk_ref(&filename, record, file_path, range)?;
+            if let Some(mem) = guard.mem.as_mut() {
+                mem.push_for_file(&filename, schema_key, record)?;
+            }
+        } else if let Some(mem) = guard.mem.as_mut() {
+            mem.push(schema_key, record)?;
         }
 
         Ok(())
@@ -2986,6 +2987,8 @@ mod tests {
             None,
             &None,
         );
+        // Keep memory coverage independent of the process-wide staging setting.
+        staging.writer.lock().unwrap().mem = Some(Default::default());
         let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -3001,12 +3004,97 @@ mod tests {
                 StreamType::UserDefined,
             )
             .unwrap();
-        assert!(staging.writer.lock().unwrap().disk.is_empty());
+        {
+            let writer = staging.writer.lock().unwrap();
+            assert!(writer.disk.is_empty());
+            let mem = writer.mem.as_ref().unwrap();
+            assert!(mem.read_buffer.is_empty());
+            assert_eq!(mem.mutable_buffer.inner.len(), 1);
+            assert!(Arc::ptr_eq(
+                mem.mutable_buffer.inner[0].column(0),
+                batch.column(0)
+            ));
+        }
         assert_eq!(
             staging.recordbatches_cloned(&schema).unwrap()[0].num_rows(),
             1
         );
         staging.flush_with_clock(false, || now).unwrap();
+        assert!(staging.recordbatches_cloned(&schema).unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_minute_query_visibility_query_internal_exact_minute_end() {
+        let dir = TempDir::new().unwrap();
+        let staging = Stream::new(
+            Arc::new(Options {
+                local_staging_path: dir.path().to_path_buf(),
+                mode: Mode::Query,
+                ..Default::default()
+            }),
+            "query-internal",
+            LogStreamMetadata {
+                stream_type: StreamType::Internal,
+                ..Default::default()
+            },
+            None,
+            &None,
+        );
+        staging.writer.lock().unwrap().mem = Some(Default::default());
+        let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = TimeRange::granularity_range(now, OBJECT_STORE_DATA_GRANULARITY).end;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![7]))])
+            .unwrap();
+        for _ in 0..2 {
+            staging
+                .push(
+                    "id-schema",
+                    &batch,
+                    now.naive_utc(),
+                    &HashMap::new(),
+                    StreamType::Internal,
+                )
+                .unwrap();
+        }
+        staging.flush_with_clock(false, || now).unwrap();
+        {
+            let writer = staging.writer.lock().unwrap();
+            assert_eq!(writer.disk.len(), 1);
+            let mem = writer.mem.as_ref().unwrap();
+            assert!(mem.read_buffer.is_empty());
+            assert!(mem.mutable_buffer.inner.is_empty());
+        }
+        assert_eq!(
+            staging.recordbatches_cloned(&schema).unwrap()[0].num_rows(),
+            2
+        );
+        let next = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![8]))])
+            .unwrap();
+        staging
+            .push(
+                "id-schema",
+                &next,
+                end.naive_utc(),
+                &HashMap::new(),
+                StreamType::Internal,
+            )
+            .unwrap();
+        assert_eq!(staging.writer.lock().unwrap().disk.len(), 2);
+        staging.flush_with_clock(false, || end).unwrap();
+        let expected = staging.filename_by_partition("id-schema", end.naive_utc(), &HashMap::new());
+        {
+            let writer = staging.writer.lock().unwrap();
+            assert_eq!(writer.disk.len(), 1);
+            assert!(writer.disk.contains_key(&expected));
+        }
+        let retained = staging.recordbatches_cloned(&schema).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0], next);
+        staging.flush_with_clock(true, || end).unwrap();
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
         assert!(staging.recordbatches_cloned(&schema).unwrap().is_empty());
     }
 
@@ -3028,6 +3116,7 @@ mod tests {
             None,
             &None,
         );
+        staging.writer.lock().unwrap().mem = Some(Default::default());
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         for (id, timestamp, partition) in [
             (1, now - TimeDelta::minutes(2), "past"),

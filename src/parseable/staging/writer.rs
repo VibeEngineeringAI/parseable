@@ -90,7 +90,6 @@ impl Default for Writer {
 
 impl Writer {
     /// Appends a batch to the writer for its schema/minute file.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn push_disk(
         &mut self,
         filename: String,
@@ -98,7 +97,18 @@ impl Writer {
         file_path: PathBuf,
         range: TimeRange,
     ) -> Result<(), StagingError> {
-        match self.disk.get_mut(&filename) {
+        self.push_disk_ref(&filename, rb, file_path, range)
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn push_disk_ref(
+        &mut self,
+        filename: &str,
+        rb: &RecordBatch,
+        file_path: PathBuf,
+        range: TimeRange,
+    ) -> Result<(), StagingError> {
+        match self.disk.get_mut(filename) {
             Some(writer) => writer.write(rb),
             None => {
                 if let Some(parent) = file_path.parent() {
@@ -106,7 +116,7 @@ impl Writer {
                 }
                 let mut writer = DiskWriter::try_new(file_path, rb.schema().as_ref(), range)?;
                 writer.write(rb)?;
-                self.disk.insert(filename, writer);
+                self.disk.insert(filename.to_owned(), writer);
                 Ok(())
             }
         }
@@ -139,6 +149,15 @@ impl Writer {
             mem.clear_unsegmented();
             mem.segments
                 .retain(|filename, _| self.disk.contains_key(filename));
+            if mem.segments.is_empty() {
+                // clear/retain alone keep the burst's bucket allocation alive.
+                mem.segments = HashMap::new();
+            } else if mem.segments.capacity()
+                > mem.segments.len().saturating_mul(2).saturating_add(16)
+            {
+                // Rehash only sparse maps; move segment owners without copying Arrow data.
+                mem.segments.shrink_to_fit();
+            }
         }
         flushable_disk
     }
@@ -258,14 +277,17 @@ impl<const N: usize> Default for MemWriter<N> {
 impl<const N: usize> MemWriter<N> {
     pub(crate) fn push_for_file(
         &mut self,
-        filename: String,
+        filename: &str,
         schema_key: &str,
         rb: &RecordBatch,
     ) -> Result<(), StagingError> {
-        self.segments
-            .entry(filename)
-            .or_default()
-            .push(schema_key, rb)
+        if let Some(segment) = self.segments.get_mut(filename) {
+            return segment.push(schema_key, rb);
+        }
+        let mut segment = Self::default();
+        segment.push(schema_key, rb)?;
+        self.segments.insert(filename.to_owned(), segment);
+        Ok(())
     }
 
     pub fn push(&mut self, schema_key: &str, rb: &RecordBatch) -> Result<(), StagingError> {
@@ -282,7 +304,7 @@ impl<const N: usize> MemWriter<N> {
     }
 
     pub fn clear(&mut self) {
-        self.segments.clear();
+        self.segments = HashMap::new();
         self.clear_unsegmented();
     }
 
@@ -370,7 +392,74 @@ mod tests {
 
     use crate::{OBJECT_STORE_DATA_GRANULARITY, utils::time::TimeRange};
 
-    use super::{DiskWriter, Writer};
+    use super::{DiskWriter, MemWriter, Writer};
+
+    #[test]
+    fn current_minute_query_visibility_releases_burst_capacity() {
+        let dir = TempDir::new().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let current = TimeRange::granularity_range(now, OBJECT_STORE_DATA_GRANULARITY);
+        let expired = TimeRange {
+            start: current.start - chrono::TimeDelta::minutes(2),
+            end: current.start,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batches = (0..128)
+            .map(|id| {
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![id]))])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut writer = Writer {
+            mem: Some(MemWriter::default()),
+            disk: Default::default(),
+        };
+        for (id, batch) in batches.iter().enumerate() {
+            let filename = format!("{id}.date=2020-01-02.data.arrows");
+            let range = if id < 2 { &current } else { &expired };
+            writer
+                .push_disk_ref(&filename, batch, dir.path().join(&filename), range.clone())
+                .unwrap();
+            writer
+                .mem
+                .as_mut()
+                .unwrap()
+                .push_for_file(&filename, "id", batch)
+                .unwrap();
+        }
+        let peak_capacity = writer.mem.as_ref().unwrap().segments.capacity();
+        assert!(peak_capacity >= 128);
+        drop(writer.take_flushable_disk_at(false, now));
+        let mem = writer.mem.as_ref().unwrap();
+        assert_eq!(mem.segments.len(), 2);
+        assert!(mem.segments.capacity() <= 2 * mem.segments.len() + 16);
+        assert!(mem.segments.capacity() < peak_capacity);
+        for (id, batch) in batches.iter().take(2).enumerate() {
+            let key = format!("{id}.date=2020-01-02.data.arrows");
+            let retained = &mem.segments[&key].mutable_buffer.inner;
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].num_rows(), 1);
+            assert!(Arc::ptr_eq(retained[0].column(0), batch.column(0)));
+        }
+        assert_eq!(
+            mem.recordbatch_cloned(&schema)
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2
+        );
+        drop(writer.take_flushable_disk_at(false, current.end));
+        assert!(writer.disk.is_empty());
+        assert_eq!(writer.mem.as_ref().unwrap().segments.capacity(), 0);
+        let mem = writer.mem.as_mut().unwrap();
+        mem.push_for_file("clear-test", "id", &batches[0]).unwrap();
+        assert!(mem.segments.capacity() > 0);
+        mem.clear();
+        assert_eq!(mem.segments.capacity(), 0);
+    }
 
     #[test]
     fn current_minute_query_visibility_segments_follow_disk_ownership() {
@@ -400,7 +489,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut writer = Writer::default();
+        let mut writer = Writer {
+            mem: Some(MemWriter::default()),
+            disk: Default::default(),
+        };
         let current_range = TimeRange {
             start: now - chrono::TimeDelta::hours(1),
             end: now + chrono::TimeDelta::hours(1),
@@ -435,22 +527,11 @@ mod tests {
                 .mem
                 .as_mut()
                 .unwrap()
-                .segments
-                .entry(filename)
-                .or_default()
-                .push(key, rb)
+                .push_for_file(&filename, key, rb)
                 .unwrap();
         }
-        // Query-mode rows have no disk owner, so retain the existing flush behavior.
-        writer
-            .mem
-            .as_mut()
-            .unwrap()
-            .segments
-            .entry("query-only".to_owned())
-            .or_default()
-            .push("id", &batch)
-            .unwrap();
+        // Query-mode user rows have no disk owner and use the public direct buffer.
+        writer.mem.as_mut().unwrap().push("id", &batch).unwrap();
         let key = "current-a.date=2020-01-02.data.arrows";
         assert!(
             Arc::ptr_eq(
@@ -503,6 +584,7 @@ mod tests {
         drop(writer.take_flushable_disk_at(true, now));
         assert!(writer.disk.is_empty());
         assert!(writer.mem.as_ref().unwrap().segments.is_empty());
+        assert_eq!(writer.mem.as_ref().unwrap().segments.capacity(), 0);
     }
 
     #[test]
