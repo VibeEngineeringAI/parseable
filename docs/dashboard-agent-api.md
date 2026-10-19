@@ -229,9 +229,21 @@ Malformed JSON records are skipped in listings/tags, as in the legacy loader;
 storage failures still surface. Default REST listing sorts by modified time
 (descending), `limit=0` means all, positive limits have no new cap, `tags` ignores
 `limit`, and an empty tags filter is a 400. An explicit `after` parameter opts
-into ID-ordered cursor pagination; dashboard tools also use ID order. Existing
-REST errors retain their plaintext status/body contracts; PATCH/tool and new
-concurrency errors are structured.
+into ID-ordered cursor pagination; dashboard tools also use ID order. Legacy
+not-found, ownership, duplicate-title, duplicate-tile and metadata errors retain
+their plaintext status/body contracts; PATCH/tool and new concurrency errors are
+structured.
+
+A remaining REST compatibility blocker is stricter configuration validation on
+create/replacement/add-tile. Previously `Tile` required only a ULID `tile_id` and
+accepted arbitrary flattened fields; for example `tileType: "ai"` was accepted.
+The shared validator rejects a newly supplied unsupported tile type with 422
+(the existing `untouched_legacy_defects_warn_while_new_ones_fail` test records
+this distinction). Untouched stored defects warn, but new legacy REST payloads
+can still be rejected. Malformed typed fields may also now get structured 422
+instead of the legacy extractor's 400 response. Preserving all legacy REST
+inputs requires a scoped compatibility-validation path; this pass has not added
+one. Keep PR51 blocked until that policy and its tests are resolved.
 
 Rollout remains blocked until supported S3/MinIO, Azure and GCS configurations
 are checked for conditional writes and parent-owned CPU/RAM benchmarks pass.
