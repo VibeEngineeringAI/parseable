@@ -27,7 +27,7 @@ use crate::{
 
 use super::{
     dashboard_patch::{DashboardOperation, apply_patch, validate_dashboard},
-    dashboards::CURRENT_DASHBOARD_VERSION,
+    dashboards::{CURRENT_DASHBOARD_VERSION, Dashboard},
 };
 
 const INTERNAL: &str = "_parseableDashboard";
@@ -55,6 +55,14 @@ pub enum DashboardMutation {
     Patch(Vec<DashboardOperation>),
 }
 
+// Only the legacy REST adapter selects this mode. Tools and PATCH always use
+// strict final-state validation, including when routed through the adapter.
+#[derive(Clone, Copy)]
+enum ValidationMode {
+    Strict,
+    LegacyRest,
+}
+
 #[derive(Debug, Clone)]
 pub struct DashboardService {
     metastore: Arc<dyn Metastore>,
@@ -79,6 +87,16 @@ pub async fn create_json(
     options: &DashboardWriteOptions,
 ) -> Result<Value, DashboardError> {
     SERVICE.create_json(actor, tenant, document, options).await
+}
+pub async fn create_legacy_json(
+    actor: &DashboardActor,
+    tenant: &Option<String>,
+    document: Dashboard,
+    options: &DashboardWriteOptions,
+) -> Result<Value, DashboardError> {
+    SERVICE
+        .create_legacy_json(actor, tenant, document, options)
+        .await
 }
 pub async fn mutate_json(
     actor: &DashboardActor,
@@ -508,9 +526,41 @@ impl DashboardService {
         document: Value,
         options: &DashboardWriteOptions,
     ) -> Result<Value, DashboardError> {
+        self.create_with_validation(actor, tenant, document, options, ValidationMode::Strict)
+            .await
+    }
+
+    pub(crate) async fn create_legacy_json(
+        &self,
+        actor: &DashboardActor,
+        tenant: &Option<String>,
+        document: Dashboard,
+        options: &DashboardWriteOptions,
+    ) -> Result<Value, DashboardError> {
+        if document.title.is_empty() {
+            return Err(DashboardError::Metadata("Title must be provided"));
+        }
+        self.create_with_validation(
+            actor,
+            tenant,
+            serde_json::to_value(document)?,
+            options,
+            ValidationMode::LegacyRest,
+        )
+        .await
+    }
+
+    async fn create_with_validation(
+        &self,
+        actor: &DashboardActor,
+        tenant: &Option<String>,
+        document: Value,
+        options: &DashboardWriteOptions,
+        validation_mode: ValidationMode,
+    ) -> Result<Value, DashboardError> {
         if options.dry_run {
             return self
-                .create_json_inner(actor, tenant, document, options)
+                .create_json_inner(actor, tenant, document, options, validation_mode)
                 .await;
         }
         // Dropping a request's JoinHandle detaches its commit task. Once a
@@ -521,7 +571,7 @@ impl DashboardService {
         let options = options.clone();
         tokio::spawn(async move {
             service
-                .create_json_inner(&actor, &tenant, document, &options)
+                .create_json_inner(&actor, &tenant, document, &options, validation_mode)
                 .await
         })
         .await
@@ -541,12 +591,14 @@ impl DashboardService {
         tenant: &Option<String>,
         mut document: Value,
         options: &DashboardWriteOptions,
+        validation_mode: ValidationMode,
     ) -> Result<Value, DashboardError> {
         validate_scope(tenant, Some(&actor.user_id))?;
         validate_options(options)?;
         require_object(&document)?;
         reject_internal(&document)?;
-        let request_hash = fingerprint(&json!({"operation":"create","document":document}));
+        let request_hash =
+            validation_mode.request_hash(&json!({"operation":"create","document":document}));
         let id = if let Some(key) = &options.idempotency_key {
             let digest = Sha256::digest(serde_json::to_vec(&json!([tenant, actor.user_id, key]))?);
             Ulid::from_bytes(digest[..16].try_into().expect("SHA256 prefix"))
@@ -588,7 +640,7 @@ impl DashboardService {
                 object.insert(key.to_owned(), default);
             }
         }
-        let validation = validate_candidate(&document, None)?;
+        let validation = validation_mode.validate(&document, None)?;
         let next_revision = Ulid::new().to_string();
         let diff = document_diff(&json!({}), &document);
         let title = title(&document)?.to_owned();
@@ -673,7 +725,12 @@ impl DashboardService {
             }
             options.expected_revision = Some(base.revision);
         }
-        self.mutate_json(actor, id, tenant, mutation, &options)
+        let validation_mode = if matches!(&mutation, DashboardMutation::Patch(_)) {
+            ValidationMode::Strict
+        } else {
+            ValidationMode::LegacyRest
+        };
+        self.mutate_with_validation(actor, id, tenant, mutation, &options, validation_mode)
             .await
     }
 
@@ -685,9 +742,23 @@ impl DashboardService {
         mutation: DashboardMutation,
         options: &DashboardWriteOptions,
     ) -> Result<Value, DashboardError> {
+        self.mutate_with_validation(actor, id, tenant, mutation, options, ValidationMode::Strict)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn mutate_with_validation(
+        &self,
+        actor: &DashboardActor,
+        id: Ulid,
+        tenant: &Option<String>,
+        mutation: DashboardMutation,
+        options: &DashboardWriteOptions,
+        validation_mode: ValidationMode,
+    ) -> Result<Value, DashboardError> {
         if options.dry_run {
             return self
-                .mutate_json_inner(actor, id, tenant, mutation, options)
+                .mutate_json_inner(actor, id, tenant, mutation, options, validation_mode)
                 .await;
         }
         // Dropping a request's JoinHandle detaches its commit task. Once a
@@ -698,7 +769,7 @@ impl DashboardService {
         let options = options.clone();
         tokio::spawn(async move {
             service
-                .mutate_json_inner(&actor, id, &tenant, mutation, &options)
+                .mutate_json_inner(&actor, id, &tenant, mutation, &options, validation_mode)
                 .await
         })
         .await
@@ -712,6 +783,7 @@ impl DashboardService {
         })?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn mutate_json_inner(
         &self,
         actor: &DashboardActor,
@@ -719,6 +791,7 @@ impl DashboardService {
         tenant: &Option<String>,
         mutation: DashboardMutation,
         options: &DashboardWriteOptions,
+        validation_mode: ValidationMode,
     ) -> Result<Value, DashboardError> {
         let retry_delta = options.expected_revision.is_none()
             && options.idempotency_key.is_none()
@@ -728,7 +801,7 @@ impl DashboardService {
             );
         for attempt in 0..8 {
             let result = self
-                .mutate_once(actor, id, tenant, &mutation, options)
+                .mutate_once(actor, id, tenant, &mutation, options, validation_mode)
                 .await;
             if retry_delta
                 && attempt < 7
@@ -748,6 +821,7 @@ impl DashboardService {
         unreachable!("bounded mutation retry always returns")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn mutate_once(
         &self,
         actor: &DashboardActor,
@@ -755,6 +829,7 @@ impl DashboardService {
         tenant: &Option<String>,
         mutation: &DashboardMutation,
         options: &DashboardWriteOptions,
+        validation_mode: ValidationMode,
     ) -> Result<Value, DashboardError> {
         let mut effective_options = options.clone();
         if let DashboardMutation::Replace(document) = mutation
@@ -770,7 +845,7 @@ impl DashboardService {
         validate_options(options)?;
         let base = self.stored(id, tenant).await?;
         authorize(actor, &base.document)?;
-        let request_hash = fingerprint(&mutation_request(mutation)?);
+        let request_hash = validation_mode.request_hash(&mutation_request(mutation)?);
         if let Some(result) = replay(
             &base.document,
             &base.revision,
@@ -826,7 +901,10 @@ impl DashboardService {
             candidate[INTERNAL] = internal.clone();
         }
         candidate["modified"] = json!(Utc::now().to_rfc3339());
-        let validation = validate_candidate(&candidate, Some(&base.document))?;
+        if matches!(validation_mode, ValidationMode::LegacyRest) {
+            legacy_defaults(&mut candidate);
+        }
+        let validation = validation_mode.validate(&candidate, Some(&base.document))?;
         let diff = document_diff(
             &public_document(&base.document, &base.revision),
             &public_document(&candidate, &base.revision),
@@ -1609,12 +1687,11 @@ fn title(document: &Value) -> Result<&str, DashboardError> {
     document
         .get("title")
         .and_then(Value::as_str)
-        .filter(|title| !title.trim().is_empty())
         .ok_or_else(|| {
             api(
                 400,
                 "invalid_title",
-                "Dashboard title must be a nonempty string",
+                "Dashboard title must be a string",
                 json!({}),
             )
         })
@@ -1876,6 +1953,60 @@ fn apply_patch_candidate(
         )
     })
 }
+fn legacy_defaults(document: &mut Value) {
+    for (key, default) in [
+        ("tiles", json!([])),
+        ("dashboardType", json!("Dashboard")),
+        ("isFavorite", json!(false)),
+    ] {
+        if document.get(key).is_none_or(Value::is_null) {
+            document[key] = default;
+        }
+    }
+}
+
+impl ValidationMode {
+    fn request_hash(self, request: &Value) -> String {
+        match self {
+            Self::Strict => fingerprint(request),
+            // A legacy receipt must never let a tool replay an input that has
+            // not passed strict validation, even if the caller reuses its key.
+            Self::LegacyRest => fingerprint(&json!({"validation":"legacyRest","request":request})),
+        }
+    }
+
+    fn validate(self, candidate: &Value, base: Option<&Value>) -> Result<Value, DashboardError> {
+        match self {
+            Self::Strict => validate_candidate(candidate, base),
+            Self::LegacyRest => {
+                // The original typed contract allows arbitrary flattened fields.
+                // Do not apply editor-specific chart/layout/query rules here.
+                let document: Dashboard = serde_json::from_value(candidate.clone())?;
+                let mut ids = std::collections::HashSet::new();
+                for tile in document.tiles.iter().flatten() {
+                    if tile.tile_id.is_nil() {
+                        return Err(DashboardError::Metadata("Tile ID must be provided"));
+                    }
+                    if !ids.insert(tile.tile_id) {
+                        return Err(DashboardError::Metadata("Tile IDs must be unique"));
+                    }
+                }
+                // Internal fields are rejected on input and restored from the
+                // authoritative base before this check, in both modes.
+                if candidate.get(INTERNAL) != base.and_then(|base| base.get(INTERNAL)) {
+                    return Err(api(
+                        400,
+                        "protected_dashboard_metadata",
+                        "Internal dashboard metadata cannot be changed",
+                        json!({}),
+                    ));
+                }
+                Ok(json!({"valid":true,"errors":[],"warnings":[]}))
+            }
+        }
+    }
+}
+
 fn validate_candidate(candidate: &Value, base: Option<&Value>) -> Result<Value, DashboardError> {
     let report = validate_dashboard(candidate, base);
     let value = serde_json::to_value(&report)?;
@@ -2264,6 +2395,340 @@ mod tests {
             json!({"op":"add","target":{"type":"dashboard"},"path":path,"value":value}),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_rest_accepts_flattened_config_while_agent_mutations_stay_strict() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, _) = services(directory.path());
+        let owner = actor();
+        let tile_id = Ulid::new().to_string();
+        let tile = json!({"tile_id":tile_id,"tileType":"ai","chartType":{"future":true},
+            "layout":{"x":-99,"h":"auto"},"config":{"arbitrary":[false,7]}});
+        let document = json!({"title":"Legacy arbitrary config","tiles":[tile],
+            "refreshInterval":"custom","variables":{"extension":true},
+            "author":"forged","tenantId":"forged","dashboardId":Ulid::new().to_string(),
+            "opaque":{"keep":true}});
+        assert!(matches!(
+            service
+                .create_json(&owner, &None, document.clone(), &Default::default())
+                .await,
+            Err(DashboardError::Api { status: 422, .. })
+        ));
+        let created = service
+            .create_legacy_json(
+                &owner,
+                &None,
+                serde_json::from_value(document).unwrap(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let dashboard_id = id(&created);
+        assert_eq!(created["dashboard"]["tiles"][0], tile);
+        assert_eq!(created["dashboard"]["author"], owner.user_id);
+        assert_eq!(created["dashboard"]["tenantId"], Value::Null);
+        let mut replacement = created["dashboard"].clone();
+        replacement["tiles"][0]["config"] = json!({"changed":[1,2,3]});
+        replacement["author"] = json!("forged-again");
+        replacement["dashboardId"] = json!(Ulid::new().to_string());
+        replacement["created"] = json!("2000-01-01T00:00:00Z");
+        let replaced = service
+            .mutate_legacy_json(
+                &owner,
+                dashboard_id,
+                &None,
+                DashboardMutation::Replace(replacement),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced["dashboard"]["tiles"][0]["config"],
+            json!({"changed":[1,2,3]})
+        );
+        for key in [
+            "author",
+            "dashboardId",
+            "created",
+            "version",
+            "tenantId",
+            "opaque",
+        ] {
+            assert_eq!(
+                replaced["dashboard"][key], created["dashboard"][key],
+                "{key}"
+            );
+        }
+        let mut second_tile = tile.clone();
+        second_tile["tile_id"] = json!(Ulid::new().to_string());
+        let added = service
+            .mutate_legacy_json(
+                &owner,
+                dashboard_id,
+                &None,
+                DashboardMutation::AddTile(second_tile.clone()),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added["dashboard"]["tiles"][1], second_tile);
+        let mut strict_replacement = added["dashboard"].clone();
+        strict_replacement["tiles"][0]["tileType"] = json!("new-unsupported-type");
+        let mut third_tile = tile.clone();
+        third_tile["tile_id"] = json!(Ulid::new().to_string());
+        let patch: DashboardOperation = serde_json::from_value(json!({"op":"replace",
+            "target":{"type":"tile","id":tile_id},"path":"/tileType","value":"new-unsupported-type"})).unwrap();
+        for mutation in [
+            DashboardMutation::Replace(strict_replacement),
+            DashboardMutation::AddTile(third_tile),
+            DashboardMutation::Patch(vec![patch]),
+        ] {
+            assert!(matches!(
+                service
+                    .mutate_json(
+                        &owner,
+                        dashboard_id,
+                        &None,
+                        mutation,
+                        &options(revision_of(&added), None)
+                    )
+                    .await,
+                Err(DashboardError::Api { status: 422, .. })
+            ));
+        }
+        // Even an accidentally routed PATCH cannot select legacy validation.
+        let patch: DashboardOperation = serde_json::from_value(json!({"op":"replace",
+            "target":{"type":"tile","id":tile_id},"path":"/tileType","value":"new-unsupported-type"})).unwrap();
+        assert!(matches!(
+            service
+                .mutate_legacy_json(
+                    &owner,
+                    dashboard_id,
+                    &None,
+                    DashboardMutation::Patch(vec![patch]),
+                    &options(revision_of(&added), None)
+                )
+                .await,
+            Err(DashboardError::Api { status: 422, .. })
+        ));
+        assert_eq!(
+            service.get_json(dashboard_id, &None).await.unwrap(),
+            added["dashboard"]
+        );
+
+        let stranger = DashboardActor {
+            user_id: "stranger".into(),
+            is_admin: false,
+        };
+        assert!(matches!(
+            service
+                .mutate_legacy_json(
+                    &stranger,
+                    dashboard_id,
+                    &None,
+                    metadata(true),
+                    &Default::default()
+                )
+                .await,
+            Err(DashboardError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            service
+                .mutate_legacy_json(
+                    &owner,
+                    dashboard_id,
+                    &None,
+                    metadata(true),
+                    &options(revision_of(&created), None)
+                )
+                .await,
+            Err(DashboardError::Api { status: 412, .. })
+        ));
+        let mut internal = added["dashboard"].clone();
+        internal[INTERNAL] = json!({"tombstone":true});
+        assert!(matches!(
+            service
+                .mutate_legacy_json(
+                    &owner,
+                    dashboard_id,
+                    &None,
+                    DashboardMutation::Replace(internal),
+                    &options(revision_of(&added), None)
+                )
+                .await,
+            Err(DashboardError::Api {
+                status: 400,
+                code: "protected_dashboard_metadata",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_receipts_cannot_bypass_strict_validation_on_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, _) = services(directory.path());
+        let owner = actor();
+        let document: Dashboard = serde_json::from_value(json!({"title":"Legacy keyed",
+            "tiles":[{"tile_id":Ulid::new().to_string(),"tileType":"ai"}]}))
+        .unwrap();
+        let create_options = DashboardWriteOptions {
+            idempotency_key: Some("create-key".into()),
+            ..Default::default()
+        };
+        let created = service
+            .create_legacy_json(&owner, &None, document.clone(), &create_options)
+            .await
+            .unwrap();
+        let replayed = service
+            .create_legacy_json(&owner, &None, document.clone(), &create_options)
+            .await
+            .unwrap();
+        assert_eq!(replayed["dashboard"], created["dashboard"]);
+        assert!(matches!(
+            service
+                .create_json(
+                    &owner,
+                    &None,
+                    serde_json::to_value(document).unwrap(),
+                    &create_options
+                )
+                .await,
+            Err(DashboardError::Api {
+                status: 409,
+                code: "idempotency_conflict",
+                ..
+            })
+        ));
+        let dashboard_id = id(&created);
+        let tile = json!({"tile_id":Ulid::new().to_string(),"tileType":"ai"});
+        let write_options = options(revision_of(&created), Some("add-key"));
+        let added = service
+            .mutate_legacy_json(
+                &owner,
+                dashboard_id,
+                &None,
+                DashboardMutation::AddTile(tile.clone()),
+                &write_options,
+            )
+            .await
+            .unwrap();
+        let replayed = service
+            .mutate_legacy_json(
+                &owner,
+                dashboard_id,
+                &None,
+                DashboardMutation::AddTile(tile.clone()),
+                &write_options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed["dashboard"], added["dashboard"]);
+        assert!(matches!(
+            service
+                .mutate_json(
+                    &owner,
+                    dashboard_id,
+                    &None,
+                    DashboardMutation::AddTile(tile),
+                    &write_options
+                )
+                .await,
+            Err(DashboardError::Api {
+                status: 409,
+                code: "idempotency_conflict",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_rest_still_requires_typed_fields_and_unique_non_nil_tile_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, _) = services(directory.path());
+        let owner = actor();
+        let tile_id = Ulid::new().to_string();
+        for tiles in [
+            json!([{"tile_id":Ulid::nil().to_string()}]),
+            json!([{"tile_id":tile_id},{"tile_id":tile_id}]),
+        ] {
+            let error = service
+                .create_legacy_json(
+                    &owner,
+                    &None,
+                    serde_json::from_value(json!({"title":"Identity","tiles":tiles})).unwrap(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, DashboardError::Metadata(_)));
+        }
+        // Whitespace-only create titles and empty replacement titles were typed
+        // REST inputs; editor validation still rejects them on strict routes.
+        let created = service
+            .create_legacy_json(
+                &owner,
+                &None,
+                serde_json::from_value(json!({"title":"   "})).unwrap(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let dashboard_id = id(&created);
+        let replaced = service
+            .mutate_legacy_json(
+                &owner,
+                dashboard_id,
+                &None,
+                DashboardMutation::Replace(
+                    json!({"title":"","tiles":null,"isFavorite":null,"dashboardType":null}),
+                ),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced["dashboard"]["title"], "");
+        assert_eq!(replaced["dashboard"]["tiles"], json!([]));
+        assert_eq!(replaced["dashboard"]["isFavorite"], false);
+        assert_eq!(replaced["dashboard"]["dashboardType"], "Dashboard");
+        for document in [
+            json!({"title":12}),
+            json!({"title":"Bad","tags":[12]}),
+            json!({"title":"Bad","tiles":[{"tile_id":"invalid"}]}),
+        ] {
+            assert!(matches!(
+                service
+                    .mutate_legacy_json(
+                        &owner,
+                        dashboard_id,
+                        &None,
+                        DashboardMutation::Replace(document),
+                        &Default::default()
+                    )
+                    .await,
+                Err(DashboardError::Serde(_))
+            ));
+        }
+        let mut internal: Dashboard =
+            serde_json::from_value(json!({"title":"Protected", "_parseableDashboard":{}})).unwrap();
+        assert!(matches!(
+            service
+                .create_legacy_json(&owner, &None, internal.clone(), &Default::default())
+                .await,
+            Err(DashboardError::Api {
+                status: 400,
+                code: "protected_dashboard_metadata",
+                ..
+            })
+        ));
+        internal.title.clear();
+        assert!(matches!(
+            service
+                .create_legacy_json(&owner, &None, internal, &Default::default())
+                .await,
+            Err(DashboardError::Metadata("Title must be provided"))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

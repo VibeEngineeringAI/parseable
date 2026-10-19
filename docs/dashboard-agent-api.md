@@ -234,16 +234,27 @@ not-found, ownership, duplicate-title, duplicate-tile and metadata errors retain
 their plaintext status/body contracts; PATCH/tool and new concurrency errors are
 structured.
 
-A remaining REST compatibility blocker is stricter configuration validation on
-create/replacement/add-tile. Previously `Tile` required only a ULID `tile_id` and
-accepted arbitrary flattened fields; for example `tileType: "ai"` was accepted.
-The shared validator rejects a newly supplied unsupported tile type with 422
-(the existing `untouched_legacy_defects_warn_while_new_ones_fail` test records
-this distinction). Untouched stored defects warn, but new legacy REST payloads
-can still be rejected. Malformed typed fields may also now get structured 422
-instead of the legacy extractor's 400 response. Preserving all legacy REST
-inputs requires a scoped compatibility-validation path; this pass has not added
-one. Keep PR51 blocked until that policy and its tests are resolved.
+Legacy REST create/replace/add-tile use the original `Dashboard`/`Tile` typed
+extractors and a separate internal validation mode. Arbitrary flattened tile and
+dashboard configuration (including `tileType: "ai"` and opaque chart/layout
+shapes) is accepted; typed fields retain their original deserialization rules
+and 400 errors. Optional PUT bodies retain the original missing-body behavior
+when typed extraction fails. Missing/null tiles, dashboard type and favorite
+values receive the legacy defaults. Non-nil, unique tile identities are still
+required, including on create. Internal metadata is rejected on input, and
+owner/identity/creation metadata is generated or restored from storage. The
+shared title-reservation, revision and conditional-write protocol is unchanged.
+PATCH, validation endpoints and all dashboard tool mutations retain strict
+configuration validation; an accidentally routed PATCH cannot select legacy
+validation. Idempotency receipts distinguish these validation modes so a tool
+cannot replay a legacy write that has not passed strict validation. Untouched stored defects remain warnings on strict updates.
+
+Regression coverage exercises arbitrary-config create/replace/add, strict
+create/replace/add/PATCH rejection, malformed typed 400 errors, defaults, required
+tile identities, owner/server-field protection and stale-revision rejection.
+The existing concurrent unversioned-PUT test still checks that a full replacement
+cannot retry over a newer edit. These additions require a passing CI test run
+before API compatibility is considered validated.
 
 Rollout remains blocked until supported S3/MinIO, Azure and GCS configurations
 are checked for conditional writes and parent-owned CPU/RAM benchmarks pass.
