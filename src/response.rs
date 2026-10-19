@@ -839,23 +839,73 @@ mod tests {
 
     #[test]
     fn json_bytes_preserve_nested_json_recursion_limit() {
-        let mut nested = Arc::new(StringArray::from(vec!["leaf"])) as ArrayRef;
-        for _ in 0..130 {
-            nested = Arc::new(StructArray::from(vec![(
-                Arc::new(Field::new("child", nested.data_type().clone(), true)),
-                nested,
-            )]));
+        // Arrow's recursive encoder construction in the legacy to_json() path
+        // overflows the default 2 MiB test-thread stack in debug builds before
+        // serde can enforce its JSON recursion limit. Give just this fixture
+        // enough stack, keeping serde's limit and every compatibility assertion.
+        std::thread::Builder::new()
+            .name("nested-json-recursion-limit".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                // The record array and row object consume two of serde's 128
+                // levels: 125 structs parse, while 126 structs exceed the limit.
+                for depth in [62, 63, 125, 126, 130] {
+                    let mut nested = Arc::new(StringArray::from(vec!["leaf"])) as ArrayRef;
+                    for _ in 0..depth {
+                        nested = Arc::new(StructArray::from(vec![(
+                            Arc::new(Field::new("child", nested.data_type().clone(), true)),
+                            nested,
+                        )]));
+                    }
+                    let batch = RecordBatch::try_from_iter(vec![("nested", nested)]).unwrap();
+                    for fill_null in [false, true] {
+                        for with_fields in [false, true] {
+                            let response = QueryResponse {
+                                records: vec![batch.clone()],
+                                fields: vec!["nested".into(), "missing".into()],
+                                fill_null,
+                                with_fields,
+                            };
+                            let expected = response.to_json().unwrap();
+                            let rows = if with_fields {
+                                &expected["records"]
+                            } else {
+                                &expected
+                            };
+                            assert_eq!(
+                                rows.as_array().unwrap().len(),
+                                usize::from(depth < 126),
+                                "depth={depth}, fill_null={fill_null}, with_fields={with_fields}"
+                            );
+                            assert_eq!(
+                                response.to_json_bytes().unwrap(),
+                                serde_json::to_vec(&expected).unwrap(),
+                                "depth={depth}, fill_null={fill_null}, with_fields={with_fields}"
+                            );
+                        }
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn json_direct_writer_depth_guard_preserves_fallback_boundary() {
+        // Exercise the guard on the default test stack without invoking Arrow's
+        // recursive debug encoder. The leaf also counts toward the depth limit.
+        for (depth, eligible) in [(62, true), (63, false), (130, false)] {
+            let mut data_type = DataType::Utf8;
+            for _ in 0..depth {
+                data_type = DataType::Struct(vec![Field::new("child", data_type, true)].into());
+            }
+            assert_eq!(
+                super::can_write_json_directly(&[Arc::new(Field::new("nested", data_type, true))]),
+                eligible,
+                "depth={depth}"
+            );
         }
-        let batch = arrow_array::RecordBatch::try_from_iter(vec![("nested", nested)]).unwrap();
-        let response = QueryResponse {
-            records: vec![batch.clone()],
-            fields: vec!["nested".into()],
-            fill_null: false,
-            with_fields: false,
-        };
-        assert_eq!(response.to_json().unwrap(), serde_json::json!([]));
-        assert_eq!(response.to_json_bytes().unwrap(), b"[]");
-        assert_json_equivalent(vec![batch], vec!["nested".into()]);
     }
 
     #[test]
