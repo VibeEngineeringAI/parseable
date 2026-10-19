@@ -555,7 +555,7 @@ impl ObjectStorage for LocalFS {
             );
         }
 
-        res.map_err(Into::into)
+        res
     }
 
     async fn delete_prefix(

@@ -536,10 +536,8 @@ fn legacy_sql(tile: &Value, query: &Value) -> Result<String, String> {
     if !order.is_empty() {
         sql.push_str(&format!(" ORDER BY {}", order.join(", ")));
     }
-    if !stat {
-        if let Some(limit) = integer(&y["limit"]) {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
+    if !stat && let Some(limit) = integer(&y["limit"]) {
+        sql.push_str(&format!(" LIMIT {limit}"));
     }
     Ok(sql)
 }
@@ -1002,18 +1000,19 @@ fn trim_promql(result: &mut Value, limit: usize) -> bool {
                 truncated = true;
             }
             for row in series {
-                if let Some(points) = row["values"].as_array_mut() {
-                    if points.len() > limit {
-                        let keep = points.len() - limit;
-                        points.drain(..keep);
-                        truncated = true;
-                    }
+                if let Some(points) = row["values"].as_array_mut()
+                    && points.len() > limit
+                {
+                    let keep = points.len() - limit;
+                    points.drain(..keep);
+                    truncated = true;
                 }
             }
         }
     }
     truncated
 }
+#[allow(clippy::too_many_arguments)]
 async fn execute_tile(
     req: &HttpRequest,
     tile: &Value,
@@ -1184,15 +1183,15 @@ async fn preview_inner(req: &HttpRequest, request: Value) -> Result<Value, Dashb
         (None, Some(document)) if document.is_object() => document,
         _ => return Err(bad("Provide exactly one of dashboardId or document")),
     };
-    if let Some(revision) = request.revision {
-        if document["revision"].as_str() != Some(revision.trim_matches('"')) {
-            return Err(DashboardError::api(
-                412,
-                "REVISION_CONFLICT",
-                "Dashboard changed before preview",
-                json!({"revision":document["revision"]}),
-            ));
-        }
+    if let Some(revision) = request.revision
+        && document["revision"].as_str() != Some(revision.trim_matches('"'))
+    {
+        return Err(DashboardError::api(
+            412,
+            "REVISION_CONFLICT",
+            "Dashboard changed before preview",
+            json!({"revision":document["revision"]}),
+        ));
     }
     if !request.operations.is_empty() {
         document = dashboard_patch::apply_patch(&document, &request.operations)
@@ -1270,14 +1269,14 @@ async fn preview_inner(req: &HttpRequest, request: Value) -> Result<Value, Dashb
     };
     let mut response = work.await?;
     // Keep a single oversized tile from defeating the aggregate wire-size bound.
-    if serde_json::to_vec(&response)?.len() > MAX_BYTES {
-        if let Some(results) = response["results"].as_array_mut() {
-            for index in (0..results.len()).rev() {
-                let tile_id = results[index]["tileId"].clone();
-                results[index] = json!({"tileId":tile_id,"status":"error","error":"Preview response exceeds 1 MiB; narrow the selection"});
-                if serde_json::to_vec(results)?.len() < MAX_BYTES / 2 {
-                    break;
-                }
+    if serde_json::to_vec(&response)?.len() > MAX_BYTES
+        && let Some(results) = response["results"].as_array_mut()
+    {
+        for index in (0..results.len()).rev() {
+            let tile_id = results[index]["tileId"].clone();
+            results[index] = json!({"tileId":tile_id,"status":"error","error":"Preview response exceeds 1 MiB; narrow the selection"});
+            if serde_json::to_vec(results)?.len() < MAX_BYTES / 2 {
+                break;
             }
         }
     }

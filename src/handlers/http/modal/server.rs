@@ -223,7 +223,7 @@ impl Server {
                 web::resource("/tools/list").route(
                     web::get()
                         .to(crate::tool_catalog::list_tool_registry)
-                        .authenticate(),
+                        .authorize(Action::Query),
                 ),
             )
             .service(

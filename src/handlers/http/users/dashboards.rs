@@ -33,7 +33,7 @@ use actix_web::{
     HttpRequest, HttpResponse, Responder,
     http::{
         StatusCode,
-        header::{ETAG, IF_MATCH},
+        header::{ContentType, ETAG, IF_MATCH},
     },
     web::{self, Json, Path},
 };
@@ -95,14 +95,29 @@ pub async fn list_dashboards(req: HttpRequest) -> Result<impl Responder, Dashboa
         .transpose()
         .map_err(|_| DashboardError::Metadata("Invalid limit value"))?
         .unwrap_or(0);
-    let tags = query.get("tags").map(|s| {
+    let tags: Option<Vec<String>> = query.get("tags").map(|s| {
         s.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect()
     });
-    let mut rows = list_dashboards_internal(0, tags, &get_tenant_id_from_request(&req)).await?;
+    if tags.as_ref().is_some_and(Vec::is_empty) {
+        return Err(DashboardError::Metadata("Tags cannot be empty"));
+    }
+    // Legacy tag filtering ignores limit. Cursor pagination explicitly opts in
+    // to ID order and applies its limit after the cursor.
+    let tagged = tags.is_some();
+    let rows = list_dashboards_internal(0, tags, &get_tenant_id_from_request(&req)).await?;
+    Ok(web::Json(filter_listing(rows, &query, tagged, limit)))
+}
+
+fn filter_listing(
+    mut rows: Vec<Value>,
+    query: &HashMap<String, String>,
+    tagged: bool,
+    limit: usize,
+) -> Vec<Value> {
     if let Some(search) = query.get("query") {
         let search = search.to_lowercase();
         rows.retain(|d| {
@@ -112,16 +127,17 @@ pub async fn list_dashboards(req: HttpRequest) -> Result<impl Responder, Dashboa
         });
     }
     if let Some(after) = query.get("after") {
+        rows.sort_by(|a, b| a["dashboardId"].as_str().cmp(&b["dashboardId"].as_str()));
         rows.retain(|d| {
             d["dashboardId"]
                 .as_str()
                 .is_some_and(|id| id > after.as_str())
         });
     }
-    if limit > 0 {
-        rows.truncate(limit.min(500));
+    if limit > 0 && (!tagged || query.contains_key("after")) {
+        rows.truncate(limit);
     }
-    Ok(web::Json(rows))
+    rows
 }
 
 pub async fn list_dashboards_internal(
@@ -139,7 +155,7 @@ pub async fn list_dashboards_internal(
             })
         });
     }
-    rows.sort_by(|a, b| a["dashboardId"].as_str().cmp(&b["dashboardId"].as_str()));
+    sort_by_modified(&mut rows);
     if limit > 0 {
         rows.truncate(limit);
     }
@@ -167,6 +183,55 @@ pub async fn list_dashboards_internal(
         .collect())
 }
 
+fn sort_by_modified(rows: &mut [Value]) {
+    rows.sort_by_cached_key(|row| {
+        std::cmp::Reverse(
+            row["modified"]
+                .as_str()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()),
+        )
+    });
+}
+
+#[derive(Clone, Copy)]
+enum LegacyOperation {
+    Get,
+    Update,
+    Delete,
+    AddTile,
+    Create,
+}
+
+// Keep the original REST error contracts at the compatibility boundary. New
+// PATCH/tool APIs continue to expose the structured service errors.
+fn legacy_error(error: DashboardError, operation: LegacyOperation) -> DashboardError {
+    match &error {
+        DashboardError::Api {
+            code: "dashboard_not_found" | "dashboard_forbidden",
+            ..
+        } => match operation {
+            LegacyOperation::Get => DashboardError::Metadata("Dashboard does not exist"),
+            LegacyOperation::Update => {
+                DashboardError::Metadata("Dashboard does not exist or user is not authorized")
+            }
+            LegacyOperation::Delete => DashboardError::Metadata(
+                "Dashboard does not exist or you do not have permission to access it",
+            ),
+            LegacyOperation::AddTile => DashboardError::Unauthorized,
+            LegacyOperation::Create => error,
+        },
+        DashboardError::Api {
+            code: "title_conflict",
+            ..
+        } => DashboardError::Metadata("Dashboard title must be unique"),
+        DashboardError::Api {
+            code: "tile_conflict",
+            ..
+        } => DashboardError::Metadata("Tile already exists"),
+        _ => error,
+    }
+}
+
 pub async fn get_dashboard(
     req: HttpRequest,
     id: Path<String>,
@@ -176,7 +241,8 @@ pub async fn get_dashboard(
             validate_dashboard_id(id.into_inner())?,
             &get_tenant_id_from_request(&req),
         )
-        .await?,
+        .await
+        .map_err(|error| legacy_error(error, LegacyOperation::Get))?,
     ))
 }
 
@@ -193,9 +259,13 @@ pub async fn create_dashboard(
     req: HttpRequest,
     Json(document): Json<Value>,
 ) -> Result<HttpResponse, DashboardError> {
+    if document.get("title").and_then(Value::as_str) == Some("") {
+        return Err(DashboardError::Metadata("Title must be provided"));
+    }
     let (actor, tenant) = actor(&req)?;
-    let result =
-        dashboard_service::create_json(&actor, &tenant, document, &write_options(&req)?).await?;
+    let result = dashboard_service::create_json(&actor, &tenant, document, &write_options(&req)?)
+        .await
+        .map_err(|error| legacy_error(error, LegacyOperation::Create))?;
     Ok(document_response(result["dashboard"].clone()))
 }
 
@@ -214,22 +284,53 @@ pub async fn update_dashboard(
                 "Cannot use both query parameters and request body for updates",
             ));
         }
+        let mut query = query;
+        if let Some(rename) = query.get("renameTo")
+            && rename.trim().is_empty()
+        {
+            return Err(DashboardError::Metadata("Rename to cannot be empty"));
+        }
+        if let Some(favorite) = query.get_mut("isFavorite") {
+            *favorite = (*favorite == "true").to_string();
+        }
+        query.retain(|key, _| matches!(key.as_str(), "isFavorite" | "tags" | "renameTo"));
         DashboardMutation::Metadata(query)
     } else {
-        DashboardMutation::Replace(
-            body.ok_or(DashboardError::Metadata("Request body is required"))?
-                .into_inner(),
-        )
+        let document = body
+            .ok_or(DashboardError::Metadata("Request body is required"))?
+            .into_inner();
+        validate_legacy_tiles(&document)?;
+        DashboardMutation::Replace(document)
     };
-    let result = dashboard_service::mutate_json(
+    let result = dashboard_service::mutate_legacy_json(
         &actor,
         validate_dashboard_id(id.into_inner())?,
         &tenant,
         mutation,
         &write_options(&req)?,
     )
-    .await?;
+    .await
+    .map_err(|error| legacy_error(error, LegacyOperation::Update))?;
     Ok(document_response(result["dashboard"].clone()))
+}
+
+fn validate_legacy_tiles(document: &Value) -> Result<(), DashboardError> {
+    if let Some(tiles) = document["tiles"].as_array() {
+        let ids = tiles
+            .iter()
+            .filter_map(|tile| tile["tile_id"].as_str())
+            .collect::<Vec<_>>();
+        if ids
+            .iter()
+            .any(|id| ulid::Ulid::from_string(id).is_ok_and(|id| id.is_nil()))
+        {
+            return Err(DashboardError::Metadata("Tile ID must be provided"));
+        }
+        if ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len() {
+            return Err(DashboardError::Metadata("Tile IDs must be unique"));
+        }
+    }
+    Ok(())
 }
 
 pub async fn patch_dashboard(
@@ -294,7 +395,8 @@ pub async fn delete_dashboard(
         &tenant,
         &write_options(&req)?,
     )
-    .await?;
+    .await
+    .map_err(|error| legacy_error(error, LegacyOperation::Delete))?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -311,7 +413,8 @@ pub async fn add_tile(
         DashboardMutation::AddTile(tile),
         &write_options(&req)?,
     )
-    .await?;
+    .await
+    .map_err(|error| legacy_error(error, LegacyOperation::AddTile))?;
     Ok(document_response(result["dashboard"].clone()))
 }
 
@@ -393,7 +496,7 @@ impl actix_web::ResponseError for DashboardError {
                 StatusCode::BAD_REQUEST
             }
             Self::UserDoesNotExist(_) => StatusCode::NOT_FOUND,
-            Self::Unauthorized => StatusCode::FORBIDDEN,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::MetastoreError(e) => e.status_code(),
             Self::Api { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
@@ -401,7 +504,119 @@ impl actix_web::ResponseError for DashboardError {
         }
     }
     fn error_response(&self) -> HttpResponse {
-        HttpResponse::build(self.status_code())
-            .json(json!({"error":self.detail(),"message":self.to_string()}))
+        match self {
+            Self::Api { .. } => HttpResponse::build(self.status_code())
+                .json(json!({"error":self.detail(),"message":self.to_string()})),
+            Self::MetastoreError(error) => {
+                HttpResponse::build(self.status_code()).json(error.to_detail())
+            }
+            _ => HttpResponse::build(self.status_code())
+                .insert_header(ContentType::plaintext())
+                .body(self.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use actix_web::{ResponseError, body::to_bytes};
+
+    #[test]
+    fn listing_preserves_sort_limit_tags_and_opt_in_cursor_contracts() {
+        let mut rows = (0..600)
+            .map(|index| json!({"dashboardId":format!("{index:03}"),"modified":null}))
+            .collect::<Vec<_>>();
+        rows[0]["modified"] = json!("2026-10-19T10:30:00+02:00");
+        rows[1]["modified"] = json!("2026-10-19T09:00:00Z");
+        sort_by_modified(&mut rows);
+        assert_eq!(rows[0]["dashboardId"], "001");
+        assert_eq!(rows[1]["dashboardId"], "000");
+        assert_eq!(
+            filter_listing(rows.clone(), &HashMap::new(), false, 550).len(),
+            550
+        );
+        assert_eq!(
+            filter_listing(rows.clone(), &HashMap::new(), false, 0).len(),
+            600
+        );
+        assert_eq!(
+            filter_listing(rows.clone(), &HashMap::new(), true, 1).len(),
+            600
+        );
+        let cursor = HashMap::from([("after".to_owned(), "002".to_owned())]);
+        let page = filter_listing(rows, &cursor, true, 2);
+        assert_eq!(
+            page.iter()
+                .map(|row| row["dashboardId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["003", "004"]
+        );
+    }
+
+    #[actix_web::test]
+    async fn empty_tags_are_rejected_before_storage_access() {
+        let request = actix_web::test::TestRequest::get()
+            .uri("/dashboards?tags=%20,%20&limit=5")
+            .to_http_request();
+        let error = match list_dashboards(request).await {
+            Err(error) => error,
+            Ok(_) => panic!("empty tags should fail"),
+        };
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.to_string(),
+            "Cannot perform this operation: Tags cannot be empty"
+        );
+    }
+
+    #[actix_web::test]
+    async fn legacy_errors_keep_plaintext_status_and_body() {
+        for (operation, status, message) in [
+            (
+                LegacyOperation::Get,
+                400,
+                "Cannot perform this operation: Dashboard does not exist",
+            ),
+            (
+                LegacyOperation::Update,
+                400,
+                "Cannot perform this operation: Dashboard does not exist or user is not authorized",
+            ),
+            (
+                LegacyOperation::Delete,
+                400,
+                "Cannot perform this operation: Dashboard does not exist or you do not have permission to access it",
+            ),
+            (
+                LegacyOperation::AddTile,
+                401,
+                "Dashboard does not exist or is not accessible",
+            ),
+        ] {
+            let error = legacy_error(
+                DashboardError::api(
+                    404,
+                    "dashboard_not_found",
+                    "Dashboard does not exist",
+                    json!({}),
+                ),
+                operation,
+            );
+            let response = error.error_response();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(
+                to_bytes(response.into_body()).await.unwrap().as_ref(),
+                message.as_bytes()
+            );
+        }
+        assert_eq!(
+            DashboardError::api(412, "revision_conflict", "changed", json!({})).status_code(),
+            StatusCode::PRECONDITION_FAILED
+        );
     }
 }

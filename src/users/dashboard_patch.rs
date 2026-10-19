@@ -281,13 +281,12 @@ impl PatchError {
         if self.target.is_none() {
             self.target = Some(operation_target(operation));
         }
-        if self.path.is_none() {
-            if let DashboardOperation::Add { path, .. }
+        if self.path.is_none()
+            && let DashboardOperation::Add { path, .. }
             | DashboardOperation::Replace { path, .. }
             | DashboardOperation::Remove { path, .. } = operation
-            {
-                self.path = Some(path.clone());
-            }
+        {
+            self.path = Some(path.clone());
         }
         self
     }
@@ -931,10 +930,10 @@ fn tile_entity(
             Edit::Replace => {
                 let index = found.ok_or_else(|| not_found(format!("tile `{id}`")))?;
                 let mut tile = entity_value(value, "tile_id", matches, &canonical)?;
-                if !tile.contains_key("layout") {
-                    if let Some(layout) = tiles[index].get("layout") {
-                        tile.insert("layout".to_owned(), layout.clone());
-                    }
+                if !tile.contains_key("layout")
+                    && let Some(layout) = tiles[index].get("layout")
+                {
+                    tile.insert("layout".to_owned(), layout.clone());
                 }
                 tiles[index] = Value::Object(tile);
             }
@@ -1459,14 +1458,14 @@ fn place_tile(
         let mut relocated = false;
         if let Some(section) = section {
             let destination = section.as_deref().filter(|id| !id.is_empty());
-            if let Some(destination) = destination {
-                if !has_section(sections, destination) {
-                    return Err(not_found(format!("section `{destination}`")).target(
-                        PatchTarget::Section {
-                            id: destination.to_owned(),
-                        },
-                    ));
-                }
+            if let Some(destination) = destination
+                && !has_section(sections, destination)
+            {
+                return Err(not_found(format!("section `{destination}`")).target(
+                    PatchTarget::Section {
+                        id: destination.to_owned(),
+                    },
+                ));
             }
             let current = tiles[index]
                 .get("sectionId")
@@ -1501,10 +1500,10 @@ fn reorder_sections(document: &mut Value, ids: &[String]) -> Result<(), PatchErr
     let mut seen = HashSet::new();
     let mut slots = Vec::new();
     for (index, section) in sections.iter().enumerate() {
-        if let Some(id) = section_id(section) {
-            if seen.insert(id.to_owned()) {
-                slots.push(index);
-            }
+        if let Some(id) = section_id(section)
+            && seen.insert(id.to_owned())
+        {
+            slots.push(index);
         }
     }
     let mut requested = HashSet::new();
@@ -1729,18 +1728,18 @@ fn rename_variable(document: &mut Value, from: &str, to: &str) -> Result<(), Pat
                 continue;
             }
             for key in VARIABLE_SOURCES {
-                if let Some(Value::String(text)) = variable.get_mut(*key) {
-                    if let Some(renamed) = rename_tokens(text, from, to) {
-                        *text = renamed;
-                    }
+                if let Some(Value::String(text)) = variable.get_mut(*key)
+                    && let Some(renamed) = rename_tokens(text, from, to)
+                {
+                    *text = renamed;
                 }
             }
             if let Some(Value::Array(filters)) = variable.get_mut("labelFilters") {
                 for filter in filters {
-                    if let Some(Value::String(text)) = filter.get_mut("value") {
-                        if let Some(renamed) = rename_tokens(text, from, to) {
-                            *text = renamed;
-                        }
+                    if let Some(Value::String(text)) = filter.get_mut("value")
+                        && let Some(renamed) = rename_tokens(text, from, to)
+                    {
+                        *text = renamed;
                     }
                 }
             }
@@ -1963,16 +1962,16 @@ impl Checker {
         key: &str,
         shape: Shape,
     ) {
-        if let Some(value) = map.get(key).filter(|value| !value.is_null()) {
-            if !shape.accepts(value) {
-                self.error(
-                    "invalid_field_type",
-                    target,
-                    join(prefix, key),
-                    value.to_string(),
-                    format!("`{key}` must be {}", shape.describe()),
-                );
-            }
+        if let Some(value) = map.get(key).filter(|value| !value.is_null())
+            && !shape.accepts(value)
+        {
+            self.error(
+                "invalid_field_type",
+                target,
+                join(prefix, key),
+                value.to_string(),
+                format!("`{key}` must be {}", shape.describe()),
+            );
         }
     }
 
@@ -1985,16 +1984,16 @@ impl Checker {
         key: &str,
         allowed: &[&str],
     ) {
-        if let Some(value) = map.get(key).filter(|value| !value.is_null()) {
-            if !value.as_str().is_some_and(|value| allowed.contains(&value)) {
-                self.error(
-                    code,
-                    target,
-                    join(prefix, key),
-                    value.to_string(),
-                    format!("`{key}` must be one of: {}", allowed.join(", ")),
-                );
-            }
+        if let Some(value) = map.get(key).filter(|value| !value.is_null())
+            && !value.as_str().is_some_and(|value| allowed.contains(&value))
+        {
+            self.error(
+                code,
+                target,
+                join(prefix, key),
+                value.to_string(),
+                format!("`{key}` must be one of: {}", allowed.join(", ")),
+            );
         }
     }
 
@@ -2074,19 +2073,18 @@ fn check_document(document: &Value) -> Vec<Finding> {
         DASHBOARD_TYPES,
     );
     check_time_range(&mut c, root);
-    if let Some(value) = root.get("refreshInterval").filter(|value| !value.is_null()) {
-        if !value
+    if let Some(value) = root.get("refreshInterval").filter(|value| !value.is_null())
+        && !value
             .as_u64()
             .is_some_and(|ms| REFRESH_INTERVALS.contains(&ms))
-        {
-            c.error(
-                "invalid_refresh_interval",
-                &d,
-                "/refreshInterval",
-                value.to_string(),
-                "`refreshInterval` must be one of 0, 15000, 30000, 60000 or 300000 milliseconds",
-            );
-        }
+    {
+        c.error(
+            "invalid_refresh_interval",
+            &d,
+            "/refreshInterval",
+            value.to_string(),
+            "`refreshInterval` must be one of 0, 15000, 30000, 60000 or 300000 milliseconds",
+        );
     }
     let sections = collection(&mut c, root, "sections");
     let variables = collection(&mut c, root, "variables");
@@ -2214,16 +2212,16 @@ fn check_time_range(c: &mut Checker, root: &Map<String, Value>) {
                     );
                 }
             }
-            if let (Some(Some(start)), Some(Some(end))) = (start, end) {
-                if start >= end {
-                    c.error(
-                        "invalid_time_range",
-                        &d,
-                        join(p, "startTime"),
-                        json!([range.get("startTime"), range.get("endTime")]).to_string(),
-                        "custom `timeRange.startTime` must be before `endTime`",
-                    );
-                }
+            if let (Some(Some(start)), Some(Some(end))) = (start, end)
+                && start >= end
+            {
+                c.error(
+                    "invalid_time_range",
+                    &d,
+                    join(p, "startTime"),
+                    json!([range.get("startTime"), range.get("endTime")]).to_string(),
+                    "custom `timeRange.startTime` must be before `endTime`",
+                );
             }
         }
         _ => {}
@@ -2404,10 +2402,10 @@ fn check_variables(c: &mut Checker, variables: &[Value]) {
             _ => &[],
         };
         for key in required {
-            if !map
+            if map
                 .get(*key)
                 .and_then(Value::as_str)
-                .is_some_and(|text| !text.trim().is_empty())
+                .is_none_or(|text| text.trim().is_empty())
             {
                 c.error(
                     "incomplete_variable",
@@ -2428,16 +2426,17 @@ fn check_variables(c: &mut Checker, variables: &[Value]) {
                     detail(map.get("options")),
                     "a `list` variable requires at least one option",
                 );
-            } else if let (Some(default), Some(options)) = (map.get("defaultValue"), options) {
-                if default.is_string() && !options.contains(default) {
-                    c.advise(
-                        "default_not_in_options",
-                        &target,
-                        "/defaultValue",
-                        default.to_string(),
-                        "`defaultValue` is not one of the options; the first option is selected",
-                    );
-                }
+            } else if let (Some(default), Some(options)) = (map.get("defaultValue"), options)
+                && default.is_string()
+                && !options.contains(default)
+            {
+                c.advise(
+                    "default_not_in_options",
+                    &target,
+                    "/defaultValue",
+                    default.to_string(),
+                    "`defaultValue` is not one of the options; the first option is selected",
+                );
             }
         }
         readable.push((name, map));
@@ -2918,15 +2917,15 @@ fn check_builder_query(
                 "builder `fields` must be an array",
             ),
         }
-        if let Some(group) = axis.get("groupBy").filter(|value| !value.is_null()) {
-            if !Shape::Strings.accepts(group) {
-                fail(
-                    c,
-                    join(&at, "groupBy"),
-                    Some(group),
-                    "builder `groupBy` must be an array of column names",
-                );
-            }
+        if let Some(group) = axis.get("groupBy").filter(|value| !value.is_null())
+            && !Shape::Strings.accepts(group)
+        {
+            fail(
+                c,
+                join(&at, "groupBy"),
+                Some(group),
+                "builder `groupBy` must be an array of column names",
+            );
         }
         if let Some(sort) = axis.get("sortBy").filter(|value| !value.is_null()) {
             let field = sort
@@ -2953,10 +2952,10 @@ fn check_builder_query(
         );
     }
     for (index, field) in fields(x).into_iter().enumerate() {
-        if !field
+        if field
             .get("name")
             .and_then(Value::as_str)
-            .is_some_and(|name| !name.is_empty())
+            .is_none_or(|name| name.is_empty())
         {
             fail(
                 c,
@@ -2993,18 +2992,16 @@ fn check_builder_query(
     if let Some(grain) = x
         .and_then(|x| x.get("granularity"))
         .filter(|value| !value.is_null())
-    {
-        if !grain
+        && !grain
             .as_str()
             .is_some_and(|grain| BUILDER_GRAINS.contains(&grain))
-        {
-            fail(
-                c,
-                join(p, "x") + "/granularity",
-                Some(grain),
-                "unsupported time granularity",
-            );
-        }
+    {
+        fail(
+            c,
+            join(p, "x") + "/granularity",
+            Some(grain),
+            "unsupported time granularity",
+        );
     }
     if chart == Some("timeseries") && fields(x).is_empty() {
         fail(
@@ -3026,20 +3023,18 @@ fn check_builder_query(
             },
         );
     }
-    if !stat {
-        if let Some(limit) = y
+    if !stat
+        && let Some(limit) = y
             .and_then(|y| y.get("limit"))
             .filter(|value| !value.is_null())
-        {
-            if !limit.as_u64().is_some_and(|limit| limit >= 1) {
-                fail(
-                    c,
-                    format!("{p}/y/limit"),
-                    Some(limit),
-                    "builder `limit` must be a whole number of at least 1",
-                );
-            }
-        }
+        && limit.as_u64().is_none_or(|limit| limit < 1)
+    {
+        fail(
+            c,
+            format!("{p}/y/limit"),
+            Some(limit),
+            "builder `limit` must be a whole number of at least 1",
+        );
     }
     match query.get("filters") {
         None | Some(Value::Null) => {}
@@ -3216,16 +3211,15 @@ fn check_chart_layout(
     );
     if let Some(position @ ("left" | "right")) =
         layout.get("legendPosition").and_then(Value::as_str)
+        && !matches!(chart, Some("pie" | "donut"))
     {
-        if !matches!(chart, Some("pie" | "donut")) {
-            c.advise(
-                "side_legend",
-                target,
-                "/config/layout/legendPosition",
-                position.to_owned(),
-                "the editor offers left/right legends only for pie and donut charts",
-            );
-        }
+        c.advise(
+            "side_legend",
+            target,
+            "/config/layout/legendPosition",
+            position.to_owned(),
+            "the editor offers left/right legends only for pie and donut charts",
+        );
     }
     for key in ["label", "stacked", "sparkline", "humanize"] {
         c.field(target, p, layout, key, Shape::Bool);
@@ -3258,19 +3252,18 @@ fn check_chart_layout(
     c.field(target, p, layout, "rangeFrom", Shape::Number);
     c.field(target, p, layout, "rangeTo", Shape::Number);
     c.field(target, p, layout, "maxDataPoints", Shape::PositiveNumber);
-    if let Some(precision) = present(layout, "precision") {
-        if !precision
+    if let Some(precision) = present(layout, "precision")
+        && !precision
             .as_i64()
             .is_some_and(|value| (-1..=20).contains(&value))
-        {
-            c.error(
-                "invalid_field_value",
-                target,
-                "/config/layout/precision",
-                precision.to_string(),
-                "`precision` must be an integer from -1 (precise) to 20",
-            );
-        }
+    {
+        c.error(
+            "invalid_field_value",
+            target,
+            "/config/layout/precision",
+            precision.to_string(),
+            "`precision` must be an integer from -1 (precise) to 20",
+        );
     }
     let segments = present(layout, "segments");
     let thresholds = segments.as_ref().and_then(|segments| {

@@ -41,7 +41,8 @@ dashboards does not grant dataset query access. No alert or notification mutatio
 is enabled by this setting.
 
 The tool transport authenticates the session/API key independently of the chosen
-tool. Dashboard configuration operations do not require `Query`. Explicit query
+tool. Catalog discovery retains its existing `Query` authorization and suspension
+gate. Dashboard configuration calls do not require `Query`. Explicit query
 execution requires `Query` and access to every referenced dataset; saved dashboard
 execution also requires `GetDashboard`. Credentials and API keys keep their
 existing scope, expiry and revocation behavior.
@@ -67,7 +68,7 @@ REST endpoint additions alone do not become tools.
 | GET | `/api/v1/dashboards/{id}` | Authoritative document, JSON `revision`, and quoted `ETag` |
 | PATCH | `/api/v1/dashboards/{id}` | Atomic ID-addressed batch; requires observed revision |
 | POST | `/api/v1/dashboards/{id}/validate` | The same batch as a dry run |
-| PUT | `/api/v1/dashboards/{id}` | Full replacement; requires header or body revision |
+| PUT | `/api/v1/dashboards/{id}` | Full replacement; optional header or body revision for legacy unkeyed PUT |
 | PUT | `/api/v1/dashboards/{id}/add_tile` | Add one raw tile using shared delta semantics |
 | DELETE | `/api/v1/dashboards/{id}` | Conditional logical deletion |
 | POST | `/api/v1/dashboards/preview` | Explicit bounded query execution without saving |
@@ -173,10 +174,16 @@ others. A `412` includes the current revision. Missing required revision is `428
 Pass a single strong quoted ETag in `If-Match`; raw JSON revisions are accepted
 for compatibility. Weak/wildcard/list preconditions are rejected.
 
-A stale full replacement without an observed revision is rejected. Older clients
-can echo the `revision` field from GET in the replacement body. Legacy unkeyed
-favorite/tags/add-tile operations apply their delta to fresh state, retrying
-storage contention at most eight times. They never write an earlier whole copy.
+Legacy unkeyed REST PUT accepts a full replacement without a revision. The
+server captures the authoritative source revision once and commits through the
+same conditional storage path; an intervening write returns 412 without retrying
+the replacement against newer data. A client body prepared before the request
+can still overwrite earlier edits: detecting that intent requires the caller to
+send its observed header/body revision. This is an inherent limit of the legacy
+unversioned replacement contract. PATCH, keyed mutations and agent tools retain
+the explicit revision requirement. Legacy unkeyed favorite/tags/add-tile
+operations apply their delta to fresh state, retrying storage contention at most
+eight times.
 
 Agent mutation keys are bound to the authenticated principal, tenant, dashboard,
 operation and arguments. Creates use a deterministic ID for keyed retries. Recent
@@ -218,6 +225,20 @@ so new dashboards created by another server remain visible. Cached legacy title
 candidates are rechecked against authoritative documents. Listing currently
 reads all dashboard documents in the tenant, including compact tombstones, before
 filtering and pagination; it is not an indexed constant-cost listing operation.
+Malformed JSON records are skipped in listings/tags, as in the legacy loader;
+storage failures still surface. Default REST listing sorts by modified time
+(descending), `limit=0` means all, positive limits have no new cap, `tags` ignores
+`limit`, and an empty tags filter is a 400. An explicit `after` parameter opts
+into ID-ordered cursor pagination; dashboard tools also use ID order. Existing
+REST errors retain their plaintext status/body contracts; PATCH/tool and new
+concurrency errors are structured.
+
+Rollout remains blocked until supported S3/MinIO, Azure and GCS configurations
+are checked for conditional writes and parent-owned CPU/RAM benchmarks pass.
+Mixed old/new serving nodes are unsafe: old nodes may expose tombstones as live
+dashboards or overwrite metadata without CAS. Upgrade all nodes together and do
+not roll back with tombstones present. No unconditional fallback is implemented
+for backends that reject conditional writes.
 Dry runs check current title availability without reserving it; concurrent writes
 can change that availability before commit.
 
