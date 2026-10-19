@@ -21,7 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::BufWriter,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -126,6 +126,14 @@ impl Writer {
 
         flushable_disk
     }
+
+    /// Part files still owned by attached disk writers.
+    pub(crate) fn active_part_paths(&self) -> HashSet<PathBuf> {
+        self.disk
+            .values()
+            .map(|writer| writer.path().to_path_buf())
+            .collect()
+    }
 }
 
 pub struct DiskWriter {
@@ -141,20 +149,8 @@ impl DiskWriter {
         schema: &Schema,
         range: TimeRange,
     ) -> Result<Self, StagingError> {
-        let mut path = path.into();
-
-        // a rudimentary way to ensure one parquet per arrow file
-        if *ONE_PARQUET_PER_ARROW {
-            path.set_extension(Ulid::new().to_string());
-            path.add_extension(ARROW_FILE_EXTENSION);
-        }
-        path.add_extension(PART_FILE_EXTENSION);
-
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&path)?;
+        let base = path.into();
+        let (file, path) = Self::create_part_file(&base, *ONE_PARQUET_PER_ARROW)?;
         let inner = StreamWriter::try_new_with_options(
             BufWriter::new(file),
             schema,
@@ -164,6 +160,44 @@ impl DiskWriter {
         )?;
 
         Ok(Self { inner, path, range })
+    }
+
+    /// Exclusively creates a new `.arrows.part` file for `base`.
+    ///
+    /// A part file is owned by exactly one writer. A writer detached by flush
+    /// still owns its part until Drop renames it, and a late event for that
+    /// minute may open a new writer in the meantime; a crash can also leave an
+    /// orphan awaiting startup recovery. Truncating either would destroy data
+    /// whose ingestion was already acknowledged, so an occupied name gets a
+    /// per-file ULID after `.data`, which keeps the same parquet group.
+    fn create_part_file(base: &Path, unique: bool) -> Result<(File, PathBuf), StagingError> {
+        const MAX_ATTEMPTS: usize = 8;
+        let mut unique = unique;
+        let mut attempt = 0;
+        loop {
+            let mut path = base.to_path_buf();
+            if unique {
+                path.set_extension(Ulid::new().to_string());
+                path.add_extension(ARROW_FILE_EXTENSION);
+            }
+            path.add_extension(PART_FILE_EXTENSION);
+
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((file, path)),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AlreadyExists
+                        && attempt < MAX_ATTEMPTS =>
+                {
+                    unique = true;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Returns whether this writer belongs to the current time range.
