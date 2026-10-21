@@ -162,6 +162,14 @@ impl Writer {
         flushable_disk.into_values().collect()
     }
 
+    /// Part files still owned by attached disk writers.
+    pub(crate) fn active_part_paths(&self) -> HashSet<PathBuf> {
+        self.disk
+            .values()
+            .map(|writer| writer.path.clone())
+            .collect()
+    }
+
     fn split_flushable_disk(
         &mut self,
         forced: bool,

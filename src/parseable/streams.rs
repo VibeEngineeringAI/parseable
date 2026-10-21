@@ -384,6 +384,12 @@ pub struct Stream {
     /// captures memory and the staging Parquet set, so each staged row is seen
     /// exactly once. Lock order: `publication`, then `writer`.
     publication: RwLock<()>,
+    /// Held shared by `flush` from detaching writers until they are sealed,
+    /// and exclusively by part recovery. Recovery therefore never sees a part
+    /// that is detached but still owned by a flush, so a part with pending
+    /// memory and no attached writer is one whose seal failed. Lock order:
+    /// `part_lifecycle`, then `writer`.
+    part_lifecycle: RwLock<()>,
     schema_writer: Mutex<()>,
     pub ingestor_id: Option<String>,
     #[cfg(test)]
@@ -707,6 +713,7 @@ impl Stream {
             options,
             writer: Mutex::new(Writer::default()),
             publication: RwLock::new(()),
+            part_lifecycle: RwLock::new(()),
             schema_writer: Mutex::new(()),
             ingestor_id,
             #[cfg(test)]
@@ -1262,9 +1269,15 @@ impl Stream {
         clock: impl FnOnce() -> DateTime<Utc>,
     ) -> Result<(), StagingError> {
         let _span = info_span!("flush", stream_name = %self.stream_name, forced).entered();
-        // Swap out stale writers under the lock, drop them after releasing it.
-        // DiskWriter::Drop does I/O (IPC finish + file rename) so dropping
-        // outside the lock avoids blocking concurrent push() calls.
+        let _lifecycle = self.part_lifecycle.read().map_err(|poisoned| {
+            StagingError::PoisonError(PoisonError::new(format!(
+                "Part lifecycle lock poisoned while flushing data for stream {} - {}",
+                self.stream_name, poisoned
+            )))
+        })?;
+        // Swap out stale writers under the lock, seal them after releasing it.
+        // Sealing does I/O (IPC finish + file rename), so doing it outside the
+        // writer lock avoids blocking concurrent push() calls.
         let stale_writers = {
             let mut writer = self.writer.lock().map_err(|poisoned| {
                 StagingError::PoisonError(PoisonError::new(format!(
@@ -2714,17 +2727,51 @@ impl Stream {
     }
 
     /// Recovers orphaned Arrow parts and removes rebuildable Parquet parts.
+    ///
+    /// Parts of attached writers are live and skipped. Pending memory follows
+    /// a recovered part to its `.arrows` name before the rename exposes it to
+    /// conversion, and is released when a part is discarded.
     fn recover_orphan_part_files(&self) {
+        // Fail closed: without the lock a part may still belong to a flush.
+        let _lifecycle = match self.part_lifecycle.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!(
+                    "Part lifecycle lock poisoned, skipping part recovery for stream {} - {poisoned}",
+                    self.stream_name
+                );
+                return;
+            }
+        };
         let Ok(dir) = self.data_path.read_dir() else {
             return;
         };
+        let candidates = dir
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == PART_FILE_EXTENSION)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        // Listed before this snapshot: writers cannot be detached meanwhile,
+        // and later writers create new parts, which were not listed.
+        let attached = match self.writer.lock() {
+            Ok(writer) => writer.active_part_paths(),
+            Err(poisoned) => {
+                error!(
+                    "Writer lock poisoned, skipping part recovery for stream {} - {poisoned}",
+                    self.stream_name
+                );
+                return;
+            }
+        };
 
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|ext| ext == PART_FILE_EXTENSION)
-            {
+        for path in candidates {
+            if !attached.contains(&path) {
                 info!(
                     "Found orphaned .part file: {:?} for stream {}",
                     path, self.stream_name
@@ -2737,6 +2784,7 @@ impl Stream {
                             "Removing empty orphaned .part file: {:?} for stream {}",
                             path, self.stream_name
                         );
+                        self.release_pending(std::slice::from_ref(&path));
                         if let Err(e) = remove_file(&path) {
                             error!("Failed to remove empty .part file {:?}: {e}", path);
                         }
@@ -2775,6 +2823,8 @@ impl Stream {
                                         self.stream_name,
                                         meta.len()
                                     );
+                                    // Discarded rows are not persisted.
+                                    self.release_pending(std::slice::from_ref(&path));
                                     if let Err(delete_err) = remove_file(&path) {
                                         error!(
                                             "Failed to remove invalid/corrupted .part file {:?}: {delete_err}",
@@ -2813,11 +2863,14 @@ impl Stream {
                                         "Recovering orphaned .part file: {:?} -> {:?} for stream {}",
                                         path, arrow_path, self.stream_name
                                     );
+                                    // A failed seal's rows follow its part.
+                                    self.rekey_pending([(&path, &arrow_path)]);
                                     if let Err(e) = std::fs::rename(&path, &arrow_path) {
                                         error!(
                                             "Failed to rename .part file {:?} to {:?}: {e}",
                                             path, arrow_path
                                         );
+                                        self.rekey_pending([(&arrow_path, &path)]);
                                     }
                                 }
                             }
@@ -3653,6 +3706,71 @@ mod tests {
         staging.prepare_parquet(false, true, &None).unwrap();
         assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![3]));
         assert_eq!(part_files(&staging), failed);
+
+        // Startup recovery on the same Stream exposes the failed part as Arrow;
+        // its rows must follow it and be published exactly once.
+        startup_then_shutdown_conversion(&staging);
+        assert!(part_files(&staging).is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![], vec![1, 2, 3]));
+    }
+
+    /// Runs startup preparation and its plan, then a shutdown conversion that
+    /// converts every root Arrow file, as a restart followed by sync would.
+    fn startup_then_shutdown_conversion(staging: &StreamRef) {
+        staging
+            .prepare_startup_sync(None)
+            .unwrap()
+            .execute()
+            .unwrap();
+        staging.prepare_parquet(false, true, &None).unwrap();
+    }
+
+    #[test]
+    fn conversion_visibility_startup_recovery_skips_attached_writer() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_stream(&dir, "startup-attached");
+        // Accepted before startup recovery reaches this stream: the writer is
+        // still attached and its part is live, not an orphan.
+        push_ids(&staging, &schema, "schema-a", vec![1, 2], conversion_now());
+        assert_eq!(part_files(&staging).len(), 1);
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![]));
+
+        startup_then_shutdown_conversion(&staging);
+        assert!(part_files(&staging).is_empty());
+        assert!(staging.arrow_files().is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![], vec![1, 2]));
+    }
+
+    #[test]
+    fn conversion_visibility_recovery_discard_releases_pending_rows() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_stream(&dir, "recovery-discard");
+        let now = conversion_now();
+        push_ids(&staging, &schema, "schema-a", vec![1, 2], now);
+        let blockers = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&blockers);
+        set_conversion_hook(&staging, move |phase| {
+            if let ConversionPhase::BeforeSealRename(arrow) = phase {
+                fs::create_dir(arrow).unwrap();
+                fs::write(arrow.join("blocker"), b"x").unwrap();
+                recorded.lock().unwrap().push(arrow.to_path_buf());
+            }
+        });
+        staging.flush_with_clock(true, || now).unwrap();
+        *staging.conversion_hook.lock().unwrap() = None;
+        for blocker in std::mem::take(&mut *blockers.lock().unwrap()) {
+            fs::remove_dir_all(blocker).unwrap();
+        }
+        let failed = part_files(&staging);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![]));
+
+        // Recovery discards a part with no complete batch; its rows are not
+        // persisted, so memory must stop serving them too.
+        fs::write(&failed[0], b"bad").unwrap();
+        startup_then_shutdown_conversion(&staging);
+        assert!(part_files(&staging).is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![], vec![]));
     }
 
     #[test]
