@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 
-use itertools::Itertools;
 use parquet::file::{
     metadata::{RowGroupMetaData, SortingColumn},
     reader::FileReader,
@@ -230,7 +229,12 @@ fn sort_order(
 ) -> Vec<Vec<(String, SortOrder)>> {
     let mut sort_orders = Vec::new();
     for row_group in row_groups {
-        let sort_order = row_group.sorting_columns().unwrap();
+        // Keep an empty claim for unknown groups so file-level comparison
+        // still includes every row group.
+        let sort_order = row_group
+            .sorting_columns()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let sort_order = sort_order
             .iter()
             .map(|sort_order| {
@@ -240,7 +244,8 @@ fn sort_order(
                     nulls_first,
                 } = sort_order;
                 let col = row_group
-                    .column(*column_idx as usize)
+                    .columns()
+                    .get(usize::try_from(*column_idx).ok()?)?
                     .column_descr()
                     .path()
                     .string();
@@ -251,9 +256,12 @@ fn sort_order(
                     (false, false) => SortOrder::AscNullsLast,
                 };
 
-                (col, sort_info)
+                Some((col, sort_info))
             })
-            .collect_vec();
+            // An invalid key invalidates the whole claim, including any
+            // valid prefix or suffix of the sorting columns.
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
 
         sort_orders.push(sort_order);
     }
@@ -388,5 +396,217 @@ mod codec_tests {
             decode_manifest(b"not json, not zstd"),
             Err(ManifestCodecError::Parse(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod sorting_tests {
+    use std::{io::Write, sync::Arc};
+
+    use parquet::{
+        data_type::Int64Type,
+        file::{
+            metadata::{ParquetMetaData, ParquetMetaDataWriter},
+            properties::WriterProperties,
+            serialized_reader::SerializedFileReader,
+            writer::{SerializedFileWriter, TrackedWrite},
+        },
+        schema::parser::parse_message_type,
+    };
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    fn sorting_column(column_idx: i32, descending: bool, nulls_first: bool) -> SortingColumn {
+        SortingColumn {
+            column_idx,
+            descending,
+            nulls_first,
+        }
+    }
+
+    // Write real column pages, then replace only the footer's per-row-group
+    // sorting declarations (WriterProperties applies one declaration to all groups).
+    fn parquet_with_sorting(sorting: Vec<Option<Vec<SortingColumn>>>) -> NamedTempFile {
+        let schema = Arc::new(
+            parse_message_type(
+                "message test { REQUIRED INT64 first; \
+                 REQUIRED GROUP nested { REQUIRED INT64 leaf; } }",
+            )
+            .unwrap(),
+        );
+        let mut bytes = Vec::new();
+        let mut writer = SerializedFileWriter::new(
+            &mut bytes,
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        for _ in &sorting {
+            let mut row_group = writer.next_row_group().unwrap();
+            while let Some(mut column) = row_group.next_column().unwrap() {
+                column
+                    .typed::<Int64Type>()
+                    .write_batch(&[1, 2], None, None)
+                    .unwrap();
+                column.close().unwrap();
+            }
+            row_group.close().unwrap();
+        }
+        let metadata = writer.close().unwrap();
+        let row_groups = metadata
+            .row_groups()
+            .iter()
+            .cloned()
+            .zip(sorting.iter().cloned())
+            .map(|(group, sorting)| {
+                group
+                    .into_builder()
+                    .set_sorting_columns(sorting)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let metadata = ParquetMetaData::new(metadata.file_metadata().clone(), row_groups);
+        let footer_len =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+        let file = NamedTempFile::new().unwrap();
+        let mut output = TrackedWrite::new(file.reopen().unwrap());
+        output
+            .write_all(&bytes[..bytes.len() - 8 - footer_len as usize])
+            .unwrap();
+        ParquetMetaDataWriter::new_with_tracked(output, &metadata)
+            .finish()
+            .unwrap();
+
+        let reader = SerializedFileReader::new(file.reopen().unwrap()).unwrap();
+        assert_eq!(
+            reader
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|group| group.sorting_columns().cloned())
+                .collect::<Vec<_>>(),
+            sorting,
+        );
+        let rows = reader
+            .get_row_iter(None)
+            .unwrap()
+            .collect::<parquet::errors::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), sorting.len() * 2);
+        file
+    }
+
+    fn manifest_with_sorting(sorting: Vec<Option<Vec<SortingColumn>>>) -> File {
+        let row_count = sorting.len() as u64 * 2;
+        let file = parquet_with_sorting(sorting);
+        let manifest = create_from_parquet_file("object.parquet".to_owned(), file.path()).unwrap();
+        assert_eq!(manifest.file_path, "object.parquet");
+        assert_eq!(manifest.num_rows, row_count);
+        assert_eq!(manifest.file_size, file.as_file().metadata().unwrap().len());
+        assert!(manifest.ingestion_size > 0);
+        let mut names = manifest
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["first", "nested.leaf"]);
+        manifest
+    }
+
+    #[test]
+    fn sort_order_preserves_row_group_alignment() {
+        let valid = vec![sorting_column(1, true, false)];
+        let file = parquet_with_sorting(vec![
+            None,
+            Some(valid.clone()),
+            Some(vec![]),
+            None,
+            Some(valid),
+        ]);
+        let reader = SerializedFileReader::new(file.reopen().unwrap()).unwrap();
+        let claim = vec![("nested.leaf".to_owned(), SortOrder::DescNullsLast)];
+        assert_eq!(
+            sort_order(reader.metadata().row_groups()),
+            vec![vec![], claim.clone(), vec![], vec![], claim]
+        );
+    }
+
+    #[test]
+    fn manifest_from_parquet_without_sorting_columns() {
+        for sorting in [None, Some(vec![])] {
+            assert!(
+                manifest_with_sorting(vec![sorting.clone(), sorting])
+                    .sort_order_id
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_from_parquet_mixed_sorting_columns_has_no_claim() {
+        let valid = Some(vec![sorting_column(1, true, false)]);
+        for missing in [None, Some(vec![])] {
+            // Unknown groups at either end must participate in the file-level comparison.
+            for sorting in [
+                vec![missing.clone(), valid.clone()],
+                vec![valid.clone(), missing],
+            ] {
+                assert!(manifest_with_sorting(sorting).sort_order_id.is_empty());
+            }
+        }
+        let different = Some(vec![sorting_column(1, false, false)]);
+        assert!(
+            manifest_with_sorting(vec![valid, different])
+                .sort_order_id
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn manifest_from_parquet_preserves_sort_flags_and_nested_paths() {
+        for (descending, nulls_first, expected) in [
+            (false, false, SortOrder::AscNullsLast),
+            (false, true, SortOrder::AscNullsFirst),
+            (true, false, SortOrder::DescNullsLast),
+            (true, true, SortOrder::DescNullsFirst),
+        ] {
+            let sorting = Some(vec![
+                sorting_column(1, descending, nulls_first),
+                sorting_column(0, false, true),
+            ]);
+            assert_eq!(
+                manifest_with_sorting(vec![sorting.clone(), sorting]).sort_order_id,
+                vec![
+                    ("nested.leaf".to_owned(), expected),
+                    ("first".to_owned(), SortOrder::AscNullsFirst)
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn sort_order_invalid_index_discards_entire_row_group() {
+        let valid = sorting_column(0, false, true);
+        for index in [-1, 2, i32::MIN, i32::MAX] {
+            for position in 0..=2 {
+                let mut sorting = vec![valid.clone(), sorting_column(1, true, false)];
+                sorting.insert(position, sorting_column(index, true, false));
+                let file = parquet_with_sorting(vec![Some(sorting), Some(vec![valid.clone()])]);
+                let reader = SerializedFileReader::new(file.reopen().unwrap()).unwrap();
+                assert_eq!(
+                    sort_order(reader.metadata().row_groups()),
+                    vec![vec![], vec![("first".to_owned(), SortOrder::AscNullsFirst)]]
+                );
+                assert!(
+                    create_from_parquet_file("object.parquet".to_owned(), file.path())
+                        .unwrap()
+                        .sort_order_id
+                        .is_empty()
+                );
+            }
+        }
     }
 }
