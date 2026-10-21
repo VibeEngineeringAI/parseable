@@ -99,15 +99,14 @@ export function AlertActions({
     <div className="alerts-action-block">
       {detail ? (
         <div className="alerts-actions">
-          {alert.queryType !== 'builder' && (
-            <Button
-              size="sm"
-              disabled={mutation.pending}
-              onClick={() => navigate(`/alerts/${encodeURIComponent(alert.id)}/edit`)}
-            >
-              Edit
-            </Button>
-          )}
+          {/* Opening the form only reads the alert; builder rules convert on save. */}
+          <Button
+            size="sm"
+            disabled={mutation.pending}
+            onClick={() => navigate(`/alerts/${encodeURIComponent(alert.id)}/edit`)}
+          >
+            {alert.queryType === 'builder' ? 'Convert to SQL rule' : 'Edit'}
+          </Button>
           {[evaluate, toggle, { ...mute, label: muted ? 'Unmute' : 'Mute' }].map((item) => (
             <Button key={item.id} size="sm" disabled={item.disabled} onClick={item.onSelect}>
               {item.label}

@@ -53,6 +53,8 @@ export function AlertForm({ original }: { original?: Alert }) {
   const duplicate =
     isAlert(duplicateValue) && duplicateValue.queryType !== 'builder' ? duplicateValue : undefined;
   const source = original ?? duplicate;
+  // Builder rules already run their stored SQL; saving converts them to SQL rules.
+  const converting = original?.queryType === 'builder';
   const promqlEnabled = about.data?.capabilities.promqlAlerts === true;
   // Keep draft row IDs stable when the shell re-renders (for example on a theme change).
   const initial = useMemo(
@@ -65,7 +67,7 @@ export function AlertForm({ original }: { original?: Alert }) {
   return (
     <div className="page alerts-page">
       <PageHeader
-        title={original ? 'Edit alert' : 'New alert'}
+        title={converting ? 'Convert to SQL rule' : original ? 'Edit alert' : 'New alert'}
         description="Trigger a threshold rule for each query value."
       />
       <QueryState loading={about.loading} error={about.error} retry={about.reload} />
@@ -78,16 +80,12 @@ export function AlertForm({ original }: { original?: Alert }) {
             title="Permission denied"
             description="Ask your administrator for permission to manage alerts."
           />
-        ) : original?.queryType === 'builder' ? (
-          <EmptyState
-            title="Builder alerts are read-only"
-            description="Editing builder alerts is not supported yet."
-          />
         ) : (
           <AlertFormFields
             key={source?.id ?? location.key}
             original={original}
             source={source}
+            converting={converting}
             promqlEnabled={promqlEnabled}
             initial={initial}
             onSaved={(id) => navigate(`/alerts/${encodeURIComponent(id)}`)}
@@ -100,12 +98,14 @@ export function AlertForm({ original }: { original?: Alert }) {
 function AlertFormFields({
   original,
   source,
+  converting,
   promqlEnabled,
   initial,
   onSaved,
 }: {
   original?: Alert;
   source?: Alert;
+  converting: boolean;
   promqlEnabled: boolean;
   initial: AlertDraft;
   onSaved: (id: string) => void;
@@ -220,6 +220,14 @@ function AlertFormFields({
             <h2>Rule</h2>
           </CardHeader>
           <CardBody className="stack">
+            {converting && (
+              <p className="notice" data-testid="alert-conversion-notice">
+                This alert was created with the query builder, which is no longer available. The SQL
+                below is the query it already runs. Saving converts it to an SQL rule and keeps its
+                threshold, evaluation, targets, severity, tags, enabled and mute state. Nothing
+                changes until you save.
+              </p>
+            )}
             <div className="alerts-fields">
               <Select
                 label="Alert type"
@@ -539,7 +547,13 @@ function AlertFormFields({
               Cancel
             </Button>
             <Button type="submit" variant="primary" disabled={!ready}>
-              {mutation.pending ? 'Saving…' : original ? 'Save alert' : 'Create alert'}
+              {mutation.pending
+                ? 'Saving…'
+                : converting
+                  ? 'Convert and save'
+                  : original
+                    ? 'Save alert'
+                    : 'Create alert'}
             </Button>
           </div>
         </div>
