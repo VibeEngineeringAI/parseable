@@ -400,10 +400,10 @@ impl StandardTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         state: &dyn Session,
-        partitioned_files: Vec<PartitionedFile>,
-        records: Vec<RecordBatch>,
+        captured: (Vec<RecordBatch>, Vec<PartitionedFile>),
     ) -> Result<(), DataFusionError> {
         // Both sources were captured before the remote snapshot was read.
+        let (records, partitioned_files) = captured;
         let arrow_exec = reversed_mem_table(records, self.schema.clone())?
             .scan(state, projection, filters, limit)
             .await?;
@@ -851,8 +851,7 @@ impl TableProvider for StandardTableProvider {
                 filters,
                 limit,
                 state,
-                staged_files,
-                staged_records,
+                (staged_records, staged_files),
             )
             .await?;
         }
