@@ -1192,8 +1192,9 @@ impl Stream {
     /// Captures staged rows for one query consistently with Parquet
     /// publication: every staged row is in exactly one of the returned memory
     /// batches or the Parquet files `capture_parquet` finds in the staging
-    /// directory. `capture_parquet` delays publication, so it should only list
-    /// or lease files; it must not read or scan them.
+    /// directory. `capture_parquet` delays publication: it may list, lease and
+    /// validate file footers, but must leave row scans and query execution
+    /// outside the lock.
     ///
     /// Without memory staging (`ENABLE_MEMORY_STAGING=false`) only published
     /// Parquet is captured: unconverted rows are intentionally not queryable.
@@ -2331,43 +2332,46 @@ impl Stream {
     /// function to validate parquet files
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_valid_parquet_file(path: &Path, stream_name: &str) -> bool {
-        // First check file size as a quick validation
-        match path.metadata() {
-            Ok(meta) if meta.len() < FOOTER_SIZE as u64 => {
-                error!(
-                    "Invalid parquet file {path:?} detected for stream {stream_name}, size: {} bytes",
-                    meta.len()
-                );
-                return false;
-            }
-            Err(e) => {
-                error!(
-                    "Cannot read metadata for parquet file {path:?} for stream {stream_name}: {e}"
-                );
-                return false;
-            }
-            _ => {} // File size is adequate, continue validation
-        }
+        Self::validate_parquet_file(path, stream_name).unwrap_or_else(|error| {
+            error!("Cannot validate parquet file {path:?} for stream {stream_name}: {error}");
+            false
+        })
+    }
 
-        // Try to open and read the parquet file metadata to verify it's valid
-        match std::fs::File::open(path) {
-            Ok(file) => match SerializedFileReader::new(file) {
-                Ok(reader) => {
-                    if reader.metadata().file_metadata().num_rows() == 0 {
-                        error!("Invalid parquet file {path:?} for stream {stream_name}");
-                        false
-                    } else {
-                        true
+    /// The query calls this on its immutable lease, propagating access/metadata
+    /// failures while retaining the uploader's corrupt/empty-file skip policy.
+    pub(crate) fn validate_parquet_file(path: &Path, stream_name: &str) -> std::io::Result<bool> {
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        if size < FOOTER_SIZE as u64 {
+            error!(
+                "Invalid parquet file {path:?} detected for stream {stream_name}, size: {size} bytes"
+            );
+            return Ok(false);
+        }
+        match SerializedFileReader::new(file) {
+            Ok(reader) => {
+                let valid = reader.metadata().file_metadata().num_rows() != 0;
+                if !valid {
+                    error!("Invalid parquet file {path:?} for stream {stream_name}: no rows");
+                }
+                Ok(valid)
+            }
+            Err(parquet::errors::ParquetError::External(error)) => {
+                // Actual filesystem read errors are capture failures too.
+                match error.downcast::<std::io::Error>() {
+                    Ok(error) => Err(*error),
+                    Err(error) => {
+                        error!(
+                            "Failed to read parquet file {path:?} for stream {stream_name}: {error}"
+                        );
+                        Ok(false)
                     }
                 }
-                Err(e) => {
-                    error!("Failed to read parquet file {path:?} for stream {stream_name}: {e}");
-                    false
-                }
-            },
-            Err(e) => {
-                error!("Failed to open parquet file {path:?} for stream {stream_name}: {e}");
-                false
+            }
+            Err(error) => {
+                error!("Failed to read parquet file {path:?} for stream {stream_name}: {error}");
+                Ok(false)
             }
         }
     }
@@ -3629,6 +3633,132 @@ mod tests {
 
         assert_eq!(captured_ids(&staging, &schema), (vec![], all));
         assert!(staging.inprocess_arrow_files().is_empty());
+    }
+
+    #[test]
+    fn conversion_capture_leases_wait_for_publication_and_survive_source_deletion() {
+        use crate::query::stream_schema_provider::staging_parquet::capture_staging_parquet_for_test;
+        use std::sync::mpsc::{TryRecvError, channel};
+
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_test_stream(&dir, "publication-lease");
+        let (before_tx, before_rx) = channel();
+        let (before_resume_tx, before_resume_rx) = channel();
+        let before_resume_rx = Mutex::new(before_resume_rx);
+        let (published_tx, published_rx) = channel();
+        let (published_resume_tx, published_resume_rx) = channel();
+        let published_resume_rx = Mutex::new(published_resume_rx);
+        let weak = Arc::downgrade(&staging);
+        set_conversion_hook(&staging, move |phase| match phase {
+            ConversionPhase::BeforeSealRename(_) => {}
+            ConversionPhase::BeforePublish(_) => {
+                before_tx.send(()).unwrap();
+                before_resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(CONVERSION_WAIT)
+                    .expect("test did not resume conversion before publication");
+            }
+            ConversionPhase::Published => {
+                assert!(weak.upgrade().unwrap().publication.try_read().is_err());
+                published_tx.send(()).unwrap();
+                published_resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(CONVERSION_WAIT)
+                    .expect("test did not resume published conversion");
+            }
+        });
+        let (done_tx, done_rx) = channel();
+        let converter = {
+            let staging = Arc::clone(&staging);
+            spawn(move || {
+                let result = staging.prepare_parquet(false, true, &None);
+                done_tx.send(()).unwrap();
+                result
+            })
+        };
+        before_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        before_resume_tx.send(()).unwrap();
+        published_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        // Renamed Parquet and pending memory coexist under the write lock.
+
+        let (started_tx, started_rx) = channel();
+        let (capture_tx, capture_rx) = channel();
+        let capture = {
+            let staging = Arc::clone(&staging);
+            let schema = Arc::clone(&schema);
+            spawn(move || {
+                // This lock assertion makes exclusion deterministic even if the
+                // worker is descheduled before entering capture_staging.
+                assert!(staging.publication.try_read().is_err());
+                started_tx.send(()).unwrap();
+                capture_tx
+                    .send(staging.capture_staging(&schema, capture_staging_parquet_for_test))
+                    .unwrap();
+            })
+        };
+        started_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        assert!(matches!(capture_rx.try_recv(), Err(TryRecvError::Empty)));
+        published_resume_tx.send(()).unwrap();
+        // The other group has its own before-publication gate, so its rows
+        // remain pending even when both groups convert concurrently.
+        before_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        let (memory, files) = capture_rx.recv_timeout(CONVERSION_WAIT).unwrap().unwrap();
+        let files = files.unwrap();
+        capture.join().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(!memory.is_empty());
+
+        let originals = fs::read_dir(&staging.data_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 1);
+        for original in originals {
+            fs::remove_file(original).unwrap();
+        }
+        let leased = files
+            .iter()
+            .map(|file| PathBuf::from("/").join(file.object_meta.location.as_ref()))
+            .collect::<Vec<_>>();
+        let lease_dirs = leased
+            .iter()
+            .map(|path| path.parent().unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert!(lease_dirs.iter().all(|path| path.is_dir()));
+        let mut ids = memory
+            .into_iter()
+            .chain(leased.iter().flat_map(|path| {
+                ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .map(Result::unwrap)
+            }))
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+        drop(files);
+        assert!(lease_dirs.iter().all(|path| !path.exists()));
+
+        before_resume_tx.send(()).unwrap();
+        published_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        published_resume_tx.send(()).unwrap();
+        // Both completion and hook waits are bounded before joining.
+        done_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        converter.join().unwrap().unwrap();
     }
 
     #[test]
