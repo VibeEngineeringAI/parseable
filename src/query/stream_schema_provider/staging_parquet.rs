@@ -78,7 +78,8 @@ impl Drop for StagingLease {
     }
 }
 
-/// Safe during startup AND active serving, including another server process.
+/// Runs during query capture, outside stream-registry locks. Safe while serving
+/// active queries, including in another server process.
 /// Only the OS lock proves a lease is abandoned; never infer it from age/PID.
 /// Unpublished ownership files are skipped (setup has not created any links).
 pub(crate) fn reclaim_staging_leases(directory: &Path) {
@@ -617,6 +618,52 @@ mod tests {
             !lease.exists(),
             "OS releases the dead owner's lock; orphan must be reclaimed"
         );
+    }
+
+    #[test]
+    fn staging_lease_constructor_defers_orphan_cleanup_until_capture() {
+        use crate::{cli::Options, metadata::LogStreamMetadata, parseable::Stream};
+
+        let directory = tempfile::tempdir().unwrap();
+        let options = Arc::new(Options {
+            local_staging_path: directory.path().to_path_buf(),
+            ..Default::default()
+        });
+        let staging = options.local_stream_data_path("deferred", &None);
+        fs::create_dir_all(&staging).unwrap();
+        let original = write_file(&staging, "rows.parquet", vec![1, 2, 3]);
+
+        // Model a crashed owner: retain its hard-link directory but release the
+        // ownership lock. No process or timing assumptions are needed.
+        let mut abandoned = Arc::try_unwrap(StagingLease::new(&staging).unwrap()).unwrap();
+        fs::hard_link(&original, abandoned.path().join("0.lease")).unwrap();
+        let orphan = abandoned.directory.take().unwrap().keep();
+        drop(abandoned);
+        assert!(orphan.join("0.lease").exists());
+
+        // get_or_create constructs streams under the shared registry write
+        // lock. Construction must not scan/remove filesystem entries there.
+        let stream = Stream::new(
+            options,
+            "deferred",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        assert!(
+            orphan.join("0.lease").exists(),
+            "stream construction must defer orphan cleanup"
+        );
+
+        let captured = capture_staging_parquet(&stream.data_path).unwrap();
+        assert!(
+            !orphan.exists(),
+            "the first query capture must reclaim the abandoned lease"
+        );
+        assert_eq!(captured.len(), 1);
+        assert!(original.exists());
+        drop(captured);
+        assert!(lease_directories(&staging).is_empty());
     }
 
     #[test]

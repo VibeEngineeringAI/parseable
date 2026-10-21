@@ -678,9 +678,6 @@ impl Stream {
     ) -> StreamRef {
         let stream_name = stream_name.into();
         let data_path = options.local_stream_data_path(&stream_name, tenant_id);
-        // Stream loading can overlap serving queries. The lease sweeper uses
-        // OS ownership locks, so it also preserves another process's live scans.
-        crate::query::stream_schema_provider::staging_parquet::reclaim_staging_leases(&data_path);
 
         Arc::new(Self {
             stream_name: stream_name.clone(),
