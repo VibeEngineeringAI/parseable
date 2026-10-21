@@ -678,6 +678,9 @@ impl Stream {
     ) -> StreamRef {
         let stream_name = stream_name.into();
         let data_path = options.local_stream_data_path(&stream_name, tenant_id);
+        // Stream loading can overlap serving queries. The lease sweeper uses
+        // OS ownership locks, so it also preserves another process's live scans.
+        crate::query::stream_schema_provider::staging_parquet::reclaim_staging_leases(&data_path);
 
         Arc::new(Self {
             stream_name: stream_name.clone(),
@@ -2160,43 +2163,46 @@ impl Stream {
     /// function to validate parquet files
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_valid_parquet_file(path: &Path, stream_name: &str) -> bool {
-        // First check file size as a quick validation
-        match path.metadata() {
-            Ok(meta) if meta.len() < FOOTER_SIZE as u64 => {
-                error!(
-                    "Invalid parquet file {path:?} detected for stream {stream_name}, size: {} bytes",
-                    meta.len()
-                );
-                return false;
-            }
-            Err(e) => {
-                error!(
-                    "Cannot read metadata for parquet file {path:?} for stream {stream_name}: {e}"
-                );
-                return false;
-            }
-            _ => {} // File size is adequate, continue validation
-        }
+        Self::validate_parquet_file(path, stream_name).unwrap_or_else(|error| {
+            error!("Cannot validate parquet file {path:?} for stream {stream_name}: {error}");
+            false
+        })
+    }
 
-        // Try to open and read the parquet file metadata to verify it's valid
-        match std::fs::File::open(path) {
-            Ok(file) => match SerializedFileReader::new(file) {
-                Ok(reader) => {
-                    if reader.metadata().file_metadata().num_rows() == 0 {
-                        error!("Invalid parquet file {path:?} for stream {stream_name}");
-                        false
-                    } else {
-                        true
+    /// The query calls this on its immutable lease, propagating access/metadata
+    /// failures while retaining the uploader's corrupt/empty-file skip policy.
+    pub(crate) fn validate_parquet_file(path: &Path, stream_name: &str) -> std::io::Result<bool> {
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        if size < FOOTER_SIZE as u64 {
+            error!(
+                "Invalid parquet file {path:?} detected for stream {stream_name}, size: {size} bytes"
+            );
+            return Ok(false);
+        }
+        match SerializedFileReader::new(file) {
+            Ok(reader) => {
+                let valid = reader.metadata().file_metadata().num_rows() != 0;
+                if !valid {
+                    error!("Invalid parquet file {path:?} for stream {stream_name}: no rows");
+                }
+                Ok(valid)
+            }
+            Err(parquet::errors::ParquetError::External(error)) => {
+                // Actual filesystem read errors are capture failures too.
+                match error.downcast::<std::io::Error>() {
+                    Ok(error) => Err(*error),
+                    Err(error) => {
+                        error!(
+                            "Failed to read parquet file {path:?} for stream {stream_name}: {error}"
+                        );
+                        Ok(false)
                     }
                 }
-                Err(e) => {
-                    error!("Failed to read parquet file {path:?} for stream {stream_name}: {e}");
-                    false
-                }
-            },
-            Err(e) => {
-                error!("Failed to open parquet file {path:?} for stream {stream_name}: {e}");
-                false
+            }
+            Err(error) => {
+                error!("Failed to read parquet file {path:?} for stream {stream_name}: {error}");
+                Ok(false)
             }
         }
     }
