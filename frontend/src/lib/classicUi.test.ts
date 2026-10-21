@@ -243,7 +243,7 @@ describe('classic Logs links', () => {
         "start=1h&end=now&type=fixed&tz=Asia%2FKolkata&groupBy=host&view=f1&query=WHERE+text+msg+ILIKE+'%25x%25'",
       ).dropped,
     ).toEqual([
-      'time zone Asia/Kolkata (times are shown in UTC)',
+      'time zone Asia/Kolkata (not restored from this link)',
       '1 filter',
       'grouping',
       'saved view',
@@ -385,7 +385,7 @@ describe('classic Metrics links', () => {
     ).toEqual({
       search: '?step=30s&query=up',
       dropped: [
-        'time zone Asia/Kolkata (times are shown in UTC)',
+        'time zone Asia/Kolkata (not restored from this link)',
         '1 filter',
         'grouping',
         'saved view',

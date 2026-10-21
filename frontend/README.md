@@ -135,7 +135,16 @@ Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DAT
 
 The Alerts live spec (`e2e-live/alerts.spec.ts`) creates a unique OTLP dataset, webhook target and PromQL rule, checks preview values and mutations against the API, and cleans up all three in `afterAll`, including after failures. Run it only against a disposable server. Set `TMPDIR` to a disk-backed directory when `/tmp` is small. The current Alerts checks and counts are recorded in [validation-review.md](docs/validation-review.md).
 
-The Dashboards live spec (`e2e-live/dashboards.spec.ts`) ingests unique logs and OTLP metrics, creates SQL and PromQL tiles with variables through this frontend, verifies their stored classic shapes, and hard-loads the same dashboard on the classic origin. It also renders a literal classic-shaped Report fixture in this frontend, checks unknown-field preservation, and verifies admin ownership rules and `limit=0`. Cleanup removes all test dashboards, datasets, users and roles. The classic comparison portion of this historical test requires a separate older server version that still embeds Prism; current builds have no classic UI mode. Both origins must point at the same disposable server and use the same hostname to share login cookies across ports (use `127.0.0.1` for both; mixing it with `localhost` fails). The spec checks this before ingesting:
+The Dashboards live spec (`e2e-live/dashboards.spec.ts`) ingests unique logs and OTLP metrics, creates SQL and PromQL tiles with variables through this frontend and verifies their stored classic-compatible shapes. It also renders a literal classic-shaped Report fixture in this frontend, checks unknown-field preservation, and verifies admin ownership rules and `limit=0`. Cleanup removes all test dashboards, datasets, users and roles. These tests need only `PARSEABLE_LIVE_URL` and run against a current native-only server.
+
+The historical classic hard-load comparison is skipped unless you set `PARSEABLE_LIVE_CLASSIC=true`. It then also requires `PARSEABLE_LIVE_SERVER_URL` to point at an older Parseable server that still embeds the classic Prism UI at `/dashboards/:id`; current builds have no classic UI mode, so do not opt in against them. Both origins must use the same disposable backend and the same hostname to share login cookies across ports (use `127.0.0.1` for both; mixing it with `localhost` fails). The spec checks this before ingesting. Native-only run:
+
+```sh
+PARSEABLE_LIVE_URL=http://127.0.0.1:8030 PARSEABLE_LIVE_USERNAME=admin PARSEABLE_LIVE_PASSWORD=admin \
+  npx playwright test -c playwright.live.config.ts e2e-live/dashboards.spec.ts
+```
+
+Classic comparison against an older classic-capable server on port 8030, with this frontend proxied to it:
 
 ```sh
 PARSEABLE_PROXY_TARGET=http://127.0.0.1:8030 npx vite --host 127.0.0.1 --port 8271
@@ -146,7 +155,7 @@ flock /home/ajs/.cache/parseable-playwright.lock bash -c '
   TMPDIR=/home/ajs/.cache/dash-tmp \
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
   PARSEABLE_LIVE_URL=http://127.0.0.1:8271 PARSEABLE_LIVE_BASE= \
-  PARSEABLE_LIVE_SERVER_URL=http://127.0.0.1:8030 \
+  PARSEABLE_LIVE_CLASSIC=true PARSEABLE_LIVE_SERVER_URL=http://127.0.0.1:8030 \
   PARSEABLE_LIVE_USERNAME=admin PARSEABLE_LIVE_PASSWORD=admin \
   npx playwright test -c playwright.live.config.ts e2e-live/dashboards.spec.ts
 '

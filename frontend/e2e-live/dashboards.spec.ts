@@ -6,6 +6,9 @@ import classicFixture from './fixtures/classic-dashboard.json' with { type: 'jso
 import type { Dashboard, DashboardSummary } from '../src/lib/types';
 const live = process.env.PARSEABLE_LIVE_URL;
 const server = process.env.PARSEABLE_LIVE_SERVER_URL;
+// Current builds serve only the native UI. The classic hard-load comparison needs an
+// older server that still embeds Prism, so it runs only when explicitly requested.
+const classic = process.env.PARSEABLE_LIVE_CLASSIC === 'true';
 const username = process.env.PARSEABLE_LIVE_USERNAME || 'frontend-smoke',
   password = process.env.PARSEABLE_LIVE_PASSWORD || 'local-smoke-password';
 const base = (process.env.PARSEABLE_LIVE_BASE ?? '').replace(/\/+$/, '');
@@ -31,10 +34,7 @@ let primary: Dashboard,
   ingestAttempted = false;
 const sql = `SELECT * FROM "${logs}" ORDER BY "p_timestamp" DESC LIMIT 12`;
 const promql = `{__name__="${metric}",host=~"$host"}`;
-test.skip(
-  !live || !server,
-  'Set PARSEABLE_LIVE_URL and PARSEABLE_LIVE_SERVER_URL to opt in to the classic interchangeability suite.',
-);
+test.skip(!live, 'Set PARSEABLE_LIVE_URL to opt in to the live dashboards suite.');
 // Tests 3 and 4 are independent; a create failure must not skip reverse or ownership checks.
 async function signIn(page: Page, path: string) {
   await page.goto(app(`/login?next=${encodeURIComponent(path)}`));
@@ -60,11 +60,14 @@ async function apiCreate(request: APIRequestContext, body: unknown, auth = heade
   return doc;
 }
 test.beforeAll(async ({ request }) => {
-  // Cookies are shared across ports only when both origins use the same host.
-  if (new URL(live!).hostname !== new URL(server!).hostname)
-    throw new Error(
-      'The native and classic origins must use the same host to share login cookies.',
-    );
+  if (classic) {
+    if (!server) throw new Error('PARSEABLE_LIVE_CLASSIC=true requires PARSEABLE_LIVE_SERVER_URL.');
+    // Cookies are shared across ports only when both origins use the same host.
+    if (new URL(live!).hostname !== new URL(server).hostname)
+      throw new Error(
+        'The native and classic origins must use the same host to share login cookies.',
+      );
+  }
   const now = Math.floor(Date.now() / 1000);
   ingestAttempted = true;
   const points = ['node-a', 'node-b'].flatMap((host, hostIndex) =>
@@ -141,7 +144,7 @@ test.beforeAll(async ({ request }) => {
     .toBe(12);
 });
 test.afterAll(async ({ request }) => {
-  if (!live || !server) return;
+  if (!live) return;
   test.setTimeout(60000);
   const errors: Error[] = [];
   async function cleanup(label: string, operation: () => Promise<void>) {
@@ -340,6 +343,10 @@ test('create SQL and PromQL tiles and variables in the native UI; verify exact c
 test('hard-load the saved dashboard on the classic origin; both tiles render without errors', async ({
   page,
 }) => {
+  test.skip(
+    !classic,
+    'Set PARSEABLE_LIVE_CLASSIC=true and PARSEABLE_LIVE_SERVER_URL to an older server that still embeds the classic UI.',
+  );
   expect(
     primary,
     'The create test must provide a saved dashboard for the classic check.',

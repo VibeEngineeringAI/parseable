@@ -5,7 +5,7 @@ const username = process.env.PARSEABLE_LIVE_USERNAME || 'frontend-smoke';
 const password = process.env.PARSEABLE_LIVE_PASSWORD || 'local-smoke-password';
 const dataset = process.env.PARSEABLE_LIVE_DATASET || 'frontend_smoke';
 const datasetPath = `/logs/explore/${encodeURIComponent(dataset)}`;
-// Page paths are at the root; set `/next` for a server started with `P_UI_ROOT=classic`.
+// Current servers serve page paths at root; override only for explicitly mounted previews.
 const base = (process.env.PARSEABLE_LIVE_BASE ?? '').replace(/\/+$/, '');
 
 /** Document path for an application route, mirroring `appPath` in src/lib/config.ts. */

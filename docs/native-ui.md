@@ -3,7 +3,9 @@
 Parseable now builds and embeds only `frontend/dist` and serves it at `/`.
 The build no longer downloads the classic Prism ZIP or applies a compiled-asset
 overlay. The release `build.zip` and `build.zip.sha1` artifacts still contain the
-native frontend with the same top-level `dist/` layout.
+native frontend with the same top-level `dist/` layout. Vite emits
+`dist/THIRD_PARTY_LICENSES.md` with bundled dependency notices; that file is
+embedded and packaged alongside the frontend.
 
 ## Build and deployment
 
@@ -50,8 +52,8 @@ focused tests. Server routing tests cover deep links, conditional caching,
 missing chunks, rejected paths, `/next` redirects and API precedence when the UI
 is disabled. OIDC handlers and their existing tests are preserved.
 
-Frontend feature migration (saved SQL, older saved Logs filters and builder
-alerts) is tracked separately from removal of the distribution. Do not infer
+See [the migration guide](native-ui-migration.md) for server-saved SQL, older
+Logs filters, builder-alert conversion and remaining feature gaps. Do not infer
 full feature equivalence from a successful native build. Historical comparison
 reports and stored classic-format fixtures remain compatibility evidence; live
 classic comparisons require an older server version.

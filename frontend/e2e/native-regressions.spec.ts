@@ -96,39 +96,31 @@ test('demo agents do not attribute synthetic telemetry to an unknown dataset', a
   await expect(page.getByRole('table')).toHaveCount(0);
 });
 
-test('native setup and settings links remain inside a /next mount', async ({ page }) => {
-  await page.route('**/next/**', async (route) => {
-    if (route.request().resourceType() !== 'document') return route.continue();
-    const response = await route.fetch();
-    await route.fulfill({
-      response,
-      body: (await response.text()).replace('<base href="/"/>', '<base href="/next/"/>'),
-    });
-  });
+test('native setup and settings stay at root without classic UI handoffs', async ({ page }) => {
   await page.route('**/api/**', (route) => route.fulfill({ json: [] }));
-  await page.goto('/next/new');
+  await page.goto('/new');
   await expect(
     page.getByRole('heading', { name: 'Set up a workspace', exact: true }),
   ).toBeVisible();
   await expect(page.getByRole('link', { name: 'Set up this server', exact: true })).toHaveAttribute(
     'href',
-    '/next/onboarding',
+    '/onboarding',
   );
   await expect(
     page.getByRole('link', { name: 'open workspace creation in classic UI', exact: true }),
   ).toHaveCount(0);
   await page.getByRole('link', { name: 'Set up this server', exact: true }).click();
-  await expect(page).toHaveURL(/\/next\/onboarding$/);
+  await expect(page).toHaveURL(/\/onboarding$/);
   await expect(page.getByRole('link', { name: 'Set up ingestion', exact: true })).toHaveAttribute(
     'href',
-    '/next/add-data',
+    '/add-data',
   );
-  await page.goto('/next/keystone/investigation');
+  await page.goto('/keystone/investigation');
   await expect(page.getByRole('link', { name: 'LLM settings', exact: true })).toHaveAttribute(
     'href',
-    '/next/settings/llm-key',
+    '/settings/llm-key',
   );
   await expect(
     page.getByRole('link', { name: 'Open investigation in classic UI', exact: true }),
-  ).toHaveAttribute('href', '/keystone/investigation');
+  ).toHaveCount(0);
 });

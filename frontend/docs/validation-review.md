@@ -423,6 +423,8 @@ flock /home/ajs/.cache/parseable-playwright.lock bash -c '
 '
 ```
 
+Current native-only builds require `PARSEABLE_LIVE_CLASSIC=true` to opt into the historical classic-origin comparison above. Set it only when that origin still serves classic Prism against the same disposable backend; native dashboard tests need only `PARSEABLE_LIVE_URL`.
+
 ## Alerts validation (2026-10-09)
 
 This section records the frontend fixes and completed checks for the four supplied Opus reviews.

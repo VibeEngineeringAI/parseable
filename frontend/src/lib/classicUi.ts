@@ -283,7 +283,7 @@ function droppedFromLink(params: URLSearchParams, unreadRange: boolean, filters:
   const dropped: string[] = [];
   if (unreadRange) dropped.push('time range');
   const tz = params.get('tz');
-  if (tz && tz !== 'UTC') dropped.push(`time zone ${tz} (times are shown in UTC)`);
+  if (tz && tz !== 'UTC') dropped.push(`time zone ${tz} (not restored from this link)`);
   if (filters) dropped.push(filters === 1 ? '1 filter' : `${filters} filters`);
   if (params.get('groupBy')) dropped.push('grouping');
   if (params.get('view')) dropped.push('saved view');
