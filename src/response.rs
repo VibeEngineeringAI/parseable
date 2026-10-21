@@ -103,6 +103,9 @@ impl QueryResponse {
         for (index, field) in fields.iter().enumerate() {
             field_indices.entry(field.as_str()).or_insert(index);
         }
+        if !fields.is_empty() && field_indices.len() == fields.len() {
+            return self.write_flat_records_unique(fields, field_indices);
+        }
         let mut seen_fields = vec![false; fields.len()];
         let mut bytes = Vec::new();
         if self.with_fields {
@@ -174,6 +177,103 @@ impl QueryResponse {
                 }
                 for field in fields {
                     let index = field_indices[field.as_str()];
+                    if !seen_fields[index] {
+                        write_flat_key::<serde_json::Error>(&mut bytes, field, &mut first_field)?;
+                        bytes.extend_from_slice(b"null");
+                        seen_fields[index] = true;
+                    }
+                }
+                bytes.push(b'}');
+            }
+        }
+        bytes.push(b']');
+        if self.with_fields {
+            bytes.push(b'}');
+        }
+        // The old transcode reserved about the response size up front; don't
+        // keep a mostly unused doubled buffer alive while it is sent.
+        if bytes.capacity() - bytes.len() > bytes.len() / 4 {
+            bytes.shrink_to_fit();
+        }
+        Ok(Some(bytes))
+    }
+
+    // Called only for nonempty, unique effective null-fill fields.
+    fn write_flat_records_unique(
+        &self,
+        fields: &[String],
+        field_indices: HashMap<&str, usize>,
+    ) -> Result<Option<Vec<u8>>, QueryError> {
+        let mut seen_fields = vec![false; fields.len()];
+        let mut bytes = Vec::new();
+        if self.with_fields {
+            bytes.extend_from_slice(b"{\"fields\":");
+            serde_json::to_writer(&mut bytes, &self.fields)?;
+            bytes.extend_from_slice(b",\"records\":");
+        }
+        bytes.push(b'[');
+        let mut first_row = true;
+        let options = EncoderOptions::default();
+        let mut scalar = Vec::new();
+        for batch in &self.records {
+            // Arrow's writer skips empty batches before creating encoders.
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let schema = batch.schema();
+            let mut columns = schema
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .map(|(field, array)| {
+                    let mut key = Vec::with_capacity(field.name().len() + 3);
+                    serde_json::to_writer(&mut key, field.name())?;
+                    key.push(b':');
+                    Ok::<_, QueryError>(FlatColumn {
+                        key,
+                        index: field_indices.get(field.name().as_str()).copied(),
+                        transcode: !is_canonical_json_scalar(field.data_type()),
+                        encoder: make_encoder(field, array.as_ref(), &options)
+                            .map_err(anyhow::Error::from)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for row in 0..batch.num_rows() {
+                if !first_row {
+                    bytes.push(b',');
+                }
+                first_row = false;
+                bytes.push(b'{');
+                seen_fields.fill(false);
+                let mut first_field = true;
+                for column in &mut columns {
+                    // Arrow elides null values unless explicit nulls are enabled.
+                    if column.encoder.is_null(row) {
+                        continue;
+                    }
+                    if !first_field {
+                        bytes.push(b',');
+                    }
+                    first_field = false;
+                    bytes.extend_from_slice(&column.key);
+                    if let Some(index) = column.index {
+                        seen_fields[index] = true;
+                    }
+                    if column.transcode {
+                        scalar.clear();
+                        column.encoder.encode(row, &mut scalar);
+                        let mut deserializer = serde_json::Deserializer::from_slice(&scalar);
+                        let parsed = FlatScalarSeed { bytes: &mut bytes }
+                            .deserialize(&mut deserializer)
+                            .and_then(|()| deserializer.end());
+                        if parsed.is_err() {
+                            return Ok(None);
+                        }
+                    } else {
+                        column.encoder.encode(row, &mut bytes);
+                    }
+                }
+                for (index, field) in fields.iter().enumerate() {
                     if !seen_fields[index] {
                         write_flat_key::<serde_json::Error>(&mut bytes, field, &mut first_field)?;
                         bytes.extend_from_slice(b"null");
@@ -983,6 +1083,336 @@ mod tests {
                 let expected = serde_json::to_vec(&response.to_json().unwrap()).unwrap();
                 assert_eq!(response.to_json_bytes().unwrap(), expected, "{context}");
             }
+        }
+    }
+
+    /// Exact row/key order plus an unchanged transcode oracle, for both flags.
+    fn assert_counter_case(
+        records: Vec<RecordBatch>,
+        fields: Vec<String>,
+        plain: &[u8],
+        filled: &[u8],
+    ) {
+        for fill_null in [false, true] {
+            for with_fields in [false, true] {
+                let response = QueryResponse {
+                    records: records.clone(),
+                    fields: fields.clone(),
+                    fill_null,
+                    with_fields,
+                };
+                let rows = if fill_null { filled } else { plain };
+                let mut expected = Vec::new();
+                if with_fields {
+                    expected.extend_from_slice(b"{\"fields\":");
+                    serde_json::to_writer(&mut expected, &fields).unwrap();
+                    expected.extend_from_slice(b",\"records\":");
+                }
+                expected.extend_from_slice(rows);
+                if with_fields {
+                    expected.push(b'}');
+                }
+                let context =
+                    format!("fields={fields:?}, fill_null={fill_null}, with_fields={with_fields}");
+                assert_eq!(
+                    response
+                        .write_flat_records()
+                        .unwrap()
+                        .expect("unexpected scalar fallback"),
+                    expected,
+                    "typed: {context}"
+                );
+                assert_eq!(
+                    response.transcode_arrow_json().unwrap(),
+                    expected,
+                    "transcode: {context}"
+                );
+                assert_eq!(
+                    response.to_json_bytes().unwrap(),
+                    expected,
+                    "public: {context}"
+                );
+                assert_eq!(
+                    serde_json::to_vec(&response.to_json().unwrap()).unwrap(),
+                    expected,
+                    "Value: {context}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counter_dense_nullable_and_duplicate_requested_fields() {
+        let dense = RecordBatch::try_from_iter(vec![
+            ("a", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+            ("b", Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef),
+        ])
+        .unwrap();
+        let rows = br#"[{"a":1,"b":"x"},{"a":2,"b":"y"}]"#;
+        // Requested order differs from schema order; all requested fields present.
+        assert_counter_case(
+            vec![dense.clone()],
+            vec!["b".into(), "a".into()],
+            rows,
+            rows,
+        );
+        // Duplicate slots stay false; the counter compares distinct requested names.
+        assert_counter_case(
+            vec![dense.clone()],
+            vec!["a".into(), "b".into(), "a".into()],
+            rows,
+            rows,
+        );
+        assert_counter_case(vec![dense], Vec::new(), rows, rows);
+        let nullable = RecordBatch::try_from_iter(vec![
+            (
+                "a",
+                Arc::new(Int64Array::from(vec![None, Some(2), None, Some(4)])) as ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(StringArray::from(vec![Some("x"), None, Some("z"), None])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        assert_counter_case(
+            vec![nullable.slice(0, 1), nullable.slice(1, 0), nullable.slice(1, 3)],
+            vec!["missing\"\n".into(), "b".into(), "a".into(), "missing\"\n".into(), "b".into()],
+            br#"[{"b":"x"},{"a":2},{"b":"z"},{"a":4}]"#,
+            br#"[{"b":"x","missing\"\n":null,"a":null},{"a":2,"missing\"\n":null,"b":null},{"b":"z","missing\"\n":null,"a":null},{"a":4,"missing\"\n":null,"b":null}]"#,
+        );
+        let all_null = RecordBatch::try_from_iter(vec![
+            ("n", Arc::new(NullArray::new(2)) as ArrayRef),
+            (
+                "extra",
+                Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        assert_counter_case(
+            vec![all_null],
+            vec!["absent".into(), "n".into(), "absent".into()],
+            br#"[{"extra":true},{"extra":false}]"#,
+            br#"[{"extra":true,"absent":null,"n":null},{"extra":false,"absent":null,"n":null}]"#,
+        );
+    }
+
+    #[test]
+    fn counter_schema_changes_empty_batches_and_columnless_rows() {
+        let first = RecordBatch::try_from_iter(vec![
+            ("a", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+            ("b", Arc::new(StringArray::from(vec!["x"])) as ArrayRef),
+        ])
+        .unwrap();
+        let reversed = RecordBatch::try_from_iter(vec![
+            ("b", Arc::new(StringArray::from(vec!["y"])) as ArrayRef),
+            ("a", Arc::new(Int64Array::from(vec![2])) as ArrayRef),
+        ])
+        .unwrap();
+        let changed = RecordBatch::try_from_iter(vec![
+            ("b", Arc::new(Int64Array::from(vec![3])) as ArrayRef),
+            (
+                "extra",
+                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        assert_counter_case(
+            vec![first.slice(0, 0), first, reversed, changed],
+            vec!["b".into(), "a".into()],
+            br#"[{"a":1,"b":"x"},{"b":"y","a":2},{"b":3,"extra":true}]"#,
+            br#"[{"a":1,"b":"x"},{"b":"y","a":2},{"b":3,"extra":true,"a":null}]"#,
+        );
+        for fields in [Vec::new(), vec!["value".into(), "value".into()]] {
+            assert_counter_case(Vec::new(), fields.clone(), b"[]", b"[]");
+            let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                true,
+            )])));
+            assert_counter_case(vec![empty], fields, b"[]", b"[]");
+        }
+        let columnless = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(2)),
+        )
+        .unwrap();
+        assert_counter_case(vec![columnless.clone()], Vec::new(), b"[{},{}]", b"[{},{}]");
+        assert_counter_case(
+            vec![columnless],
+            vec!["value".into(), "value".into()],
+            b"[{},{}]",
+            br#"[{"value":null},{"value":null}]"#,
+        );
+    }
+
+    #[test]
+    fn counter_preserves_ineligible_schema_fallback_bytes() {
+        let duplicate = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("same", DataType::Int64, false),
+                Field::new("same", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        // Duplicate input columns plus a missing name must stay on public fallback.
+        assert!(!super::can_transcode_flat_json(duplicate.schema().fields()));
+        assert_json_equivalent(
+            vec![duplicate.clone()],
+            vec!["same".into(), "missing".into()],
+        );
+        let invalid_timestamp = RecordBatch::try_from_iter(vec![(
+            "timestamp",
+            Arc::new(TimestampMillisecondArray::from(vec![0, i64::MAX]).with_timezone("UTC"))
+                as ArrayRef,
+        )])
+        .unwrap();
+        for (batch, fields, rows) in [
+            (
+                duplicate,
+                vec!["same".into(), "same".into()],
+                br#"[{"same":2}]"#.as_slice(),
+            ),
+            (
+                invalid_timestamp,
+                vec!["timestamp".into()],
+                b"[]".as_slice(),
+            ),
+        ] {
+            assert!(!super::can_transcode_flat_json(batch.schema().fields()));
+            for fill_null in [false, true] {
+                for with_fields in [false, true] {
+                    let response = QueryResponse {
+                        records: vec![batch.clone()],
+                        fields: fields.clone(),
+                        fill_null,
+                        with_fields,
+                    };
+                    let mut expected = Vec::new();
+                    if with_fields {
+                        expected.extend_from_slice(b"{\"fields\":");
+                        serde_json::to_writer(&mut expected, &fields).unwrap();
+                        expected.extend_from_slice(b",\"records\":");
+                    }
+                    expected.extend_from_slice(rows);
+                    if with_fields {
+                        expected.push(b'}');
+                    }
+                    assert_eq!(response.to_json_bytes().unwrap(), expected);
+                    assert_eq!(
+                        serde_json::to_vec(&response.to_json().unwrap()).unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counter_unrequested_columns_do_not_complete_requested_fields() {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "a",
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+            ),
+            (
+                "extra_x",
+                Arc::new(Int64Array::from(vec![10, 11, 13])) as ArrayRef,
+            ),
+            (
+                "extra_y",
+                Arc::new(Int64Array::from(vec![None, Some(12), Some(14)])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        // Two emitted columns must not stand in for two distinct requested names.
+        // The third row also catches a recognized-field counter not reset per row.
+        assert_counter_case(
+            vec![batch],
+            vec!["a".into(), "missing".into(), "a".into()],
+            br#"[{"a":1,"extra_x":10},{"extra_x":11,"extra_y":12},{"a":3,"extra_x":13,"extra_y":14}]"#,
+            br#"[{"a":1,"extra_x":10,"missing":null},{"extra_x":11,"extra_y":12,"a":null,"missing":null},{"a":3,"extra_x":13,"extra_y":14,"missing":null}]"#,
+        );
+    }
+
+    #[test]
+    fn index_unique_missing_before_middle_after_requested_order() {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "a",
+                Arc::new(Int64Array::from(vec![None, Some(2)])) as ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(StringArray::from(vec![Some("x"), None])) as ArrayRef,
+            ),
+            (
+                "extra",
+                Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        assert_counter_case(
+            vec![batch.clone()],
+            vec!["missing".into(), "b".into(), "a".into()],
+            br#"[{"b":"x","extra":true},{"a":2,"extra":false}]"#,
+            br#"[{"b":"x","extra":true,"missing":null,"a":null},{"a":2,"extra":false,"missing":null,"b":null}]"#,
+        );
+        assert_counter_case(
+            vec![batch.clone()],
+            vec!["b".into(), "missing".into(), "a".into()],
+            br#"[{"b":"x","extra":true},{"a":2,"extra":false}]"#,
+            br#"[{"b":"x","extra":true,"missing":null,"a":null},{"a":2,"extra":false,"b":null,"missing":null}]"#,
+        );
+        assert_counter_case(
+            vec![batch.clone()],
+            vec!["b".into(), "a".into(), "missing".into()],
+            br#"[{"b":"x","extra":true},{"a":2,"extra":false}]"#,
+            br#"[{"b":"x","extra":true,"a":null,"missing":null},{"a":2,"extra":false,"b":null,"missing":null}]"#,
+        );
+    }
+
+    #[test]
+    fn selective_unique_duplicate_and_empty_effective_fields() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "a",
+            Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef,
+        )])
+        .unwrap();
+        let plain = br#"[{"a":1},{}]"#;
+        let filled = br#"[{"a":1,"missing":null},{"missing":null,"a":null}]"#;
+        // Same schema and nullable rows: eligible with fill=true; original body
+        // with fill=false. Repeated known/missing names must use first slots.
+        for fields in [
+            vec!["missing".into(), "a".into()],
+            vec!["missing".into(), "a".into(), "missing".into(), "a".into()],
+        ] {
+            assert_counter_case(vec![batch.clone()], fields, plain, filled);
+        }
+        assert_counter_case(vec![batch], Vec::new(), plain, plain);
+        // Every requested field is absent. Both the direct and first-slot
+        // loops must append one null despite an empty schema and no columns.
+        let columnless = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(2)),
+        )
+        .unwrap();
+        for fields in [
+            vec!["missing".into()],
+            vec!["missing".into(), "missing".into()],
+        ] {
+            assert_counter_case(
+                vec![columnless.clone()],
+                fields,
+                b"[{},{}]",
+                br#"[{"missing":null},{"missing":null}]"#,
+            );
         }
     }
 
