@@ -18,6 +18,9 @@
 
 use std::{any::Any, cmp::Reverse, collections::HashMap, ops::Bound, sync::Arc};
 
+pub(crate) mod staging_parquet;
+use staging_parquet::capture_staging_parquet;
+
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Timelike, Utc};
@@ -397,43 +400,17 @@ impl StandardTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         state: &dyn Session,
+        captured: (Vec<RecordBatch>, Vec<PartitionedFile>),
     ) -> Result<(), DataFusionError> {
-        let Ok(staging) = PARSEABLE.get_stream(&self.stream, &self.tenant_id) else {
-            return Ok(());
-        };
-
-        // Staging arrow exection plan
-        let records = staging
-            .recordbatches_cloned(&self.schema)
-            .map_err(|e| DataFusionError::Internal(format!("Error during staging exec- {e}")))?;
+        // Both sources were captured before the remote snapshot was read.
+        let (records, partitioned_files) = captured;
         let arrow_exec = reversed_mem_table(records, self.schema.clone())?
             .scan(state, projection, filters, limit)
             .await?;
         execution_plans.push(arrow_exec);
 
-        // Get a list of parquet files still in staging, order by filename
-        let mut parquet_files = staging.parquet_files();
-        parquet_files.sort_by(|a, b| a.cmp(b).reverse());
-
-        // NOTE: We don't partition among CPUs to ensure consistent results.
-        // i.e. We were seeing in-consistent ordering when querying over parquets in staging.
-        let mut partitioned_files = Vec::with_capacity(parquet_files.len());
-        for file_path in parquet_files {
-            let Ok(file_meta) = file_path.metadata() else {
-                continue;
-            };
-            let file = PartitionedFile::new(file_path.display().to_string(), file_meta.len());
-            partitioned_files.push(file)
-        }
-
-        // // NOTE: There is the possibility of a parquet file being pushed to object store
-        // // and deleted from staging in the time it takes for datafusion to get to it.
-        // // Staging parquet execution plan
-        // let object_store_url = if let Some(tenant_id) = self.tenant_id.as_ref() {
-        //     &format!("file://{tenant_id}/")
-        // } else {
-        //     "file:///"
-        // };
+        // Keep the native scan and its file extensions: each extension owns the
+        // hard-link lease through optimizer rewrites and execution streams.
         let object_store_url = "file:///";
         self.create_parquet_physical_plan(
             execution_plans,
@@ -756,34 +733,55 @@ impl TableProvider for StandardTableProvider {
 
         let time_partition = object_store_format.time_partition;
         let mut time_filters = extract_primary_filter(filters, &time_partition);
-        if is_within_staging_window(&time_filters) {
-            self.get_staging_execution_plan(
-                &mut execution_plans,
-                projection,
-                filters,
-                limit,
-                state,
-            )
-            .await?;
+        let include_staging = is_within_staging_window(&time_filters);
+        // Capture before reading the snapshot used by this scan. Upload publishes
+        // the manifest before unlinking staging: either source will then survive.
+        let (staged_records, staged_files) = if include_staging {
+            match PARSEABLE.get_stream(&self.stream, &self.tenant_id) {
+                Ok(staging) => {
+                    // Preserve memory-first capture. A future coherent staging
+                    // API must make this handoff atomic with conversion as well.
+                    let records = staging
+                        .recordbatches_cloned(&self.schema)
+                        .map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "Cannot capture staging record batches: {error}"
+                            ))
+                        })?;
+                    let files = capture_staging_parquet(&staging.data_path)?;
+                    (records, files)
+                }
+                Err(_) => (Vec::new(), Vec::new()),
+            }
+        } else {
+            (Vec::new(), Vec::new())
         };
         let mut merged_snapshot = Snapshot::default();
         if PARSEABLE.options.mode == Mode::Query || PARSEABLE.options.mode == Mode::Prism {
-            let obs = PARSEABLE
+            let objects = PARSEABLE
                 .metastore
                 .get_all_stream_jsons(&self.stream, None, &self.tenant_id, false)
-                .await;
-            if let Ok(obs) = obs {
-                for ob in obs {
-                    if let Ok(object_store_format) =
-                        serde_json::from_slice::<ObjectStoreFormat>(&ob)
-                    {
-                        let snapshot = object_store_format.snapshot;
-                        for manifest in snapshot.manifest_list {
-                            merged_snapshot.manifest_list.push(manifest);
-                        }
-                    }
-                }
+                .await
+                .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+            for object in objects {
+                let format: ObjectStoreFormat = serde_json::from_slice(&object)
+                    .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+                merged_snapshot
+                    .manifest_list
+                    .extend(format.snapshot.manifest_list);
             }
+        } else if include_staging {
+            // The first read supplies stream settings only; its snapshot may
+            // predate the staging capture and must not be used for this scan.
+            let refreshed: ObjectStoreFormat = serde_json::from_slice(
+                &PARSEABLE
+                    .metastore
+                    .get_stream_json(&self.stream, false, &self.tenant_id, false)
+                    .await
+                    .map_err(|e| DataFusionError::Plan(e.to_string()))?,
+            )
+            .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+            merged_snapshot = refreshed.snapshot;
         } else {
             merged_snapshot = object_store_format.snapshot;
         }
@@ -817,6 +815,46 @@ impl TableProvider for StandardTableProvider {
             &self.tenant_id,
         )
         .await?;
+
+        // Compare only with files actually selected for the remote scan, before
+        // hot-tier routing mutates that list. Pruned/limit-excluded files must not
+        // hide a staging copy. Use exactly the uploader's path mapping.
+        if include_staging {
+            let selected_remote = manifest_files
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let staged_files =
+                staging_parquet::exclude_uploaded(staged_files, &selected_remote, |path| {
+                    let filename =
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "Invalid staging Parquet filename: {}",
+                                    path.display()
+                                ))
+                            })?;
+                    let relative = crate::storage::object_storage::stream_relative_path(
+                        &self.stream,
+                        filename,
+                        &object_store_format.custom_partition,
+                        &self.tenant_id,
+                    );
+                    Ok(glob_storage
+                        .absolute_url(relative_path::RelativePath::new(&relative))
+                        .to_string())
+                })?;
+            self.get_staging_execution_plan(
+                &mut execution_plans,
+                projection,
+                filters,
+                limit,
+                state,
+                (staged_records, staged_files),
+            )
+            .await?;
+        }
 
         if manifest_files.is_empty() {
             return self.final_plan(execution_plans, projection);
