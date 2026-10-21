@@ -12,17 +12,6 @@ env:
   NEXT_ASSETS_PATH: ${{ github.workspace }}/frontend/dist
 
 jobs:
-  community-ui:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - name: Test community UI overlay
-        run: node --test scripts/test-community-ui.mjs
-
   clippy:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45

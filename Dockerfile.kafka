@@ -43,7 +43,10 @@ RUN apt-get update && \
 WORKDIR /parseable
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY build_support ./build_support
-COPY scripts/community-ui-overlay.json scripts/community-promql-capabilities.js ./scripts/
+
+# The build script requires native assets, including during dependency warmup.
+COPY --from=frontend /frontend/dist /parseable/frontend/dist
+ENV NEXT_ASSETS_PATH=/parseable/frontend/dist
 
 # Fix librdkafka CMakeLists.txt before building
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
@@ -68,16 +71,13 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
 RUN cargo build --release --features kafka && \
     rm -rf src
 
-# Embed frontend assets after compiling dependencies so UI edits reuse them.
-COPY --from=frontend /frontend/dist /parseable/frontend/dist
-ENV NEXT_ASSETS_PATH=/parseable/frontend/dist
-
 # Copy the actual source code
 COPY src ./src
 COPY resources ./resources
 
 # Build the actual binary with kafka feature
-RUN cargo build --release --features kafka
+# Invalidate the dummy crate even when COPY preserves older source timestamps.
+RUN touch src/main.rs src/lib.rs && cargo build --release --features kafka
 
 # final stage
 FROM gcr.io/distroless/cc-debian12:latest

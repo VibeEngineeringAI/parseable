@@ -501,9 +501,16 @@ fn callback_base_url(req: &HttpRequest) -> String {
     format!("{}://{host}/", PARSEABLE.options.get_scheme())
 }
 
-/// Re-verifies the Basic credentials and swaps their session for a cookie one.
+/// Re-verifies the Basic credentials and issues a cookie session for them.
 /// `new_basic_session` re-reads the user under SESSIONS, so an admin change
 /// racing the login cannot leave a cookie session with stale credentials.
+///
+/// The Basic session `/login` authorized through is kept: other requests with
+/// the same credentials may be between their middleware check and a later
+/// `get_permissions`, and would see no permissions if it vanished. Dropping it
+/// revoked nothing, as the next Basic request re-verifies and re-tracks it;
+/// password changes, deletions and role changes still reach it through the
+/// user's tracked sessions.
 pub(crate) fn exchange_basic_for_cookie(
     username: &str,
     password: &str,
@@ -511,18 +518,15 @@ pub(crate) fn exchange_basic_for_cookie(
     expires_in: TimeDelta,
 ) -> Option<Cookie<'static>> {
     let id = Ulid::new();
-    let mut sessions = Users.new_basic_session(
-        username,
-        password,
-        tenant_id.as_deref().unwrap_or(DEFAULT_TENANT),
-        SessionKey::SessionId(id),
-        Utc::now() + expires_in,
-    )?;
-    sessions.remove_session(&SessionKey::BasicAuth {
-        username: username.to_owned(),
-        password: password.to_owned(),
-    });
-    Some(cookie_session(id))
+    Users
+        .new_basic_session(
+            username,
+            password,
+            tenant_id.as_deref().unwrap_or(DEFAULT_TENANT),
+            SessionKey::SessionId(id),
+            Utc::now() + expires_in,
+        )
+        .map(|_| cookie_session(id))
 }
 
 fn redirect_to_oidc_logout(mut logout_endpoint: Url, redirect: &Url) -> HttpResponse {

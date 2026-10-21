@@ -28,8 +28,8 @@ recovery stays inside the error panel so it does not obscure the normal avatar.
 Sign out navigates to the server logout endpoint, which ends the Parseable
 session, clears its cookies, and redirects to the provider's end-session
 endpoint (when the provider has one) before returning to `/login`. The provider
-must allow `<P_ORIGIN_URI>/login` as a post-logout redirect URI; with
-`P_UI_ROOT=classic`, the new frontend returns to `/next/login` instead. Ending the
+must allow `<P_ORIGIN_URI>/login` as a post-logout redirect URI. Legacy
+`/next/login` URLs redirect to `/login`. Ending the
 provider session lets a user who reached No access sign in as a different
 account, or sign in again to obtain fresh group claims. Refresh tabs opened
 before deployment to load these controls; older tabs cannot lazy-load the

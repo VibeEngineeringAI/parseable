@@ -5,7 +5,7 @@ import { CapabilityPage } from './CapabilityPage';
 const meta = {
   title: 'Settings/Capabilities',
   component: CapabilityPage,
-  args: { feature: 'llm', demo: false, classicAvailable: false },
+  args: { feature: 'llm', demo: false },
   decorators: [
     (Story) => (
       <MemoryRouter>
@@ -20,7 +20,6 @@ type Story = StoryObj<typeof meta>;
 export const LlmProviders: Story = {};
 export const Keystone: Story = { args: { feature: 'keystone' } };
 export const Investigation: Story = {
-  args: { feature: 'keystone', id: 'investigation-123', classicAvailable: true },
+  args: { feature: 'keystone', id: 'investigation-123' },
 };
-export const ClassicAvailable: Story = { args: { classicAvailable: true } };
-export const SampleWorkspace: Story = { args: { demo: true, classicAvailable: true } };
+export const SampleWorkspace: Story = { args: { demo: true } };

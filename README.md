@@ -114,23 +114,38 @@ gh attestation verify PATH/TO/YOUR/PARSEABLE/ARTIFACT-BINARY -R parseablehq/pars
 
 ### Editable frontend
 
-An initial React/TypeScript frontend and reusable component library live in
-[`frontend/`](frontend/README.md), with Logs Explore, SQL, datasets, local
-dashboards, Storybook, and browser tests. Billing and payment collection are
-excluded.
+The React/TypeScript frontend and reusable component library live in
+[`frontend/`](frontend/README.md), with Logs Explore, SQL, datasets, dashboards,
+Storybook, and browser tests. Billing and payment collection are excluded.
 
-Parseable serves it at `/`, and links to its earlier `/next/` mount redirect
-there. For one release, `P_UI_ROOT=classic` restores the classic UI at `/` and
-mounts the new frontend beside it at `/next/`, sharing the same session. Docker
-images and build/release workflows build it with Node 24 and embed
-`frontend/dist` through `NEXT_ASSETS_PATH`. To build locally from the
-repository root:
+Parseable embeds only this native frontend and serves it at `/`. Links to the
+earlier `/next/` mount redirect to the same path at the root. Classic Prism assets
+are no longer downloaded or embedded; `P_UI_ROOT=classic` is rejected with
+migration instructions. Docker images and build/release workflows build native
+assets with Node 24 and embed `frontend/dist` through `NEXT_ASSETS_PATH`.
+To build locally from the repository root:
 
 ```sh
 (cd frontend && npm ci && npm run build)
 NEXT_ASSETS_PATH="$PWD/frontend/dist" cargo build --release
 ```
 
-Then open `/`. See the
-[frontend README](frontend/README.md#build-and-embed-in-parseable) for build
-details, PowerShell instructions, and the classic UI's rollback setting.
+Missing native assets fail the build. For backend-only debug development, explicitly
+use `P_BUILD_NO_UI=1 cargo run -- local-store` with `NEXT_ASSETS_PATH` unset; UI
+requests then explain that the UI is disabled. This mode cannot be used for release
+builds. `/api/v1/about` reports `native-<server version>` or `disabled` as the UI
+version, alongside the server commit/build metadata.
+
+To run this checkout in Docker:
+
+```sh
+docker compose -f compose.yaml -f compose.source.yaml up -d --build
+```
+
+`docker compose up` alone uses the prebuilt upstream image from `compose.yaml`;
+it does not build this checkout and can still show the old UI. The source override
+uses the existing named data/staging volumes.
+
+See the [native UI retirement notes](docs/native-ui.md) and
+[frontend build instructions](frontend/README.md#build-and-embed-in-parseable)
+for compatibility, backend development and PowerShell details.
