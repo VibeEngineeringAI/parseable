@@ -32,7 +32,7 @@ use arrow_ipc::{
 };
 use arrow_schema::Schema;
 use arrow_select::concat::concat_batches;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use rand::distributions::{Alphanumeric, DistString};
@@ -90,7 +90,6 @@ impl Default for Writer {
 
 impl Writer {
     /// Appends a batch to the writer for its schema/minute file.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn push_disk(
         &mut self,
         filename: String,
@@ -98,7 +97,18 @@ impl Writer {
         file_path: PathBuf,
         range: TimeRange,
     ) -> Result<(), StagingError> {
-        match self.disk.get_mut(&filename) {
+        self.push_disk_ref(&filename, rb, file_path, range)
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn push_disk_ref(
+        &mut self,
+        filename: &str,
+        rb: &RecordBatch,
+        file_path: PathBuf,
+        range: TimeRange,
+    ) -> Result<(), StagingError> {
+        match self.disk.get_mut(filename) {
             Some(writer) => writer.write(rb),
             None => {
                 if let Some(parent) = file_path.parent() {
@@ -106,24 +116,49 @@ impl Writer {
                 }
                 let mut writer = DiskWriter::try_new(file_path, rb.schema().as_ref(), range)?;
                 writer.write(rb)?;
-                self.disk.insert(filename, writer);
+                self.disk.insert(filename.to_owned(), writer);
                 Ok(())
             }
         }
     }
 
-    /// Detaches completed disk writers, or all writers when `forced` is true.
+    /// Detaches completed disk writers and evicts their memory segments.
+    /// Forced flushes also detach current writers; ownerless memory always expires.
     pub fn take_flushable_disk(&mut self, forced: bool) -> HashMap<String, DiskWriter> {
+        self.take_flushable_disk_at(forced, Utc::now())
+    }
+
+    pub(crate) fn take_flushable_disk_at(
+        &mut self,
+        forced: bool,
+        now: DateTime<Utc>,
+    ) -> HashMap<String, DiskWriter> {
         let mut flushable_disk = HashMap::new();
         let old_disk = std::mem::take(&mut self.disk);
         for (filename, writer) in old_disk {
-            if !forced && writer.is_current() {
+            if !forced && writer.range.contains(now) {
                 self.disk.insert(filename, writer);
             } else {
                 flushable_disk.insert(filename, writer);
             }
         }
 
+        if let Some(mem) = self.mem.as_mut() {
+            // Use the selected writer keys, not a second clock/range check.
+            // Query-only segments have no disk owner and expire at each flush.
+            mem.clear_unsegmented();
+            mem.segments
+                .retain(|filename, _| self.disk.contains_key(filename));
+            if mem.segments.is_empty() {
+                // clear/retain alone keep the burst's bucket allocation alive.
+                mem.segments = HashMap::new();
+            } else if mem.segments.capacity()
+                > mem.segments.len().saturating_mul(2).saturating_add(16)
+            {
+                // Rehash only sparse maps; move segment owners without copying Arrow data.
+                mem.segments.shrink_to_fit();
+            }
+        }
         flushable_disk
     }
 }
@@ -217,6 +252,9 @@ impl Drop for DiskWriter {
 /// Recordbatches are pushed to mutable buffer first and then concated together and pushed to read buffer
 #[derive(Debug)]
 pub struct MemWriter<const N: usize> {
+    // Private file-owned buffers preserve the existing public MemWriter shape.
+    // Stream query callers use recordbatch_cloned to read every segment.
+    segments: HashMap<String, MemWriter<N>>,
     schema: Schema,
     // for checking uniqueness of schema
     schema_map: HashSet<String>,
@@ -227,6 +265,7 @@ pub struct MemWriter<const N: usize> {
 impl<const N: usize> Default for MemWriter<N> {
     fn default() -> Self {
         Self {
+            segments: HashMap::new(),
             schema: Schema::empty(),
             schema_map: HashSet::default(),
             read_buffer: Vec::default(),
@@ -236,6 +275,21 @@ impl<const N: usize> Default for MemWriter<N> {
 }
 
 impl<const N: usize> MemWriter<N> {
+    pub(crate) fn push_for_file(
+        &mut self,
+        filename: &str,
+        schema_key: &str,
+        rb: &RecordBatch,
+    ) -> Result<(), StagingError> {
+        if let Some(segment) = self.segments.get_mut(filename) {
+            return segment.push(schema_key, rb);
+        }
+        let mut segment = Self::default();
+        segment.push(schema_key, rb)?;
+        self.segments.insert(filename.to_owned(), segment);
+        Ok(())
+    }
+
     pub fn push(&mut self, schema_key: &str, rb: &RecordBatch) -> Result<(), StagingError> {
         if !self.schema_map.contains(schema_key) {
             self.schema_map.insert(schema_key.to_owned());
@@ -250,6 +304,11 @@ impl<const N: usize> MemWriter<N> {
     }
 
     pub fn clear(&mut self) {
+        self.segments = HashMap::new();
+        self.clear_unsegmented();
+    }
+
+    fn clear_unsegmented(&mut self) {
         self.schema = Schema::empty();
         self.schema_map.clear();
         self.read_buffer.clear();
@@ -266,10 +325,14 @@ impl<const N: usize> MemWriter<N> {
             read_buffer.push(rb)
         }
 
-        Ok(read_buffer
+        let mut batches = read_buffer
             .into_iter()
             .map(|rb| adapt_batch(schema.clone(), &rb))
-            .collect())
+            .collect::<Vec<_>>();
+        for segment in self.segments.values() {
+            batches.extend(segment.recordbatch_cloned(schema)?);
+        }
+        Ok(batches)
     }
 }
 
@@ -329,7 +392,200 @@ mod tests {
 
     use crate::{OBJECT_STORE_DATA_GRANULARITY, utils::time::TimeRange};
 
-    use super::{DiskWriter, Writer};
+    use super::{DiskWriter, MemWriter, Writer};
+
+    #[test]
+    fn current_minute_query_visibility_releases_burst_capacity() {
+        let dir = TempDir::new().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let current = TimeRange::granularity_range(now, OBJECT_STORE_DATA_GRANULARITY);
+        let expired = TimeRange {
+            start: current.start - chrono::TimeDelta::minutes(2),
+            end: current.start,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batches = (0..128)
+            .map(|id| {
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![id]))])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut writer = Writer {
+            mem: Some(MemWriter::default()),
+            disk: Default::default(),
+        };
+        for (id, batch) in batches.iter().enumerate() {
+            let filename = format!("{id}.date=2020-01-02.data.arrows");
+            let range = if id < 2 { &current } else { &expired };
+            writer
+                .push_disk_ref(&filename, batch, dir.path().join(&filename), range.clone())
+                .unwrap();
+            writer
+                .mem
+                .as_mut()
+                .unwrap()
+                .push_for_file(&filename, "id", batch)
+                .unwrap();
+        }
+        let peak_capacity = writer.mem.as_ref().unwrap().segments.capacity();
+        assert!(peak_capacity >= 128);
+        drop(writer.take_flushable_disk_at(false, now));
+        let mem = writer.mem.as_ref().unwrap();
+        assert_eq!(mem.segments.len(), 2);
+        assert!(mem.segments.capacity() <= 2 * mem.segments.len() + 16);
+        assert!(mem.segments.capacity() < peak_capacity);
+        for (id, batch) in batches.iter().take(2).enumerate() {
+            let key = format!("{id}.date=2020-01-02.data.arrows");
+            let retained = &mem.segments[&key].mutable_buffer.inner;
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].num_rows(), 1);
+            assert!(Arc::ptr_eq(retained[0].column(0), batch.column(0)));
+        }
+        assert_eq!(
+            mem.recordbatch_cloned(&schema)
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2
+        );
+        drop(writer.take_flushable_disk_at(false, current.end));
+        assert!(writer.disk.is_empty());
+        assert_eq!(writer.mem.as_ref().unwrap().segments.capacity(), 0);
+        let mem = writer.mem.as_mut().unwrap();
+        mem.push_for_file("clear-test", "id", &batches[0]).unwrap();
+        assert!(mem.segments.capacity() > 0);
+        mem.clear();
+        assert_eq!(mem.segments.capacity(), 0);
+    }
+
+    #[test]
+    fn current_minute_query_visibility_segments_follow_disk_ownership() {
+        let dir = TempDir::new().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let extended = Arc::new(Schema::new(vec![
+            Field::new("extra", DataType::Int32, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let query_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 11]))],
+        )
+        .unwrap();
+        let extended_batch = RecordBatch::try_new(
+            extended,
+            vec![
+                Arc::new(Int32Array::from(vec![99])),
+                Arc::new(Int32Array::from(vec![12])),
+            ],
+        )
+        .unwrap();
+        let mut writer = Writer {
+            mem: Some(MemWriter::default()),
+            disk: Default::default(),
+        };
+        let current_range = TimeRange {
+            start: now - chrono::TimeDelta::hours(1),
+            end: now + chrono::TimeDelta::hours(1),
+        };
+        for (name, range, rb, key) in [
+            (
+                "past",
+                TimeRange {
+                    start: now - chrono::TimeDelta::hours(3),
+                    end: now - chrono::TimeDelta::hours(2),
+                },
+                &batch,
+                "id",
+            ),
+            ("current-a", current_range.clone(), &batch, "id"),
+            ("current-b", current_range, &extended_batch, "extended"),
+            (
+                "future",
+                TimeRange {
+                    start: now + chrono::TimeDelta::hours(2),
+                    end: now + chrono::TimeDelta::hours(3),
+                },
+                &batch,
+                "id",
+            ),
+        ] {
+            let filename = format!("{name}.date=2020-01-02.data.arrows");
+            writer
+                .push_disk(filename.clone(), rb, dir.path().join(&filename), range)
+                .unwrap();
+            writer
+                .mem
+                .as_mut()
+                .unwrap()
+                .push_for_file(&filename, key, rb)
+                .unwrap();
+        }
+        // Query-mode user rows have no disk owner and use the public direct buffer.
+        writer.mem.as_mut().unwrap().push("id", &batch).unwrap();
+        let key = "current-a.date=2020-01-02.data.arrows";
+        assert!(
+            Arc::ptr_eq(
+                writer.mem.as_ref().unwrap().segments[key]
+                    .mutable_buffer
+                    .inner[0]
+                    .column(0),
+                batch.column(0)
+            ),
+            "ingestion must keep the existing Arrow allocation"
+        );
+        let detached = writer.take_flushable_disk_at(false, now);
+        assert_eq!(detached.len(), 2);
+        assert_eq!(writer.disk.len(), 2);
+        let mem = &writer.mem.as_ref().unwrap().segments;
+        assert_eq!(mem.len(), 2);
+        eprintln!(
+            "memory segment fixed header: {} bytes; filename String header: {} bytes (heap buffers/hash buckets excluded)",
+            std::mem::size_of::<super::MemWriter<4096>>(),
+            std::mem::size_of::<String>()
+        );
+        assert!(
+            Arc::ptr_eq(mem[key].mutable_buffer.inner[0].column(0), batch.column(0)),
+            "flushing must retain the same Arrow allocation"
+        );
+        let mut ids = Vec::new();
+        for segment in mem.values() {
+            for rb in segment.recordbatch_cloned(&query_schema).unwrap() {
+                assert_eq!(rb.schema(), query_schema);
+                ids.extend_from_slice(
+                    rb.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values(),
+                );
+                let extras = rb.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                if rb.num_rows() == 1 {
+                    assert_eq!(extras.value(0), 99);
+                } else {
+                    assert_eq!(arrow_array::Array::null_count(extras), 2);
+                }
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![10, 11, 12]);
+        drop(detached);
+        assert!(writer.take_flushable_disk_at(false, now).is_empty());
+        assert_eq!(writer.mem.as_ref().unwrap().segments.len(), 2);
+        drop(writer.take_flushable_disk_at(true, now));
+        assert!(writer.disk.is_empty());
+        assert!(writer.mem.as_ref().unwrap().segments.is_empty());
+        assert_eq!(writer.mem.as_ref().unwrap().segments.capacity(), 0);
+    }
 
     #[test]
     fn disk_writer_flushes_each_complete_batch_before_drop() {
