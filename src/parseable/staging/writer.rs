@@ -21,7 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::BufWriter,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -133,6 +133,40 @@ impl Writer {
         forced: bool,
         now: DateTime<Utc>,
     ) -> HashMap<String, DiskWriter> {
+        let flushable_disk = self.split_flushable_disk(forced, now);
+        self.compact_memory();
+        flushable_disk
+    }
+
+    /// Detaches like `take_flushable_disk_at`, but keeps each detached writer's
+    /// rows queryable as pending memory keyed by its part path. The caller must
+    /// seal the writers and follow their files with `MemWriter::rekey_pending`
+    /// until their rows are published in Parquet or discarded.
+    pub(crate) fn detach_flushable_disk_at(
+        &mut self,
+        forced: bool,
+        now: DateTime<Utc>,
+    ) -> Vec<DiskWriter> {
+        let flushable_disk = self.split_flushable_disk(forced, now);
+        if let Some(mem) = self.mem.as_mut() {
+            for (filename, writer) in &flushable_disk {
+                if let Some(segment) = mem.segments.remove(filename) {
+                    mem.pending
+                        .entry(writer.path.clone())
+                        .or_default()
+                        .push(segment);
+                }
+            }
+        }
+        self.compact_memory();
+        flushable_disk.into_values().collect()
+    }
+
+    fn split_flushable_disk(
+        &mut self,
+        forced: bool,
+        now: DateTime<Utc>,
+    ) -> HashMap<String, DiskWriter> {
         let mut flushable_disk = HashMap::new();
         let old_disk = std::mem::take(&mut self.disk);
         for (filename, writer) in old_disk {
@@ -142,7 +176,10 @@ impl Writer {
                 flushable_disk.insert(filename, writer);
             }
         }
+        flushable_disk
+    }
 
+    fn compact_memory(&mut self) {
         if let Some(mem) = self.mem.as_mut() {
             // Use the selected writer keys, not a second clock/range check.
             // Query-only segments have no disk owner and expire at each flush.
@@ -159,14 +196,21 @@ impl Writer {
                 mem.segments.shrink_to_fit();
             }
         }
-        flushable_disk
     }
+}
+
+/// A detached part whose IPC stream is finished but not yet renamed.
+pub(crate) struct SealedPart {
+    pub(crate) part: PathBuf,
+    pub(crate) arrow: PathBuf,
 }
 
 pub struct DiskWriter {
     inner: StreamWriter<BufWriter<File>>,
     path: PathBuf,
     range: TimeRange,
+    // Set once `seal` has taken over finishing and renaming from Drop.
+    sealed: bool,
 }
 
 impl DiskWriter {
@@ -176,20 +220,9 @@ impl DiskWriter {
         schema: &Schema,
         range: TimeRange,
     ) -> Result<Self, StagingError> {
-        let mut path = path.into();
-
-        // a rudimentary way to ensure one parquet per arrow file
-        if *ONE_PARQUET_PER_ARROW {
-            path.set_extension(Ulid::new().to_string());
-            path.add_extension(ARROW_FILE_EXTENSION);
-        }
-        path.add_extension(PART_FILE_EXTENSION);
-
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&path)?;
+        let base = path.into();
+        // ONE_PARQUET_PER_ARROW is a rudimentary way to ensure one parquet per arrow file
+        let (file, path) = Self::create_part_file(&base, *ONE_PARQUET_PER_ARROW)?;
         let inner = StreamWriter::try_new_with_options(
             BufWriter::new(file),
             schema,
@@ -198,7 +231,59 @@ impl DiskWriter {
                 .unwrap(),
         )?;
 
-        Ok(Self { inner, path, range })
+        Ok(Self {
+            inner,
+            path,
+            range,
+            sealed: false,
+        })
+    }
+
+    /// Exclusively creates a new `.arrows.part` file for `base`.
+    ///
+    /// Each part is owned by exactly one writer, and pending memory is keyed
+    /// by it. A detached writer still owns its part until sealed, a part whose
+    /// seal failed awaits startup recovery, and a late event for that writer key
+    /// may open a new writer meanwhile. Truncating or sharing such a part would
+    /// destroy acknowledged rows and alias their memory, so an occupied name
+    /// gets a per-file ULID after `.data`, which keeps the same Parquet group.
+    fn create_part_file(base: &Path, unique: bool) -> Result<(File, PathBuf), StagingError> {
+        const MAX_ATTEMPTS: usize = 8;
+        let mut unique = unique;
+        let mut attempt = 0;
+        loop {
+            let mut path = base.to_path_buf();
+            if unique {
+                path.set_extension(Ulid::new().to_string());
+                path.add_extension(ARROW_FILE_EXTENSION);
+            }
+            path.add_extension(PART_FILE_EXTENSION);
+
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((file, path)),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AlreadyExists
+                        && attempt < MAX_ATTEMPTS =>
+                {
+                    unique = true;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// Finishes the IPC stream and chooses its `.arrows` name without renaming,
+    /// so callers can move memory ownership to that name before conversion can
+    /// see it. On error the part file is left for startup recovery.
+    pub(crate) fn seal(mut self) -> Result<SealedPart, (PathBuf, StagingError)> {
+        self.sealed = true;
+        let part = std::mem::take(&mut self.path);
+        if let Err(err) = self.inner.finish() {
+            return Err((part, StagingError::Arrow(err)));
+        }
+        let arrow = sealed_arrow_path(&part);
+        Ok(SealedPart { part, arrow })
     }
 
     /// Returns whether this writer belongs to the current time range.
@@ -221,29 +306,36 @@ impl DiskWriter {
 impl Drop for DiskWriter {
     /// Write the continuation bytes and mark the file as done, rename to `.data.arrows`
     fn drop(&mut self) {
+        if self.sealed {
+            return;
+        }
         if let Err(err) = self.inner.finish() {
             error!("Couldn't finish arrow file {:?}, error = {err}", self.path);
             return;
         }
 
-        // `.arrows.part` becomes `.arrows` while preserving a per-file ULID.
-        let mut arrow_path = self.path.with_extension("");
-        // If file exists, append a random string before .date to avoid overwriting
-        if arrow_path.exists() {
-            let file_name = arrow_path.file_name().unwrap().to_string_lossy();
-            let date_pos = file_name
-                .find(".date")
-                .expect("File name should contain .date");
-            let random_suffix = Alphanumeric.sample_string(&mut rand::thread_rng(), 8);
-            let new_name = format!("{}{}", random_suffix, &file_name[date_pos..]);
-            arrow_path.set_file_name(new_name);
-        }
-
+        let arrow_path = sealed_arrow_path(&self.path);
         if let Err(err) = std::fs::rename(&self.path, &arrow_path) {
             error!("Couldn't rename file {:?}, error = {err}", self.path);
         }
         tracing::info!("flushing {:?} due to drop", self.path);
     }
+}
+
+/// `.arrows.part` becomes `.arrows` while preserving a per-file ULID.
+fn sealed_arrow_path(part: &Path) -> PathBuf {
+    let mut arrow_path = part.with_extension("");
+    // If file exists, append a random string before .date to avoid overwriting
+    if arrow_path.exists() {
+        let file_name = arrow_path.file_name().unwrap().to_string_lossy();
+        let date_pos = file_name
+            .find(".date")
+            .expect("File name should contain .date");
+        let random_suffix = Alphanumeric.sample_string(&mut rand::thread_rng(), 8);
+        let new_name = format!("{}{}", random_suffix, &file_name[date_pos..]);
+        arrow_path.set_file_name(new_name);
+    }
+    arrow_path
 }
 
 /// Structure to keep recordbatches in memory.
@@ -255,6 +347,17 @@ pub struct MemWriter<const N: usize> {
     // Private file-owned buffers preserve the existing public MemWriter shape.
     // Stream query callers use recordbatch_cloned to read every segment.
     segments: HashMap<String, MemWriter<N>>,
+    // Segments of detached writers, keyed by the current path of the staging
+    // file holding their rows: the part, then its `.arrows` name, then its
+    // processing-directory name. Released only when that exact file is
+    // published in Parquet or discarded, so a reused writer key or a colliding
+    // physical name never releases another file's rows. These rows share the
+    // ingested Arrow buffers. A failed conversion leaves its sources in a
+    // processing directory, retried only at startup, so their rows stay in RAM
+    // until then and can exceed the usual one or two minutes of staging; so do
+    // rows of parts that could not be sealed. Rows of sources discarded as
+    // invalid are released, matching what is persisted.
+    pending: HashMap<PathBuf, Vec<MemWriter<N>>>,
     schema: Schema,
     // for checking uniqueness of schema
     schema_map: HashSet<String>,
@@ -266,6 +369,7 @@ impl<const N: usize> Default for MemWriter<N> {
     fn default() -> Self {
         Self {
             segments: HashMap::new(),
+            pending: HashMap::new(),
             schema: Schema::empty(),
             schema_map: HashSet::default(),
             read_buffer: Vec::default(),
@@ -303,8 +407,32 @@ impl<const N: usize> MemWriter<N> {
         Ok(())
     }
 
+    /// Moves pending rows to the new path of their staging file.
+    pub(crate) fn rekey_pending(&mut self, from: &Path, to: &Path) {
+        if let Some(segments) = self.pending.remove(from) {
+            self.pending
+                .entry(to.to_path_buf())
+                .or_default()
+                .extend(segments);
+        }
+    }
+
+    /// Drops pending rows whose staging files were published or discarded.
+    pub(crate) fn release_pending(&mut self, paths: &[PathBuf]) {
+        if self.pending.is_empty() {
+            return;
+        }
+        for path in paths {
+            self.pending.remove(path);
+        }
+        if self.pending.is_empty() {
+            self.pending = HashMap::new();
+        }
+    }
+
     pub fn clear(&mut self) {
         self.segments = HashMap::new();
+        self.pending = HashMap::new();
         self.clear_unsegmented();
     }
 
@@ -329,7 +457,11 @@ impl<const N: usize> MemWriter<N> {
             .into_iter()
             .map(|rb| adapt_batch(schema.clone(), &rb))
             .collect::<Vec<_>>();
-        for segment in self.segments.values() {
+        for segment in self
+            .segments
+            .values()
+            .chain(self.pending.values().flatten())
+        {
             batches.extend(segment.recordbatch_cloned(schema)?);
         }
         Ok(batches)

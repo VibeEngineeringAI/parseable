@@ -445,17 +445,17 @@ impl StandardTableProvider {
             return Ok(());
         };
 
-        // Staging arrow exection plan
-        let records = staging
-            .recordbatches_cloned(&self.schema)
+        // Capture memory and the staging Parquet set together, so a conversion
+        // publishing meanwhile is seen either before or after, never both.
+        let (records, mut parquet_files) = staging
+            .capture_staging(&self.schema, |_| staging.parquet_files())
             .map_err(|e| DataFusionError::Internal(format!("Error during staging exec- {e}")))?;
         let arrow_exec = reversed_mem_table(records, self.schema.clone())?
             .scan(state, projection, filters, limit)
             .await?;
         execution_plans.push(arrow_exec);
 
-        // Get a list of parquet files still in staging, order by filename
-        let mut parquet_files = staging.parquet_files();
+        // Order the staging parquet files by filename
         parquet_files.sort_by(|a, b| a.cmp(b).reverse());
 
         // NOTE: We don't partition among CPUs to ensure consistent results.
