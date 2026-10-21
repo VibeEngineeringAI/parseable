@@ -2,7 +2,7 @@
 export const demoEnabled = import.meta.env.DEV || import.meta.env.VITE_ENABLE_DEMO === 'true';
 
 /**
- * Router base without a trailing slash; `/next` while served beside the classic UI.
+ * Router base without a trailing slash, derived from the document base.
  * The build loads its assets relative to `<base href>`, which the server points at
  * the mount, so one build serves `/` and `/next`.
  */

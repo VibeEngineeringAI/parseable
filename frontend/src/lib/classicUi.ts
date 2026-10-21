@@ -1,10 +1,6 @@
 import { parser } from '@prometheus-io/lezer-promql';
-import { basePath } from './config';
 import { matcher, metricSelector, validateRange } from './promql';
 import type { LogFilter, TimeRange } from './types';
-
-/** The classic (Prism) UI owns the root while this frontend is mounted under a prefix. */
-export const classicUiAvailable = basePath !== '';
 
 /**
  * How a classic URL opens here:
@@ -159,12 +155,6 @@ export function nativePath(path: string): string {
   }
   const query = search.toString();
   return `${fill(found.route.native, found.captures)}${query ? `?${query}` : ''}${hash}`;
-}
-
-/** The classic UI page equivalent to a route in this frontend, for comparison. */
-export function classicUiPath(pathname: string): string {
-  const found = bestMatch('native', pathname);
-  return found ? fill(found.route.classic, found.captures) : '/';
 }
 
 /** Classic quick ranges, by their `start` value when `type=fixed`. */

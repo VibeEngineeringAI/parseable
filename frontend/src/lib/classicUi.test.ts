@@ -6,7 +6,6 @@ import {
   classicMetricsSearch,
   classicRoute,
   classicRoutes,
-  classicUiPath,
   nativePath,
 } from './classicUi';
 import { appPath } from './config';
@@ -183,28 +182,7 @@ describe('classic routes opened here', () => {
   });
 });
 
-describe('comparing in the classic UI', () => {
-  it.each([
-    ['/', '/'],
-    ['/logs', '/'],
-    ['/logs/explore/team%20logs', '/logs/explore/team%20logs'],
-    ['/metrics', '/'],
-    ['/metrics/explore/team%20metrics', '/metrics/explore/team%20metrics'],
-    ['/sql-editor', '/sql-editor'],
-    ['/datasets', '/datasets'],
-    ['/dashboards', '/dashboards'],
-    ['/dashboards/01ABC/', '/dashboards/01ABC'],
-    ['/team', '/team'],
-    ['/alerts', '/alerts'],
-    ['/alerts/new', '/alerts/create'],
-    ['/alerts/targets', '/settings/alert-targets'],
-    ['/alerts/abc', '/alerts/abc'],
-    ['/alerts/abc/edit', '/alerts/abc/edit'],
-    ['/components', '/'],
-  ])('maps %s to the classic page %s', (route, classic) => {
-    expect(classicUiPath(route)).toBe(classic);
-  });
-
+describe('document navigation compatibility', () => {
   it('prefixes document navigations with the mount path', () => {
     expect(appPath('/login', '/next')).toBe('/next/login');
     expect(appPath('/login', '')).toBe('/login');

@@ -12,7 +12,6 @@ export const settingsCapabilities = {
     unavailable: 'Keystone analysis is unavailable in this native UI',
     explanation:
       'This native UI does not have a supported API for Keystone investigations or conversations. Existing investigations cannot be listed or opened here.',
-    classicPath: '/keystone',
   },
   llm: {
     title: 'LLM settings',
@@ -20,21 +19,7 @@ export const settingsCapabilities = {
     unavailable: 'Provider management is unavailable in this native UI',
     explanation:
       'This native UI does not have a supported API for listing providers, saving provider keys or selecting a default model. No provider credentials are read or stored here.',
-    classicPath: '/settings/llm-key',
   },
 } as const;
 
 export type SettingsCapability = keyof typeof settingsCapabilities;
-
-/** Fixed same-origin paths only; IDs are always a single encoded segment. */
-export function settingsClassicPath(feature: SettingsCapability, id?: string): string {
-  const path = settingsCapabilities[feature].classicPath;
-  // URL parsers normalize dot segments, including percent-encoded dots.
-  if (feature !== 'keystone' || !id || id === '.' || id === '..') return path;
-  try {
-    return `${path}/${encodeURIComponent(id)}`;
-  } catch {
-    // Invalid Unicode cannot be encoded as a route segment.
-    return path;
-  }
-}

@@ -6,7 +6,7 @@ const record = (value: unknown) => (object(value) ? value : {});
 const text = (value: unknown) => (typeof value === 'string' ? value : '');
 const unavailable = (part: string): never => {
   throw new Error(
-    `This legacy ${part} cannot be converted faithfully to SQL. Open it in the classic UI.`,
+    `This legacy ${part} cannot be converted faithfully to SQL. The stored definition is preserved; recreate this query with supported SQL.`,
   );
 };
 function filtersSql(value: unknown): string {

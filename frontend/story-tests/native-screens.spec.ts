@@ -69,7 +69,6 @@ const states = [
   ['settings-network-access--validation-error', 'Network access'],
   ['settings-capabilities--keystone', 'Keystone'],
   ['settings-capabilities--investigation', 'Keystone'],
-  ['settings-capabilities--classic-available', 'LLM settings'],
   ['settings-capabilities--sample-workspace', 'LLM settings'],
   ['operations-cluster--healthy', 'ingestor'],
   ['operations-cluster--empty', 'No cluster nodes'],
@@ -139,7 +138,7 @@ for (const [id, heading] of states) {
 
 for (const [id, heading] of [
   ['agents-telemetry--default', 'Agents'],
-  ['settings-capabilities--classic-available', 'LLM settings'],
+  ['settings-capabilities--llm-providers', 'LLM settings'],
   ['settings-network-access--default', 'Network access'],
   ['operations-cluster--healthy', 'ingestor'],
   ['operations-errors--success', 'Errors'],
@@ -190,22 +189,14 @@ test('failed agent queries remain honest after retry', async ({ page }) => {
   await expect(page.getByRole('table')).toHaveCount(0);
 });
 
-test('settings classic links preserve feature destinations and demo never links live mutations', async ({
-  page,
-}) => {
+test('unsupported settings explain their scope without retired classic links', async ({ page }) => {
   await story(page, 'settings-capabilities--investigation');
-  const open = page.getByRole('link', { name: 'Open investigation in classic UI' });
-  await expect(open).toHaveAttribute('href', '/keystone/investigation-123');
-  await open.focus();
-  await expect(open).toBeFocused();
+  await expect(page.getByRole('link', { name: /in classic UI/ })).toHaveCount(0);
   await expect(
     page.getByText(/Its existence and your access have not been verified/),
   ).toBeVisible();
-  await story(page, 'settings-capabilities--classic-available');
-  await expect(page.getByRole('link', { name: 'Open LLM settings in classic UI' })).toHaveAttribute(
-    'href',
-    '/settings/llm-key',
-  );
+  await story(page, 'settings-capabilities--llm-providers');
+  await expect(page.getByRole('link', { name: /in classic UI/ })).toHaveCount(0);
   await expect(page.locator('input')).toHaveCount(0);
   await story(page, 'settings-capabilities--sample-workspace');
   await expect(page.getByRole('status')).toContainText('not simulated');
