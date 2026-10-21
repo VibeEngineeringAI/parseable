@@ -64,6 +64,7 @@ async function mocked(
     missingType?: boolean;
     empty?: boolean;
     failCreate?: boolean;
+    failUpdate?: boolean;
     original?: Alert;
   } = {},
 ) {
@@ -131,6 +132,8 @@ async function mocked(
       if (options.missingType && path.endsWith('/0'))
         return route.fulfill({ status: 400, body: 'Missing alert' });
       if (request.method() === 'PUT') {
+        if (options.failUpdate)
+          return route.fulfill({ status: 400, body: 'Invalid alert query: Subquery not allowed' });
         writes.push(body);
         current = { ...current, ...body, promqlRuntime: undefined } as Alert;
       }
@@ -336,14 +339,129 @@ test('detail shows firing instances, delivery attempts, disabled banner and cust
   await expect(page.getByRole('button', { name: 'Disable', exact: true })).toBeFocused();
   await expect(page.getByRole('button', { name: 'Evaluate now', exact: true })).toBeEnabled();
 });
-test('builder rules are read-only with SQL and no Edit action', async ({ page }) => {
+test('builder rules convert to SQL only on a deliberate save, and cancel keeps them', async ({
+  page,
+}) => {
+  const sql = 'SELECT COUNT(*) FROM "application_logs" WHERE level = \'ERROR\'';
   await demo(page, '/alerts/01M4H000000000000000000012');
-  await expect(
-    page.getByText('Editing builder alerts is not supported yet.', { exact: false }),
-  ).toBeVisible();
-  await expect(page.locator('.alerts-query')).toContainText('SELECT COUNT(*)');
+  await expect(page.locator('.alerts-query')).toHaveText(sql);
+  await expect(page.getByText('Builder', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Duplicate', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Convert to SQL rule', exact: true }).click();
+  await expect(page).toHaveURL(/\/alerts\/01M4H000000000000000000012\/edit$/);
+  await expect(
+    page.getByRole('heading', { name: 'Convert to SQL rule', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByTestId('alert-conversion-notice')).toContainText(
+    'Nothing changes until you save.',
+  );
+  await expect(page.getByRole('textbox', { name: 'SQL query', exact: true })).toHaveText(sql);
+  await expect(page.getByLabel('Alert type')).toHaveValue('code');
+  await expect(page.getByLabel('Alert type')).toBeDisabled();
+  await expect(page.getByLabel('Threshold value')).toHaveValue('5');
+  await expect(page.getByLabel('Evaluation frequency (minutes)')).toHaveValue('5');
+  await expect(page.getByLabel('Evaluation window')).toHaveValue('10m');
+  await expect(page.getByLabel('Severity')).toHaveValue('high');
+  await expect(page.getByRole('checkbox', { name: 'Operations Slack' })).toBeChecked();
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(page).toHaveURL(/\/alerts\/01M4H000000000000000000012$/);
+  await expect(page.getByText('Builder', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Convert to SQL rule', exact: true }).click();
+  await page.getByRole('button', { name: 'Convert and save', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Checkout errors (builder)', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText('SQL', { exact: true })).toBeVisible();
+  await expect(page.locator('.alerts-query')).toHaveText(sql);
+  await expect(page.getByText('created with the query builder', { exact: false })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Edit', exact: true })).toBeVisible();
+});
+const builderAlert: Alert = {
+  ...alertFixture,
+  title: 'Checkout errors',
+  severity: 'critical',
+  query: 'SELECT COUNT(*) FROM "logs" WHERE "status" >= 500',
+  queryType: 'builder',
+  datasets: ['logs'],
+  thresholdConfig: { operator: '>=', value: 12.5 },
+  evalConfig: { rollingWindow: { evalStart: '1h30m', evalEnd: 'now', evalFrequency: 15 } },
+  notificationConfig: { interval: 5 },
+  targets: [targetFixture.id],
+  tags: ['checkout', 'production'],
+  state: 'disabled',
+  notificationState: { mute: 'indefinite' },
+  promqlConfig: undefined,
+  promqlRuntime: undefined,
+  units: 'requests',
+};
+test('builder conversion failure keeps the form and the stored rule unchanged', async ({
+  page,
+}) => {
+  const api = await mocked(page, { original: builderAlert, failUpdate: true });
+  await page.goto(`${detailPath}/edit`);
+  await expect(page.getByRole('textbox', { name: 'SQL query', exact: true })).toHaveText(
+    builderAlert.query,
+  );
+  // Opening the conversion only reads the alert.
+  expect(api.calls.filter((call) => call.method !== 'GET')).toEqual([]);
+  await page.getByRole('button', { name: 'Convert and save', exact: true }).click();
+  await expect(page.getByText('Subquery not allowed', { exact: false })).toBeVisible();
+  await expect(page).toHaveURL(/\/edit$/);
+  await expect(page.getByRole('button', { name: 'Convert and save', exact: true })).toBeEnabled();
+  await expect(page.getByRole('textbox', { name: 'SQL query', exact: true })).toHaveText(
+    builderAlert.query,
+  );
+  expect(api.writes).toEqual([]);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(page.getByText('Builder', { exact: true })).toBeVisible();
+  await expect(page.getByText('This alert is disabled.', { exact: false })).toBeVisible();
+});
+test('builder conversion sends the generated SQL with every existing setting', async ({ page }) => {
+  const api = await mocked(page, { original: builderAlert });
+  await page.goto(`${detailPath}/edit`);
+  await page.getByRole('button', { name: 'Convert and save', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Checkout errors', exact: true })).toBeVisible();
+  const puts = api.calls.filter((call) => call.method === 'PUT');
+  expect(puts.map((call) => call.path)).toEqual([`/api/v1/alerts/${builderAlert.id}`]);
+  expect(api.writes).toEqual([
+    {
+      title: 'Checkout errors',
+      severity: 'critical',
+      query: builderAlert.query,
+      queryType: 'code',
+      datasets: ['logs'],
+      alertType: 'threshold',
+      thresholdConfig: { operator: '>=', value: 12.5 },
+      evalConfig: { rollingWindow: { evalStart: '1h30m', evalEnd: 'now', evalFrequency: 15 } },
+      notificationConfig: { interval: 5 },
+      targets: [targetFixture.id],
+      tags: ['checkout', 'production'],
+      units: 'requests',
+    },
+  ]);
+  // Enabled and mute state are server-managed and kept by the update.
+  await expect(page.getByText('This alert is disabled.', { exact: false })).toBeVisible();
+  await expect(page.locator('.alerts-metadata')).toContainText('Muted indefinitely');
+  await expect(page.getByText('SQL', { exact: true })).toBeVisible();
+});
+test('SQL rules keep the ordinary edit flow without conversion', async ({ page }) => {
+  const api = await mocked(page, {
+    original: { ...builderAlert, queryType: 'code', state: 'not-triggered' },
+  });
+  await page.goto(detailPath);
+  await expect(page.getByRole('button', { name: 'Convert to SQL rule' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Edit alert', exact: true })).toBeVisible();
+  await expect(page.getByTestId('alert-conversion-notice')).toHaveCount(0);
+  await page.getByLabel('Threshold value').fill('20');
+  await page.getByRole('button', { name: 'Save alert', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Checkout errors', exact: true })).toBeVisible();
+  expect(api.writes[0]).toMatchObject({
+    queryType: 'code',
+    query: builderAlert.query,
+    thresholdConfig: { operator: '>=', value: 20 },
+  });
 });
 test('title search, tag filtering and sorting distinguish empty searches', async ({ page }) => {
   await demo(page);

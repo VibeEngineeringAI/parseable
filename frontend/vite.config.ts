@@ -4,6 +4,8 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   return {
     plugins: [react()],
+    // Keep bundled dependency notices in the embedded assets and release ZIP.
+    build: { license: { fileName: 'THIRD_PARTY_LICENSES.md' } },
     server: {
       port: 5173,
       strictPort: true,

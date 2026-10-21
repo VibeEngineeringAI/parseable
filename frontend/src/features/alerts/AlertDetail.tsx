@@ -81,7 +81,8 @@ export function AlertDetail({ alert, onChanged }: { alert: Alert; onChanged: () 
             <pre className="alerts-query">{alert.query}</pre>
             {alert.queryType === 'builder' && (
               <p className="notice">
-                Editing builder alerts is not supported yet. This SQL rule is read-only.
+                This alert was created with the query builder and runs the SQL above. Convert it to
+                an SQL rule to edit it.
               </p>
             )}
           </CardBody>

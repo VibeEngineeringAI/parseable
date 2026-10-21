@@ -36,8 +36,6 @@ pub enum UiRoot {
     /// The native frontend. `/next`, where it used to live, redirects to `/`.
     #[default]
     Native,
-    /// The classic Prism UI, with the native frontend beside it under `/next`.
-    Classic,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,8 +159,8 @@ pub mod validation {
     pub fn ui_root(s: &str) -> Result<UiRoot, String> {
         match s {
             "native" => Ok(UiRoot::Native),
-            "classic" => Ok(UiRoot::Classic),
-            _ => Err("Invalid P_UI_ROOT provided, expected native or classic".to_string()),
+            "classic" => Err("The classic Prism UI has been removed. Unset P_UI_ROOT (or use native) and rebuild with NEXT_ASSETS_PATH pointing to frontend/dist".to_string()),
+            _ => Err("Invalid P_UI_ROOT provided, expected native".to_string()),
         }
     }
 
@@ -295,5 +293,19 @@ pub mod validation {
         } else {
             Err("Invalid value for P_MAX_EVENT_PAYLOAD_SIZE. It should be given as integer number of bytes".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::{UiRoot, validation};
+
+    #[test]
+    fn only_native_ui_is_supported() {
+        assert_eq!(validation::ui_root("native").unwrap(), UiRoot::Native);
+        let error = validation::ui_root("classic").unwrap_err();
+        assert!(error.contains("removed"));
+        assert!(error.contains("Unset P_UI_ROOT"));
+        assert!(validation::ui_root("other").is_err());
     }
 }

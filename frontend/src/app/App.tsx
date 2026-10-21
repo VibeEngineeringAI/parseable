@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useState } from 'react';
 import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import { ChevronRight, ExternalLink, Moon, Sun, LogOut } from 'lucide-react';
+import { ChevronRight, Moon, Sun, LogOut } from 'lucide-react';
 import { Badge, Button, EmptyState, Spinner } from '../components/ui';
 import { Sidebar } from './Sidebar';
 import { ConnectionDialog } from './ConnectionDialog';
@@ -8,7 +8,7 @@ import { useApp } from './AppProvider';
 import { LoginPage } from './LoginPage';
 import { PageErrorBoundary } from './RouteError';
 import { safeReturnPath } from '../lib/auth';
-import { classicRoute, classicUiAvailable, classicUiPath, nativePath } from '../lib/classicUi';
+import { classicRoute, nativePath } from '../lib/classicUi';
 import '../styles/auth-shell.css';
 const LogsPage = lazy(() =>
   import('../features/logs/LogsPage').then((m) => ({ default: m.LogsPage })),
@@ -149,19 +149,6 @@ export function App() {
           </div>
           <div id="workspace-context" />
           <div className="inline">
-            {classicUiAvailable && (
-              <a
-                className="ui-button"
-                data-variant="ghost"
-                data-size="sm"
-                href={classicUiPath(location.pathname)}
-                target="_blank"
-                rel="noopener"
-                data-testid="compare-classic-ui"
-              >
-                Compare in classic UI <ExternalLink size={13} aria-hidden="true" />
-              </a>
-            )}
             <Badge tone={mode === 'demo' ? 'warning' : 'neutral'}>
               {mode === 'demo' ? 'Demo data' : 'Live server'}
             </Badge>
@@ -255,7 +242,7 @@ export function App() {
                         title="Page not found"
                         description={
                           classicRoute(location.pathname)?.kind === 'classic-only'
-                            ? 'This page is only available in the classic UI.'
+                            ? 'This legacy page was retired with the classic UI. Use the navigation to open a supported page.'
                             : 'This route is not part of this frontend iteration.'
                         }
                         action={<Link to="/">Back to overview</Link>}

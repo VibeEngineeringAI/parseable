@@ -1,7 +1,5 @@
-// Serves the production build in `dist-e2e` the way Parseable embeds it: at `/`,
-// and under `/next` with `<base href="/">` pointed at the mount, as `mount_ui`
-// does with P_UI_ROOT=classic. Paths that are not files get `index.html`,
-// except missing hashed assets, which stay a 404.
+// Serves the production build at `/`, with legacy `/next` page redirects.
+// Missing hashed assets (including stale `/next/assets/` URLs) stay a 404.
 import { createServer } from 'node:http';
 import { readdir, readFile } from 'node:fs/promises';
 import { extname, join, relative, sep } from 'node:path';
@@ -31,10 +29,18 @@ if (!index.includes('<base href="/"'))
   throw new Error('dist-e2e/index.html has no <base href="/">');
 
 createServer((req, res) => {
-  const { pathname } = new URL(req.url ?? '/', 'http://localhost');
+  const { pathname, search } = new URL(req.url ?? '/', 'http://localhost');
   const mount = pathname === '/next' || pathname.startsWith('/next/') ? '/next' : '';
   const path = decodeURIComponent(pathname.slice(mount.length)).replace(/^\/+/, '');
-  // `index.html` itself is served rewritten, like every client route.
+  if (mount) {
+    if (path.startsWith('assets/')) {
+      res.writeHead(404, { 'cache-control': 'no-cache' }).end();
+    } else {
+      const target = pathname.slice(mount.length).replace(/^[\/\\]+/, '');
+      res.writeHead(307, { location: `/${target}${search}`, 'cache-control': 'no-store' }).end();
+    }
+    return;
+  }
   const file = path === 'index.html' ? undefined : files.get(path);
   if (file) {
     res.writeHead(200, { 'content-type': types[extname(path)] ?? 'application/octet-stream' });
@@ -43,6 +49,6 @@ createServer((req, res) => {
     res.writeHead(404).end();
   } else {
     res.writeHead(200, { 'content-type': types['.html'] });
-    res.end(index.replace('<base href="/"', `<base href="${mount}/"`));
+    res.end(index);
   }
 }).listen(port, '127.0.0.1');
