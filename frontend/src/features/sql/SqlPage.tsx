@@ -492,6 +492,27 @@ function SqlWorkspace() {
           onSaved={(item) => patch(tab.id, { savedId: item.id, name: item.name })}
           onGenerateQuery={() => newQuery(datasetQuery(tab.datasets), tab.datasets)}
           onInsertText={(text) => editor.current?.insertText(text)}
+          onOpenServerQuery={(item) => {
+            // Server records stay read only: the tab is an unsaved draft of their SQL.
+            const existing = tabs.find(
+              (tab) =>
+                !tab.savedId &&
+                tab.name === item.name &&
+                tab.query === item.sql &&
+                JSON.stringify(tab.range) === JSON.stringify(item.range),
+            );
+            if (existing) {
+              setActiveId(existing.id);
+              setRow(undefined);
+              focusTab(existing.id);
+              return;
+            }
+            const next = createQueryTab(item.name, item.sql, item.range);
+            next.datasets = [...item.datasets];
+            setTabs((items) => [...items, next]);
+            setActiveId(next.id);
+            setRow(undefined);
+          }}
           onOpenQuery={(item) => {
             const existing = tabs.find((tab) => tab.savedId === item.id);
             if (existing) {

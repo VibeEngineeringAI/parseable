@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ChevronDown, ChevronRight, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, Copy, Trash2 } from 'lucide-react';
 import { Button, Input } from '../../components/ui';
 import { QueryState } from '../../components/explorer/QueryState';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
+import { ApiError } from '../../lib/apiError';
 import { quoteIdentifier } from '../../lib/query';
+import { sha256 } from '../../lib/sha256';
 import type { Dataset, TimeRange } from '../../lib/types';
 import { readSavedQueries, saveQuery, sqlStorageScope, type SavedQuery } from './savedQueries';
+import { importServerQuery, serverSavedQueries, type ServerSavedQuery } from './serverSavedQueries';
 import './sql-sidebar.css';
 export interface SqlSidebarProps {
   datasets: Dataset[];
@@ -16,6 +19,7 @@ export interface SqlSidebarProps {
   selectedDatasets: string[];
   onSelectedDatasetsChange: (names: string[]) => void;
   onOpenQuery: (item: SavedQuery) => void;
+  onOpenServerQuery?: (item: ServerSavedQuery) => void;
   onGenerateQuery: () => void;
   onInsertText?: (text: string) => void;
   currentQuery: string;
@@ -48,6 +52,98 @@ function Schema({ name, onInsertText }: { name: string; onInsertText?: (text: st
     </div>
   );
 }
+/**
+ * Read-only server library of SQL saved through /filters, including classic
+ * Prism SQL queries. Records are never written from here; copying one creates
+ * an independent browser-library entry.
+ */
+function ServerLibrary({
+  search,
+  onOpen,
+  onCopy,
+}: {
+  search: string;
+  onOpen?: (item: ServerSavedQuery) => void;
+  onCopy: (item: ServerSavedQuery) => void;
+}) {
+  const { client, identity, mode } = useApp();
+  const owner = useAsync(
+    useCallback(
+      async () => (identity?.source === 'server' ? sha256(identity.id) : undefined),
+      [identity?.id, identity?.source],
+    ),
+  );
+  const views = useAsync(
+    useCallback((signal) => client.listLogViews(signal).then(serverSavedQueries), [client]),
+  );
+  const ownerHash = mode === 'demo' ? 'demo' : owner.data;
+  const forbidden = views.error instanceof ApiError && views.error.status === 403;
+  const items = (views.data ?? []).filter((item) =>
+    `${item.name} ${item.sql} ${item.datasets.join(' ')}`
+      .toLowerCase()
+      .includes(search.toLowerCase()),
+  );
+  return (
+    <>
+      <div className="panel-heading">
+        <h2>Server saved queries</h2>
+        <span className="count-label">{views.data?.length ?? 0}</span>
+      </div>
+      <p className="muted sql-library-hint">
+        SQL saved on the server, including classic saved queries and SQL Logs views. Read only here:
+        open one or copy it to this browser to edit.
+      </p>
+      {views.loading && (
+        <p className="muted" role="status">
+          Loading server saved queries…
+        </p>
+      )}
+      {views.error && (
+        <div role="alert">
+          <p>
+            {forbidden
+              ? 'You do not have permission to list server saved queries.'
+              : views.error.message}
+          </p>
+          {!forbidden && (
+            <Button size="sm" onClick={views.reload}>
+              Retry server saved queries
+            </Button>
+          )}
+        </div>
+      )}
+      <div className="sql-library-items" aria-label="Server saved queries">
+        {items.map((item) => (
+          <div className="sql-library-item" key={item.key}>
+            <Button
+              variant="ghost"
+              size="sm"
+              title={item.sql}
+              disabled={!onOpen}
+              onClick={() => onOpen?.(item)}
+            >
+              {item.name}
+              <span className="muted sql-library-origin">
+                {item.origin === 'sql' ? 'SQL' : 'Logs view'}
+                {item.ownerHash && item.ownerHash === ownerHash ? '' : ' · shared'}
+              </span>
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={`Copy server query ${item.name} to this browser`}
+              title="Copy to this browser"
+              onClick={() => onCopy(item)}
+            >
+              <Copy size={13} />
+            </Button>
+          </div>
+        ))}
+        {views.data && !items.length && <p className="muted">No server saved queries.</p>}
+      </div>
+    </>
+  );
+}
 export function SqlSidebar(props: SqlSidebarProps) {
   const { mode, identity } = useApp();
   const scope = sqlStorageScope(mode, identity);
@@ -56,6 +152,7 @@ export function SqlSidebar(props: SqlSidebarProps) {
     items: [],
   });
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [search, setSearch] = useState('');
   const [librarySearch, setLibrarySearch] = useState('');
   const [name, setName] = useState(props.currentName);
@@ -90,6 +187,7 @@ export function SqlSidebar(props: SqlSidebarProps) {
       localStorage.setItem(`${scope}:library`, JSON.stringify(next));
       setStored({ scope, items: next });
       setError('');
+      setNotice('');
       return true;
     } catch {
       setError('Could not save: browser storage is unavailable or full.');
@@ -109,6 +207,22 @@ export function SqlSidebar(props: SqlSidebarProps) {
       ...(props.currentChart === undefined ? {} : { chart: props.currentChart }),
     };
     if (persist(saveQuery(items, item))) props.onSaved?.(item);
+  };
+  const copyServerQuery = (item: ServerSavedQuery) => {
+    // Read the latest stored library so another tab's saves are never overwritten.
+    let current = items;
+    try {
+      if (scope) current = readSavedQueries(localStorage.getItem(`${scope}:library`));
+    } catch {
+      /* persist reports unavailable storage */
+    }
+    const result = importServerQuery(current, item);
+    if (!result.imported) {
+      setError('');
+      setNotice(`${item.name} is already in this browser library.`);
+      return;
+    }
+    if (persist(result.items)) setNotice(`Copied ${item.name} to this browser library.`);
   };
   const canSave = !!scope && !!name.trim() && !!props.currentQuery.trim();
   return (
@@ -198,6 +312,7 @@ export function SqlSidebar(props: SqlSidebarProps) {
         )}
       </div>
       {error && <p role="alert">{error}</p>}
+      {notice && <p role="status">{notice}</p>}
       <Input
         aria-label="Search saved queries"
         placeholder="Search saved queries"
@@ -233,6 +348,15 @@ export function SqlSidebar(props: SqlSidebarProps) {
           ))}
         {!items.length && <p className="muted">No saved queries yet.</p>}
       </div>
+      {scope && (
+        // Keyed by account scope: a changed account never shows the previous list.
+        <ServerLibrary
+          key={scope}
+          search={librarySearch}
+          onOpen={props.onOpenServerQuery}
+          onCopy={copyServerQuery}
+        />
+      )}
     </aside>
   );
 }
