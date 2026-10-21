@@ -18,15 +18,25 @@
 
 use std::{ops::Bound, sync::Arc};
 
-use arrow_schema::Schema;
+use arrow_schema::{Schema, SchemaRef};
 use datafusion::{
+    catalog::Session,
+    common::Statistics,
     datasource::{
-        file_format::parquet::ParquetFormat,
+        file_format::{
+            FileFormat, FileMeta, file_compression_type::FileCompressionType,
+            parquet::ParquetFormat,
+        },
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+        physical_plan::{FileScanConfig, FileSource},
+        table_schema::TableSchema,
     },
     error::DataFusionError,
+    physical_expr::LexOrdering,
+    physical_plan::ExecutionPlan,
 };
 use itertools::Itertools;
+use object_store::{ObjectMeta, ObjectStore};
 
 use crate::{OBJECT_STORE_DATA_GRANULARITY, storage::ObjectStorage, utils::time::TimeRange};
 
@@ -122,7 +132,8 @@ impl ListingTableBuilder {
             return Ok(None);
         }
 
-        let file_format = ParquetFormat::default().with_enable_pruning(true);
+        let file_format =
+            UnorderedParquetFormat(ParquetFormat::default().with_enable_pruning(true));
         let listing_options =
             ListingOptions::new(Arc::new(file_format)).with_file_extension(".parquet");
         let config = ListingTableConfig::new_with_multi_paths(map(self.listing))
@@ -131,5 +142,87 @@ impl ListingTableBuilder {
         let listing_table = ListingTable::try_new(config)?;
 
         Ok(Some(Arc::new(listing_table)))
+    }
+}
+
+/// Parquet format for listed files that never infers an ordering.
+///
+/// With statistics collection on, `ListingTable` takes each file's ordering from its first row
+/// group's footer `sorting_columns` and advertises the ordering the files share. Parseable's
+/// writer declares time-descending order without sorting (see `parquet_scan_plan`), so trusting
+/// that claim lets DataFusion drop a sort or stop a TopK scan early and return the wrong rows.
+/// Statistics are still read for pruning.
+#[derive(Debug)]
+struct UnorderedParquetFormat(ParquetFormat);
+
+#[async_trait::async_trait]
+impl FileFormat for UnorderedParquetFormat {
+    fn get_ext(&self) -> String {
+        self.0.get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> Result<String, DataFusionError> {
+        self.0.get_ext_with_compression(file_compression_type)
+    }
+
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        self.0.compression_type()
+    }
+
+    async fn infer_schema(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> Result<SchemaRef, DataFusionError> {
+        self.0.infer_schema(state, store, objects).await
+    }
+
+    async fn infer_stats(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<Statistics, DataFusionError> {
+        self.0.infer_stats(state, store, table_schema, object).await
+    }
+
+    async fn infer_ordering(
+        &self,
+        _state: &dyn Session,
+        _store: &Arc<dyn ObjectStore>,
+        _table_schema: SchemaRef,
+        _object: &ObjectMeta,
+    ) -> Result<Option<LexOrdering>, DataFusionError> {
+        Ok(None)
+    }
+
+    // `ParquetFormat` overrides this to return the footer ordering along with the statistics.
+    async fn infer_stats_and_ordering(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<FileMeta, DataFusionError> {
+        self.infer_stats(state, store, table_schema, object)
+            .await
+            .map(FileMeta::new)
+    }
+
+    async fn create_physical_plan(
+        &self,
+        state: &dyn Session,
+        conf: FileScanConfig,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.0.create_physical_plan(state, conf).await
+    }
+
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
+        self.0.file_source(table_schema)
     }
 }

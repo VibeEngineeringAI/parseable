@@ -21,10 +21,10 @@
 //!
 //! The files come from the real staging writer (`Stream::push` -> `flush` ->
 //! `convert_disk_files_to_parquet`), and their manifest entries from `create_from_parquet_file`.
-//! Scans are planned with the production `partitioned_files` and `parquet_scan_plan`. Every
-//! result is compared with an independent sort of the decoded rows. Where a `LIMIT` cuts through
-//! equal timestamps the test only checks that the rows came from that timestamp, because SQL
-//! leaves their order and selection open.
+//! Scans are planned with the production `partitioned_files` and `parquet_scan_plan`, or for data
+//! no manifest covers, `ListingTableBuilder`. Every result is compared with an independent sort of
+//! the decoded rows. Where a `LIMIT` cuts through equal timestamps the test only checks that the
+//! rows came from that timestamp, because SQL leaves their order and selection open.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -55,7 +55,7 @@ use crate::{
     cli::Options,
     metadata::LogStreamMetadata,
     parseable::Stream,
-    storage::StreamType,
+    storage::{LocalFS, StreamType},
 };
 
 /// `P_EXECUTION_BATCH_SIZE` default (src/cli.rs).
@@ -960,7 +960,7 @@ async fn reappearing_timestamp_aggregates() {
 // Externally written file: the Parseable writer never stores a null `p_timestamp`
 // ---------------------------------------------------------------------------
 
-fn write_external(path: &Path, times: &[Option<i64>]) {
+fn write_external(path: &Path, times: &[Option<i64>], claim: Vec<SortingColumn>) {
     let schema = p_timestamp_schema();
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -972,7 +972,7 @@ fn write_external(path: &Path, times: &[Option<i64>]) {
     .unwrap();
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(2))
-        .set_sorting_columns(Some(time_desc_claim(0)))
+        .set_sorting_columns(Some(claim))
         .build();
     let mut writer =
         ArrowWriter::try_new(fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
@@ -992,7 +992,7 @@ async fn external_leading_null_with_nulls_last_claim() {
         ),
     ] {
         let path = temp_dir.path().join(format!("{case}.parquet"));
-        write_external(&path, &times);
+        write_external(&path, &times, time_desc_claim(0));
         let file = StoredFile::open(path, DEFAULT_TIMESTAMP_KEY, "id");
         file.assert_manifest_claims_time_desc();
         checks
@@ -1007,6 +1007,164 @@ async fn external_leading_null_with_nulls_last_claim() {
             .await;
     }
     checks.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Data no manifest covers, scanned through `ListingTableBuilder`
+// ---------------------------------------------------------------------------
+
+/// Places `file` where legacy listing finds it and builds the table with the production
+/// `ListingTableBuilder`, as `legacy_listing_table` does for a query range before every manifest.
+/// `LocalFS::query_prefixes` resolves prefixes against `/`, so the store is rooted there and the
+/// stream is named by its absolute path.
+async fn listed_table(store: &TempDir, file: &StoredFile) -> Arc<dyn TableProvider> {
+    let stream_dir = store.path().join("ordering");
+    let minute_dir = stream_dir.join("date=2026-10-17/hour=12/minute=59");
+    fs::create_dir_all(&minute_dir).unwrap();
+    fs::copy(&file.path, minute_dir.join("listed.data.parquet")).unwrap();
+    let storage: Arc<dyn ObjectStorage> = Arc::new(LocalFS::new(PathBuf::from("/")));
+    let midnight = |day| {
+        NaiveDate::from_ymd_opt(2026, 10, day)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    };
+    // 2026-10-17 lies wholly inside the range, so it is listed by its `date=` prefix.
+    let time_filters = [
+        PartialTimeFilter::Low(Bound::Included(midnight(16))),
+        PartialTimeFilter::High(Bound::Excluded(midnight(18))),
+    ];
+    // The absolute path without its leading `/`.
+    let stream = stream_dir.to_str().unwrap()[1..].to_owned();
+    let schema = file.schema.clone();
+    ListingTableBuilder::new(stream)
+        .populate_via_listing(storage.clone(), &time_filters)
+        .await
+        .unwrap()
+        .build(schema, |prefixes| storage.query_prefixes(prefixes))
+        .unwrap()
+        .expect("the copied file is listed")
+}
+
+const LISTING_QUERIES: [(&str, usize, TimeOrder, bool); 6] = [
+    (
+        "SELECT id, p_timestamp FROM t ORDER BY p_timestamp DESC NULLS LAST LIMIT 4",
+        4,
+        TimeOrder::DescNullsLast,
+        false,
+    ),
+    (
+        "SELECT id, p_timestamp FROM t ORDER BY p_timestamp DESC NULLS LAST LIMIT 8",
+        8,
+        TimeOrder::DescNullsLast,
+        false,
+    ),
+    (
+        "SELECT id, p_timestamp FROM t ORDER BY p_timestamp DESC NULLS LAST",
+        12,
+        TimeOrder::DescNullsLast,
+        false,
+    ),
+    (
+        "SELECT id, p_timestamp FROM t ORDER BY p_timestamp DESC NULLS LAST, id DESC LIMIT 6",
+        6,
+        TimeOrder::DescNullsLast,
+        true,
+    ),
+    (
+        "SELECT id, p_timestamp FROM t ORDER BY p_timestamp DESC LIMIT 4",
+        4,
+        TimeOrder::Desc,
+        false,
+    ),
+    (
+        "SELECT id, p_timestamp FROM t ORDER BY p_timestamp ASC LIMIT 4",
+        4,
+        TimeOrder::Asc,
+        false,
+    ),
+];
+
+/// Lists `file` as `legacy_listing_table` does for a query range before every manifest, and
+/// returns every ordering claim and wrong answer of `LISTING_QUERIES` over it.
+async fn listing_failures(file: &StoredFile) -> Vec<String> {
+    let store = TempDir::new().unwrap();
+    let table = listed_table(&store, file).await;
+    let context = production_session();
+    let state = context.state();
+    let scan = table.scan(&state, None, &[], None).await.unwrap();
+    let mut failures = Vec::new();
+    if scan.properties().output_ordering().is_some() {
+        failures.push(format!(
+            "the scan advertises an ordering\n{}",
+            displayable(scan.as_ref()).indent(true)
+        ));
+    }
+    context.register_table("t", table).unwrap();
+    for (sql, limit, order, id_tiebreak) in LISTING_QUERIES {
+        let plan = context
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+        let batches = collect(plan, context.task_ctx()).await.unwrap();
+        let actual = rows_of(&batches, DEFAULT_TIMESTAMP_KEY, "id");
+        let mismatch = top_rows_mismatch(&actual, &file.rows(), limit, order, id_tiebreak);
+        if let Some(mismatch) = mismatch {
+            failures.push(format!("{sql}: {mismatch}\n{plan_text}"));
+        }
+    }
+    failures
+}
+
+/// The lock-order inversion above, listed: `ListingTable` would take the file's ordering from
+/// its one row group's `p_timestamp DESC NULLS LAST` claim.
+#[tokio::test]
+async fn listing_table_ignores_footer_sort_order() {
+    let temp_dir = TempDir::new().unwrap();
+    let schema = p_timestamp_schema();
+    let path = write_with_staging_writer(
+        &temp_dir,
+        262_144,
+        &[
+            request(&schema, 1_000, 0..4),
+            request(&schema, 1_002, 4..8),
+            request(&schema, 1_001, 8..12),
+        ],
+        &[],
+        None,
+    );
+    let file = StoredFile::open(path, DEFAULT_TIMESTAMP_KEY, "id");
+    assert_eq!(
+        footer_sorting_columns(&file.path),
+        vec![Some(time_desc_claim(0))]
+    );
+    assert_eq!(desc_nulls_last_breaks(&file.rows()), 1);
+    let failures = listing_failures(&file).await;
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A footer claim on a column the file does not have. Inferring an ordering from it indexes past
+/// the Parquet schema and panics while listing.
+#[tokio::test]
+async fn listing_table_plans_footer_with_invalid_sort_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("invalid_sort_column.parquet");
+    write_external(
+        &path,
+        &[Some(3), Some(9), Some(5), Some(7)],
+        time_desc_claim(7),
+    );
+    let file = StoredFile::open(path, DEFAULT_TIMESTAMP_KEY, "id");
+    assert_eq!(
+        footer_sorting_columns(&file.path),
+        vec![Some(time_desc_claim(7)); 2]
+    );
+    let failures = listing_failures(&file).await;
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 // ---------------------------------------------------------------------------
