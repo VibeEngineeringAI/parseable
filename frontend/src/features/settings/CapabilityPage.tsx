@@ -1,12 +1,8 @@
 import { Link } from 'react-router-dom';
-import { ExternalLink, LockKeyhole, Sparkles, Shield } from 'lucide-react';
+import { LockKeyhole, Sparkles, Shield } from 'lucide-react';
 import { Badge, Card, CardBody, EmptyState } from '../../components/ui';
 import { PageHeader } from '../../components/explorer/PageHeader';
-import {
-  settingsCapabilities,
-  settingsClassicPath,
-  type SettingsCapability,
-} from '../../lib/settingsCapabilities';
+import { settingsCapabilities, type SettingsCapability } from '../../lib/settingsCapabilities';
 import './settings.css';
 
 /** Local informational content: it deliberately makes no API or secret requests. */
@@ -14,12 +10,10 @@ export function CapabilityPage({
   feature,
   id,
   demo = false,
-  classicAvailable = false,
 }: {
   feature: SettingsCapability;
   id?: string;
   demo?: boolean;
-  classicAvailable?: boolean;
 }) {
   const scope = settingsCapabilities[feature];
   const Icon = feature === 'keystone' ? Sparkles : feature === 'llm' ? LockKeyhole : Shield;
@@ -40,19 +34,6 @@ export function CapabilityPage({
             title={scope.unavailable}
             description={scope.explanation}
             icon={<Icon size={28} strokeWidth={1.5} />}
-            action={
-              classicAvailable && !demo ? (
-                <a
-                  className="ui-button"
-                  data-variant="secondary"
-                  data-size="md"
-                  href={settingsClassicPath(feature, id)}
-                >
-                  Open {feature === 'keystone' && id ? 'investigation' : scope.title} in classic UI
-                  <ExternalLink size={14} aria-hidden="true" />
-                </a>
-              ) : undefined
-            }
           />
           {feature === 'keystone' && id && (
             <p className="settings-scope-note">
@@ -61,9 +42,7 @@ export function CapabilityPage({
             </p>
           )}
           <p className="settings-scope-note">
-            {classicAvailable && !demo
-              ? 'The classic UI may support this feature for your deployment. Your existing permissions still apply.'
-              : 'Ask your deployment administrator which management interface supports this feature.'}
+            Ask your deployment administrator which API supports this feature.
           </p>
         </CardBody>
       </Card>

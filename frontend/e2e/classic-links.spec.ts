@@ -37,7 +37,7 @@ test('a classic Logs bookmark opens with its range and filters', async ({ page }
   await expect(page.getByTestId('filter-pill-value')).toHaveText(['error']);
   await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('custom');
   await expect(page.getByRole('status').filter({ hasText: 'Not carried over' })).toHaveText(
-    /time zone Asia\/Kolkata \(times are shown in UTC\), 1 filter\./,
+    /time zone Asia\/Kolkata \(not restored from this link\), 1 filter\./,
   );
   await expectLogsURL(page, '/logs/explore/app?keep=1');
   await expect.poll(() => queries.length).toBeGreaterThan(0);
@@ -316,7 +316,9 @@ test('a classic PromQL link that does not parse opens as classic shows it', asyn
   await expect(editor).toHaveText('WHERE >');
   await expect(page).toHaveURL(/query=WHERE\+%3E/);
   // Translated once: the notice is the link's, not a second rewrite's "1 filter".
-  await expect(notice(page)).toHaveText(/time zone Asia\/Kolkata \(times are shown in UTC\)\./);
+  await expect(notice(page)).toHaveText(
+    /time zone Asia\/Kolkata \(not restored from this link\)\./,
+  );
 });
 
 test('a dismissed Metrics notice stays dismissed after reconnecting', async ({ page }) => {
