@@ -22,9 +22,10 @@ import { SqlChartPanel, readSqlChartConfig } from './SqlChartPanel';
 import { createQueryTab, datasetQuery, hydrateQueryTabs, type QueryTab } from './workspace';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
-import { paramsRange, timeBounds } from '../../lib/query';
+import { timeBounds } from '../../lib/query';
 import type { LogRecord } from '../../lib/types';
 import { readSavedQueries, sqlStorageScope } from './savedQueries';
+import { sqlHandoffRange } from './serverSavedQueries';
 import './sql.css';
 // Session storage isolates draft workspaces per browser tab while surviving reloads.
 // The saved-query library separately uses persistent local storage.
@@ -84,7 +85,7 @@ function SqlWorkspace() {
     const drafts = restoreDrafts(scope);
     if (params.has('query')) {
       const query = params.get('query') || '';
-      const range = paramsRange(params);
+      const range = sqlHandoffRange(params);
       const index = drafts.findIndex(
         (item) => item.query === query && JSON.stringify(item.range) === JSON.stringify(range),
       );
@@ -97,7 +98,7 @@ function SqlWorkspace() {
           createQueryTab(
             'Query 1',
             mode === 'demo' ? datasetQuery(['application_logs']) : '',
-            paramsRange(params),
+            sqlHandoffRange(params),
           ),
         ];
   });
@@ -194,7 +195,7 @@ function SqlWorkspace() {
     // An edit can rerun this effect while params still contains the old query.
     previousUrl.current = url;
     const query = params.get('query') || '';
-    const range = paramsRange(params);
+    const range = sqlHandoffRange(params);
     const existing = tabs.find(
       (item) => item.query === query && JSON.stringify(item.range) === JSON.stringify(range),
     );

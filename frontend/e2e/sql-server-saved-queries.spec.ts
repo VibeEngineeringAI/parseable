@@ -271,7 +271,10 @@ test('classic Logs views open their stored SQL read only; builder views stay una
   baseURL,
 }) => {
   await context.addCookies([{ name: 'user_id', value: 'reader', url: baseURL! }]);
-  const views = [{ ...classicLogs, user_id: hash('reader') }, classicBuilder];
+  const views = [
+    { ...classicLogs, user_id: hash('reader'), time_filter: { from: 'now-2d', to: 'now' } },
+    classicBuilder,
+  ];
   const before = structuredClone(views);
   const writes = await serve(page, async () => ({ json: views }));
   await page.goto('/logs/explore/events');
@@ -293,4 +296,134 @@ test('classic Logs views open their stored SQL read only; builder views stay una
   );
   expect(writes).toEqual([]);
   expect(views).toEqual(before);
+});
+
+const nativeWeek: SavedLogView = {
+  version: 'v2',
+  user_id: hash('reader'),
+  stream_name: 'sql',
+  filter_name: 'Native week',
+  filter_id: '01HNATIVE',
+  query: { filter_type: 'sql', filter_query: 'SELECT * FROM "events" LIMIT 500' },
+  explorer_state: JSON.stringify({
+    version: 1,
+    dataset: 'events',
+    range: '7d',
+    search: '',
+    expression: { combinator: 'and', groups: [] },
+    timezone: 'UTC',
+    limit: 500,
+    wrap: false,
+    showHistogram: true,
+  }),
+  time_filter: null,
+};
+
+test('classic relative windows keep supported presets and warn before using a fallback', async ({
+  page,
+  context,
+  baseURL,
+}) => {
+  await context.addCookies([{ name: 'user_id', value: 'reader', url: baseURL! }]);
+  const writes = await serve(page, async () => ({
+    json: [
+      { ...classicLogs, filter_name: 'Week errors', time_filter: { from: 'now-7d', to: 'now' } },
+      {
+        ...classicLogs,
+        filter_id: '01HTWODAYS',
+        filter_name: 'Two day errors',
+        query: { filter_type: 'sql', filter_query: 'SELECT 2' },
+        time_filter: { from: 'now-2d', to: 'now' },
+      },
+    ],
+  }));
+  await page.goto('/sql-editor');
+  const list = serverList(page);
+  await expect(list.getByRole('note')).toHaveCount(1);
+  await expect(list.getByRole('note')).toHaveText(
+    'Saved time range now-2d to now is not supported; opening or copying uses the last hour.',
+  );
+  await list.getByRole('button', { name: /^Week errors/ }).click();
+  await expect(page.getByRole('textbox', { name: 'SQL query' })).toHaveText(
+    classicLogs.query.filter_query!,
+  );
+  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('7d');
+  await list.getByRole('button', { name: /^Two day errors/ }).click();
+  await expect(page.getByRole('textbox', { name: 'SQL query' })).toHaveText('SELECT 2');
+  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('1h');
+  expect(writes).toEqual([]);
+});
+
+test('native Logs views open in SQL with their saved relative range', async ({
+  page,
+  context,
+  baseURL,
+}) => {
+  await context.addCookies([{ name: 'user_id', value: 'reader', url: baseURL! }]);
+  const views = [nativeWeek];
+  const before = structuredClone(views);
+  const writes = await serve(page, async () => ({ json: views }));
+  await page.goto('/logs/explore/events');
+  await page.getByRole('button', { name: 'Saved views', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Saved log views' });
+  await dialog.getByLabel('Saved log view').selectOption({ label: 'Native week' });
+  await dialog.getByRole('button', { name: 'Open in SQL editor' }).click();
+  await expect(page.getByRole('textbox', { name: 'SQL query' })).toHaveText(
+    nativeWeek.query.filter_query!,
+  );
+  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('7d');
+  // The consumed handoff leaves no query, range or bounds in the URL.
+  await expect(page).toHaveURL(/\/sql-editor$/);
+
+  await serverList(page)
+    .getByRole('button', { name: /^Native week/ })
+    .click();
+  await expect(page.getByRole('tab', { name: 'Native week', exact: true })).toHaveCount(1);
+  await expect(page.getByLabel('Time range', { exact: true })).toHaveValue('7d');
+  expect(writes).toEqual([]);
+  expect(views).toEqual(before);
+});
+
+test('copies same-named server queries with different windows or datasets separately', async ({
+  page,
+  context,
+  baseURL,
+}) => {
+  await context.addCookies([{ name: 'user_id', value: 'reader', url: baseURL! }]);
+  const writes = await serve(page, async () => ({
+    json: [
+      classicSql('reader'),
+      classicSql('reader', {
+        filter_id: '01HOCTOBER5',
+        time_filter: { from: '2026-10-05T00:00:00.000Z', to: '2026-10-06T00:00:00.000Z' },
+      }),
+      classicSql('reader', { filter_id: '01HSCOPED', stream_name: 'events' }),
+    ],
+  }));
+  await page.goto('/sql-editor');
+  const copies = page.getByRole('button', {
+    name: 'Copy server query Slow requests to this browser',
+  });
+  await expect(copies).toHaveCount(3);
+  for (const index of [0, 1, 2]) {
+    await copies.nth(index).click();
+    await expect(page.getByText('Copied Slow requests to this browser library.')).toBeVisible();
+  }
+  await copies.nth(1).click();
+  await expect(page.getByText('Slow requests is already in this browser library.')).toBeVisible();
+  const stored = await page.evaluate(
+    (key) => JSON.parse(localStorage.getItem(key) || '[]'),
+    libraryKey(new URL(baseURL!).origin, 'reader'),
+  );
+  expect(
+    stored.map((item: { range: unknown; datasets: string[] }) => [item.range, item.datasets]),
+  ).toEqual(
+    expect.arrayContaining([
+      [{ startTime: '2026-10-01T00:00:00.000Z', endTime: '2026-10-02T00:00:00.000Z' }, []],
+      [{ startTime: '2026-10-05T00:00:00.000Z', endTime: '2026-10-06T00:00:00.000Z' }, []],
+      [{ startTime: '2026-10-01T00:00:00.000Z', endTime: '2026-10-02T00:00:00.000Z' }, ['events']],
+    ]),
+  );
+  expect(stored).toHaveLength(3);
+  expect(writes).toEqual([]);
 });

@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { savedLogView } from '../../lib/logsContract';
 import type { SavedLogView } from '../../lib/types';
+import { encodeLogView, type LogViewState } from '../logs/logViewState';
 import { saveQuery, type SavedQuery } from './savedQueries';
 import {
+  classicTimeRange,
   importServerQuery,
   serverSavedQueries,
   serverSavedQuery,
   sqlEditorHandoff,
+  sqlHandoffRange,
 } from './serverSavedQueries';
 
 // Shapes as stored by classic Prism and returned by GET /api/v1/filters.
@@ -32,6 +35,32 @@ const classicLogsSql: SavedLogView = {
   filter_id: '01HCLASSICLOGS',
   query: { filter_type: 'sql', filter_query: "SELECT * FROM app WHERE level = 'error'" },
   time_filter: { from: 'now-1h', to: 'now' },
+};
+const nativeState: LogViewState = {
+  version: 1,
+  dataset: 'app',
+  range: '7d',
+  search: '',
+  expression: { combinator: 'and', groups: [] },
+  timezone: 'UTC',
+  limit: 500,
+  wrap: false,
+  showHistogram: true,
+};
+// A native Logs view saved with a relative range keeps it only in explorer_state.
+const nativeLogsSql: SavedLogView = {
+  version: 'v2',
+  user_id: 'owner-hash',
+  stream_name: 'sql',
+  filter_name: 'Native week',
+  filter_id: '01HNATIVE',
+  query: {
+    filter_type: 'sql',
+    filter_query: 'SELECT * FROM "app" LIMIT 500',
+    filter_builder: null,
+  },
+  explorer_state: encodeLogView(nativeState),
+  time_filter: null,
 };
 const classicBuilder: SavedLogView = {
   version: 'v2',
@@ -64,7 +93,7 @@ const classicSearch: SavedLogView = {
 
 describe('server saved SQL queries', () => {
   it('accepts the real classic fixtures through the client contract', () => {
-    for (const view of [classicSql, classicLogsSql, classicBuilder, classicSearch])
+    for (const view of [classicSql, classicLogsSql, nativeLogsSql, classicBuilder, classicSearch])
       expect(savedLogView(view)).toBe(true);
   });
   it('reads classic SQL editor queries with their saved bounds and no dataset scope', () => {
@@ -80,18 +109,65 @@ describe('server saved SQL queries', () => {
       ownerHash: 'owner-hash',
     });
   });
-  it('marks Logs-origin SQL and falls back from unreadable bounds without changing the SQL', () => {
+  it('marks Logs-origin SQL and keeps a supported classic relative window', () => {
     expect(serverSavedQuery(classicLogsSql)).toMatchObject({
       origin: 'logs',
       datasets: ['app'],
       range: '1h',
-      rangeFallback: true,
+      rangeFallback: false,
       sql: classicLogsSql.query.filter_query,
     });
     // A converted native Logs view keeps explorer_state and stays Logs-origin.
     expect(serverSavedQuery({ ...classicSql, explorer_state: '{"version":1}' })?.origin).toBe(
       'logs',
     );
+  });
+  it('maps classic relative presets and flags unsupported windows instead of guessing', () => {
+    expect(classicTimeRange('now-7d', 'now')).toBe('7d');
+    expect(classicTimeRange('now-1w', 'now')).toBe('7d');
+    expect(classicTimeRange('now-24h', 'now')).toBe('24h');
+    expect(classicTimeRange('now-1d', 'now')).toBe('1d');
+    expect(classicTimeRange('now-60m', 'now')).toBe('1h');
+    expect(classicTimeRange('now-2d', 'now')).toBeUndefined();
+    expect(classicTimeRange('now-7d', 'now-1d')).toBeUndefined();
+    const week = serverSavedQuery({
+      ...classicLogsSql,
+      time_filter: { from: 'now-7d', to: 'now' },
+    });
+    expect(week).toMatchObject({ range: '7d', rangeFallback: false });
+    expect(week).not.toHaveProperty('savedRange');
+    const twoDays = { ...classicLogsSql, time_filter: { from: 'now-2d', to: 'now' } };
+    expect(serverSavedQuery(twoDays)).toMatchObject({
+      range: '1h',
+      rangeFallback: true,
+      savedRange: 'now-2d to now',
+      sql: classicLogsSql.query.filter_query,
+    });
+  });
+  it('honors a valid native explorer state range and dataset over the empty time filter', () => {
+    expect(serverSavedQuery(nativeLogsSql)).toMatchObject({
+      origin: 'logs',
+      range: '7d',
+      rangeFallback: false,
+      datasets: ['app'],
+      sql: nativeLogsSql.query.filter_query,
+    });
+    const absolute = {
+      ...nativeState,
+      range: { startTime: '2026-10-01T00:00:00.000Z', endTime: '2026-10-03T00:00:00.000Z' },
+    };
+    expect(
+      serverSavedQuery({
+        ...nativeLogsSql,
+        explorer_state: encodeLogView(absolute),
+        time_filter: { from: absolute.range.startTime, to: absolute.range.endTime },
+      })?.range,
+    ).toEqual(absolute.range);
+    // A dataset-scoped record whose state names another dataset is not trusted.
+    expect(serverSavedQuery({ ...nativeLogsSql, stream_name: 'other' })).toMatchObject({
+      range: '1h',
+      datasets: ['other'],
+    });
   });
   it('never fabricates SQL for builder, search, empty or unidentified records', () => {
     expect(serverSavedQuery(classicBuilder)).toBeUndefined();
@@ -115,13 +191,21 @@ describe('server saved SQL queries', () => {
       ['Slow requests', 'owner-hash'],
     ]);
   });
-  it('hands the stored SQL to the editor verbatim', () => {
+  it('hands the stored SQL and its range to the editor verbatim', () => {
     const item = serverSavedQuery(classicSql)!;
     const params = new URL(sqlEditorHandoff(item), 'http://x').searchParams;
     expect(params.get('query')).toBe(item.sql);
     expect(params.get('start')).toBe('2026-10-01T00:00:00.000Z');
     expect(params.get('end')).toBe('2026-10-02T00:00:00.000Z');
-    expect(sqlEditorHandoff(serverSavedQuery(classicLogsSql)!)).not.toContain('start=');
+    expect(sqlHandoffRange(params)).toEqual(item.range);
+    const native = new URL(sqlEditorHandoff(serverSavedQuery(nativeLogsSql)!), 'http://x')
+      .searchParams;
+    expect(native.has('start')).toBe(false);
+    expect(native.get('range')).toBe('7d');
+    expect(native.get('query')).toBe(nativeLogsSql.query.filter_query);
+    expect(sqlHandoffRange(native)).toBe('7d');
+    expect(sqlHandoffRange(new URLSearchParams({ range: 'forever' }))).toBe('1h');
+    expect(sqlHandoffRange(new URLSearchParams())).toBe('1h');
   });
   it('copies into the browser library without losing local queries or duplicating', () => {
     const local: SavedQuery = {
@@ -147,5 +231,26 @@ describe('server saved SQL queries', () => {
     const again = importServerQuery(first.items, item);
     expect(again.imported).toBeUndefined();
     expect(again.items).toBe(first.items);
+    // Equivalent bounds in another ISO spelling are still the same copy.
+    const respelled = importServerQuery(first.items, {
+      ...item,
+      range: { startTime: '2026-10-01T00:00:00Z', endTime: '2026-10-02T00:00:00+00:00' },
+    });
+    expect(respelled.imported).toBeUndefined();
+  });
+  it('keeps same-named copies whose window or dataset scope differ', () => {
+    const item = serverSavedQuery(classicSql)!;
+    const first = importServerQuery([], item).items;
+    const otherWindow = importServerQuery(first, {
+      ...item,
+      range: { startTime: '2026-10-05T00:00:00.000Z', endTime: '2026-10-06T00:00:00.000Z' },
+    });
+    expect(otherWindow.imported).toBeDefined();
+    const relative = importServerQuery(otherWindow.items, { ...item, range: '7d' });
+    expect(relative.imported).toBeDefined();
+    const scoped = importServerQuery(relative.items, { ...item, datasets: ['app'] });
+    expect(scoped.imported).toBeDefined();
+    expect(scoped.items).toHaveLength(4);
+    expect(importServerQuery(scoped.items, { ...item, range: '7d' }).imported).toBeUndefined();
   });
 });

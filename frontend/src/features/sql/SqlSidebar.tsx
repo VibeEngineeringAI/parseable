@@ -114,7 +114,10 @@ function ServerLibrary({
       )}
       <div className="sql-library-items" aria-label="Server saved queries">
         {items.map((item) => (
-          <div className="sql-library-item" key={item.key}>
+          <div
+            className={`sql-library-item${item.rangeFallback ? ' sql-library-item-warned' : ''}`}
+            key={item.key}
+          >
             <Button
               variant="ghost"
               size="sm"
@@ -137,6 +140,12 @@ function ServerLibrary({
             >
               <Copy size={13} />
             </Button>
+            {item.rangeFallback && (
+              <p className="sql-library-warning" role="note">
+                Saved time range {item.savedRange} is not supported; opening or copying uses the
+                last hour.
+              </p>
+            )}
           </div>
         ))}
         {views.data && !items.length && <p className="muted">No server saved queries.</p>}
