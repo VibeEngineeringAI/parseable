@@ -316,7 +316,9 @@ test('a classic PromQL link that does not parse opens as classic shows it', asyn
   await expect(editor).toHaveText('WHERE >');
   await expect(page).toHaveURL(/query=WHERE\+%3E/);
   // Translated once: the notice is the link's, not a second rewrite's "1 filter".
-  await expect(notice(page)).toHaveText(/time zone Asia\/Kolkata \(not restored from this link\)\./);
+  await expect(notice(page)).toHaveText(
+    /time zone Asia\/Kolkata \(not restored from this link\)\./,
+  );
 });
 
 test('a dismissed Metrics notice stays dismissed after reconnecting', async ({ page }) => {

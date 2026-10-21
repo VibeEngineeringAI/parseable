@@ -500,7 +500,9 @@ function SqlWorkspace() {
                 !tab.savedId &&
                 tab.name === item.name &&
                 tab.query === item.sql &&
-                JSON.stringify(tab.range) === JSON.stringify(item.range),
+                JSON.stringify(tab.range) === JSON.stringify(item.range) &&
+                JSON.stringify([...tab.datasets].sort()) ===
+                  JSON.stringify([...item.datasets].sort()),
             );
             if (existing) {
               setActiveId(existing.id);

@@ -16,6 +16,11 @@ not execute it, update its server record, or replace an existing browser query.
 Editing and saving a browser copy does not synchronize changes to the original
 server record.
 
+Supported classic relative ranges and validated native Logs ranges are retained.
+Unsupported saved ranges show a warning before opening or copying with the
+default last-hour range. Copies with different time windows or dataset selections
+remain separate, even when their names and SQL match.
+
 In Logs, **Open in SQL editor** makes the stored SQL of an older saved view
 accessible even when its explorer settings cannot be applied by the native UI.
 The original view is retained. Saved definitions that contain only a classic

@@ -1,5 +1,17 @@
 # Frontend validation and independent review
 
+## Native-only migration (2026-10-21)
+
+The [migration guide](../../docs/native-ui-migration.md) records current behavior and remaining gaps. Historical commands below that select `P_UI_ROOT=classic` or `LOCAL_ASSETS_PATH` apply only to older builds.
+
+- Formatting, TypeScript/production build and the full unit suite pass: **2,403 passed, 14 skipped**.
+- The application browser run completed **593 passed, 2 skipped**, with three Chromium resource failures. Traces contained `ERR_INSUFFICIENT_RESOURCES` and a crashed target while the user's `/tmp` quota had only 414 MiB headroom. All three affected checks passed in a five-test isolated rerun using disk-backed `TMPDIR`, with zero retries or console errors.
+- After the final draft dataset-selection fix, all **10 saved-query browser tests** pass. They cover permissions/session recovery, exact SQL, no server writes, relative ranges, distinct windows/datasets, browser copies and Logs handoffs.
+- All **25 production browser tests** pass, including `/next` redirects and stale assets. The capability Storybook checks pass, including accessibility and absence of classic links.
+- Full `cargo check --locked --tests` passes with native assets and separately with `P_BUILD_NO_UI=1`. Focused build/routing tests were also exercised during implementation. Native ZIP contents/checksum and bundled third-party notices were verified.
+
+These checks do not include linked Rust test execution, Docker image builds, live ingestion/query checks, or real-provider OIDC interoperability. The historical classic dashboard browser comparison is now explicitly opt-in; native dashboard live tests remain independently runnable.
+
 ## PR #32 review fixes (2026-10-12)
 
 The seven review findings are addressed. Trace-focused Logs share links retain their encoded time window, and Traces Refresh reloads fixed windows while advancing preset windows with one request per active list/detail. Agents search keeps typing and caret updates synchronous with URL navigation, and searches literal recorded values, including backslashes and quotes.

@@ -103,6 +103,44 @@ async function seedLocal(page: Page, user: string, items: unknown[]) {
 const serverList = (page: Page) =>
   page.getByLabel('SQL datasets and saved queries').getByLabel('Server saved queries');
 
+test('opening identical server SQL with different datasets preserves each draft scope', async ({
+  page,
+  context,
+  baseURL,
+}) => {
+  await context.addCookies([{ name: 'user_id', value: 'reader', url: baseURL! }]);
+  const writes = await serve(page, async () => ({
+    json: [
+      classicSql('reader'),
+      classicSql('reader', { filter_id: '01HSCOPED', stream_name: 'events' }),
+    ],
+  }));
+  await page.goto('/sql-editor');
+  const opens = serverList(page).getByRole('button', { name: /^Slow requests/ });
+  await expect(opens).toHaveCount(2);
+  await opens.nth(0).click();
+  await expect(
+    page.getByRole('checkbox', { name: 'Select events', exact: true }),
+  ).not.toBeChecked();
+  await opens.nth(1).click();
+  await expect(page.getByRole('checkbox', { name: 'Select events', exact: true })).toBeChecked();
+  await expect(page.getByRole('tab', { name: 'Slow requests', exact: true })).toHaveCount(2);
+  await opens.nth(0).click();
+  await expect(
+    page.getByRole('checkbox', { name: 'Select events', exact: true }),
+  ).not.toBeChecked();
+  await opens.nth(1).click();
+  await expect(page.getByRole('tab', { name: 'Slow requests', exact: true })).toHaveCount(2);
+  await page.getByRole('button', { name: 'Save as new', exact: true }).click();
+  const stored = await page.evaluate(
+    (key) => JSON.parse(localStorage.getItem(key) || '[]'),
+    libraryKey(new URL(baseURL!).origin, 'reader'),
+  );
+  expect(stored).toHaveLength(1);
+  expect(stored[0].datasets).toEqual(['events']);
+  expect(writes).toEqual([]);
+});
+
 test('lists classic server SQL read only, opens it and copies it without losing local queries', async ({
   page,
   context,
