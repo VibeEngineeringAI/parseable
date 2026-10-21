@@ -135,6 +135,12 @@ Set `PARSEABLE_LIVE_USERNAME`, `PARSEABLE_LIVE_PASSWORD` and `PARSEABLE_LIVE_DAT
 
 The Alerts live spec (`e2e-live/alerts.spec.ts`) creates a unique OTLP dataset, webhook target and PromQL rule, checks preview values and mutations against the API, and cleans up all three in `afterAll`, including after failures. Run it only against a disposable server. Set `TMPDIR` to a disk-backed directory when `/tmp` is small. The current Alerts checks and counts are recorded in [validation-review.md](docs/validation-review.md).
 
+The native migration live spec (`e2e-live/native-migration.spec.ts`) seeds classic SQL queries, a dataset-scoped SQL view and a disabled, muted builder alert through the real API. Browser checks open, copy and execute the saved SQL, follow the Logs handoff, cancel and save alert conversion, then edit the converted rule. They verify exact query results, time windows, unchanged server views and preserved alert settings. Fixtures use unique names, no notification targets, and cleanup after failures. Run it against a disposable native-only server with the same live environment variables:
+
+```sh
+npx playwright test -c playwright.live.config.ts e2e-live/native-migration.spec.ts
+```
+
 The Dashboards live spec (`e2e-live/dashboards.spec.ts`) ingests unique logs and OTLP metrics, creates SQL and PromQL tiles with variables through this frontend and verifies their stored classic-compatible shapes. It also renders a literal classic-shaped Report fixture in this frontend, checks unknown-field preservation, and verifies admin ownership rules and `limit=0`. Cleanup removes all test dashboards, datasets, users and roles. These tests need only `PARSEABLE_LIVE_URL` and run against a current native-only server.
 
 The historical classic hard-load comparison is skipped unless you set `PARSEABLE_LIVE_CLASSIC=true`. It then also requires `PARSEABLE_LIVE_SERVER_URL` to point at an older Parseable server that still embeds the classic Prism UI at `/dashboards/:id`; current builds have no classic UI mode, so do not opt in against them. Both origins must use the same disposable backend and the same hostname to share login cookies across ports (use `127.0.0.1` for both; mixing it with `localhost` fails). The spec checks this before ingesting. Native-only run:

@@ -80,14 +80,17 @@ test('missing session asks for login and preserves the intended route', async ({
 }) => {
   await signIn(page);
   await expect(page.getByRole('table')).toContainText('Live smoke');
+  const intendedUrl = new URL(page.url());
   await context.clearCookies();
   await page.reload();
   await expect(page).toHaveURL((url) => atLogin(url) && url.searchParams.has('next'));
-  expect(new URL(page.url()).searchParams.get('next')).toBe(datasetPath);
+  expect(new URL(page.url()).searchParams.get('next')).toBe(
+    intendedUrl.pathname + intendedUrl.search,
+  );
   await page.getByLabel('Username', { exact: true }).fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Login', exact: true }).click();
-  await expect(page).toHaveURL(appUrl(datasetPath));
+  await expect(page).toHaveURL(intendedUrl.href);
   await expect(page.getByRole('table')).toContainText('Live smoke');
 });
 

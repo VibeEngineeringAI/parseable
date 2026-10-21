@@ -289,9 +289,16 @@ test('create SQL and PromQL tiles and variables in the native UI; verify exact c
     .attach('stored-dashboard.json', { body: verbatim, contentType: 'application/json' });
   expect(primary.tiles).toHaveLength(2);
   const [sqlTile, promTile] = primary.tiles!;
+  // The native editor adds explicit grouping and table stacking defaults to
+  // the historical classic config; keep checking the complete stored shape.
   expect(sqlTile).toEqual({
     tile_id: expect.any(String),
-    config: { ...classicFixture.tiles[0].config, type: 'table' },
+    config: {
+      ...classicFixture.tiles[0].config,
+      type: 'table',
+      axes: { ...classicFixture.tiles[0].config.axes, groupBy: { field: [] } },
+      layout: { ...classicFixture.tiles[0].config.layout, stacked: false },
+    },
     layout: { x: 0, y: 0, w: 12, h: 4 },
     title: 'Live log events',
     tileType: 'code',
@@ -302,7 +309,11 @@ test('create SQL and PromQL tiles and variables in the native UI; verify exact c
   });
   expect(promTile).toEqual({
     tile_id: expect.any(String),
-    config: { ...classicFixture.tiles[0].config, type: 'timeseries' },
+    config: {
+      ...classicFixture.tiles[0].config,
+      type: 'timeseries',
+      axes: { ...classicFixture.tiles[0].config.axes, groupBy: { field: [] } },
+    },
     layout: { x: 0, y: 4, w: 12, h: 4 },
     title: 'Live host load',
     tileType: 'promql',
