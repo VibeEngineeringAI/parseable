@@ -164,6 +164,14 @@ pub(super) fn capture_staging_parquet(directory: &Path) -> Result<Vec<CapturedFi
     capture_paths(directory, paths)
 }
 
+/// Exercise the production capture callback from stream publication tests without
+/// exposing query capture internals outside test builds.
+#[cfg(test)]
+pub(crate) fn capture_staging_parquet_for_test(directory: &Path) -> Result<Vec<PartitionedFile>> {
+    capture_staging_parquet(directory)
+        .map(|files| files.into_iter().map(|captured| captured.file).collect())
+}
+
 fn capture_paths(directory: &Path, paths: Vec<PathBuf>) -> Result<Vec<CapturedFile>> {
     if paths.is_empty() {
         return Ok(Vec::new());

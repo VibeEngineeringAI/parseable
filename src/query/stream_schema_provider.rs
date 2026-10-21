@@ -739,17 +739,16 @@ impl TableProvider for StandardTableProvider {
         let (staged_records, staged_files) = if include_staging {
             match PARSEABLE.get_stream(&self.stream, &self.tenant_id) {
                 Ok(staging) => {
-                    // Preserve memory-first capture. A future coherent staging
-                    // API must make this handoff atomic with conversion as well.
-                    let records = staging
-                        .recordbatches_cloned(&self.schema)
+                    // Capture memory and leased files under the publication lock,
+                    // before reading the refreshed remote snapshot.
+                    let (records, files) = staging
+                        .capture_staging(&self.schema, capture_staging_parquet)
                         .map_err(|error| {
                             DataFusionError::Execution(format!(
                                 "Cannot capture staging record batches: {error}"
                             ))
                         })?;
-                    let files = capture_staging_parquet(&staging.data_path)?;
-                    (records, files)
+                    (records, files?)
                 }
                 Err(_) => (Vec::new(), Vec::new()),
             }
