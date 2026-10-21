@@ -995,7 +995,7 @@ mod lock_order_tests {
     }
 
     /// The session a `/login` cookie names, checked to belong to `login`'s user
-    /// and tenant, with the Basic session `/login` authorized through removed.
+    /// and tenant.
     fn issued_session(
         cookie: Option<Cookie<'static>>,
         login: &SessionKey,
@@ -1007,7 +1007,6 @@ mod lock_order_tests {
             Users.get_userid_from_session(&session),
             Some((credentials(login).0.to_owned(), tenant.to_owned()))
         );
-        assert!(!Users.session_exists(login));
         session
     }
 
@@ -1084,6 +1083,118 @@ mod lock_order_tests {
         let before = tracked_sessions(&login, &tenant);
         assert!(finish(&cookie_login(&wrong, &tenant), "cookie login").is_none());
         assert_eq!(tracked_sessions(&login, &tenant), before);
+    }
+
+    /// Runs the query handler's dataset check for `key`.
+    fn query_auth(key: &SessionKey) -> Result<(), actix_web::Error> {
+        futures::executor::block_on(crate::utils::user_auth_for_query(
+            key,
+            "select * from lock_order_stream",
+        ))
+    }
+
+    // Reproduction: `/login` dropped the Basic session it authorized through, so
+    // a query with the same credentials that had passed the middleware then
+    // read no permissions and failed with "does not have access".
+    #[test]
+    fn cookie_login_keeps_the_basic_session_of_an_in_flight_query() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let (_, login) = native_user(&tenant, &[ROLE]);
+
+        // The query passes the middleware, then `/login` exchanges the same
+        // credentials before the query handler reads permissions.
+        assert_eq!(finish(&first_login(&login), "query"), Response::Authorized);
+        let cookie = finish(&cookie_login(&login, &tenant), "cookie login");
+        let session = issued_session(cookie, &login, &tenant);
+
+        assert!(Users.session_exists(&login));
+        assert!(!Users.get_permissions(&login).is_empty());
+        assert!(query_auth(&login).is_ok());
+        assert!(query_auth(&session).is_ok());
+        // The cookie session expires on its own; the Basic one never does.
+        assert!(!sessions().is_session_expired(&session));
+        assert!(!sessions().is_session_expired(&login));
+        assert_eq!(tracked_sessions(&login, &tenant), 2);
+
+        let cookie = finish(
+            &spawn({
+                let (login, tenant) = (login.clone(), Some(tenant.clone()));
+                move || {
+                    let (username, password) = credentials(&login);
+                    exchange_basic_for_cookie(username, password, &tenant, TimeDelta::seconds(-1))
+                }
+            }),
+            "expired cookie login",
+        );
+        let expired = issued_session(cookie, &login, &tenant);
+        // The middleware rejects expired sessions; the Basic one is unaffected.
+        assert!(sessions().is_session_expired(&expired));
+        assert!(!sessions().is_session_expired(&login));
+        assert!(query_auth(&login).is_ok());
+    }
+
+    // Keeping the Basic session must not let it outlive a logout, password
+    // change, role removal or deletion that also ends the cookie session.
+    #[test]
+    fn revocations_after_a_cookie_login_reach_the_basic_session() {
+        let _serial = auth_state();
+        let tenant = tenant();
+        let roles = HashSet::from([ROLE.to_owned()]);
+        let cookie_and_basic = |login: &SessionKey| {
+            assert_eq!(finish(&first_login(login), "query"), Response::Authorized);
+            let cookie = finish(&cookie_login(login, &tenant), "cookie login");
+            issued_session(cookie, login, &tenant)
+        };
+
+        // Logging out one session leaves the other.
+        let (_, login) = native_user(&tenant, &[ROLE]);
+        let session = cookie_and_basic(&login);
+        Users.remove_session(&session);
+        assert!(!Users.session_exists(&session));
+        assert!(query_auth(&login).is_ok());
+        let session = finish(&cookie_login(&login, &tenant), "cookie login");
+        let session = issued_session(session, &login, &tenant);
+        Users.remove_session(&login);
+        assert!(!Users.session_exists(&login));
+        assert!(query_auth(&session).is_ok());
+
+        let (user, login) = native_user(&tenant, &[ROLE]);
+        let session = cookie_and_basic(&login);
+        Users.change_password_hash(user.userid(), &cheap_hash("changed"), &user.tenant);
+        assert_eq!(tracked_sessions(&login, &tenant), 0);
+        assert!(query_auth(&login).is_err());
+        assert!(query_auth(&session).is_err());
+        assert_eq!(
+            finish(&first_login(&login), "query"),
+            Response::UnAuthorized
+        );
+
+        let (user, login) = native_user(&tenant, &[ROLE]);
+        let session = cookie_and_basic(&login);
+        Users.remove_roles(user.userid(), roles.clone(), &user.tenant);
+        for key in [&login, &session] {
+            assert!(Users.get_permissions(key).is_empty());
+            assert!(query_auth(key).is_err());
+            assert_eq!(
+                Users.authorize(key.clone(), Action::Query, None, None),
+                Response::UnAuthorized
+            );
+        }
+        Users.add_roles(user.userid(), roles, &user.tenant);
+        assert!(query_auth(&login).is_ok());
+        assert!(query_auth(&session).is_ok());
+
+        let (user, login) = native_user(&tenant, &[ROLE]);
+        let session = cookie_and_basic(&login);
+        Users.delete_user(user.userid(), &user.tenant);
+        assert_eq!(tracked_sessions(&login, &tenant), 0);
+        assert!(query_auth(&login).is_err());
+        assert!(query_auth(&session).is_err());
+        assert_eq!(
+            finish(&first_login(&login), "query"),
+            Response::UnAuthorized
+        );
     }
 
     // The Basic lookups verify passwords after dropping USERS; they must still
