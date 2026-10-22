@@ -309,10 +309,11 @@ async fn handle_non_streaming_query(
         fill_null: query_request.send_null,
         with_fields: query_request.fields,
     }
-    .to_json()?;
+    .to_json_bytes()?;
     Ok(HttpResponse::Ok()
         .insert_header((TIME_ELAPSED_HEADER, total_time.as_str()))
-        .json(response))
+        .content_type(ContentType::json())
+        .body(response))
 }
 
 /// Handles streaming queries, returning results as newline-delimited JSON (NDJSON).
@@ -403,12 +404,14 @@ fn create_batch_processor(
                 fill_null: send_null,
                 with_fields: false,
             }
-            .to_json()
+            .to_json_bytes()
             .map_err(|e| {
                 error!("Failed to parse record batch into JSON: {}", e);
                 actix_web::error::ErrorInternalServerError(e)
             })?;
-            Ok(Bytes::from(format!("{response}\n")))
+            let mut response = response;
+            response.push(b'\n');
+            Ok(Bytes::from(response))
         }
         Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
     }
@@ -761,5 +764,102 @@ impl actix_web::ResponseError for QueryError {
 impl From<reqwest::Error> for QueryError {
     fn from(value: reqwest::Error) -> Self {
         QueryError::Anyhow(anyhow::Error::msg(value.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    use actix_web::{ResponseError, body::to_bytes, http::header::CONTENT_TYPE};
+    use arrow_array::{Float64Array, TimestampMillisecondArray};
+
+    #[test]
+    fn streaming_batch_bytes_preserve_legacy_rows_and_newline() {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "text",
+                Arc::new(StringArray::from(vec![Some("quote\"\n雪"), None])) as ArrayRef,
+            ),
+            (
+                "float",
+                Arc::new(Float64Array::from(vec![-0.0, 1.2345678901234567])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        // Streaming has no requested field list, even when send_null is set.
+        for send_null in [false, true] {
+            let mut processor = create_batch_processor(send_null);
+            for batch in [batch.clone(), batch.slice(0, 0), batch.slice(1, 1)] {
+                let expected = QueryResponse {
+                    records: vec![batch.clone()],
+                    fields: Vec::new(),
+                    fill_null: send_null,
+                    with_fields: false,
+                }
+                .to_json()
+                .unwrap();
+                assert_eq!(
+                    processor(Ok(batch)).unwrap().as_ref(),
+                    format!("{expected}\n").as_bytes()
+                );
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn streaming_errors_preserve_status_and_body() {
+        let mut processor = create_batch_processor(false);
+        let error = processor(Err(QueryError::MalformedQuery("stream failed"))).unwrap_err();
+        let response = error.error_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap().as_ref(),
+            b"Error: stream failed"
+        );
+
+        // An Arrow encoder error must still become the same internal stream
+        // error rather than yielding a partial JSON chunk.
+        let batch = RecordBatch::try_from_iter(vec![(
+            "timestamp",
+            Arc::new(TimestampMillisecondArray::from(vec![0]).with_timezone("invalid timezone"))
+                as ArrayRef,
+        )])
+        .unwrap();
+        let response = QueryResponse {
+            records: vec![batch.clone()],
+            fields: Vec::new(),
+            fill_null: false,
+            with_fields: false,
+        };
+        let expected = response.to_json().unwrap_err().to_string();
+        assert_eq!(response.to_json_bytes().unwrap_err().to_string(), expected);
+        let error = processor(Ok(batch)).unwrap_err();
+        let response = error.error_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap().as_ref(),
+            expected.as_bytes()
+        );
+    }
+
+    #[actix_web::test]
+    async fn query_errors_keep_plaintext_framing() {
+        // Authorization and query failures continue to use QueryError's
+        // existing response path, independent of success-body serialization.
+        for (error, expected) in [
+            (QueryError::Unauthorized, "Unauthorized"),
+            (QueryError::EmptyQuery, "Query cannot be empty"),
+        ] {
+            let response = error.error_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(
+                to_bytes(response.into_body()).await.unwrap().as_ref(),
+                expected.as_bytes()
+            );
+        }
     }
 }

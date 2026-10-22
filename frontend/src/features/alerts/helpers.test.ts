@@ -53,6 +53,51 @@ const original = (): Alert => ({
   units: 'bytes',
 });
 describe('alert forms and payloads', () => {
+  it('converts a builder rule to SQL without changing its generated query or settings', () => {
+    const query = '  SELECT COUNT(*) FROM "app" WHERE "level" = \'error\'\n';
+    const alert: Alert = {
+      ...original(),
+      queryType: 'builder',
+      query,
+      datasets: ['app'],
+      severity: 'critical',
+      thresholdConfig: { operator: '>=', value: 12.5 },
+      evalConfig: { rollingWindow: { evalStart: '1h30m', evalEnd: 'now', evalFrequency: 15 } },
+      notificationConfig: { interval: 5 },
+      targets: ['t1', 't2'],
+      tags: ['prod', 'checkout'],
+      promqlConfig: undefined,
+    };
+    const form = alertDraft(alert);
+    // The editor shows the stored SQL exactly.
+    expect(form).toMatchObject({ type: 'code', query, dataset: 'app' });
+    const payload = buildAlertPayload(form, alert);
+    expect(payload).toMatchObject({
+      queryType: 'code',
+      query: query.trim(),
+      datasets: ['app'],
+      alertType: 'threshold',
+      title: alert.title,
+      severity: 'critical',
+      thresholdConfig: { operator: '>=', value: 12.5 },
+      evalConfig: { rollingWindow: { evalStart: '1h30m', evalEnd: 'now', evalFrequency: 15 } },
+      notificationConfig: { interval: 5 },
+      targets: ['t1', 't2'],
+      tags: ['prod', 'checkout'],
+      units: 'bytes',
+    });
+    // State and mute are server-managed and kept by PUT; runtime and owner are not resent.
+    for (const key of [
+      'state',
+      'notificationState',
+      'created',
+      'promqlConfig',
+      'promqlRuntime',
+      'executionIdentity',
+    ])
+      expect(payload).not.toHaveProperty(key);
+    expect(alert.queryType).toBe('builder');
+  });
   it('resends PromQL config while excluding runtime and managed response fields', () => {
     const alert = original(),
       form = alertDraft(alert);

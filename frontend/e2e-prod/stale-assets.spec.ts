@@ -27,8 +27,9 @@ async function removeAssets(page: Page, mount: string, pattern: RegExp) {
 
 // Only a production build preloads a lazy page's stylesheet before its module.
 // When that stylesheet is gone, Vite rejects with a plain Error, not a TypeError.
-for (const mount of ['', '/next']) {
-  test.describe(`a page whose assets are gone, mounted at ${mount || '/'}`, () => {
+for (const entry of ['', '/next']) {
+  const mount = '';
+  test.describe(`a page whose assets are gone, opened from ${entry || '/'}`, () => {
     for (const [path, asset] of [
       ['/metrics', /\/MetricsPage-[\w-]+\.css$/],
       ['/team', /\/TeamPage-[\w-]+\.css$/],
@@ -43,7 +44,7 @@ for (const mount of ['', '/next']) {
       test(`${path} offers a reload`, async ({ page }) => {
         await server(page);
         const removed = await removeAssets(page, mount, asset);
-        await page.goto(`${mount}${path}`);
+        await page.goto(`${entry}${path}`);
         const error = page.locator('main#main-section').getByRole('alert');
         await expect(
           error.getByRole('heading', { name: 'This page could not be loaded' }),

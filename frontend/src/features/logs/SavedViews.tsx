@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bookmark } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { Button, Dialog, Input, Select } from '../../components/ui';
 import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { sha256 } from '../../lib/sha256';
 import { buildExplorerQuery } from '../../lib/logQuery';
 import type { SavedLogView } from '../../lib/types';
+import { serverSavedQuery, sqlEditorHandoff } from '../sql/serverSavedQueries';
 import { decodeLogView, encodeLogView, type LogViewState } from './logViewState';
 
 export function savedLogViewState(view: SavedLogView): LogViewState {
@@ -84,6 +86,7 @@ export function SavedViews({
   onApply: (state: LogViewState) => void;
 }) {
   const { client, identity, mode } = useApp();
+  const navigate = useNavigate();
   const ownerHash = useAsync(
     useCallback(
       async () => (identity?.source === 'server' ? sha256(identity.id) : undefined),
@@ -197,6 +200,8 @@ export function SavedViews({
   }
   const editingDisabled = busy && pendingMutation.current?.generation === generation.current;
   const compatible = !!selectedView?.decoded;
+  // Opening uses the stored SQL verbatim and never writes the record.
+  const storedSql = view ? serverSavedQuery(view) : undefined;
   return (
     <>
       <Button variant="secondary" onClick={() => setOpen(true)}>
@@ -251,10 +256,19 @@ export function SavedViews({
                 ))}
             </Select>
           </label>
-          {view && !compatible && (
+          {view && !compatible && storedSql && (
             <p>
-              This classic or incompatible view cannot be applied or overwritten here. Save a new
-              view instead.
+              This classic view cannot be applied or overwritten here. Open its saved SQL in the SQL
+              editor, or save a new view instead.
+              {storedSql.rangeFallback
+                ? ' Its saved time range is unreadable, so the default range is used.'
+                : ''}
+            </p>
+          )}
+          {view && !compatible && !storedSql && (
+            <p>
+              This classic view stores a filter builder or search instead of SQL, so it cannot be
+              opened in this explorer or the SQL editor. Save a new view instead.
             </p>
           )}
           {view && !owned && (
@@ -285,6 +299,17 @@ export function SavedViews({
               onClick={() => void mutate('convert')}
             >
               Convert to SQL view
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={busy || !storedSql}
+              onClick={() => {
+                if (!storedSql) return;
+                setOpen(false);
+                navigate(sqlEditorHandoff(storedSql));
+              }}
+            >
+              Open in SQL editor
             </Button>
             <Button
               disabled={busy || !compatible}

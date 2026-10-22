@@ -5,7 +5,7 @@ const username = process.env.PARSEABLE_LIVE_USERNAME || 'frontend-smoke';
 const password = process.env.PARSEABLE_LIVE_PASSWORD || 'local-smoke-password';
 const dataset = process.env.PARSEABLE_LIVE_DATASET || 'frontend_smoke';
 const datasetPath = `/logs/explore/${encodeURIComponent(dataset)}`;
-// Page paths are at the root; set `/next` for a server started with `P_UI_ROOT=classic`.
+// Current servers serve page paths at root; override only for explicitly mounted previews.
 const base = (process.env.PARSEABLE_LIVE_BASE ?? '').replace(/\/+$/, '');
 
 /** Document path for an application route, mirroring `appPath` in src/lib/config.ts. */
@@ -80,14 +80,17 @@ test('missing session asks for login and preserves the intended route', async ({
 }) => {
   await signIn(page);
   await expect(page.getByRole('table')).toContainText('Live smoke');
+  const intendedUrl = new URL(page.url());
   await context.clearCookies();
   await page.reload();
   await expect(page).toHaveURL((url) => atLogin(url) && url.searchParams.has('next'));
-  expect(new URL(page.url()).searchParams.get('next')).toBe(datasetPath);
+  expect(new URL(page.url()).searchParams.get('next')).toBe(
+    intendedUrl.pathname + intendedUrl.search,
+  );
   await page.getByLabel('Username', { exact: true }).fill(username);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Login', exact: true }).click();
-  await expect(page).toHaveURL(appUrl(datasetPath));
+  await expect(page).toHaveURL(intendedUrl.href);
   await expect(page.getByRole('table')).toContainText('Live smoke');
 });
 

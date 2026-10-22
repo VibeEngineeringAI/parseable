@@ -134,7 +134,7 @@ pub static INTRA_CLUSTER_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("Construction of client shouldn't fail")
 });
 
-// Compiled by build.rs; included here so its overlay logic is unit tested.
+// Keep the native build contract covered without network or frontend tooling.
 #[cfg(test)]
-#[path = "../build_support/community_ui.rs"]
-mod community_ui_build;
+#[path = "../build_support/native_ui.rs"]
+mod native_ui_build;

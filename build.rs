@@ -16,9 +16,6 @@
  *
  */
 
-#[path = "build_support/community_ui.rs"]
-mod community_ui;
-
 use anyhow::Result;
 use vergen_gitcl::{
     BuildBuilder, CargoBuilder, Emitter, GitclBuilder, RustcBuilder, SysinfoBuilder,
@@ -26,7 +23,6 @@ use vergen_gitcl::{
 
 pub fn main() -> Result<()> {
     ui::setup()?;
-    ui::setup_next()?;
 
     // Init vergen
     Emitter::default()
@@ -40,159 +36,51 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
+#[path = "build_support/native_ui.rs"]
+mod native_ui;
+
 mod ui {
-
-    use std::fs::{self, OpenOptions, create_dir_all};
-    use std::io::{self, Cursor, Read, Write};
-    use std::path::{Path, PathBuf};
-    use std::{env, panic};
-
-    use cargo_toml::Manifest;
-    use sha1_smol::Sha1;
     use static_files::resource_dir;
-    use ureq::get as get_from_url;
+    use std::{env, fs, io, path::PathBuf};
 
-    const CARGO_MANIFEST_DIR: &str = "CARGO_MANIFEST_DIR";
-    const OUT_DIR: &str = "OUT_DIR";
-    const LOCAL_ASSETS_PATH: &str = "LOCAL_ASSETS_PATH";
-    const NEXT_ASSETS_PATH: &str = "NEXT_ASSETS_PATH";
-
-    fn build_resource_from(local_path: impl AsRef<Path>) -> io::Result<()> {
-        let local_path = local_path.as_ref();
-        if local_path.exists() {
-            resource_dir(local_path).build()
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Local UI directory not found!",
-            ))
-        }
-    }
-
-    /// Embeds the native frontend, served at `/` or, with `P_UI_ROOT=classic`,
-    /// under `/next` beside the classic UI. Without one, `generate_next` returns
-    /// no files and the classic UI serves `/`.
-    pub fn setup_next() -> io::Result<()> {
-        println!("cargo:rerun-if-env-changed={NEXT_ASSETS_PATH}");
-        let out_dir = PathBuf::from(env::var(OUT_DIR).unwrap());
-        let generated = out_dir.join("next_generated.rs");
-        let Ok(path) = env::var(NEXT_ASSETS_PATH) else {
-            return fs::write(
-                generated,
-                "pub fn generate_next() -> ::std::collections::HashMap<&'static str, ::static_files::Resource> {\n    ::std::collections::HashMap::new()\n}\n",
-            );
-        };
-        let path = PathBuf::from(path);
-        let Ok(index) = fs::read_to_string(path.join("index.html")) else {
-            panic!("Directory specified in NEXT_ASSETS_PATH has no index.html")
-        };
-        // The server points this base at whichever mount serves the build.
-        if !index.contains(r#"<base href="/""#) {
-            panic!(
-                "NEXT_ASSETS_PATH index.html has no <base href=\"/\">; rebuild it with `npm run build`"
-            )
-        }
-        println!("cargo:rerun-if-changed={}", path.display());
-        let mut next = resource_dir(path);
-        next.with_generated_filename(generated)
-            .with_generated_fn("generate_next");
-        next.build()
-    }
+    use crate::native_ui;
 
     pub fn setup() -> io::Result<()> {
-        println!("cargo:rerun-if-env-changed={LOCAL_ASSETS_PATH}");
+        for name in ["NEXT_ASSETS_PATH", "P_BUILD_NO_UI", "LOCAL_ASSETS_PATH"] {
+            println!("cargo:rerun-if-env-changed={name}");
+        }
         println!("cargo:rerun-if-changed=build.rs");
-        println!("cargo:rerun-if-changed=Cargo.toml");
-        let cargo_manifest_dir = PathBuf::from(env::var(CARGO_MANIFEST_DIR).unwrap());
-        let cargo_toml = cargo_manifest_dir.join("Cargo.toml");
-        let out_dir = PathBuf::from(env::var(OUT_DIR).unwrap());
-        let parseable_ui_path = out_dir.join("ui");
-        let checksum_path = out_dir.join("parseable_ui.sha1");
-
-        let manifest = Manifest::from_path(cargo_toml).unwrap();
-
-        let manifest = manifest
-            .package
-            .expect("package not specified in Cargo.toml")
-            .metadata
-            .expect("no metadata specified in Cargo.toml");
-
-        let metadata = manifest
-            .get("parseable_ui")
-            .expect("Parseable UI Metadata not defined correctly");
-
-        // try fetching frontend path from env var
-        let local_assets_path: Option<PathBuf> =
-            env::var(LOCAL_ASSETS_PATH).ok().map(PathBuf::from);
-
-        // If local build of ui is to be used
-        if let Some(ref path) = local_assets_path {
-            if path.exists() {
-                println!("cargo:rerun-if-changed={}", path.to_str().unwrap());
-                println!("cargo:rustc-env=UI_VERSION=local");
-                build_resource_from(path).unwrap();
-                return Ok(());
-            } else {
-                panic!("Directory specified in LOCAL_ASSETS_PATH is not found")
-            }
+        println!("cargo:rerun-if-changed=build_support/native_ui.rs");
+        if env::var_os("LOCAL_ASSETS_PATH").is_some() {
+            return Err(io::Error::other(
+                "LOCAL_ASSETS_PATH was removed with the classic UI; build frontend/ and set NEXT_ASSETS_PATH to its dist directory",
+            ));
         }
-
-        // Emit this on every upstream build, including a cached asset build.
-        let url = metadata["assets-url"].as_str().unwrap();
-        let asset_url = url::Url::parse(url).expect("valid url");
-        let ui_version = asset_url
-            .path_segments()
-            .expect("has segments")
-            .find(|v| v.starts_with('v'))
-            .expect("version segment");
-        println!("cargo:rustc-env=UI_VERSION={ui_version}");
-
-        let cached = checksum_path.exists()
-            && parseable_ui_path.join("dist").exists()
-            && fs::read_to_string(&checksum_path)? == metadata["assets-sha1"].as_str().unwrap();
-        if !cached {
-            // If there is no UI in the target directory or checksum check failed
-            // then we downlaod the UI from given url in cargo.toml metadata
-            // See https://docs.rs/ureq/2.5.0/ureq/struct.Response.html#method.into_reader
-            let parseable_ui_bytes = get_from_url(url)
-                .call()
-                .map(|data| {
-                    let mut buf: Vec<u8> = Vec::new();
-                    data.into_reader().read_to_end(&mut buf).unwrap();
-                    buf
-                })
-                .expect("Failed to get resource from {url}");
-
-            let checksum = Sha1::from(&parseable_ui_bytes).hexdigest();
-
-            assert_eq!(
-                metadata["assets-sha1"].as_str().unwrap(),
-                checksum,
-                "Downloaded parseable UI shasum differs from the one specified in the Cargo.toml"
-            );
-
-            create_dir_all(&parseable_ui_path)?;
-            let mut zip = zip::read::ZipArchive::new(Cursor::new(&parseable_ui_bytes))?;
-            zip.extract(&parseable_ui_path)?;
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(checksum_path)?;
-
-            file.write_all(checksum.as_bytes())?;
-            file.flush()?;
-        }
-        let community_path = out_dir.join("community-ui");
-        crate::community_ui::prepare(
-            &cargo_manifest_dir,
-            &parseable_ui_path.join("dist"),
-            &community_path,
-            ui_version,
+        let assets = env::var_os("NEXT_ASSETS_PATH").map(PathBuf::from);
+        let disabled = native_ui::no_ui(
+            env::var("P_BUILD_NO_UI").ok().as_deref(),
+            env::var("PROFILE").as_deref() == Ok("debug"),
+            assets.is_some(),
         )?;
-        resource_dir(&community_path).build()?;
-
-        Ok(())
+        if disabled {
+            println!(
+                "cargo:warning=Building without a UI for backend development (P_BUILD_NO_UI=1)"
+            );
+            println!("cargo:rustc-env=UI_VERSION=disabled");
+            return fs::write(
+                PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("generated.rs"),
+                "pub fn generate() -> ::std::collections::HashMap<&'static str, ::static_files::Resource> { ::std::collections::HashMap::new() }\n",
+            );
+        }
+        let path = assets.ok_or_else(|| io::Error::other(
+            "Native UI assets are required. Run `cd frontend && npm ci && npm run build`, then set NEXT_ASSETS_PATH to frontend/dist. For backend-only debug development, set P_BUILD_NO_UI=1.",
+        ))?;
+        println!("cargo:rerun-if-changed={}", path.display());
+        native_ui::validate(&path)?;
+        println!(
+            "cargo:rustc-env=UI_VERSION=native-{}",
+            env!("CARGO_PKG_VERSION")
+        );
+        resource_dir(path).build()
     }
 }
