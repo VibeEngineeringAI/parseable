@@ -651,9 +651,35 @@ impl DashboardService {
                 json!({"dashboard":public_document(&document,&next_revision),"revision":next_revision,"validation":validation,"diff":diff,"dryRun":true,"titleAvailability":{"checked":true,"reserved":false,"mayConflictAtCommit":true}}),
             );
         }
-        let claim = self
+        let claim = match self
             .claim_title(&title, id, None, actor, options, &request_hash, tenant)
-            .await?;
+            .await
+        {
+            Ok(claim) => claim,
+            Err(error) => {
+                // A matching create can commit after our initial receipt read
+                // and activate its title before this attempt claims it. Only
+                // the durable receipt can distinguish a replay from a conflict.
+                if options.idempotency_key.is_some()
+                    && matches!(
+                        &error,
+                        DashboardError::Api {
+                            code: "title_conflict",
+                            ..
+                        }
+                    )
+                    && let Ok(Some((existing, _version))) = self.read(&path, tenant).await
+                {
+                    let revision = revision(&existing);
+                    if let Some(result) =
+                        replay(&existing, &revision, actor, options, &request_hash, false)?
+                    {
+                        return Ok(result);
+                    }
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = self.install_locator(id, &actor.user_id, tenant).await {
             self.release_claim(&claim, tenant).await;
             return Err(error);
@@ -2090,6 +2116,7 @@ mod tests {
         pause_path: String,
         armed: AtomicBool,
         scans: AtomicUsize,
+        pause_missing_read: AtomicBool,
         fault: std::sync::Mutex<Option<WriteFault>>,
         entered: tokio::sync::Notify,
         released: tokio::sync::Notify,
@@ -2101,6 +2128,7 @@ mod tests {
                 pause_path,
                 armed: AtomicBool::new(true),
                 scans: AtomicUsize::new(0),
+                pause_missing_read: AtomicBool::new(false),
                 fault: Default::default(),
                 entered: Default::default(),
                 released: Default::default(),
@@ -2114,7 +2142,17 @@ mod tests {
             path: &RelativePath,
             tenant: &Option<String>,
         ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
-            self.inner.get_metadata_versioned(path, tenant).await
+            let current = self.inner.get_metadata_versioned(path, tenant).await?;
+            // Preserve an actual absent snapshot while another node commits.
+            // No storage lock is held while this test-only barrier is paused.
+            if current.is_none()
+                && path.as_str().contains("/dashboards/")
+                && self.pause_missing_read.swap(false, Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.released.notified().await;
+            }
+            Ok(current)
         }
         async fn put_metadata_conditional(
             &self,
@@ -3087,6 +3125,123 @@ mod tests {
         );
         assert!(changed["dashboard"].get(INTERNAL).is_none());
         assert_eq!(second.list_json(&tenant).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keyed_create_rechecks_receipt_after_title_conflict() {
+        for (retry_key, retry_document, later_edit, expected_error) in [
+            ("create-once", json!({"title":"Once"}), false, None),
+            ("create-once", json!({"title":"Once"}), true, None),
+            (
+                "create-once",
+                json!({"title":"Once","custom":"different arguments"}),
+                false,
+                Some("idempotency_conflict"),
+            ),
+            (
+                "distinct-create",
+                json!({"title":"Once"}),
+                false,
+                Some("title_conflict"),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (winner, _) = services(directory.path());
+            let owner = actor();
+            let paused = Arc::new(PausedStorage::new(directory.path(), "never-match".into()));
+            paused.armed.store(false, Ordering::SeqCst);
+            paused.pause_missing_read.store(true, Ordering::SeqCst);
+            let delayed = DashboardService::new(Arc::new(ObjectStoreMetastore {
+                storage: paused.clone(),
+            }));
+            let caller = tokio::spawn({
+                let owner = owner.clone();
+                async move {
+                    delayed
+                        .create_json(
+                            &owner,
+                            &None,
+                            retry_document,
+                            &DashboardWriteOptions {
+                                idempotency_key: Some(retry_key.into()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), paused.entered.notified())
+                .await
+                .expect("retry must observe an absent document before winner commits");
+            let created = winner
+                .create_json(
+                    &owner,
+                    &None,
+                    json!({"title":"Once"}),
+                    &DashboardWriteOptions {
+                        idempotency_key: Some("create-once".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let dashboard_id = id(&created);
+            let (claim_before, claim_version) = winner
+                .read(&title_path(&None, "Once"), &None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim_before["state"], "active");
+            if later_edit {
+                winner
+                    .mutate_json(
+                        &owner,
+                        dashboard_id,
+                        &None,
+                        metadata(true),
+                        &options(revision_of(&created), Some("later-edit")),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let before = winner.stored(dashboard_id, &None).await.unwrap();
+            paused.released.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+                .await
+                .expect("retry must finish after barrier release")
+                .unwrap();
+            if let Some(expected) = expected_error {
+                assert!(matches!(
+                    result,
+                    Err(DashboardError::Api { status: 409, code, .. }) if code == expected
+                ));
+            } else {
+                let replayed = result.expect("matching create must replay after winner commits");
+                assert_eq!(id(&replayed), dashboard_id);
+                assert_eq!(replayed["revision"], before.revision);
+                assert_eq!(replayed["replayed"], true);
+                assert_eq!(replayed["appliedRevision"], created["revision"]);
+                assert_eq!(
+                    replayed["dashboard"],
+                    winner.get_json(dashboard_id, &None).await.unwrap()
+                );
+            }
+            // The late replay/conflict must not rewrite the document or title.
+            assert_eq!(
+                winner.stored(dashboard_id, &None).await.unwrap().version,
+                before.version
+            );
+            assert_eq!(
+                winner
+                    .read(&title_path(&None, "Once"), &None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                claim_version
+            );
+            assert_eq!(winner.list_json(&None).await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
