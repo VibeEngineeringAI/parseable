@@ -130,3 +130,95 @@ and last-seen value, and coalesces supported aliases per row. Its `total` is the
 number of returned groups, not an unbounded count of all matching groups. The
 native Errors page additionally separates issues by message, so its grouping
 and pagination are not identical to this summary tool.
+
+## SQL tool limits
+
+`query_sql`, `explain_query` and other tools that run SQL internally parse the
+statement with DataFusion's SQL parser and accept exactly one `SELECT` or `WITH`
+query. A trailing semicolon and trailing comments are allowed. Every `SELECT`
+projection, including those inside nested queries and set operations, must
+name at most 10 explicit columns. `*` and `table.*` are rejected. Casts to
+`INT64`, `UINT64` or `FLOAT64` are rejected with a hint to use `BIGINT` or
+`DOUBLE`. The statement is wrapped with an outer `LIMIT 500`. `sample_events`
+returns at most 10 columns, choosing common observability fields such as
+`p_timestamp`, `service.name`, `severity_text`, `body` and `trace_id` before
+other fields.
+
+## Dataset and time resolution
+
+`list_datasets`, `resolve_dataset` and `discover_datasets` omit internal
+datasets.
+
+`resolve_dataset` accepts an optional `telemetryType` (`logs`, `metrics` or
+`traces`) and `limit` (1–20, default 5). It resolves a `selectedDataset` or
+`contextDataset` exactly, or resolves the only visible dataset. Otherwise it
+ranks visible datasets by name match against `query`. It resolves only a
+unique high-confidence name match. In every other case it returns
+`status: "ambiguous"` with up to `limit` scored `candidates`, or `"not_found"`.
+It never falls back to an arbitrary dataset. A selected dataset whose telemetry
+type does not match `telemetryType` returns `not_found`.
+
+`discover_datasets` counts events in the requested range for each visible
+dataset of the requested telemetry type that the caller can query. It returns
+active datasets ordered by event count as `{ name, eventsInRange }`, together
+with `selectedDatasets`, `activeDatasetCount`, `truncated` and up to 20
+`unavailableDatasets`. If no dataset is active and at least one could not be
+counted, the result has `status: "error"` and no datasets.
+
+`resolve_time_range` accepts any IANA `timezone` (default `UTC`), and uses it
+for `today` and `yesterday` day boundaries. It also accepts `last <duration>`,
+`past <duration>`, `now-<duration>`, `<start> to <end>` and RFC3339 start
+times. An unknown timezone is an error.
+
+`sample_events` accepts an explicit `startTime` and `endTime`, which must be
+provided together. They take precedence over `minutes`.
+
+## Log context
+
+`get_log_context` uses the same implementation as `POST /api/v1/query/context`.
+Arguments must include exactly one of `log`, `body` or `message`, holding the
+anchor row's exact value. The schema enforces this with `oneOf`, so calls with
+none or more than one are rejected with `400`. If no context bounds are given,
+the window defaults to `contextWindow: "5 minutes"`. Returned records keep at
+most 10 fields per row, preferring `p_timestamp`, service, severity, message
+and trace identifiers. The response also includes the anchor index, scope and
+the executed queries.
+
+## Trace activity
+
+`get_trace_activity` returns a bucketed span and trace activity series for one
+traces dataset:
+
+```json
+{
+  "name": "get_trace_activity",
+  "arguments": {
+    "dataset": "otel-traces",
+    "startTime": "2026-10-22T00:00:00Z",
+    "endTime": "2026-10-22T01:00:00Z",
+    "groupBy": ["service.name"],
+    "filters": { "span_status_code": 2 },
+    "bucketCount": 60
+  }
+}
+```
+
+`dataset`, `startTime` and `endTime` are required. `groupBy` takes up to 5
+exact field names. `filters` maps exact field names to JSON scalars: strings,
+numbers and booleans test equality, and `null` tests `IS NULL`. `bucketCount`
+is 1–100, default 60. It approximates the number of `DATE_BIN` buckets over the
+dataset's time partition, or `p_timestamp` if none is configured. The dataset
+must have traces telemetry and contain `span_span_id` and `span_trace_id`.
+Unknown fields are rejected. `span_count` is `COUNT(DISTINCT span_span_id)` and
+`trace_count` is `COUNT(DISTINCT span_trace_id)`, so duplicate span rows are
+not double counted. The result contains the exact executed SQL as `query`,
+along with `bucketInterval`, `semantics` and up to 500 `rows`. Clients can
+rerun that SQL unchanged, for example in a dashboard tile.
+
+## Argument schema validation
+
+`inputSchema` is enforced server-side for `type`, `required`,
+`additionalProperties`, `enum`, `const`, `minLength`/`maxLength`,
+`minimum`/`maximum`, `minItems`/`maxItems`, `items`, `anyOf` and `oneOf`.
+`oneOf` passes only when exactly one variant matches. Combinators are checked
+in addition to sibling keywords; they do not replace them.
