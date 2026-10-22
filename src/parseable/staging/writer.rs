@@ -166,7 +166,7 @@ impl Writer {
     pub(crate) fn active_part_paths(&self) -> HashSet<PathBuf> {
         self.disk
             .values()
-            .map(|writer| writer.path.clone())
+            .map(|writer| writer.path().to_path_buf())
             .collect()
     }
 
@@ -292,6 +292,10 @@ impl DiskWriter {
         }
         let arrow = sealed_arrow_path(&part);
         Ok(SealedPart { part, arrow })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Returns whether this writer belongs to the current time range.
