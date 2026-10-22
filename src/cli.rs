@@ -141,6 +141,10 @@ pub struct Options {
     #[arg(long, env = "P_PASSWORD", help = "Admin password to be set for this Parseable server", default_value = DEFAULT_PASSWORD)]
     pub password: String,
 
+    #[arg(long, env = "P_DASHBOARD_AGENT_WRITES", default_value = "false", action = clap::ArgAction::Set,
+        help = "Allow authenticated dashboard mutation tools through the external tool API; dashboard RBAC and ownership still apply")]
+    pub dashboard_agent_writes: bool,
+
     // Server configuration
     #[arg(
         long,

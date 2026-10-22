@@ -330,8 +330,158 @@ pub trait ObjectStorageProvider: std::fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+/// Opaque storage precondition. Preserve both fields when returning it to storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataVersion {
+    pub e_tag: Option<String>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionedMetadata {
+    pub bytes: Bytes,
+    pub version: MetadataVersion,
+}
+
+#[derive(Debug, Clone)]
+pub enum MetadataWriteCondition {
+    Create,
+    Update(MetadataVersion),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConditionalMetadataError {
+    #[error("metadata changed or already exists")]
+    Conflict,
+    #[error("conditional metadata operation unsupported: {0}")]
+    Unsupported(String),
+    #[error(transparent)]
+    Storage(#[from] ObjectStorageError),
+}
+
+impl From<object_store::Error> for ConditionalMetadataError {
+    fn from(error: object_store::Error) -> Self {
+        match error {
+            object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. }
+            | object_store::Error::NotModified { .. } => Self::Conflict,
+            object_store::Error::NotImplemented { .. }
+            | object_store::Error::NotSupported { .. } => Self::Unsupported(error.to_string()),
+            error => Self::Storage(error.into()),
+        }
+    }
+}
+
+/// A single GET binds the returned bytes to their actual storage version.
+pub(crate) async fn get_cloud_metadata(
+    store: &dyn object_store::ObjectStore,
+    path: &RelativePath,
+) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
+    use object_store::ObjectStoreExt;
+    let result = match store.get(&super::to_object_store_path(path)).await {
+        Ok(result) => result,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let version = MetadataVersion {
+        e_tag: result.meta.e_tag.clone(),
+        version: result.meta.version.clone(),
+    };
+    if version.e_tag.is_none() && version.version.is_none() {
+        return Err(ConditionalMetadataError::Unsupported(
+            "storage did not return an object version".into(),
+        ));
+    }
+    Ok(Some(VersionedMetadata {
+        bytes: result
+            .bytes()
+            .await
+            .map_err(ConditionalMetadataError::from)?,
+        version,
+    }))
+}
+
+pub(crate) async fn put_cloud_metadata(
+    store: &dyn object_store::ObjectStore,
+    path: &RelativePath,
+    bytes: Bytes,
+    condition: MetadataWriteCondition,
+) -> Result<MetadataVersion, ConditionalMetadataError> {
+    let mode = match condition {
+        MetadataWriteCondition::Create => object_store::PutMode::Create,
+        MetadataWriteCondition::Update(version) => {
+            if version.e_tag.is_none() && version.version.is_none() {
+                return Err(ConditionalMetadataError::Unsupported(
+                    "empty update version".into(),
+                ));
+            }
+            object_store::PutMode::Update(object_store::UpdateVersion {
+                e_tag: version.e_tag,
+                version: version.version,
+            })
+        }
+    };
+    // Never retry with an unconditional PUT if the provider rejects preconditions.
+    let result = store
+        .put_opts(
+            &super::to_object_store_path(path),
+            bytes.into(),
+            mode.into(),
+        )
+        .await
+        .map_err(|error| match error {
+            object_store::Error::NotFound { .. } => ConditionalMetadataError::Conflict,
+            error => error.into(),
+        })?;
+    if result.e_tag.is_none() && result.version.is_none() {
+        return Err(ConditionalMetadataError::Unsupported(
+            "committed write did not return an object version".into(),
+        ));
+    }
+    Ok(MetadataVersion {
+        e_tag: result.e_tag,
+        version: result.version,
+    })
+}
+
 #[async_trait]
 pub trait ObjectStorage: Debug + Send + Sync + 'static {
+    /// Paths already contain the trusted tenant prefix; tenant_id is metrics context.
+    async fn get_metadata_versioned(
+        &self,
+        _path: &RelativePath,
+        _tenant_id: &Option<String>,
+    ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported(
+            "versioned GET".into(),
+        ))
+    }
+
+    async fn put_metadata_conditional(
+        &self,
+        _path: &RelativePath,
+        _bytes: Bytes,
+        _condition: MetadataWriteCondition,
+        _tenant_id: &Option<String>,
+    ) -> Result<MetadataVersion, ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported(
+            "conditional PUT".into(),
+        ))
+    }
+
+    /// object_store 0.13 has no conditional DELETE. Use a conditional tombstone
+    /// PUT on cloud stores rather than an unsafe check-then-delete sequence.
+    async fn delete_metadata_conditional(
+        &self,
+        _path: &RelativePath,
+        _version: MetadataVersion,
+        _tenant_id: &Option<String>,
+    ) -> Result<(), ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported(
+            "conditional DELETE; use a conditional tombstone PUT".into(),
+        ))
+    }
+
     async fn get_buffered_reader(
         &self,
         path: &RelativePath,
@@ -1838,6 +1988,73 @@ mod manifest_ownership_tests {
         assert!(!manifest_segment_matches(
             "stream/date=2026-08-13/host-a.manifest.json",
             "host-b.manifest.json"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod conditional_cloud_metadata_tests {
+    use super::*;
+    use crate::storage::metrics_layer::MetricLayer;
+    use object_store::{limit::LimitStore, memory::InMemory};
+
+    #[tokio::test]
+    async fn cloud_adapter_preserves_preconditions_through_storage_wrappers() {
+        let store = MetricLayer::new(LimitStore::new(InMemory::new(), 8), "s3");
+        let path = RelativePath::new("tenant/users/owner/dashboards/test.json");
+        assert!(get_cloud_metadata(&store, path).await.unwrap().is_none());
+        let initial = put_cloud_metadata(
+            &store,
+            path,
+            Bytes::from_static(b"initial"),
+            MetadataWriteCondition::Create,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            put_cloud_metadata(
+                &store,
+                path,
+                Bytes::from_static(b"duplicate"),
+                MetadataWriteCondition::Create
+            )
+            .await,
+            Err(ConditionalMetadataError::Conflict)
+        ));
+        let read = get_cloud_metadata(&store, path).await.unwrap().unwrap();
+        assert_eq!(read.bytes, Bytes::from_static(b"initial"));
+        assert_eq!(read.version, initial);
+        let (first, second) = tokio::join!(
+            put_cloud_metadata(
+                &store,
+                path,
+                Bytes::from_static(b"first"),
+                MetadataWriteCondition::Update(initial.clone())
+            ),
+            put_cloud_metadata(
+                &store,
+                path,
+                Bytes::from_static(b"second"),
+                MetadataWriteCondition::Update(initial)
+            ),
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(matches!(
+            if first.is_err() { first } else { second },
+            Err(ConditionalMetadataError::Conflict)
+        ));
+        assert!(matches!(
+            put_cloud_metadata(
+                &store,
+                path,
+                Bytes::from_static(b"unguarded"),
+                MetadataWriteCondition::Update(MetadataVersion {
+                    e_tag: None,
+                    version: None
+                })
+            )
+            .await,
+            Err(ConditionalMetadataError::Unsupported(_))
         ));
     }
 }

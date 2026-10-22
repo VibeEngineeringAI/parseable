@@ -678,6 +678,31 @@ impl ObjectStorage for BlobStore {
         Ok(result?)
     }
 
+    async fn get_metadata_versioned(
+        &self,
+        path: &RelativePath,
+        _tenant_id: &Option<String>,
+    ) -> Result<
+        Option<super::object_storage::VersionedMetadata>,
+        super::object_storage::ConditionalMetadataError,
+    > {
+        super::object_storage::get_cloud_metadata(self.client.as_ref(), path).await
+    }
+
+    async fn put_metadata_conditional(
+        &self,
+        path: &RelativePath,
+        bytes: Bytes,
+        condition: super::object_storage::MetadataWriteCondition,
+        _tenant_id: &Option<String>,
+    ) -> Result<
+        super::object_storage::MetadataVersion,
+        super::object_storage::ConditionalMetadataError,
+    > {
+        super::object_storage::put_cloud_metadata(self.client.as_ref(), path, bytes, condition)
+            .await
+    }
+
     async fn get_object(
         &self,
         path: &RelativePath,

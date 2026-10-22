@@ -9,7 +9,13 @@ import { useCollection } from '../../hooks/useCollection';
 import { useMutation } from '../../hooks/useMutation';
 import type { Dashboard, DashboardSummary } from '../../lib/types';
 import { useLeaveGuard } from '../../hooks/useLeaveGuard';
-import { dashboardError, duplicateDashboard, metadataPatch, patchConflicts } from './helpers';
+import {
+  dashboardError,
+  duplicateDashboard,
+  metadataPatch,
+  patchConflicts,
+  saveDashboardDocument,
+} from './helpers';
 import { patchedDocument } from './draft';
 import { useDashboardAccess } from './owner';
 import { DashboardsList } from './DashboardsList';
@@ -55,14 +61,22 @@ export function DashboardsPage() {
   }
   /** Applies a metadata patch to the latest stored copy, so newer tiles and settings survive. */
   async function save(loaded: Dashboard, patch: Partial<Dashboard>, overwrite = false) {
-    const latest = await client.getDashboard(loaded.dashboardId, readSignal());
+    const signal = readSignal();
+    // An overwrite is conditional on the copy shown in the conflict dialog.
+    const latest = overwrite ? loaded : await client.getDashboard(loaded.dashboardId, signal);
     if (!mutation.isActive()) return;
     if (!overwrite && patchConflicts(loaded, latest, patch)) {
       setForm(undefined);
       setConflict({ latest, patch });
       return;
     }
-    await client.updateDashboard(latest.dashboardId, patchedDocument(latest, patch));
+    const result = await saveDashboardDocument(client, patchedDocument(latest, patch), signal);
+    if (!mutation.isActive()) return;
+    if (result.conflict) {
+      setForm(undefined);
+      setConflict({ latest: result.conflict, patch });
+      return;
+    }
     if (mutation.isActive()) {
       markSaved();
       completed('Dashboard updated.');
@@ -239,7 +253,7 @@ export function DashboardsPage() {
         onConfirm={() =>
           void mutation.run(async () => {
             if (!deleting) return;
-            await client.deleteDashboard(deleting.dashboardId);
+            await client.deleteDashboard(deleting.dashboardId, deleting.revision);
             if (mutation.isActive()) {
               setDeleted(deleting.dashboardId);
               setDeleting(undefined);

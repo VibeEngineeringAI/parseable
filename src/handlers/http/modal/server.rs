@@ -210,6 +210,12 @@ impl ParseableServer for Server {
 impl Server {
     pub fn get_llm_webscope() -> Scope {
         web::scope("/llm")
+            .app_data(web::JsonConfig::default().limit(2 * 1024 * 1024))
+            .app_data(web::Data::new(
+                crate::users::dashboard_tools::DashboardToolPolicy {
+                    writes_enabled: PARSEABLE.options.dashboard_agent_writes,
+                },
+            ))
             .service(
                 web::resource("/tools/list").route(
                     web::get()
@@ -221,7 +227,7 @@ impl Server {
                 web::resource("/tools/call").route(
                     web::post()
                         .to(crate::tool_executor::call_tool_registry)
-                        .authorize(Action::Query),
+                        .authenticate(),
                 ),
             )
     }
@@ -435,6 +441,33 @@ impl Server {
     // get the dashboards web scope
     pub fn get_dashboards_webscope() -> Scope {
         web::scope("/dashboards")
+            .app_data(web::JsonConfig::default().limit(2 * 1024 * 1024))
+            .app_data(web::Data::new(
+                crate::users::dashboard_tools::DashboardToolPolicy {
+                    writes_enabled: PARSEABLE.options.dashboard_agent_writes,
+                },
+            ))
+            .service(
+                web::resource("/preview").route(
+                    web::post()
+                        .to(crate::users::dashboard_runtime::preview)
+                        .authorize(Action::Query),
+                ),
+            )
+            .service(
+                web::resource("/capabilities").route(
+                    web::get()
+                        .to(dashboards::dashboard_capabilities)
+                        .authorize(Action::GetDashboard),
+                ),
+            )
+            .service(
+                web::resource("/validate").route(
+                    web::post()
+                        .to(dashboards::validate_dashboard)
+                        .authorize(Action::CreateDashboard),
+                ),
+            )
             .service(
                 web::resource("")
                     .route(
@@ -473,7 +506,19 @@ impl Server {
                                 web::put()
                                     .to(dashboards::update_dashboard)
                                     .authorize(Action::CreateDashboard),
+                            )
+                            .route(
+                                web::patch()
+                                    .to(dashboards::patch_dashboard)
+                                    .authorize(Action::CreateDashboard),
                             ),
+                    )
+                    .service(
+                        web::resource("/validate").route(
+                            web::post()
+                                .to(dashboards::validate_dashboard_changes)
+                                .authorize(Action::CreateDashboard),
+                        ),
                     )
                     .service(
                         web::resource("/add_tile").route(

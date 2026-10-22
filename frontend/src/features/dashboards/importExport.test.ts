@@ -19,12 +19,13 @@ describe('classic portable JSON', () => {
     expect(result.variables).toEqual(classic.variables);
   });
   it('imports promql_query, empty tiles, saved timeRange and unknown fields', () => {
-    const result = importDashboard(JSON.stringify(classic), 'Imported');
+    const result = importDashboard(JSON.stringify({ ...classic, revision: 'r1' }), 'Imported');
     expect(result.title).toBe('Imported');
     expect(result.variables).toEqual(classic.variables);
     expect(result.timeRange).toEqual(classic.timeRange);
     expect(result.future).toEqual(classic.future);
     expect(result).not.toHaveProperty('tenantId');
+    expect(result).not.toHaveProperty('revision');
     expect(result.dashboardType).toBe('Report');
     expect(result.tiles?.every((tile) => ulid(tile.tile_id))).toBe(true);
     expect(result.tiles?.[0].tile_id).not.toBe(classic.tiles[0].tile_id);

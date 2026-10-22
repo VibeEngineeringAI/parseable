@@ -80,7 +80,7 @@ pub struct ToolSpec {
 }
 
 impl ToolSpec {
-    fn new(
+    pub(crate) fn new(
         name: &'static str,
         title: &'static str,
         description: &'static str,
@@ -100,6 +100,7 @@ impl ToolSpec {
             | "sample_events"
             | "get_log_context"
             | "query_sql"
+            | "run_dashboard_queries"
             | "get_cluster_metrics"
             | "explain_query"
             | "discover_datasets"
@@ -135,7 +136,21 @@ pub fn validate_tool_arguments(schema: &Value, arguments: &Value) -> Result<(), 
 
 fn validate_schema_value(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
     if let Some(result) = validate_any_of(schema, value, path) {
-        return result;
+        result?;
+    }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+        let matches = variants
+            .iter()
+            .filter(|variant| validate_schema_value(variant, value, path).is_ok())
+            .count();
+        if matches != 1 {
+            return Err(format!("{path} must match exactly one allowed schema"));
+        }
+    }
+    if let Some(expected) = schema.get("const")
+        && expected != value
+    {
+        return Err(format!("{path} must equal {expected}"));
     }
 
     validate_enum(schema, value, path)?;
@@ -246,6 +261,12 @@ fn validate_string(schema: &Value, value: &Value, path: &str) -> Result<(), Stri
     {
         return Err(format!("{path} must contain at least {minimum} characters"));
     }
+    if let Some(string) = value.as_str()
+        && let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
+        && string.chars().count() > maximum as usize
+    {
+        return Err(format!("{path} must contain at most {maximum} characters"));
+    }
     Ok(())
 }
 
@@ -307,7 +328,7 @@ fn target_schema() -> Value {
 /// Read-only tools implemented by Parseable OSS and safe for generic external
 /// invocation without a confirmation flow.
 pub fn oss_read_tool_specs() -> Vec<ToolSpec> {
-    vec![
+    let mut tools = vec![
         ToolSpec::new(
             "list_datasets",
             "List datasets",
@@ -632,19 +653,22 @@ pub fn oss_read_tool_specs() -> Vec<ToolSpec> {
             object_schema(
                 json!({
                     "query": { "type": "string" },
+                    "after": { "type": "string", "description": "Opaque dashboard ID cursor returned by the previous page." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 }
                 }),
                 &[],
             ),
         ),
-    ]
+    ];
+    tools.extend(crate::users::dashboard_tools::read_specs());
+    tools
 }
 
 /// Effectful OSS tools retained in the canonical registry for internal agents.
 /// Generic external invocation must not use this catalog until confirmation is
 /// server-verifiable.
 pub fn oss_action_tool_specs() -> Vec<ToolSpec> {
-    vec![
+    let mut tools = vec![
         ToolSpec::new(
             "enable_alert",
             "Enable alert",
@@ -733,58 +757,9 @@ pub fn oss_action_tool_specs() -> Vec<ToolSpec> {
                 &["targetId", "idempotencyKey"],
             ),
         ),
-        ToolSpec::new(
-            "save_tile",
-            "Save tile",
-            "Persist a validated tile in an existing dashboard after confirmation.",
-            object_schema(
-                json!({
-                    "dashboardId": string_property("Dashboard ID."),
-                    "tile": { "type": "object", "additionalProperties": true },
-                    "idempotencyKey": string_property("Server-scoped idempotency key.")
-                }),
-                &["dashboardId", "tile", "idempotencyKey"],
-            ),
-        ),
-        ToolSpec::new(
-            "create_dashboard",
-            "Create dashboard",
-            "Persist a validated dashboard after confirmation.",
-            object_schema(
-                json!({
-                    "dashboard": { "type": "object", "additionalProperties": true },
-                    "idempotencyKey": string_property("Server-scoped idempotency key.")
-                }),
-                &["dashboard", "idempotencyKey"],
-            ),
-        ),
-        ToolSpec::new(
-            "update_dashboard",
-            "Update dashboard",
-            "Update a dashboard using an explicit patch or validated replacement after confirmation.",
-            object_schema(
-                json!({
-                    "dashboardId": string_property("Dashboard ID."),
-                    "patch": { "type": "object", "additionalProperties": true },
-                    "replacement": { "type": "object", "additionalProperties": true },
-                    "idempotencyKey": string_property("Server-scoped idempotency key.")
-                }),
-                &["dashboardId", "idempotencyKey"],
-            ),
-        ),
-        ToolSpec::new(
-            "delete_dashboard",
-            "Delete dashboard",
-            "Delete one dashboard after explicit confirmation.",
-            object_schema(
-                json!({
-                    "dashboardId": string_property("Dashboard ID."),
-                    "idempotencyKey": string_property("Server-scoped idempotency key.")
-                }),
-                &["dashboardId", "idempotencyKey"],
-            ),
-        ),
-    ]
+    ];
+    tools.extend(crate::users::dashboard_tools::write_specs());
+    tools
 }
 
 /// Canonical OSS catalog used by internal agents and imported by Enterprise.
@@ -826,17 +801,29 @@ pub fn registry_http_response(request: &HttpRequest, tools: Vec<Value>) -> HttpR
         .body(body)
 }
 
+/// Immutable schemas are shared across concurrent calls so rich dashboard
+/// operation schemas are built once rather than allocated for every mutation.
+pub fn external_tool_specs(writes_enabled: bool) -> impl Iterator<Item = &'static ToolSpec> {
+    static READ: std::sync::LazyLock<Vec<ToolSpec>> = std::sync::LazyLock::new(oss_read_tool_specs);
+    static WRITES: std::sync::LazyLock<Vec<ToolSpec>> =
+        std::sync::LazyLock::new(crate::users::dashboard_tools::write_specs);
+    READ.iter()
+        .chain(WRITES.iter().filter(move |_| writes_enabled))
+}
+
 /// `GET /api/prism/v1/llm/tools/list`
 pub async fn list_tool_registry(request: HttpRequest) -> HttpResponse {
-    let tools = oss_read_tool_specs()
-        .into_iter()
+    let tools = external_tool_specs(crate::users::dashboard_tools::writes_enabled(&request))
         .map(|tool| {
-            json!({
+            let mut value = json!({
                 "name": tool.name,
                 "title": tool.title,
                 "description": tool.description,
                 "inputSchema": tool.input_schema,
-            })
+                "annotations": { "readOnlyHint": matches!(tool.effect(), ToolEffect::ReadOnly | ToolEffect::ExpensiveRead), "destructiveHint": tool.name == "delete_dashboard", "idempotentHint": crate::users::dashboard_tools::is_write(tool.name), "openWorldHint": false },
+            });
+            if let Some(schema) = crate::users::dashboard_tools::output_schema(tool.name) { value["outputSchema"] = schema; }
+            value
         })
         .collect::<Vec<_>>();
 
@@ -845,6 +832,7 @@ pub async fn list_tool_registry(request: HttpRequest) -> HttpResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::validate_tool_arguments;
     use std::collections::HashSet;
 
     use actix_web::{App, http::header, test, web};
@@ -860,7 +848,7 @@ mod tests {
         let tools = oss_tool_specs();
         let names = tools.iter().map(|tool| tool.name).collect::<HashSet<_>>();
 
-        assert_eq!(tools.len(), 49);
+        assert_eq!(tools.len(), 53);
         assert_eq!(tools.len(), names.len());
     }
 
@@ -899,7 +887,7 @@ mod tests {
         let read_tools = oss_read_tool_specs();
         let action_tools = oss_action_tool_specs();
 
-        assert_eq!(read_tools.len(), 36);
+        assert_eq!(read_tools.len(), 40);
         assert_eq!(action_tools.len(), 13);
         assert!(read_tools.iter().all(|tool| matches!(
             tool.effect(),
@@ -1040,6 +1028,43 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[actix_web::test]
+    async fn schema_combinators_enforce_branches_and_sibling_constraints() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"op": {"type": "string"}, "value": {}},
+            "oneOf": [
+                {"required": ["op", "value"], "properties": {"op": {"const": "add"}}},
+                {"required": ["op"], "properties": {"op": {"const": "remove"}}}
+            ]
+        });
+        for value in [
+            serde_json::json!({"op":"add","value":1}),
+            serde_json::json!({"op":"remove"}),
+        ] {
+            assert!(validate_tool_arguments(&schema, &value).is_ok());
+        }
+        for value in [
+            serde_json::json!({"op":"add"}),
+            serde_json::json!({"op":"unknown"}),
+            serde_json::json!({"op":"remove","extra":1}),
+        ] {
+            assert!(validate_tool_arguments(&schema, &value).is_err());
+        }
+        assert!(
+            validate_tool_arguments(&serde_json::json!({"oneOf":[{},{}]}), &serde_json::json!(1))
+                .is_err()
+        );
+        assert!(
+            validate_tool_arguments(
+                &serde_json::json!({"anyOf":[{"type":"string"}],"maxLength":2}),
+                &serde_json::json!("long")
+            )
+            .is_err()
+        );
     }
 
     #[actix_web::test]

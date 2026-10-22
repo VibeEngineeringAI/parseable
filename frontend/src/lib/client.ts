@@ -125,6 +125,9 @@ async function readText(endpoint: string, init: RequestInit, onUnauthorized?: ()
 function jsonBody(method: string, body: unknown): RequestInit {
   return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
 }
+function dashboardRevisionHeaders(revision?: string): Record<string, string> {
+  return revision ? { 'If-Match': revision.startsWith('"') ? revision : `"${revision}"` } : {};
+}
 
 const seconds = (value: number) => String(Math.round(value * 1000) / 1000);
 
@@ -249,10 +252,32 @@ export function createClient({
     },
     getDashboard: (id, signal) => readDashboard(dashboardPath(id), { signal }),
     createDashboard: (body) => readDashboard(`${base}/dashboards`, jsonBody('POST', body)),
-    updateDashboard: (id, body) => readDashboard(dashboardPath(id), jsonBody('PUT', body)),
+    updateDashboard: (id, body) =>
+      readDashboard(dashboardPath(id), {
+        ...jsonBody('PUT', body),
+        headers: {
+          'Content-Type': 'application/json',
+          ...dashboardRevisionHeaders(body.revision),
+        },
+      }),
     setDashboardFavorite: (id, isFavorite) =>
       readDashboard(`${dashboardPath(id)}?isFavorite=${isFavorite}`, { method: 'PUT' }),
-    deleteDashboard: (id) => mutate(dashboardPath(id), { method: 'DELETE' }),
+    async deleteDashboard(id, revision) {
+      try {
+        await mutate(dashboardPath(id), {
+          method: 'DELETE',
+          headers: dashboardRevisionHeaders(revision),
+        });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 412)
+          throw new ApiError(
+            'This dashboard changed. Reload and review it before deleting.',
+            412,
+            error.detail,
+          );
+        throw error;
+      }
+    },
     async listAlerts(signal) {
       // The server caps each page at 1000 and returns no total. Never silently truncate.
       // It sorts by state, severity and title before offsetting, so an alert changing state

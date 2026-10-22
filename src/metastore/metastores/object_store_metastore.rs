@@ -27,7 +27,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt};
-use relative_path::RelativePathBuf;
+use relative_path::{RelativePath, RelativePathBuf};
 use tonic::async_trait;
 use tracing::{info, warn};
 use ulid::Ulid;
@@ -48,7 +48,10 @@ use crate::{
     },
     metastore::{
         MetastoreError,
-        metastore_traits::{Metastore, MetastoreObject},
+        metastore_traits::{
+            ConditionalMetadataError, MetadataVersion, MetadataWriteCondition, Metastore,
+            MetastoreObject, VersionedMetadata,
+        },
     },
     option::Mode,
     parseable::{DEFAULT_TENANT, PARSEABLE},
@@ -688,40 +691,84 @@ impl Metastore for ObjectStoreMetastore {
             .await?)
     }
 
-    /// Fetch all dashboards
-    async fn get_dashboards(&self) -> Result<HashMap<String, Vec<Bytes>>, MetastoreError> {
-        let mut dashboards: HashMap<String, Vec<Bytes>> = HashMap::new();
-        let base_paths = PARSEABLE.list_tenants().unwrap_or_else(|| vec!["".into()]);
-        for tenant in base_paths {
-            let tenant_id = &Some(tenant.clone());
-            let users_dir = RelativePathBuf::from_iter([&tenant, USERS_ROOT_DIR]);
-            for user in self
-                .storage
-                .list_dirs_relative(&users_dir, tenant_id)
-                .await?
-            {
-                let dashboards_path = users_dir.join(&user).join("dashboards");
-                let dashboard_bytes = self
-                    .storage
-                    .get_objects(
-                        Some(&dashboards_path),
-                        Box::new(|file_name| file_name.ends_with(".json")),
-                        tenant_id,
-                    )
-                    .await?;
+    async fn get_dashboard_versioned(
+        &self,
+        path: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
+        self.storage
+            .get_metadata_versioned(RelativePath::new(path), tenant_id)
+            .await
+    }
 
-                let tenant_key = if tenant.is_empty() {
-                    DEFAULT_TENANT.to_string()
-                } else {
-                    tenant.clone()
-                };
-                dashboards
-                    .entry(tenant_key)
-                    .or_default()
-                    .extend(dashboard_bytes);
+    async fn put_dashboard_conditional(
+        &self,
+        path: &str,
+        bytes: Bytes,
+        condition: MetadataWriteCondition,
+        tenant_id: &Option<String>,
+    ) -> Result<MetadataVersion, ConditionalMetadataError> {
+        self.storage
+            .put_metadata_conditional(RelativePath::new(path), bytes, condition, tenant_id)
+            .await
+    }
+
+    async fn delete_dashboard_conditional(
+        &self,
+        path: &str,
+        version: MetadataVersion,
+        tenant_id: &Option<String>,
+    ) -> Result<(), ConditionalMetadataError> {
+        self.storage
+            .delete_metadata_conditional(RelativePath::new(path), version, tenant_id)
+            .await
+    }
+
+    /// Fetch all dashboards; hidden service indexes are not dashboard owners.
+    async fn get_dashboards(&self) -> Result<HashMap<String, Vec<Bytes>>, MetastoreError> {
+        let mut dashboards = HashMap::new();
+        let tenants = PARSEABLE.list_tenants().unwrap_or_else(|| vec!["".into()]);
+        for tenant in tenants {
+            let tenant_id = if tenant.is_empty() {
+                None
+            } else {
+                Some(tenant.clone())
+            };
+            let bytes = self.get_tenant_dashboards(&tenant_id).await?;
+            dashboards.insert(
+                tenant_id.unwrap_or_else(|| DEFAULT_TENANT.to_string()),
+                bytes,
+            );
+        }
+        Ok(dashboards)
+    }
+
+    async fn get_tenant_dashboards(
+        &self,
+        tenant_id: &Option<String>,
+    ) -> Result<Vec<Bytes>, MetastoreError> {
+        let users =
+            RelativePathBuf::from_iter([tenant_id.as_deref().unwrap_or(""), USERS_ROOT_DIR]);
+        let mut dashboards = Vec::new();
+        for owner in self.storage.list_dirs_relative(&users, tenant_id).await? {
+            if owner.starts_with('.') {
+                continue;
+            }
+            let path = users.join(owner).join("dashboards");
+            match self
+                .storage
+                .get_objects(
+                    Some(&path),
+                    Box::new(|name| name.ends_with(".json")),
+                    tenant_id,
+                )
+                .await
+            {
+                Ok(bytes) => dashboards.extend(bytes),
+                Err(error) if is_missing_optional_dir(&error) => {}
+                Err(error) => return Err(error.into()),
             }
         }
-
         Ok(dashboards)
     }
 

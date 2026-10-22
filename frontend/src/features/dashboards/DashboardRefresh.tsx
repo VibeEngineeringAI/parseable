@@ -20,6 +20,8 @@ export const refreshIntervals = [
   { value: 60_000, label: '1m' },
   { value: 300_000, label: '5m' },
 ];
+export const savedRefreshInterval = (value: unknown): number =>
+  refreshIntervals.some((interval) => interval.value === value) ? Number(value) : 0;
 
 type Tracker = {
   track: <T>(
@@ -47,12 +49,15 @@ const Refresh = createContext<
 /** One completion-based timer for the whole view, including variable queries. */
 export function DashboardRefreshProvider({
   onRefresh,
+  savedInterval = 0,
   children,
 }: {
   onRefresh: () => void;
+  savedInterval?: number;
   children: ReactNode;
 }) {
-  const [interval, setRefreshInterval] = useState(0);
+  const [interval, setRefreshInterval] = useState(() => savedRefreshInterval(savedInterval));
+  useEffect(() => setRefreshInterval(savedRefreshInterval(savedInterval)), [savedInterval]);
   const [hidden, setHidden] = useState(() => document.hidden);
   const [activity, setActivity] = useState(0);
   const [lastUpdated, setLastUpdated] = useState<number>();
@@ -161,7 +166,15 @@ export function useDashboardQuery<T>(
   return useAsync(tracked);
 }
 
-export function DashboardRefreshControls({ onManualRefresh }: { onManualRefresh?: () => void }) {
+export function DashboardRefreshControls({
+  onManualRefresh,
+  savedInterval = 0,
+  onSaveDefault,
+}: {
+  onManualRefresh?: () => void;
+  savedInterval?: number;
+  onSaveDefault?: (interval: number) => void;
+}) {
   const state = useContext(Refresh);
   const [announcement, setAnnouncement] = useState('');
   const previouslyFailed = useRef(false);
@@ -185,6 +198,9 @@ export function DashboardRefreshControls({ onManualRefresh }: { onManualRefresh?
           </option>
         ))}
       </Select>
+      {onSaveDefault && state.interval !== savedRefreshInterval(savedInterval) && (
+        <Button onClick={() => onSaveDefault(state.interval)}>Use as saved default</Button>
+      )}
       <Button
         className="dashboard-refresh-button"
         aria-disabled={state.busy || state.hidden}

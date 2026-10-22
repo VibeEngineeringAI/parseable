@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createClient } from './client';
 import classic from '../features/dashboards/__fixtures__/classic.json';
 import type { ParseableClient } from './types';
-import { checkDashboardConflict } from '../features/dashboards/helpers';
+import { checkDashboardConflict, saveDashboardDocument } from '../features/dashboards/helpers';
 import { applyTile, dashboardPayload, loadDraft } from '../features/dashboards/draft';
 const path = '/api/v1/dashboards/id%2Fwith%20space';
 const cases: Array<{
@@ -55,6 +55,102 @@ const cases: Array<{
 ];
 afterEach(() => vi.unstubAllGlobals());
 describe('dashboard requests', () => {
+  it.each(['observed-revision', '"observed-revision"'])(
+    'deletes only revision %s using a strong If-Match header',
+    async (revision) => {
+      const fetch = vi.fn().mockResolvedValue(new Response(''));
+      vi.stubGlobal('fetch', fetch);
+      await createClient({ mode: 'live' }).deleteDashboard(classic.dashboardId, revision);
+      const init = fetch.mock.calls[0][1];
+      expect(init.method).toBe('DELETE');
+      expect(new Headers(init.headers).get('If-Match')).toBe('"observed-revision"');
+      expect(init.body).toBeUndefined();
+    },
+  );
+  it('keeps revision-less legacy deletes and never retries a rejected conditional delete', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(''))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'revision_conflict' } }), { status: 412 }),
+      );
+    vi.stubGlobal('fetch', fetch);
+    const client = createClient({ mode: 'live' });
+    await client.deleteDashboard(classic.dashboardId);
+    expect(new Headers(fetch.mock.calls[0][1].headers).has('If-Match')).toBe(false);
+    await expect(client.deleteDashboard(classic.dashboardId, 'stale')).rejects.toMatchObject({
+      status: 412,
+      message: 'This dashboard changed. Reload and review it before deleting.',
+      detail: { error: { code: 'revision_conflict' } },
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+  it.each(['server-revision-1', '"server-revision-1"'])(
+    'sends revision %s as a strong If-Match ETag and preserves the complete document',
+    async (revision) => {
+      const body = { ...classic, revision, refreshInterval: 30_000 };
+      const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(body)));
+      vi.stubGlobal('fetch', fetch);
+      await createClient({ mode: 'live' }).updateDashboard(classic.dashboardId, body);
+      const init = fetch.mock.calls[0][1];
+      expect(new Headers(init.headers).get('If-Match')).toBe('"server-revision-1"');
+      expect(JSON.parse(init.body)).toEqual(body);
+    },
+  );
+  it('keeps unconditional legacy requests when a document has no revision', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(classic)));
+    vi.stubGlobal('fetch', fetch);
+    await createClient({ mode: 'live' }).updateDashboard(classic.dashboardId, classic);
+    expect(new Headers(fetch.mock.calls[0][1].headers).has('If-Match')).toBe(false);
+  });
+  it('shows a 412 conflict and conditions each intentional overwrite on the observed copy', async () => {
+    const remote = {
+      ...classic,
+      revision: 'revision-2',
+      title: 'Agent saved',
+      future: { kept: true },
+    };
+    const newer = { ...remote, revision: 'revision-3', title: 'Another concurrent edit' };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('Dashboard changed', { status: 412 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(remote)))
+      .mockResolvedValueOnce(new Response('Dashboard changed again', { status: 412 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(newer)))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ...newer, title: 'UI edit', revision: 'revision-4' })),
+      );
+    vi.stubGlobal('fetch', fetch);
+    const client = createClient({ mode: 'live' }),
+      signal = new AbortController().signal;
+    const first = await saveDashboardDocument(
+      client,
+      { ...classic, revision: 'revision-1', title: 'UI edit' },
+      signal,
+    );
+    expect(first).toEqual({ conflict: remote });
+    const second = await saveDashboardDocument(
+      client,
+      { ...first.conflict!, title: 'UI edit' },
+      signal,
+    );
+    expect(second).toEqual({ conflict: newer });
+    const third = await saveDashboardDocument(
+      client,
+      { ...second.conflict!, title: 'UI edit' },
+      signal,
+    );
+    expect(third.saved).toMatchObject({
+      revision: 'revision-4',
+      title: 'UI edit',
+      future: { kept: true },
+    });
+    expect(
+      fetch.mock.calls
+        .filter(([, init]) => init.method === 'PUT')
+        .map(([, init]) => new Headers(init.headers).get('If-Match')),
+    ).toEqual(['"revision-1"', '"revision-2"', '"revision-3"']);
+  });
   it('loads, edits and saves a complete classic document without narrowing it', async () => {
     const fetch = vi
       .fn()

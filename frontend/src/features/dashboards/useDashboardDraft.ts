@@ -4,7 +4,7 @@ import { useLeaveGuard } from '../../hooks/useLeaveGuard';
 import { useMutation } from '../../hooks/useMutation';
 import type { Dashboard, TimeRange } from '../../lib/types';
 import { dashboardPayload, loadDraft } from './draft';
-import { checkDashboardConflict } from './helpers';
+import { checkDashboardConflict, saveDashboardDocument } from './helpers';
 import { dashboardRange } from './timeRange';
 
 export function useDashboardDraft(original: Dashboard, focusHeading: () => void) {
@@ -66,7 +66,7 @@ export function useDashboardDraft(original: Dashboard, focusHeading: () => void)
     void mutation.run(async () => {
       read.current?.abort();
       read.current = new AbortController();
-      if (!overwrite) {
+      if (!overwrite && !loaded.revision) {
         const latest = await checkDashboardConflict(client, loaded, read.current.signal);
         if (!mutation.isActive()) return;
         if (latest) {
@@ -74,11 +74,18 @@ export function useDashboardDraft(original: Dashboard, focusHeading: () => void)
           return;
         }
       }
-      const saved = await client.updateDashboard(
-        draft.dashboardId,
-        dashboardPayload(draft, range, rangeDirty),
+      const result = await saveDashboardDocument(
+        client,
+        dashboardPayload(
+          { ...draft, revision: (overwrite ? conflict : loaded)?.revision },
+          range,
+          rangeDirty,
+        ),
+        read.current.signal,
       );
-      if (mutation.isActive()) accept(saved, 'Dashboard saved.');
+      if (!mutation.isActive()) return;
+      if (result.conflict) setConflict(result.conflict);
+      else accept(result.saved, 'Dashboard saved.');
     });
   }
   return {

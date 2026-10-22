@@ -48,6 +48,7 @@ type Call = {
   method: string;
   body?: Record<string, unknown>;
   params: URLSearchParams;
+  headers: Record<string, string>;
 };
 async function mockServer(
   page: Page,
@@ -82,7 +83,7 @@ async function mockServer(
         ? Object.fromEntries(new URLSearchParams(request.postData()!))
         : request.postDataJSON()
       : undefined;
-    calls.push({ path, method, body, params: url.searchParams });
+    calls.push({ path, method, body, params: url.searchParams, headers: request.headers() });
     if (path === options.denied)
       return route.fulfill({ status: 403, body: 'Dashboard permission denied' });
     if (path === '/api/v1/about')
@@ -146,7 +147,7 @@ async function mockServer(
         json:
           options.rows ??
           [...documents.values()].map(
-            ({ title, dataset, author, dashboardId, created, modified, tags, isFavorite }) => ({
+            ({
               title,
               dataset,
               author,
@@ -155,6 +156,17 @@ async function mockServer(
               modified,
               tags,
               isFavorite,
+              revision,
+            }) => ({
+              title,
+              dataset,
+              author,
+              dashboardId,
+              created,
+              modified,
+              tags,
+              isFavorite,
+              revision,
             }),
           ),
       });
@@ -177,6 +189,13 @@ async function mockServer(
         return route.fulfill({ json: doc });
       }
       if (method === 'DELETE') {
+        const document = documents.get(requestedId);
+        const observed = request.headers()['if-match'];
+        if (document?.revision && observed && observed !== `"${document.revision}"`)
+          return route.fulfill({
+            status: 412,
+            json: { error: { code: 'revision_conflict', message: 'Dashboard changed' } },
+          });
         documents.delete(requestedId);
         return route.fulfill({ status: 200, body: '' });
       }
@@ -329,6 +348,64 @@ test('list favourites and rename preserve the full document; typed deletion rest
   await expect(page.getByRole('link', { name: 'Renamed service', exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Search dashboards')).toBeFocused();
 });
+
+for (const location of ['list', 'detail'] as const) {
+  test(`conditional deletion from ${location} keeps agent edits until a fresh confirmation`, async ({
+    page,
+  }) => {
+    const source = { ...classic, revision: 'revision-1', tiles: [], variables: [], sections: [] };
+    const server = await mockServer(page, { document: source });
+    await page.goto(location === 'list' ? '/dashboards' : detail);
+    async function openDelete(title: string) {
+      await page
+        .getByRole('button', {
+          name: location === 'list' ? `Actions for ${title}` : 'Dashboard actions',
+          exact: true,
+        })
+        .click();
+      await page
+        .getByRole('menuitem', {
+          name: location === 'list' ? 'Delete' : 'Delete dashboard',
+          exact: true,
+        })
+        .click();
+      const dialog = page.getByRole('dialog', { name: 'Delete dashboard', exact: true });
+      await dialog.getByLabel('Confirmation name').fill(title);
+      return dialog;
+    }
+    const dialog = await openDelete(source.title);
+    server.change({ revision: 'revision-2', title: 'Agent saved a newer dashboard' });
+    await dialog.locator('[data-dialog-confirm]').click();
+    await expect(dialog.getByRole('alert')).toHaveText(
+      'This dashboard changed. Reload and review it before deleting.',
+    );
+    await expect(dialog).toBeVisible();
+    const deletes = () => server.calls.filter((call) => call.method === 'DELETE');
+    expect(deletes()).toHaveLength(1);
+    expect(deletes()[0].headers['if-match']).toBe('"revision-1"');
+    expect(server.current()).toMatchObject({
+      revision: 'revision-2',
+      title: 'Agent saved a newer dashboard',
+    });
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    if (location === 'list') {
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await expect(
+        page.getByRole('link', { name: 'Agent saved a newer dashboard', exact: true }),
+      ).toBeVisible();
+    } else {
+      await page.reload();
+      await expect(
+        page.getByRole('heading', { name: 'Agent saved a newer dashboard', exact: true }),
+      ).toBeVisible();
+    }
+    const fresh = await openDelete('Agent saved a newer dashboard');
+    await fresh.locator('[data-dialog-confirm]').click();
+    await expect(fresh).not.toBeVisible();
+    expect(deletes()).toHaveLength(2);
+    expect(deletes()[1].headers['if-match']).toBe('"revision-2"');
+  });
+}
 
 test('demo PromQL tile add/edit/delete and variable selection', async ({ page }) => {
   await demo(page, '/dashboards/01M4J000000000000000000002');

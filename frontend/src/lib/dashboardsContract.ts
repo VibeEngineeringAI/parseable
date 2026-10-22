@@ -11,6 +11,7 @@ export function dashboardSummary(value: unknown): value is DashboardSummary {
     object(value) &&
     ulid(value.dashboardId) &&
     typeof value.title === 'string' &&
+    (value.revision === undefined || typeof value.revision === 'string') &&
     ['author', 'created', 'modified', 'dataset'].every((key) => optionalString(value[key])) &&
     (value.tags == null || strings(value.tags)) &&
     (value.isFavorite == null || typeof value.isFavorite === 'boolean')

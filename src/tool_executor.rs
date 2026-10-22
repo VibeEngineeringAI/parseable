@@ -15,7 +15,7 @@ use crate::{
     parseable::PARSEABLE,
     prism::logstream::get_prism_logstream_info,
     rbac::{Response, Users, map::SessionKey, role::Action},
-    tool_catalog::{ToolCallRequest, ToolCallResult, oss_read_tool_specs},
+    tool_catalog::{ToolCallRequest, ToolCallResult},
     utils::{
         actix::extract_session_key_from_req,
         get_tenant_id_from_request,
@@ -53,12 +53,12 @@ fn bounded_select(query: &str) -> Result<String, String> {
     if query.contains(';') {
         return Err("exactly one SQL statement is required".to_owned());
     }
-    let normalized = query.to_ascii_lowercase();
-    if !(normalized.starts_with("select ") || normalized.starts_with("with ")) {
+    let first_word = query.split_whitespace().next().unwrap_or("");
+    if !(first_word.eq_ignore_ascii_case("select") || first_word.eq_ignore_ascii_case("with")) {
         return Err("only SQL SELECT queries are allowed".to_owned());
     }
     Ok(format!(
-        "SELECT * FROM ({query}) AS __parseable_tool_query LIMIT 500"
+        "SELECT * FROM (\n{query}\n) AS __parseable_tool_query LIMIT 500"
     ))
 }
 
@@ -988,8 +988,12 @@ async fn execute_saved_object_tool(
         }
         "list_dashboard_tags" => {
             authorize(context.session_key, Action::ListDashboard, None, None)?;
-            serde_json::to_value(dashboards::list_tags_internal(context.tenant_id).await)
-                .map_err(|error| error.to_string())
+            serde_json::to_value(
+                dashboards::list_tags_internal(context.tenant_id)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|error| error.to_string())
         }
         "get_dashboard" => {
             authorize(context.session_key, Action::GetDashboard, None, None)?;
@@ -1008,6 +1012,7 @@ async fn execute_saved_object_tool(
             Ok(
                 dashboards::list_dashboards_internal(limit, None, context.tenant_id)
                     .await
+                    .map_err(|e| e.to_string())?
                     .into(),
             )
         }
@@ -1086,16 +1091,42 @@ pub async fn call_tool_registry(
             "Your session has expired or is no longer valid. Please re-authenticate to access this resource.",
         ));
     }
-    let Some(spec) = oss_read_tool_specs()
-        .into_iter()
-        .find(|tool| tool.name == call.name)
-    else {
+    let Some(spec) = crate::tool_catalog::external_tool_specs(
+        crate::users::dashboard_tools::writes_enabled(&req),
+    )
+    .find(|tool| tool.name == call.name) else {
         return HttpResponse::NotFound().json(ToolCallResult::error("unknown tool"));
     };
     if let Err(error) = spec.validate_arguments(&call.arguments) {
         return HttpResponse::BadRequest().json(ToolCallResult::error(error));
     }
     let tenant_id = get_tenant_id_from_request(&req);
+    if crate::users::dashboard_tools::is_dashboard_tool(spec.name) {
+        return match crate::users::dashboard_tools::execute(&req, spec.name, &call.arguments).await
+        {
+            Ok(result) => HttpResponse::Ok().json(ToolCallResult::success(result)),
+            Err(error) => {
+                let mut result = ToolCallResult::error(error.to_string());
+                result.structured_content =
+                    json!({"error":crate::users::dashboard_tools::tool_error(&error)});
+                HttpResponse::Ok().json(result)
+            }
+        };
+    }
+    // Multiplexed transport authentication is separate from per-tool policy.
+    // Preserve the existing query gate for non-dashboard tools, including
+    // tenant suspension checks, without requiring query access to edit config.
+    if let crate::rbac::Response::Suspended(message) =
+        crate::handlers::http::middleware::check_suspension_for_tenant(
+            tenant_id.as_deref(),
+            Action::Query,
+        )
+    {
+        return HttpResponse::Forbidden().json(ToolCallResult::error(message));
+    }
+    if let Err(message) = authorize(&session_key, Action::Query, None, None) {
+        return HttpResponse::Forbidden().json(ToolCallResult::error(message));
+    }
     match execute_oss_tool_inner(
         spec.name,
         &call.arguments,
@@ -1112,6 +1143,27 @@ pub async fn call_tool_registry(
 
 #[cfg(test)]
 mod tests {
+    #[actix_web::test]
+    async fn bounded_tool_sql_preserves_multiline_queries_and_trailing_comments() {
+        use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+        for source in [
+            "SELECT\n1 AS value",
+            "WITH\nx AS (SELECT 1) SELECT * FROM x",
+            "SELECT 1 -- trailing comment",
+        ] {
+            let bounded = super::bounded_select(source).unwrap();
+            assert_eq!(
+                Parser::parse_sql(&GenericDialect {}, &bounded)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(bounded.ends_with("LIMIT 500"));
+        }
+        assert!(super::bounded_select("DELETE FROM logs").is_err());
+        assert!(super::bounded_select("SELECT 1; SELECT 2").is_err());
+    }
+
     use actix_web::{App, http::StatusCode, test, web};
     use chrono::{DateTime, Duration, Utc};
     use serde_json::{Value, json};

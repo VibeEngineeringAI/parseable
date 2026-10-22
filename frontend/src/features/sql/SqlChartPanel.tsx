@@ -6,6 +6,7 @@ import { Button, Dialog, Input, InlineError, Select } from '../../components/ui'
 import { QueryState } from '../../components/explorer/QueryState';
 import { useAsync } from '../../hooks/useAsync';
 import { useMutation } from '../../hooks/useMutation';
+import { ApiError } from '../../lib/apiError';
 import type { Dashboard, LogRecord, TimeRange } from '../../lib/types';
 import { timeBounds } from '../../lib/query';
 import { TileChart } from '../dashboards/TileChart';
@@ -197,10 +198,20 @@ export function SqlChartPanel({
                       'This dashboard changed. Review the latest version and add the chart again.',
                     );
                   }
-                  result = await client.updateDashboard(
-                    loaded.dashboardId,
-                    appendSqlTile(latest, tile),
-                  );
+                  try {
+                    result = await client.updateDashboard(
+                      loaded.dashboardId,
+                      appendSqlTile(latest, tile),
+                    );
+                  } catch (error) {
+                    if (error instanceof ApiError && error.status === 412) {
+                      selected.reload();
+                      throw new Error(
+                        'This dashboard changed. Review the latest version and add the chart again.',
+                      );
+                    }
+                    throw error;
+                  }
                 }
                 if (mutation.isActive()) {
                   setSaved(result);

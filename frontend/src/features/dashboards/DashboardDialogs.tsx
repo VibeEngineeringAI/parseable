@@ -218,7 +218,7 @@ export function DashboardDialogs({
         error={dashboardError(mutation.error)}
         onConfirm={() =>
           void mutation.run(async () => {
-            await client.deleteDashboard(draft.dashboardId);
+            await client.deleteDashboard(draft.dashboardId, draft.revision);
             if (mutation.isActive()) {
               workspace.markSaved();
               onDashboardDeleted();

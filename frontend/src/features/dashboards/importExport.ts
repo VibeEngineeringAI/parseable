@@ -44,7 +44,8 @@ export function importDashboard(json: string, title: string): DashboardRequest {
     throw new Error('Invalid dashboard variables.');
   if (!title.trim()) throw new Error('Enter a dashboard title.');
   const body = structuredClone(value);
-  for (const key of ['dashboardId', 'author', 'created', 'modified', 'tenantId']) delete body[key];
+  for (const key of ['dashboardId', 'author', 'created', 'modified', 'tenantId', 'revision'])
+    delete body[key];
   const tiles: DashboardTile[] = value.tiles.map((tile) => ({
     ...structuredClone(tile),
     tile_id: createUlid(),
