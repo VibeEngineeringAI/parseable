@@ -170,6 +170,7 @@ impl LocalFS {
     ) -> Result<T, ConditionalMetadataError> {
         let lock_path = self.metadata_lock_path(path);
         let path = self.checked_metadata_path(path)?;
+        let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
             let parent = path
                 .parent()
@@ -199,6 +200,19 @@ impl LocalFS {
                     // valid nonzero generation proves this initialization ran.
                     sync_metadata_parent(&lock_path)?;
                     sync_metadata_parent(lock_path.parent().expect("private lock directory"))?;
+                }
+                // create_dir_all above, or a concurrent opener, may have just
+                // created any directory up to root without syncing its entry.
+                // Neither an existing parent nor a nonzero generation proves
+                // durability (prefix deletes keep locks), so sync the chain
+                // under the lock before acknowledging. The parent itself is
+                // synced by the mutation.
+                for directory in parent
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|directory| directory.starts_with(&root))
+                {
+                    sync_directory(directory)?;
                 }
             } else {
                 lock.lock_shared().map_err(ObjectStorageError::from)?;
@@ -1212,8 +1226,14 @@ fn read_local_metadata(
 }
 
 fn sync_metadata_parent(path: &Path) -> Result<(), ObjectStorageError> {
+    sync_directory(path.parent().expect("metadata parent"))
+}
+
+fn sync_directory(directory: &Path) -> Result<(), ObjectStorageError> {
     #[cfg(unix)]
-    std::fs::File::open(path.parent().expect("metadata parent"))?.sync_all()?;
+    std::fs::File::open(directory)?.sync_all()?;
+    #[cfg(test)]
+    conditional_metadata_tests::record_directory_sync(directory);
     Ok(())
 }
 
@@ -1246,6 +1266,24 @@ mod conditional_metadata_tests {
     use crate::metastore::{
         metastore_traits::Metastore, metastores::object_store_metastore::ObjectStoreMetastore,
     };
+
+    static DIRECTORY_SYNCS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn record_directory_sync(directory: &Path) {
+        DIRECTORY_SYNCS
+            .lock()
+            .unwrap()
+            .push(directory.to_path_buf());
+    }
+
+    fn take_directory_syncs_under(root: &Path) -> HashSet<PathBuf> {
+        let mut syncs = DIRECTORY_SYNCS.lock().unwrap();
+        let (taken, kept) = std::mem::take(&mut *syncs)
+            .into_iter()
+            .partition(|directory| directory.starts_with(root));
+        *syncs = kept;
+        taken.into_iter().collect()
+    }
 
     fn service(root: &Path) -> Arc<ObjectStoreMetastore> {
         Arc::new(ObjectStoreMetastore {
@@ -1535,6 +1573,94 @@ mod conditional_metadata_tests {
                 .await,
             Err(ConditionalMetadataError::Conflict)
         ));
+    }
+
+    fn assert_synced_up_to_root(root: &Path, object: &Path, context: &str) {
+        let synced = take_directory_syncs_under(root);
+        for ancestor in object
+            .parent()
+            .unwrap()
+            .ancestors()
+            .take_while(|ancestor| ancestor.starts_with(root))
+        {
+            assert!(
+                synced.contains(ancestor),
+                "{context} did not sync {}",
+                ancestor.display()
+            );
+        }
+    }
+
+    async fn create_metadata(storage: &LocalFS, path: &RelativePath) {
+        storage
+            .put_metadata_conditional(
+                path,
+                Bytes::from_static(b"{}"),
+                MetadataWriteCondition::Create,
+                &None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writes_sync_every_new_directory_entry_up_to_root() {
+        let paths = [
+            ".users/.dashboard-locations/01ARZ3NDEKTSV4RRFFQ69G5FAV.json",
+            ".users/.dashboard-titles/first-title.json",
+            ".users/owner/dashboards/01ARZ3NDEKTSV4RRFFQ69G5FAV.json",
+            "tenant/.users/.dashboard-titles/first-title.json",
+            "tenant/.users/owner/dashboards/01ARZ3NDEKTSV4RRFFQ69G5FAV.json",
+        ];
+        for scenario in ["absent", "legacy", "unsynced", "concurrent", "recreated"] {
+            for path in paths {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path().to_path_buf();
+                let storage = Arc::new(LocalFS::new(root.clone()));
+                let path = RelativePath::new(path);
+                let object = storage.path_in_root(path);
+                match scenario {
+                    "absent" => create_metadata(&storage, path).await,
+                    "legacy" => storage
+                        .put_object(path, Bytes::from_static(b"{}"), &None)
+                        .await
+                        .unwrap(),
+                    // Another opener created the hierarchy without syncing it.
+                    "unsynced" => {
+                        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+                        std::fs::create_dir_all(root.join(METADATA_LOCK_DIRECTORY)).unwrap();
+                        create_metadata(&storage, path).await;
+                    }
+                    // First writers race to create shared directories.
+                    "concurrent" => {
+                        let sibling = format!("{}.sibling", path.as_str());
+                        let writers = [path.to_relative_path_buf(), sibling.into()].map(|path| {
+                            let storage = storage.clone();
+                            tokio::spawn(async move { create_metadata(&storage, &path).await })
+                        });
+                        for writer in writers {
+                            writer.await.unwrap();
+                        }
+                    }
+                    // A nonzero lock generation does not prove the hierarchy
+                    // still exists: a prefix delete keeps locks but not dirs.
+                    _ => {
+                        create_metadata(&storage, path).await;
+                        let mut lock =
+                            std::fs::File::open(storage.metadata_lock_path(path)).unwrap();
+                        assert_ne!(read_metadata_generation(&mut lock).unwrap(), [0; 16]);
+                        let users = path.as_str().split_once(".users/").unwrap().0;
+                        storage
+                            .delete_prefix(&RelativePath::new(users).join(".users"), &None)
+                            .await
+                            .unwrap();
+                        take_directory_syncs_under(&root);
+                        create_metadata(&storage, path).await;
+                    }
+                }
+                assert_synced_up_to_root(&root, &object, &format!("{scenario} write of {path}"));
+            }
+        }
     }
 
     #[tokio::test]
