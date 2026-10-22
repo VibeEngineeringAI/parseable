@@ -16,8 +16,7 @@
  *
  */
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, Once};
+use std::sync::Once;
 use std::thread;
 
 use crate::analytics;
@@ -46,7 +45,6 @@ use crate::hottier::HotTierMessage;
 use crate::hottier::hottier_runtime;
 use crate::metrics;
 use crate::migration;
-use crate::option::UiRoot;
 use crate::storage;
 use crate::storage::field_stats::get_dataset_stats;
 use crate::sync;
@@ -81,10 +79,9 @@ use crate::{
     rbac::role::Action,
 };
 
-// use super::generate;
 use super::ParseableServer;
+use super::generate;
 use super::load_on_init;
-use super::{generate, generate_next};
 
 pub struct Server;
 
@@ -900,43 +897,25 @@ impl Server {
             .route(web::post().to(get_dataset_stats).authorize(Action::Query))
     }
 
-    // GET "/" ==> Serve the UI chosen by P_UI_ROOT
-    // GET "/next" ==> Serve the native frontend beside the classic UI, or redirect to "/"
+    // Native UI at `/`; preserve old `/next` bookmarks and OIDC return URLs.
     pub fn configure_ui(config: &mut web::ServiceConfig) {
-        Self::mount_ui(
-            config,
-            generate(),
-            generate_next(),
-            PARSEABLE.options.ui_root,
-        );
+        Self::mount_ui(config, generate());
     }
 
-    /// The native frontend serves `/` unless `root` is classic or no native build
-    /// was embedded; the classic UI then serves `/` and the native one, if any,
-    /// `/next`. `/next` is registered ahead of the catch-all `/` either way.
-    /// `root` is `None` when `P_UI_ROOT` is unset, which means native.
-    fn mount_ui(
-        config: &mut web::ServiceConfig,
-        classic: UiFiles,
-        native: UiFiles,
-        root: Option<UiRoot>,
-    ) {
+    fn mount_ui(config: &mut web::ServiceConfig, native: UiFiles) {
+        config.service(web::scope("/next").default_service(web::to(redirect_from_next)));
         if native.is_empty() {
             static LOGGED: Once = Once::new();
-            LOGGED.call_once(|| match root {
-                Some(UiRoot::Native) => tracing::warn!(
-                    "P_UI_ROOT=native, but no native frontend was embedded; serving the classic UI"
-                ),
-                Some(UiRoot::Classic) => {}
-                None => tracing::info!("No native frontend was embedded; serving the classic UI"),
-            });
-            config.service(Self::ui_scope("", classic));
-        } else if root.unwrap_or_default() == UiRoot::Native {
-            config.service(web::scope("/next").default_service(web::to(redirect_from_next)));
-            config.service(Self::ui_scope("", native));
+            LOGGED.call_once(|| tracing::warn!(
+                "UI disabled by P_BUILD_NO_UI=1 at build time; rebuild with NEXT_ASSETS_PATH to enable it"
+            ));
+            config.service(web::scope("").default_service(web::to(|| async {
+                HttpResponse::ServiceUnavailable()
+                    .insert_header((CACHE_CONTROL, "no-store"))
+                    .body("UI disabled in this backend development build. Rebuild with NEXT_ASSETS_PATH pointing to frontend/dist.")
+            })));
         } else {
-            config.service(Self::ui_scope("/next", native));
-            config.service(Self::ui_scope("", classic));
+            config.service(Self::ui_scope("", native));
         }
     }
 
@@ -954,7 +933,7 @@ impl Server {
     > {
         // A single-page app: any path that is not a file is a client-side route
         // and gets `index.html`, except a missing hashed asset (see `serve_ui`).
-        let files = Rc::new(at_mount(files, path));
+        let files = Rc::new(files);
         let lookup = Rc::clone(&files);
         web::scope(path)
             .wrap(from_fn(move |req: ServiceRequest, next: Next<_>| {
@@ -966,40 +945,8 @@ impl Server {
 
 type UiFiles = std::collections::HashMap<&'static str, static_files::Resource>;
 
-/// The native build loads its assets relative to `<base href="/">`. Pointing
-/// that at the mount lets one build serve `/` and `/next`. The rewritten
-/// `index.html` is a different length, so its ETag differs as well.
-fn at_mount(mut files: UiFiles, mount: &str) -> UiFiles {
-    if !mount.is_empty()
-        && let Some(index) = files.get_mut("index.html")
-    {
-        index.data = mounted_index(index.data, mount);
-    }
-    files
-}
-
-/// `index` with its base at `mount`, built once per build and mount since every
-/// worker mounts the UI and the served bytes must be `'static`.
-fn mounted_index(index: &'static [u8], mount: &str) -> &'static [u8] {
-    type Key = (usize, String);
-    static MOUNTED: LazyLock<Mutex<HashMap<Key, &'static [u8]>>> = LazyLock::new(Default::default);
-    MOUNTED
-        .lock()
-        .unwrap()
-        .entry((index.as_ptr() as usize, mount.to_owned()))
-        .or_insert_with(|| {
-            let html = String::from_utf8_lossy(index).replacen(
-                r#"<base href="/""#,
-                &format!(r#"<base href="{mount}/""#),
-                1,
-            );
-            Box::leak(html.into_bytes().into_boxed_slice())
-        })
-}
-
 /// The native frontend moved from `/next` to `/`. Old links, bookmarks and
-/// logins started there keep their path and query. The redirect is temporary so
-/// browsers do not keep it while `P_UI_ROOT=classic` can move the UI back.
+/// logins started there keep their path and query. Do not cache the redirect.
 ///
 /// Assets are not redirected. A tab still running the build it loaded from
 /// `/next` would import a chunk from `/assets/`, and that chunk's own imports
@@ -1038,7 +985,7 @@ async fn redirect_from_next(req: HttpRequest) -> HttpResponse {
 }
 
 /// Vite names every file it emits under `assets/` after a hash of its content,
-/// in both UIs. Only the prefix is checked: client routes such as Prism's
+/// in the native UI. Only the prefix is checked: legacy client routes such as
 /// `/apm/<service>` may end in a segment containing a dot. `path` must be
 /// normalized, so that `assets/` with nothing after it is not a file.
 fn is_hashed_asset(path: &str) -> bool {
@@ -1150,50 +1097,22 @@ mod tests {
         ])
     }
 
-    async fn call_with(
-        request: test::TestRequest,
-        path: &str,
-        native: UiFiles,
-        root: Option<UiRoot>,
-    ) -> ServiceResponse {
-        let app = test::init_service(
-            App::new().configure(|config| Server::mount_ui(config, ui(b"classic"), native, root)),
-        )
-        .await;
+    async fn call(request: test::TestRequest, path: &str, native: UiFiles) -> ServiceResponse {
+        let app =
+            test::init_service(App::new().configure(|config| Server::mount_ui(config, native)))
+                .await;
         test::call_service(&app, request.uri(path).to_request()).await
     }
 
-    async fn serve(path: &str, native: UiFiles, root: UiRoot) -> ServiceResponse {
-        serve_with(path, native, Some(root)).await
+    async fn get(path: &str, native: UiFiles) -> ServiceResponse {
+        call(test::TestRequest::get(), path, native).await
     }
 
-    async fn serve_with(path: &str, native: UiFiles, root: Option<UiRoot>) -> ServiceResponse {
-        call_with(test::TestRequest::get(), path, native, root).await
-    }
-
-    /// With the classic UI at `/` and the native one beside it under `/next`.
-    async fn call(request: test::TestRequest, path: &str, next: UiFiles) -> ServiceResponse {
-        call_with(request, path, next, Some(UiRoot::Classic)).await
-    }
-
-    /// With the classic UI at `/` and the native one beside it under `/next`.
-    async fn get(path: &str, next: UiFiles) -> ServiceResponse {
-        serve(path, next, UiRoot::Classic).await
-    }
-
-    /// With the classic UI at `/` and the native one beside it under `/next`.
-    async fn get_and_revalidate(path: &str, next: UiFiles) -> [ServiceResponse; 2] {
-        revalidate(path, next, UiRoot::Classic).await
-    }
-
-    /// GETs `path`, then again with the first response's ETag in `If-None-Match`,
-    /// as a browser revalidating its copy does. Returns both responses.
-    async fn revalidate(path: &str, native: UiFiles, root: UiRoot) -> [ServiceResponse; 2] {
-        let app = test::init_service(
-            App::new()
-                .configure(|config| Server::mount_ui(config, ui(b"classic"), native, Some(root))),
-        )
-        .await;
+    /// Revalidate an actual response using its ETag, as browsers do.
+    async fn get_and_revalidate(path: &str, native: UiFiles) -> [ServiceResponse; 2] {
+        let app =
+            test::init_service(App::new().configure(|config| Server::mount_ui(config, native)))
+                .await;
         let first = test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
         let etag = first.headers().get(ETAG).expect("an ETag").clone();
         let request = test::TestRequest::get()
@@ -1209,14 +1128,10 @@ mod tests {
         [first, second]
     }
 
-    async fn body_from(path: &str, native: UiFiles, root: UiRoot) -> Bytes {
-        let response = serve(path, native, root).await;
+    async fn body_at(path: &str, native: UiFiles) -> Bytes {
+        let response = get(path, native).await;
         assert!(response.status().is_success(), "GET {path} failed");
         to_bytes(response.into_body()).await.unwrap()
-    }
-
-    async fn body_at(path: &str, next: UiFiles) -> Bytes {
-        body_from(path, next, UiRoot::Classic).await
     }
 
     fn location(response: &ServiceResponse) -> &str {
@@ -1233,35 +1148,15 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn next_routes_take_precedence_over_the_root_fallback() {
-        for path in [
-            "/next",
-            "/next/",
-            "/next/logs?x=1",
-            "/next/oidc-not-configured",
-        ] {
-            assert_eq!(body_at(path, ui(b"next")).await, "next", "GET {path}");
-        }
-        for path in ["/", "/logs", "/nextfoo", "/oidc-not-configured"] {
-            assert_eq!(body_at(path, ui(b"next")).await, "classic", "GET {path}");
-        }
-    }
-
-    #[actix_web::test]
-    async fn without_a_next_build_the_classic_ui_serves_next_paths() {
-        assert_eq!(body_at("/next/logs", UiFiles::new()).await, "classic");
-    }
-
-    #[actix_web::test]
     async fn client_routes_get_index_html_even_with_a_dot_in_them() {
         for path in [
             "/apm/checkout.api",
             "/errors/TypeError.x",
             "/assetsfoo/a.js",
         ] {
-            assert_eq!(body_at(path, UiFiles::new()).await, "classic", "GET {path}");
+            assert_eq!(body_at(path, ui(b"native")).await, "native", "GET {path}");
         }
-        assert_eq!(body_at("/next/apm/a.b", ui(b"next")).await, "next");
+        assert_eq!(body_at("/apm/a.b", ui(b"native")).await, "native");
     }
 
     #[actix_web::test]
@@ -1280,14 +1175,14 @@ mod tests {
         let response = call(
             test::TestRequest::post(),
             "/assets/index-gone.js",
-            UiFiles::new(),
+            ui(b"native"),
         )
         .await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         let response = call(
             test::TestRequest::default().method(Method::HEAD),
             "/assets/index-gone.js",
-            UiFiles::new(),
+            ui(b"native"),
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1295,17 +1190,13 @@ mod tests {
 
     #[actix_web::test]
     async fn hashed_assets_are_immutable_and_everything_else_revalidates() {
-        for path in [
-            "/assets/index-abc123.js",
-            "/assets//index-abc123.js",
-            "/next/assets/index-abc123.js",
-        ] {
+        for path in ["/assets/index-abc123.js", "/assets//index-abc123.js"] {
             let [response, revalidated] = get_and_revalidate(path, ui(b"next")).await;
             assert_eq!(response.status(), StatusCode::OK, "GET {path}");
             assert_eq!(cache_control(&response), IMMUTABLE, "GET {path}");
             assert_eq!(cache_control(&revalidated), IMMUTABLE, "revalidate {path}");
         }
-        for path in ["/", "/logs", "/favicon.ico", "/next", "/next/team"] {
+        for path in ["/", "/logs", "/favicon.ico"] {
             let [response, revalidated] = get_and_revalidate(path, ui(b"next")).await;
             assert_eq!(response.status(), StatusCode::OK, "GET {path}");
             assert_eq!(cache_control(&response), "no-cache", "GET {path}");
@@ -1328,10 +1219,7 @@ mod tests {
         for path in [
             "/assets/",
             "/assets//",
-            "/next/assets/",
-            "/next/assets//",
             "/assets/%2e%2e/index.html",
-            "/next/assets/%2E%2E/index.html",
             "/assets/x/%2e%2e/%2e%2e/logs",
         ] {
             let [response, revalidated] = get_and_revalidate(path, ui(b"next")).await;
@@ -1353,8 +1241,7 @@ mod tests {
     async fn html_is_never_immutable() {
         let mut next = ui(b"next");
         next.insert("assets/page-abc123.html", file(b"page", "text/html"));
-        let [response, revalidated] =
-            get_and_revalidate("/next/assets/page-abc123.html", next).await;
+        let [response, revalidated] = get_and_revalidate("/assets/page-abc123.html", next).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(cache_control(&response), "no-cache");
         assert_eq!(cache_control(&revalidated), "no-cache");
@@ -1363,26 +1250,20 @@ mod tests {
     #[actix_web::test]
     async fn existing_files_are_served_as_themselves() {
         assert_eq!(
-            body_at("/assets/index-abc123.js", UiFiles::new()).await,
+            body_at("/assets/index-abc123.js", ui(b"native")).await,
             "chunk"
         );
-        assert_eq!(body_at("/favicon.ico", UiFiles::new()).await, "icon");
-        assert_eq!(body_at("/next/favicon.ico", ui(b"next")).await, "icon");
+        assert_eq!(body_at("/favicon.ico", ui(b"native")).await, "icon");
     }
 
     #[actix_web::test]
     async fn the_native_frontend_serves_the_root_by_default() {
-        assert_eq!(UiRoot::default(), UiRoot::Native);
         for path in ["/", "/logs/explore/app", "/nextfoo", "/oidc-not-configured"] {
-            assert_eq!(
-                body_from(path, ui(b"native"), UiRoot::Native).await,
-                "native",
-                "GET {path}"
-            );
-            let unset = serve_with(path, ui(b"native"), None).await;
+            assert_eq!(body_at(path, ui(b"native")).await, "native", "GET {path}");
+            let unset = get(path, ui(b"native")).await;
             assert_eq!(to_bytes(unset.into_body()).await.unwrap(), "native");
         }
-        let unset = serve_with("/next/logs", ui(b"native"), None).await;
+        let unset = get("/next/logs", ui(b"native")).await;
         assert_eq!(unset.status(), StatusCode::TEMPORARY_REDIRECT);
     }
 
@@ -1402,19 +1283,19 @@ mod tests {
             "/next/%2e%2e/assets/index-abc123.js",
             "/next/assets//index-abc123.js",
         ] {
-            let response = serve(path, ui(b"native"), UiRoot::Native).await;
+            let response = get(path, ui(b"native")).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
             assert_eq!(cache_control(&response), "no-cache", "GET {path}");
             assert!(response.headers().get(LOCATION).is_none(), "GET {path}");
         }
         // At the root the native build's assets are served and cached as usual.
-        let response = serve("/assets/index-abc123.js", ui(b"native"), UiRoot::Native).await;
+        let response = get("/assets/index-abc123.js", ui(b"native")).await;
         assert_eq!(cache_control(&response), IMMUTABLE);
         assert_eq!(to_bytes(response.into_body()).await.unwrap(), "chunk");
-        let response = serve("/assets/index-gone.js", ui(b"native"), UiRoot::Native).await;
+        let response = get("/assets/index-gone.js", ui(b"native")).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(cache_control(&response), "no-cache");
-        let response = serve("/logs", ui(b"native"), UiRoot::Native).await;
+        let response = get("/logs", ui(b"native")).await;
         assert_eq!(cache_control(&response), "no-cache");
     }
 
@@ -1444,7 +1325,7 @@ mod tests {
             ("/%6Eext//evil.example", "/evil.example"),
             ("/%6Eext/\\evil.example", "/evil.example"),
         ] {
-            let response = serve(path, ui(b"native"), UiRoot::Native).await;
+            let response = get(path, ui(b"native")).await;
             assert_eq!(
                 response.status(),
                 StatusCode::TEMPORARY_REDIRECT,
@@ -1454,78 +1335,20 @@ mod tests {
         }
     }
 
-    #[actix_web::test]
-    async fn without_a_native_build_the_classic_ui_serves_the_root() {
-        for root in [UiRoot::Native, UiRoot::Classic] {
-            assert_eq!(body_from("/logs", UiFiles::new(), root).await, "classic");
-            assert_eq!(
-                body_from("/next/logs", UiFiles::new(), root).await,
-                "classic"
-            );
-        }
-    }
-
-    #[actix_web::test]
-    async fn the_native_build_loads_its_assets_from_its_mount() {
-        let native = || ui(br#"<head><base href="/" /></head>"#);
-        assert_eq!(
-            body_from("/next/logs", native(), UiRoot::Classic).await,
-            r#"<head><base href="/next/" /></head>"#
-        );
-        assert_eq!(
-            body_from("/logs", native(), UiRoot::Native).await,
-            r#"<head><base href="/" /></head>"#
-        );
-        for path in ["/next", "/next/", "/next/index.html", "/next/a/b/c"] {
-            assert_eq!(
-                body_from(path, native(), UiRoot::Classic).await,
-                r#"<head><base href="/next/" /></head>"#,
-                "GET {path}"
-            );
-        }
-        let asset = serve("/next/assets/index-abc123.js", native(), UiRoot::Classic).await;
-        assert_eq!(to_bytes(asset.into_body()).await.unwrap(), "chunk");
-    }
-
-    /// A browser keeps the build's `index.html` from one mount apart from the
-    /// other's, and revalidates the rewritten one like any other.
-    #[actix_web::test]
-    async fn the_rewritten_index_has_its_own_etag() {
-        let native = || ui(br#"<head><base href="/" /></head>"#);
-        let [at_next, revalidated] = revalidate("/next/logs", native(), UiRoot::Classic).await;
-        assert_eq!(cache_control(&at_next), "no-cache");
-        assert_eq!(cache_control(&revalidated), "no-cache");
-        let [at_root, _] = revalidate("/logs", native(), UiRoot::Native).await;
-        assert_ne!(at_next.headers().get(ETAG), at_root.headers().get(ETAG));
-        let request = test::TestRequest::get()
-            .insert_header((IF_NONE_MATCH, at_root.headers().get(ETAG).unwrap().clone()));
-        let response = call(request, "/next/logs", native()).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            to_bytes(response.into_body()).await.unwrap(),
-            r#"<head><base href="/next/" /></head>"#
-        );
-    }
-
     /// The SPA fallback applies only once `ResourceFiles` has normalized the path
     /// and tried a directory index, as with the plain `ResourceFiles` before.
     #[actix_web::test]
     async fn paths_are_normalized_before_the_fallback() {
         for (path, body) in [
             ("/foo/../assets/index-abc123.js", "chunk"),
-            ("/next/foo/../assets/index-abc123.js", "chunk"),
             ("/integrations-assets//k8s.svg", "svg"),
-            ("/next/integrations-assets//k8s.svg", "svg"),
             ("/docs/", "docs"),
-            ("/next/docs/", "docs"),
-            ("/logs/", "classic"),
-            ("/logs//x/..", "classic"),
-            ("/next/logs/", "next"),
+            ("/logs/", "next"),
+            ("/logs//x/..", "next"),
             ("/favicon.ico/", "icon"),
-            ("/next/favicon.ico/", "icon"),
             ("/integrations-assets/k8s.svg/", "svg"),
-            ("/favicon.ico/index.html", "classic"),
-            ("/index.html/index.html", "classic"),
+            ("/favicon.ico/index.html", "next"),
+            ("/index.html/index.html", "next"),
             ("/assets/index-abc123.js/", "chunk"),
         ] {
             assert_eq!(body_at(path, ui(b"next")).await, body, "GET {path}");
@@ -1546,13 +1369,7 @@ mod tests {
     /// `ResourceFiles` rejects these segments with a 400 rather than serve them.
     #[actix_web::test]
     async fn paths_the_crate_rejects_stay_bad_requests() {
-        for path in [
-            "/.env",
-            "/next/.env",
-            "/logs/.git/config",
-            "/explore/x:",
-            "/*x",
-        ] {
+        for path in ["/.env", "/logs/.git/config", "/explore/x:", "/*x"] {
             let response = get(path, ui(b"next")).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "GET {path}");
             assert_eq!(cache_control(&response), "no-cache", "GET {path}");
@@ -1560,7 +1377,7 @@ mod tests {
         // Even a file of that name in the build is not served.
         let mut next = ui(b"next");
         next.insert(".env", file(b"secret", "text/plain"));
-        let response = get("/next/.env", next).await;
+        let response = get("/.env", next).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1568,11 +1385,44 @@ mod tests {
     async fn a_directory_index_under_assets_is_served() {
         let mut next = ui(b"next");
         next.insert("assets/dir/index.html", file(b"dir", "text/html"));
-        let [response, revalidated] = get_and_revalidate("/next/assets/dir/", next).await;
+        let [response, revalidated] = get_and_revalidate("/assets/dir/", next).await;
         assert_eq!(cache_control(&response), "no-cache");
         assert_eq!(to_bytes(response.into_body()).await.unwrap(), "dir");
         assert_eq!(cache_control(&revalidated), "no-cache");
-        let response = get("/next/assets/dir/", ui(b"next")).await;
+        let response = get("/assets/dir/", ui(b"next")).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    #[actix_web::test]
+    async fn backend_only_build_explains_missing_ui_and_preserves_api_routes() {
+        let app = test::init_service(
+            App::new()
+                .route(
+                    "/api/prism/v1/probe",
+                    web::get().to(|| async { HttpResponse::Ok().body("api") }),
+                )
+                .configure(|config| Server::mount_ui(config, UiFiles::new())),
+        )
+        .await;
+        for path in ["/", "/logs", "/oidc-not-configured"] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(cache_control(&response), "no-store");
+            assert!(
+                String::from_utf8(to_bytes(response.into_body()).await.unwrap().to_vec())
+                    .unwrap()
+                    .contains("NEXT_ASSETS_PATH")
+            );
+        }
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/prism/v1/probe")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = get("/next/logs?x=1", UiFiles::new()).await;
+        assert_eq!(location(&response), "/logs?x=1");
     }
 }

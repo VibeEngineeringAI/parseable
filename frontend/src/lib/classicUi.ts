@@ -1,10 +1,6 @@
 import { parser } from '@prometheus-io/lezer-promql';
-import { basePath } from './config';
 import { matcher, metricSelector, validateRange } from './promql';
 import type { LogFilter, TimeRange } from './types';
-
-/** The classic (Prism) UI owns the root while this frontend is mounted under a prefix. */
-export const classicUiAvailable = basePath !== '';
 
 /**
  * How a classic URL opens here:
@@ -161,12 +157,6 @@ export function nativePath(path: string): string {
   return `${fill(found.route.native, found.captures)}${query ? `?${query}` : ''}${hash}`;
 }
 
-/** The classic UI page equivalent to a route in this frontend, for comparison. */
-export function classicUiPath(pathname: string): string {
-  const found = bestMatch('native', pathname);
-  return found ? fill(found.route.classic, found.captures) : '/';
-}
-
 /** Classic quick ranges, by their `start` value when `type=fixed`. */
 const classicPresets: Record<string, TimeRange> = {
   '10m': '10m',
@@ -293,7 +283,7 @@ function droppedFromLink(params: URLSearchParams, unreadRange: boolean, filters:
   const dropped: string[] = [];
   if (unreadRange) dropped.push('time range');
   const tz = params.get('tz');
-  if (tz && tz !== 'UTC') dropped.push(`time zone ${tz} (times are shown in UTC)`);
+  if (tz && tz !== 'UTC') dropped.push(`time zone ${tz} (not restored from this link)`);
   if (filters) dropped.push(filters === 1 ? '1 filter' : `${filters} filters`);
   if (params.get('groupBy')) dropped.push('grouping');
   if (params.get('view')) dropped.push('saved view');

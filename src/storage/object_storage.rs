@@ -1512,7 +1512,7 @@ async fn process_schema_files(
 }
 
 /// Builds the stream relative path for a file
-fn stream_relative_path(
+pub(crate) fn stream_relative_path(
     stream_name: &str,
     filename: &str,
     custom_partition: &Option<String>,

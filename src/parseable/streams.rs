@@ -23,7 +23,7 @@ use arrow::{
 };
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{ArrowError, Field, Fields, Schema, SortOptions};
-use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
 use derive_more::derive::{Deref, DerefMut};
 use itertools::Itertools;
 use once_cell::sync::{Lazy, OnceCell};
@@ -95,7 +95,7 @@ use super::{
             ForwardFilePlan, ForwardStreamReader, MergedForwardRecordReader,
             MergedReverseRecordReader, get_reverse_reader,
         },
-        writer::Writer,
+        writer::{DiskWriter, Writer},
     },
 };
 
@@ -378,24 +378,179 @@ pub struct Stream {
     pub metadata: RwLock<LogStreamMetadata>,
     pub data_path: PathBuf,
     pub options: Arc<Options>,
+    /// Staging writers, also accessible directly to library consumers.
+    ///
+    /// Direct access has historically allowed inspecting and detaching writers.
+    /// `Stream::flush` coordinates detachment and sealing with part recovery;
+    /// direct writer operations do not acquire that lifecycle lock. Prefer
+    /// Stream-managed flushing when recovery or conversion can run concurrently.
     pub writer: Mutex<Writer>,
+    /// Held exclusively while a Parquet output is renamed into place and the
+    /// pending memory of its sources is released, and shared while a query
+    /// captures memory and the staging Parquet set, so each staged row is seen
+    /// exactly once. Lock order: `publication`, then `writer`.
+    publication: RwLock<()>,
+    /// Held shared by `flush` from detaching writers until they are sealed,
+    /// and exclusively by part recovery. Recovery therefore never sees a part
+    /// that is detached but still owned by a flush, so a part with pending
+    /// memory and no attached writer is one whose seal failed. Lock order:
+    /// `part_lifecycle`, then `writer`.
+    part_lifecycle: RwLock<()>,
     schema_writer: Mutex<()>,
+    /// Processing directories and temporary Parquet outputs owned by running
+    /// conversions for this Stream object. Recovery may hold `part_lifecycle`
+    /// when taking this leaf lock; it acquires no other locks while held.
+    /// Separate Stream objects, including delete/recreate, do not share it.
+    conversion_claims: Arc<Mutex<ConversionClaims>>,
     pub ingestor_id: Option<String>,
+    #[cfg(test)]
+    conversion_hook: Mutex<Option<ConversionHook>>,
+    #[cfg(test)]
+    lifecycle_hook: Mutex<Option<LifecycleHook>>,
 }
 
-/// Startup conversion owns this immutable processing-file snapshot. Periodic
-/// sync may run while it is consumed because it only claims root Arrow files
-/// and its newly-created processing directory.
+/// Test-only pause points in the part lifecycle, for forcing interleavings.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LifecyclePhase {
+    /// `flush` has detached writers and is about to seal them.
+    FlushDetached,
+    /// Part recovery was entered.
+    RecoveryStarted,
+    /// Part recovery is waiting for a flush to finish its detached writers.
+    RecoveryWaitingForFlush,
+    /// Part recovery selected these orphan candidates.
+    RecoveryCandidates(Vec<PathBuf>),
+    /// Startup preparation recovered parts and is about to flush.
+    StartupRecovered,
+    /// Part recovery chose this Arrow name and is about to rename an orphan.
+    RecoveryPublishing(PathBuf),
+    /// A conversion took these output groups and their Arrow sources.
+    ConversionClaimed(Vec<(PathBuf, Vec<PathBuf>)>),
+    /// A conversion opened readers on these sources for this output.
+    ConversionReadersOpened {
+        output: PathBuf,
+        sources: Vec<PathBuf>,
+    },
+    /// A temporary Parquet output was created and is still empty.
+    ParquetPartCreated(PathBuf),
+    /// A temporary Parquet output was written and closed, not yet validated.
+    ParquetPartClosed(PathBuf),
+    /// A temporary Parquet output is valid and about to be renamed.
+    ParquetPartWritten(PathBuf),
+}
+
+#[cfg(test)]
+pub(crate) type LifecycleHook = Arc<dyn Fn(LifecyclePhase) + Send + Sync>;
+
+/// Staging paths owned by the running conversions of one stream.
+///
+/// Every conversion registers its processing directories, and so every sealed
+/// Arrow source inside them, before it reads them, and its temporary Parquet
+/// outputs before it creates them. Periodic and shutdown conversions create
+/// and register a fresh directory under the lock before moving root Arrow
+/// files into it. Startup and init conversions register, under the lock, only
+/// the processing directories nobody owns. Part recovery never deletes a
+/// registered output. Entries are released only when their `ConversionClaim`
+/// is dropped, after that conversion has stopped mutating the paths. Metric
+/// workers open source paths lazily and may outlive the claim on early error;
+/// they only read and never mutate staging paths. Ownership is per Stream
+/// object; deletion and recreation at the same path are not coordinated here.
+#[derive(Default)]
+struct ConversionClaims {
+    next_claim: u64,
+    dirs: HashMap<PathBuf, u64>,
+    outputs: HashMap<PathBuf, u64>,
+}
+
+/// Ownership of the staging paths registered by one conversion. Dropping it
+/// releases exactly those entries that are still registered to this claim.
+struct ConversionClaim {
+    claims: Arc<Mutex<ConversionClaims>>,
+    id: u64,
+    dirs: Vec<PathBuf>,
+    outputs: Vec<PathBuf>,
+}
+
+impl ConversionClaim {
+    fn new(claims: &Arc<Mutex<ConversionClaims>>) -> Self {
+        let id = {
+            let mut registry = lock_conversion_claims(claims);
+            registry.next_claim += 1;
+            registry.next_claim
+        };
+        Self {
+            claims: Arc::clone(claims),
+            id,
+            dirs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+}
+
+impl Drop for ConversionClaim {
+    fn drop(&mut self) {
+        let mut registry = lock_conversion_claims(&self.claims);
+        for dir in &self.dirs {
+            if registry.dirs.get(dir) == Some(&self.id) {
+                registry.dirs.remove(dir);
+            }
+        }
+        for output in &self.outputs {
+            if registry.outputs.get(output) == Some(&self.id) {
+                registry.outputs.remove(output);
+            }
+        }
+    }
+}
+
+/// The registry holds only path ownership, and every update to it is a
+/// single map operation, so a panic elsewhere cannot leave it inconsistent.
+fn lock_conversion_claims(
+    claims: &Mutex<ConversionClaims>,
+) -> std::sync::MutexGuard<'_, ConversionClaims> {
+    claims.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The temporary file a Parquet output is written to before its rename.
+fn parquet_part_path(parquet_path: &Path) -> PathBuf {
+    let mut part_path = parquet_path.to_path_buf();
+    part_path.add_extension(PART_FILE_EXTENSION);
+    part_path
+}
+
+/// Test-only pause points around sealing and Parquet publication.
+#[cfg(test)]
+enum ConversionPhase<'a> {
+    /// A detached part is finished and about to be renamed to this `.arrows` path.
+    BeforeSealRename(&'a Path),
+    /// The Parquet part is complete; publication has not started.
+    BeforePublish(&'a Path),
+    /// The Parquet file is visible; its sources' memory is not yet released.
+    Published,
+}
+
+#[cfg(test)]
+type ConversionHook = Arc<dyn Fn(ConversionPhase<'_>) + Send + Sync>;
+
+/// A startup conversion of the processing directories that no running
+/// conversion owned when it was prepared. The plan owns those directories and
+/// its outputs until it has been executed or dropped, so periodic, shutdown
+/// and init conversions can run meanwhile without touching them.
 pub(crate) struct StartupSyncPlan {
     stream: StreamRef,
     tenant_id: Option<String>,
     staging_files: Vec<(PathBuf, Vec<PathBuf>)>,
+    claim: ConversionClaim,
 }
 
 #[derive(Default)]
 struct ArrowFileConversionOutcome {
     schema: Option<Schema>,
     first_error: Option<StagingError>,
+    /// The conversion's claim, released once the outcome is consumed, after
+    /// the schema is staged. Callers attach it after converting.
+    claim: Option<ConversionClaim>,
 }
 
 #[derive(Clone, Copy)]
@@ -645,26 +800,39 @@ impl ConversionRecordReader {
 
 impl ArrowFileConversionOutcome {
     fn into_result(self) -> Result<Option<Schema>, StagingError> {
-        if let Some(err) = self.first_error {
+        let Self {
+            schema,
+            first_error,
+            claim,
+        } = self;
+        drop(claim);
+        if let Some(err) = first_error {
             Err(err)
         } else {
-            Ok(self.schema)
+            Ok(schema)
         }
     }
 }
 
 impl StartupSyncPlan {
     pub(crate) fn execute(self) -> Result<(), StagingError> {
-        let time_partition = self.stream.get_time_partition();
-        let custom_partition = self.stream.get_custom_partition();
-        let outcome = self.stream.convert_arrow_file_groups_to_parquet(
-            self.staging_files,
+        let Self {
+            stream,
+            tenant_id,
+            staging_files,
+            claim,
+        } = self;
+        let time_partition = stream.get_time_partition();
+        let custom_partition = stream.get_custom_partition();
+        let mut outcome = stream.convert_arrow_file_groups_to_parquet(
+            staging_files,
             time_partition.as_ref(),
             custom_partition.as_ref(),
-            &self.tenant_id,
+            &tenant_id,
             ArrowGroupExecution::Sequential,
         )?;
-        self.stream.finish_arrow_file_conversion(outcome)
+        outcome.claim = Some(claim);
+        stream.finish_arrow_file_conversion(outcome)
     }
 }
 
@@ -685,9 +853,24 @@ impl Stream {
             data_path,
             options,
             writer: Mutex::new(Writer::default()),
+            publication: RwLock::new(()),
+            part_lifecycle: RwLock::new(()),
             schema_writer: Mutex::new(()),
+            conversion_claims: Arc::default(),
             ingestor_id,
+            #[cfg(test)]
+            lifecycle_hook: Mutex::new(None),
+            #[cfg(test)]
+            conversion_hook: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn lifecycle_phase(&self, phase: LifecyclePhase) {
+        let hook = self.lifecycle_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(phase);
+        }
     }
 
     // Concatenates record batches and puts them in memory store for each event.
@@ -733,10 +916,11 @@ impl Stream {
             );
             let file_path = self.data_path.join(&filename);
 
-            guard.push_disk(filename, record, file_path, range)?;
-        }
-
-        if let Some(mem) = guard.mem.as_mut() {
+            guard.push_disk_ref(&filename, record, file_path, range)?;
+            if let Some(mem) = guard.mem.as_mut() {
+                mem.push_for_file(&filename, schema_key, record)?;
+            }
+        } else if let Some(mem) = guard.mem.as_mut() {
             mem.push(schema_key, record)?;
         }
 
@@ -796,12 +980,17 @@ impl Stream {
             .collect()
     }
 
+    /// Lists Arrow files in every processing directory. This is a read-only
+    /// view; converting them requires claiming their directories first.
     pub fn inprocess_arrow_files(&self) -> Vec<PathBuf> {
+        Self::arrow_files_in_dirs(&self.inprocess_dirs())
+    }
+
+    fn inprocess_dirs(&self) -> Vec<PathBuf> {
         let Ok(dir) = self.data_path.read_dir() else {
             return vec![];
         };
 
-        // iterate through all the inprocess_ directories and collect all arrow files
         dir.filter_map(|entry| {
             let path = entry.ok()?.path();
             if path.is_dir()
@@ -815,25 +1004,39 @@ impl Stream {
                 None
             }
         })
-        .flat_map(|dir| {
-            fs::read_dir(dir)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| entry.ok().map(|file| file.path()))
-        })
-        .filter(|file| {
-            file.extension()
-                .is_some_and(|ext| ext.eq(ARROW_FILE_EXTENSION))
-        })
-        .collect::<Vec<_>>()
+        .collect()
     }
 
-    /// Groups arrow files which are to be included in one parquet
+    fn arrow_files_in_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+        dirs.iter()
+            .flat_map(|dir| {
+                fs::read_dir(dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok().map(|file| file.path()))
+            })
+            .filter(|file| {
+                file.extension()
+                    .is_some_and(|ext| ext.eq(ARROW_FILE_EXTENSION))
+            })
+            .collect()
+    }
+
+    /// Groups sealed Arrow files by their prospective Parquet output.
     ///
-    /// Excludes the arrow file being written for the current minute (data is still being written to that one)
+    /// As in the legacy behavior, non-init calls move eligible root files into
+    /// a fresh processing directory before grouping them: files from minutes
+    /// before `exclude` are selected, or all root Arrow files on shutdown.
+    /// Existing validation removes invalid Arrow files. Init leaves root files
+    /// in place and groups existing processing directories, now excluding those
+    /// with live conversion claims at acquisition under the registry lock.
     ///
-    /// Only includes ones starting from the previous minute
+    /// This is a concurrency-aware snapshot, not a read-only operation or a
+    /// reservation for the caller. The temporary claim is released before return;
+    /// the returned groups are unowned, and concurrent conversion can subsequently
+    /// move or remove their files. Prefer Stream-managed flushing/conversion,
+    /// whose internal claimed conversion paths retain ownership through mutation.
     pub fn arrow_files_grouped_exclude_time(
         &self,
         exclude: SystemTime,
@@ -841,24 +1044,40 @@ impl Stream {
         init_signal: bool,
         shutdown_signal: bool,
     ) -> Vec<(PathBuf, Vec<PathBuf>)> {
-        if init_signal {
-            // Startup owns only this one-time snapshot of processing files.
-            // Root Arrow files are left for regular sync so startup never
-            // races a live writer or a periodic cycle for the same file.
-            self.group_inprocess_arrow_files(&Ulid::new().to_string())
+        self.claim_conversion_groups(exclude, group_minute, init_signal, shutdown_signal)
+            .1
+    }
+
+    /// Claims sealed Arrow files for one conversion and groups them by output.
+    ///
+    /// Init claims every processing directory that no running conversion owns
+    /// and leaves root Arrow files to regular sync, so it never races a live
+    /// writer or a periodic cycle for the same file. Otherwise root Arrow files
+    /// from before the current minute (all of them on shutdown) are moved into
+    /// a newly claimed processing directory. The outputs are claimed as well,
+    /// and everything stays owned until the returned claim is dropped.
+    fn claim_conversion_groups(
+        &self,
+        exclude: SystemTime,
+        group_minute: u128,
+        init_signal: bool,
+        shutdown_signal: bool,
+    ) -> (ConversionClaim, Vec<(PathBuf, Vec<PathBuf>)>) {
+        let mut claim = ConversionClaim::new(&self.conversion_claims);
+        let groups = if init_signal {
+            let dirs = self.claim_unowned_inprocess_dirs(&mut claim);
+            self.group_arrow_files_in_dirs(&dirs, &Ulid::new().to_string())
         } else {
             let arrow_files = self.fetch_arrow_files_for_conversion(exclude, shutdown_signal);
             if arrow_files.is_empty() {
-                return Vec::new();
+                return (claim, Vec::new());
             }
 
-            // Never reuse a directory that may belong to the immutable startup
-            // snapshot (possible when a process restarts within the same minute).
-            let inprocess_dir = match self.create_inprocess_folder(group_minute) {
+            let inprocess_dir = match self.claim_new_inprocess_folder(&mut claim, group_minute) {
                 Ok(inprocess_dir) => inprocess_dir,
                 Err(e) => {
                     error!("Failed to create inprocess directory: {e}");
-                    return Vec::new();
+                    return (claim, Vec::new());
                 }
             };
             self.move_arrow_files(arrow_files, &inprocess_dir);
@@ -874,7 +1093,76 @@ impl Stream {
                 );
             }
             groups
+        };
+        let groups = self.claim_conversion_outputs(&mut claim, groups);
+        (claim, groups)
+    }
+
+    /// Claims every existing processing directory that no running conversion
+    /// owns. Listing under the registry lock means a directory created by a
+    /// running conversion is either not listed yet or already registered.
+    fn claim_unowned_inprocess_dirs(&self, claim: &mut ConversionClaim) -> Vec<PathBuf> {
+        let mut registry = lock_conversion_claims(&self.conversion_claims);
+        let Ok(dir) = self.data_path.read_dir() else {
+            return Vec::new();
+        };
+        let unowned: Vec<PathBuf> = dir
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(INPROCESS_DIR_PREFIX))
+            })
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && !registry.dirs.contains_key(path))
+            .collect();
+        for dir in &unowned {
+            registry.dirs.insert(dir.clone(), claim.id);
         }
+        claim.dirs.extend(unowned.iter().cloned());
+        unowned
+    }
+
+    /// Creates a fresh processing directory owned by `claim`.
+    fn claim_new_inprocess_folder(
+        &self,
+        claim: &mut ConversionClaim,
+        minute: u128,
+    ) -> std::io::Result<PathBuf> {
+        let mut registry = lock_conversion_claims(&self.conversion_claims);
+        let dir = self.create_inprocess_folder(minute, &registry.dirs)?;
+        registry.dirs.insert(dir.clone(), claim.id);
+        claim.dirs.push(dir.clone());
+        Ok(dir)
+    }
+
+    /// Registers the temporary output of every group before it is created.
+    /// Output names embed a fresh ULID, so another claim never holds one; a
+    /// group whose output is somehow owned already is left for a later retry.
+    fn claim_conversion_outputs(
+        &self,
+        claim: &mut ConversionClaim,
+        groups: Vec<(PathBuf, Vec<PathBuf>)>,
+    ) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        let mut registry = lock_conversion_claims(&self.conversion_claims);
+        groups
+            .into_iter()
+            .filter(|(parquet_path, _)| {
+                let part_path = parquet_part_path(parquet_path);
+                if registry.outputs.contains_key(&part_path) {
+                    error!(
+                        "Temporary Parquet output {} is owned by another conversion of stream {}; retaining its sources",
+                        part_path.display(),
+                        self.stream_name
+                    );
+                    return false;
+                }
+                registry.outputs.insert(part_path.clone(), claim.id);
+                claim.outputs.push(part_path);
+                true
+            })
+            .collect()
     }
 
     /// Groups arrow files only from the specified inprocess folder
@@ -905,12 +1193,22 @@ impl Stream {
         ordered_arrow_file_groups(grouped)
     }
 
-    /// Takes one logical snapshot across every existing processing directory.
+    /// Groups the files of every existing processing directory, owned or not.
+    #[cfg(test)]
+    fn group_inprocess_arrow_files(&self, random_string: &str) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        self.group_arrow_files_in_dirs(&self.inprocess_dirs(), random_string)
+    }
+
+    /// Takes one logical snapshot across the given processing directories.
     /// Files sharing the same event-minute/output prefix are consolidated even
     /// when a crash left them in different processing directories.
-    fn group_inprocess_arrow_files(&self, random_string: &str) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    fn group_arrow_files_in_dirs(
+        &self,
+        dirs: &[PathBuf],
+        random_string: &str,
+    ) -> Vec<(PathBuf, Vec<PathBuf>)> {
         let mut grouped: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-        for inprocess_file in self.inprocess_arrow_files() {
+        for inprocess_file in Self::arrow_files_in_dirs(dirs) {
             if let Some(parquet_path) =
                 arrow_path_to_parquet(&self.data_path, &inprocess_file, random_string)
             {
@@ -948,6 +1246,7 @@ impl Stream {
 
     /// Moves eligible arrow files to the inprocess folder and groups them by parquet path.
     fn move_arrow_files(&self, arrow_files: Vec<PathBuf>, inprocess_dir: &Path) {
+        let mut moves = Vec::with_capacity(arrow_files.len());
         for arrow_file_path in arrow_files {
             match arrow_file_path.metadata() {
                 Ok(meta) if meta.len() == 0 => {
@@ -955,6 +1254,7 @@ impl Stream {
                         "Invalid arrow file {:?} detected for stream {}, removing it",
                         &arrow_file_path, self.stream_name
                     );
+                    self.release_pending(std::slice::from_ref(&arrow_file_path));
                     remove_file(&arrow_file_path).expect("File should be removed");
                 }
                 Ok(_) => {
@@ -963,13 +1263,7 @@ impl Stream {
                             .file_name()
                             .expect("Arrow file should have a name"),
                     );
-                    if let Err(e) = fs::rename(&arrow_file_path, &new_path) {
-                        error!(
-                            "Failed to rename arrow file to inprocess directory: {} -> {}: {e}",
-                            arrow_file_path.display(),
-                            new_path.display()
-                        );
-                    }
+                    moves.push((arrow_file_path, new_path));
                 }
                 Err(e) => {
                     warn!(
@@ -979,6 +1273,21 @@ impl Stream {
                 }
             }
         }
+
+        // Pending rows follow their file before conversion can observe the move.
+        self.rekey_pending(moves.iter().map(|(from, to)| (from, to)));
+        let mut failed = Vec::new();
+        for (arrow_file_path, new_path) in moves {
+            if let Err(e) = fs::rename(&arrow_file_path, &new_path) {
+                error!(
+                    "Failed to rename arrow file to inprocess directory: {} -> {}: {e}",
+                    arrow_file_path.display(),
+                    new_path.display()
+                );
+                failed.push((new_path, arrow_file_path));
+            }
+        }
+        self.rekey_pending(failed.iter().map(|(from, to)| (from, to)));
     }
 
     fn inprocess_folder(base: &Path, minute: u128) -> PathBuf {
@@ -987,13 +1296,20 @@ impl Stream {
 
     /// Atomically reserves a processing directory. Overlapping periodic
     /// cycles therefore never share one directory, even when they start in
-    /// the same minute.
-    fn create_inprocess_folder(&self, minute: u128) -> std::io::Result<PathBuf> {
+    /// the same minute. A claimed name is never reused, even if its owner has
+    /// already removed the directory.
+    fn create_inprocess_folder(
+        &self,
+        minute: u128,
+        claimed: &HashMap<PathBuf, u64>,
+    ) -> std::io::Result<PathBuf> {
         let preferred = Self::inprocess_folder(&self.data_path, minute);
-        match fs::DirBuilder::new().create(&preferred) {
-            Ok(()) => return Ok(preferred),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
+        if !claimed.contains_key(&preferred) {
+            match fs::DirBuilder::new().create(&preferred) {
+                Ok(()) => return Ok(preferred),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
         }
 
         loop {
@@ -1146,6 +1462,58 @@ impl Stream {
         }
     }
 
+    /// Captures staged rows for one query consistently with Parquet
+    /// publication: every staged row is in exactly one of the returned memory
+    /// batches or the Parquet files `capture_parquet` finds in the staging
+    /// directory. `capture_parquet` delays publication: it may list, lease and
+    /// validate file footers, but must leave row scans and query execution
+    /// outside the lock.
+    ///
+    /// Without memory staging (`ENABLE_MEMORY_STAGING=false`) only published
+    /// Parquet is captured: unconverted rows are intentionally not queryable.
+    pub fn capture_staging<T>(
+        &self,
+        schema: &Arc<Schema>,
+        capture_parquet: impl FnOnce(&Path) -> T,
+    ) -> Result<(Vec<RecordBatch>, T), StagingError> {
+        // A publication that panicked may have renamed its Parquet without
+        // releasing its sources' memory; fail closed rather than double count.
+        let _publication = self.publication.read().map_err(|poisoned| {
+            StagingError::PoisonError(PoisonError::new(format!(
+                "Publication lock poisoned while capturing staging for stream {} - {}",
+                self.stream_name, poisoned
+            )))
+        })?;
+        let records = self.recordbatches_cloned(schema)?;
+        Ok((records, capture_parquet(&self.data_path)))
+    }
+
+    /// Moves pending memory to the new paths of its staging files. A poisoned
+    /// writer is still updated: every capture already fails closed on it.
+    fn rekey_pending<'a>(&self, moves: impl IntoIterator<Item = (&'a PathBuf, &'a PathBuf)>) {
+        let mut moves = moves.into_iter().peekable();
+        if moves.peek().is_none() {
+            return;
+        }
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(mem) = writer.mem.as_mut() {
+            for (from, to) in moves {
+                mem.rekey_pending(from, to);
+            }
+        }
+    }
+
+    /// Releases pending memory of staging files that were published or discarded.
+    fn release_pending(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(mem) = writer.mem.as_mut() {
+            mem.release_pending(paths);
+        }
+    }
+
     pub fn clear(&self) -> Result<(), StagingError> {
         if let Some(m) = self
             .writer
@@ -1166,9 +1534,24 @@ impl Stream {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn flush(&self, forced: bool) -> Result<(), StagingError> {
+        self.flush_with_clock(forced, Utc::now)
+    }
+
+    fn flush_with_clock(
+        &self,
+        forced: bool,
+        clock: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<(), StagingError> {
         let _span = info_span!("flush", stream_name = %self.stream_name, forced).entered();
-        // Swap out stale writers under the lock, drop them after releasing it.
-        // DiskWriter::Drop does I/O (IPC finish + file rename) so dropping
+        // A detached writer owns its part until sealing has renamed it. Keep part
+        // recovery out until then; concurrent flushes only share this lock.
+        // It guards no data, so poisoning by a panicked recovery is ignored.
+        let _lifecycle = self
+            .part_lifecycle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Swap out stale writers under the lock, seal them after releasing it.
+        // Sealing does I/O (IPC finish + file rename) so sealing
         // outside the lock avoids blocking concurrent push() calls.
         let stale_writers = {
             let mut writer = self.writer.lock().map_err(|poisoned| {
@@ -1178,14 +1561,84 @@ impl Stream {
                 )))
             })?;
 
-            if let Some(mem) = writer.mem.as_mut() {
-                mem.clear();
-            }
-            writer.take_flushable_disk(forced)
+            writer.detach_flushable_disk_at(forced, clock())
         };
-        // DiskWriter::Drop I/O happens here, outside the lock
-        drop(stale_writers);
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::FlushDetached);
+        // Sealing I/O happens here, outside the lock
+        self.seal_detached(stale_writers);
         Ok(())
+    }
+
+    /// Finishes detached writers and renames their parts to `.arrows`. Pending
+    /// memory is re-keyed to the final name before the rename makes the file
+    /// visible to conversion, and back if the rename fails. A part that cannot
+    /// be finished or renamed is left for startup recovery; its rows stay
+    /// queryable from memory until then.
+    fn seal_detached(&self, detached: Vec<DiskWriter>) {
+        let mut sealed = Vec::with_capacity(detached.len());
+        for writer in detached {
+            match writer.seal() {
+                Ok(part) => sealed.push(part),
+                Err((part, err)) => error!("Couldn't finish arrow file {part:?}, error = {err}"),
+            }
+        }
+        self.rekey_pending(sealed.iter().map(|s| (&s.part, &s.arrow)));
+        let mut failed = Vec::new();
+        for part in sealed {
+            #[cfg(test)]
+            self.conversion_phase(ConversionPhase::BeforeSealRename(&part.arrow));
+            if let Err(err) = fs::rename(&part.part, &part.arrow) {
+                error!("Couldn't rename file {:?}, error = {err}", part.part);
+                failed.push(part);
+            } else {
+                info!("flushing {:?}", part.part);
+            }
+        }
+        self.rekey_pending(failed.iter().map(|s| (&s.arrow, &s.part)));
+    }
+
+    /// Renames a finished Parquet output into the staging set and releases the
+    /// pending memory of its sources as one step with respect to query capture.
+    fn publish_parquet(
+        &self,
+        part_path: &Path,
+        parquet_path: &Path,
+        sources: &[PathBuf],
+    ) -> Result<(), StagingError> {
+        #[cfg(test)]
+        self.conversion_phase(ConversionPhase::BeforePublish(parquet_path));
+        // The lock covers the rename and the memory release together. If an
+        // earlier publication panicked between them, captures fail closed;
+        // keep the sources and their memory for retry instead of publishing.
+        let _publication = match self.publication.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                Self::remove_partial_parquet_file(part_path);
+                return Err(StagingError::PoisonError(PoisonError::new(format!(
+                    "Publication lock poisoned while publishing {parquet_path:?} for stream {} - {}",
+                    self.stream_name, poisoned
+                ))));
+            }
+        };
+        if let Err(err) = std::fs::rename(part_path, parquet_path) {
+            error!("Couldn't rename part file: {part_path:?} -> {parquet_path:?}, error = {err}");
+            Self::remove_partial_parquet_file(part_path);
+            return Err(err.into());
+        }
+        #[cfg(test)]
+        self.conversion_phase(ConversionPhase::Published);
+        self.release_pending(sources);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn conversion_phase(&self, phase: ConversionPhase<'_>) {
+        // Clone out so a hook blocking one group never blocks another's phase.
+        let hook = self.conversion_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(phase);
+        }
     }
 
     fn parquet_writer_props(
@@ -1753,18 +2206,24 @@ impl Stream {
 
         let now = SystemTime::now();
         let group_minute = minute_from_system_time(now) - 1;
-        let staging_files =
-            self.arrow_files_grouped_exclude_time(now, group_minute, init_signal, shutdown_signal);
+        let (claim, staging_files) =
+            self.claim_conversion_groups(now, group_minute, init_signal, shutdown_signal);
         span.record("file_group_count", staging_files.len());
-        self.convert_arrow_file_groups_to_parquet(
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::ConversionClaimed(staging_files.clone()));
+        let mut outcome = self.convert_arrow_file_groups_to_parquet(
             staging_files,
             time_partition,
             custom_partition,
             tenant_id,
             ArrowGroupExecution::Parallel,
-        )
+        )?;
+        outcome.claim = Some(claim);
+        Ok(outcome)
     }
 
+    /// Converts groups whose sources and outputs the caller has claimed. Every
+    /// group, parallel or not, has finished before this returns.
     fn convert_arrow_file_groups_to_parquet(
         &self,
         staging_files: Vec<(PathBuf, Vec<PathBuf>)>,
@@ -1839,6 +2298,7 @@ impl Stream {
         Ok(ArrowFileConversionOutcome {
             schema,
             first_error,
+            claim: None,
         })
     }
 
@@ -1848,12 +2308,18 @@ impl Stream {
         &self,
         outcome: ArrowFileConversionOutcome,
     ) -> Result<(), StagingError> {
-        if let Some(schema) = outcome.schema
-            && !self.get_static_schema_flag()
-        {
-            self.stage_schema_file(schema)?;
-        }
-        if let Some(err) = outcome.first_error {
+        let ArrowFileConversionOutcome {
+            schema,
+            first_error,
+            claim,
+        } = outcome;
+        let staged = match schema {
+            Some(schema) if !self.get_static_schema_flag() => self.stage_schema_file(schema),
+            _ => Ok(()),
+        };
+        drop(claim);
+        staged?;
+        if let Some(err) = first_error {
             return Err(err);
         }
         Ok(())
@@ -1878,12 +2344,16 @@ impl Stream {
         if record_reader.reader_count() == 0 {
             return Ok(None);
         }
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::ConversionReadersOpened {
+            output: parquet_path.clone(),
+            sources: readable_arrow_files.clone(),
+        });
 
         let merged_schema = record_reader.merged_schema();
         let props = self.parquet_writer_props(&merged_schema, time_partition, custom_partition);
         let schema = Arc::new(merged_schema.clone());
-        let mut part_path = parquet_path.clone();
-        part_path.add_extension(PART_FILE_EXTENSION);
+        let part_path = parquet_part_path(&parquet_path);
 
         let write_result = self.write_parquet_part_file(
             &part_path,
@@ -1893,7 +2363,10 @@ impl Stream {
             time_partition,
         );
         match write_result {
-            Ok(true) => {}
+            Ok(true) => {
+                #[cfg(test)]
+                self.lifecycle_phase(LifecyclePhase::ParquetPartWritten(part_path.clone()));
+            }
             Ok(false) => {
                 Self::remove_partial_parquet_file(&part_path);
                 return Ok(None);
@@ -1919,12 +2392,7 @@ impl Stream {
             }
         }
 
-        if let Err(err) = std::fs::rename(&part_path, &parquet_path) {
-            error!("Couldn't rename part file: {part_path:?} -> {parquet_path:?}, error = {err}");
-            Self::remove_partial_parquet_file(&part_path);
-            return Err(err.into());
-        }
-
+        self.publish_parquet(&part_path, &parquet_path, &readable_arrow_files)?;
         self.cleanup_arrow_files_and_dir(&readable_arrow_files, tenant_id);
         Ok(Some(merged_schema))
     }
@@ -1950,6 +2418,8 @@ impl Stream {
             .truncate(true)
             .open(part_path)
             .map_err(|_| StagingError::Create)?;
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::ParquetPartCreated(part_path.to_path_buf()));
         if self.is_otel_metrics() {
             self.write_metric_parquet_part_file(
                 part_path,
@@ -1969,6 +2439,8 @@ impl Stream {
         }
 
         drop(part_file);
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::ParquetPartClosed(part_path.to_path_buf()));
 
         if !Self::is_valid_parquet_file(part_path, &self.stream_name) {
             error!(
@@ -2160,43 +2632,46 @@ impl Stream {
     /// function to validate parquet files
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn is_valid_parquet_file(path: &Path, stream_name: &str) -> bool {
-        // First check file size as a quick validation
-        match path.metadata() {
-            Ok(meta) if meta.len() < FOOTER_SIZE as u64 => {
-                error!(
-                    "Invalid parquet file {path:?} detected for stream {stream_name}, size: {} bytes",
-                    meta.len()
-                );
-                return false;
-            }
-            Err(e) => {
-                error!(
-                    "Cannot read metadata for parquet file {path:?} for stream {stream_name}: {e}"
-                );
-                return false;
-            }
-            _ => {} // File size is adequate, continue validation
-        }
+        Self::validate_parquet_file(path, stream_name).unwrap_or_else(|error| {
+            error!("Cannot validate parquet file {path:?} for stream {stream_name}: {error}");
+            false
+        })
+    }
 
-        // Try to open and read the parquet file metadata to verify it's valid
-        match std::fs::File::open(path) {
-            Ok(file) => match SerializedFileReader::new(file) {
-                Ok(reader) => {
-                    if reader.metadata().file_metadata().num_rows() == 0 {
-                        error!("Invalid parquet file {path:?} for stream {stream_name}");
-                        false
-                    } else {
-                        true
+    /// The query calls this on its immutable lease, propagating access/metadata
+    /// failures while retaining the uploader's corrupt/empty-file skip policy.
+    pub(crate) fn validate_parquet_file(path: &Path, stream_name: &str) -> std::io::Result<bool> {
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        if size < FOOTER_SIZE as u64 {
+            error!(
+                "Invalid parquet file {path:?} detected for stream {stream_name}, size: {size} bytes"
+            );
+            return Ok(false);
+        }
+        match SerializedFileReader::new(file) {
+            Ok(reader) => {
+                let valid = reader.metadata().file_metadata().num_rows() != 0;
+                if !valid {
+                    error!("Invalid parquet file {path:?} for stream {stream_name}: no rows");
+                }
+                Ok(valid)
+            }
+            Err(parquet::errors::ParquetError::External(error)) => {
+                // Actual filesystem read errors are capture failures too.
+                match error.downcast::<std::io::Error>() {
+                    Ok(error) => Err(*error),
+                    Err(error) => {
+                        error!(
+                            "Failed to read parquet file {path:?} for stream {stream_name}: {error}"
+                        );
+                        Ok(false)
                     }
                 }
-                Err(e) => {
-                    error!("Failed to read parquet file {path:?} for stream {stream_name}: {e}");
-                    false
-                }
-            },
-            Err(e) => {
-                error!("Failed to open parquet file {path:?} for stream {stream_name}: {e}");
-                false
+            }
+            Err(error) => {
+                error!("Failed to read parquet file {path:?} for stream {stream_name}: {error}");
+                Ok(false)
             }
         }
     }
@@ -2284,6 +2759,8 @@ impl Stream {
                 ),
             }
         }
+        // Discarded rows are not persisted; stop serving them from memory.
+        self.release_pending(arrow_files);
         self.cleanup_arrow_files_and_dir(arrow_files, tenant_id);
     }
 
@@ -2554,13 +3031,70 @@ impl Stream {
     }
 
     /// Recovers orphaned Arrow parts and removes rebuildable Parquet parts.
+    ///
+    /// Parts of attached writers are live and skipped. Pending memory follows
+    /// a recovered part to its `.arrows` name before the rename exposes it to
+    /// conversion, and is released when a part is discarded.
     fn recover_orphan_part_files(&self) {
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::RecoveryStarted);
+        // Ingestion and shutdown flushes can run concurrently with startup
+        // recovery, so a part may belong to a live writer. Holding the
+        // lifecycle lock exclusively until recovery returns waits for every
+        // flush to finish sealing its detached writers, and stops flush from
+        // detaching or renaming any writer meanwhile. Only attached writers
+        // remain, and they are skipped below.
+        let _lifecycle = self.lock_part_lifecycle_for_recovery();
+
         let Ok(dir) = self.data_path.read_dir() else {
             return;
         };
+        let listed: Vec<PathBuf> = dir
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == PART_FILE_EXTENSION)
+            })
+            .collect();
 
-        for entry in dir.flatten() {
-            let path = entry.path();
+        // A part that exists while no writer owns it is an orphan, and stays
+        // one until recovery acts on it: DiskWriter::try_new never opens an
+        // existing part. Check under the writer lock, because push_disk may
+        // drop a writer whose first write failed, vacating its listed path.
+        let candidates: Vec<PathBuf> = {
+            let writer = match self.writer.lock() {
+                Ok(writer) => writer,
+                Err(poisoned) => {
+                    error!(
+                        "Writer lock poisoned; skipping .part recovery for stream {} - {poisoned}",
+                        self.stream_name
+                    );
+                    return;
+                }
+            };
+            let active = writer.active_part_paths();
+            listed
+                .into_iter()
+                .filter(|path| !active.contains(path) && path.exists())
+                .collect()
+        };
+        // A conversion registers its temporary Parquet output before creating
+        // it and releases it only after renaming or removing it, and output
+        // names are not reused by this Stream object. Delete/recreate at the
+        // same path is outside this registry's lifecycle. An unclaimed output is
+        // therefore an orphan that no conversion will touch again.
+        let candidates: Vec<PathBuf> = {
+            let registry = lock_conversion_claims(&self.conversion_claims);
+            candidates
+                .into_iter()
+                .filter(|path| !registry.outputs.contains_key(path))
+                .collect()
+        };
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::RecoveryCandidates(candidates.clone()));
+
+        for path in candidates {
             if path
                 .extension()
                 .is_some_and(|ext| ext == PART_FILE_EXTENSION)
@@ -2577,6 +3111,7 @@ impl Stream {
                             "Removing empty orphaned .part file: {:?} for stream {}",
                             path, self.stream_name
                         );
+                        self.release_pending(std::slice::from_ref(&path));
                         if let Err(e) = remove_file(&path) {
                             error!("Failed to remove empty .part file {:?}: {e}", path);
                         }
@@ -2615,6 +3150,8 @@ impl Stream {
                                         self.stream_name,
                                         meta.len()
                                     );
+                                    // Discarded rows are not persisted.
+                                    self.release_pending(std::slice::from_ref(&path));
                                     if let Err(delete_err) = remove_file(&path) {
                                         error!(
                                             "Failed to remove invalid/corrupted .part file {:?}: {delete_err}",
@@ -2623,42 +3160,7 @@ impl Stream {
                                     }
                                 } else {
                                     // File has at least one structurally complete batch.
-                                    let mut arrow_path = if path
-                                        .file_name()
-                                        .and_then(|name| name.to_str())
-                                        .is_some_and(|name| name.ends_with(ARROW_PART_FILE_SUFFIX))
-                                    {
-                                        path.with_extension("")
-                                    } else {
-                                        // Legacy Arrow files used a bare `.part` suffix.
-                                        path.with_extension(ARROW_FILE_EXTENSION)
-                                    };
-
-                                    // If arrow file with same name exists, generate a unique name
-                                    if arrow_path.exists() {
-                                        let file_name =
-                                            arrow_path.file_name().unwrap().to_string_lossy();
-                                        if let Some(date_pos) = file_name.find(".date") {
-                                            let random_suffix = ulid::Ulid::new().to_string();
-                                            let new_name = format!(
-                                                "{}{}",
-                                                random_suffix,
-                                                &file_name[date_pos..]
-                                            );
-                                            arrow_path.set_file_name(new_name);
-                                        }
-                                    }
-
-                                    info!(
-                                        "Recovering orphaned .part file: {:?} -> {:?} for stream {}",
-                                        path, arrow_path, self.stream_name
-                                    );
-                                    if let Err(e) = std::fs::rename(&path, &arrow_path) {
-                                        error!(
-                                            "Failed to rename .part file {:?} to {:?}: {e}",
-                                            path, arrow_path
-                                        );
-                                    }
+                                    self.publish_recovered_part(&path);
                                 }
                             }
                             Err(e) => {
@@ -2674,14 +3176,95 @@ impl Stream {
         }
     }
 
-    /// Recovers and flushes startup writers, then snapshots only files already
-    /// present in processing directories. Root Arrow files remain owned by
+    /// Renames a validated orphan part to a free `.arrows` name. The name is
+    /// chosen and taken under the writer lock: a writer whose first write
+    /// failed is dropped (and renamed) inside push's critical section, and
+    /// every other writer is dropped by a flush, which recovery excludes. So
+    /// no other publisher can take the same name between the check and the
+    /// rename, and nothing already published is replaced.
+    fn publish_recovered_part(&self, path: &Path) {
+        let mut arrow_path = if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(ARROW_PART_FILE_SUFFIX))
+        {
+            path.with_extension("")
+        } else {
+            // Legacy Arrow files used a bare `.part` suffix.
+            path.with_extension(ARROW_FILE_EXTENSION)
+        };
+
+        let mut writer = match self.writer.lock() {
+            Ok(writer) => writer,
+            Err(poisoned) => {
+                error!(
+                    "Writer lock poisoned; leaving .part file {:?} for a later recovery - {poisoned}",
+                    path
+                );
+                return;
+            }
+        };
+        // If arrow file with same name exists, generate a unique name
+        if arrow_path.exists() {
+            let file_name = arrow_path.file_name().unwrap().to_string_lossy();
+            let Some(date_pos) = file_name.find(".date") else {
+                error!(
+                    "Cannot choose a free name for orphaned .part file {:?}; {:?} exists, leaving it for a later recovery",
+                    path, arrow_path
+                );
+                return;
+            };
+            let new_name = format!("{}{}", Ulid::new(), &file_name[date_pos..]);
+            arrow_path.set_file_name(new_name);
+        }
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::RecoveryPublishing(arrow_path.clone()));
+
+        info!(
+            "Recovering orphaned .part file: {:?} -> {:?} for stream {}",
+            path, arrow_path, self.stream_name
+        );
+        // Keep pending rows keyed to the visible file, without re-locking writer.
+        if let Some(mem) = writer.mem.as_mut() {
+            mem.rekey_pending(path, &arrow_path);
+        }
+        if let Err(e) = std::fs::rename(path, &arrow_path) {
+            if let Some(mem) = writer.mem.as_mut() {
+                mem.rekey_pending(&arrow_path, path);
+            }
+            error!(
+                "Failed to rename .part file {:?} to {:?}: {e}",
+                path, arrow_path
+            );
+        }
+    }
+
+    /// Takes the part lifecycle lock exclusively. It guards no data, and only
+    /// a panicked recovery can poison it, which leaves no writer detached, so
+    /// poisoning is ignored.
+    fn lock_part_lifecycle_for_recovery(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        #[cfg(test)]
+        if matches!(
+            self.part_lifecycle.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) {
+            self.lifecycle_phase(LifecyclePhase::RecoveryWaitingForFlush);
+        }
+        self.part_lifecycle
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Recovers and flushes startup writers, then claims the processing
+    /// directories no running conversion owns. Root Arrow files remain owned by
     /// periodic sync, which can start as soon as every stream is snapshotted.
     fn prepare_startup_sync(
         self: &Arc<Self>,
         tenant_id: Option<String>,
     ) -> Result<StartupSyncPlan, StagingError> {
         self.recover_orphan_part_files();
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::StartupRecovered);
 
         let start_flush = Instant::now();
         self.flush(true)?;
@@ -2693,7 +3276,11 @@ impl Stream {
             );
         }
 
-        let staging_files = self.group_inprocess_arrow_files(&Ulid::new().to_string());
+        let now = SystemTime::now();
+        let (claim, staging_files) =
+            self.claim_conversion_groups(now, minute_from_system_time(now) - 1, true, false);
+        #[cfg(test)]
+        self.lifecycle_phase(LifecyclePhase::ConversionClaimed(staging_files.clone()));
         info!(
             "Captured {} startup parquet groups for stream {}",
             staging_files.len(),
@@ -2703,6 +3290,7 @@ impl Stream {
             stream: Arc::clone(self),
             tenant_id,
             staging_files,
+            claim,
         })
     }
 
@@ -2962,10 +3550,762 @@ mod tests {
     use arrow_ipc::writer::StreamWriter as ArrowStreamWriter;
     use arrow_schema::{DataType, Field, TimeUnit};
     use chrono::{NaiveDate, TimeDelta, Utc};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use temp_dir::TempDir;
     use tokio::time::sleep;
 
     use super::*;
+
+    #[test]
+    fn current_minute_query_visibility_query_mode_flushes_ownerless_memory() {
+        let dir = TempDir::new().unwrap();
+        let staging = Stream::new(
+            Arc::new(Options {
+                local_staging_path: dir.path().to_path_buf(),
+                mode: Mode::Query,
+                ..Default::default()
+            }),
+            "query-memory",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        // Keep memory coverage independent of the process-wide staging setting.
+        staging.writer.lock().unwrap().mem = Some(Default::default());
+        let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        staging
+            .push(
+                "id-schema",
+                &batch,
+                now.naive_utc(),
+                &HashMap::new(),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+        {
+            let writer = staging.writer.lock().unwrap();
+            assert!(writer.disk.is_empty());
+            let mem = writer.mem.as_ref().unwrap();
+            assert!(mem.read_buffer.is_empty());
+            assert_eq!(mem.mutable_buffer.inner.len(), 1);
+            assert!(Arc::ptr_eq(
+                mem.mutable_buffer.inner[0].column(0),
+                batch.column(0)
+            ));
+        }
+        assert_eq!(
+            staging.recordbatches_cloned(&schema).unwrap()[0].num_rows(),
+            1
+        );
+        staging.flush_with_clock(false, || now).unwrap();
+        assert!(staging.recordbatches_cloned(&schema).unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_minute_query_visibility_query_internal_exact_minute_end() {
+        let dir = TempDir::new().unwrap();
+        let staging = Stream::new(
+            Arc::new(Options {
+                local_staging_path: dir.path().to_path_buf(),
+                mode: Mode::Query,
+                ..Default::default()
+            }),
+            "query-internal",
+            LogStreamMetadata {
+                stream_type: StreamType::Internal,
+                ..Default::default()
+            },
+            None,
+            &None,
+        );
+        staging.writer.lock().unwrap().mem = Some(Default::default());
+        let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = TimeRange::granularity_range(now, OBJECT_STORE_DATA_GRANULARITY).end;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![7]))])
+            .unwrap();
+        for _ in 0..2 {
+            staging
+                .push(
+                    "id-schema",
+                    &batch,
+                    now.naive_utc(),
+                    &HashMap::new(),
+                    StreamType::Internal,
+                )
+                .unwrap();
+        }
+        staging.flush_with_clock(false, || now).unwrap();
+        {
+            let writer = staging.writer.lock().unwrap();
+            assert_eq!(writer.disk.len(), 1);
+            let mem = writer.mem.as_ref().unwrap();
+            assert!(mem.read_buffer.is_empty());
+            assert!(mem.mutable_buffer.inner.is_empty());
+        }
+        assert_eq!(
+            staging.recordbatches_cloned(&schema).unwrap()[0].num_rows(),
+            2
+        );
+        let next = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![8]))])
+            .unwrap();
+        staging
+            .push(
+                "id-schema",
+                &next,
+                end.naive_utc(),
+                &HashMap::new(),
+                StreamType::Internal,
+            )
+            .unwrap();
+        assert_eq!(staging.writer.lock().unwrap().disk.len(), 2);
+        staging.flush_with_clock(false, || end).unwrap();
+        let expected = staging.filename_by_partition("id-schema", end.naive_utc(), &HashMap::new());
+        {
+            let writer = staging.writer.lock().unwrap();
+            assert_eq!(writer.disk.len(), 1);
+            assert!(writer.disk.contains_key(&expected));
+        }
+        // The detached minute stays queryable until its Parquet is published.
+        assert_eq!(captured_ids(&staging, &schema), (vec![7, 7, 8], vec![]));
+        staging.flush_with_clock(true, || end).unwrap();
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![7, 7, 8], vec![]));
+    }
+
+    #[test]
+    fn current_minute_query_visibility_survives_nonforced_flush() {
+        // A fixed reference clock tests the production push/flush/query path without
+        // relying on a wall-clock minute boundary or retrying the test.
+        let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let dir = TempDir::new().unwrap();
+        let staging = Stream::new(
+            Arc::new(Options {
+                local_staging_path: dir.path().to_path_buf(),
+                ..Default::default()
+            }),
+            "visibility",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        staging.writer.lock().unwrap().mem = Some(Default::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        for (id, timestamp, partition) in [
+            (1, now - TimeDelta::minutes(2), "past"),
+            (2, now, "a"),
+            (3, now, "b"),
+            (4, now + TimeDelta::minutes(2), "future"),
+        ] {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![id]))])
+                    .unwrap();
+            staging
+                .push(
+                    "id-schema",
+                    &batch,
+                    timestamp.naive_utc(),
+                    &HashMap::from([("tenant".to_owned(), partition.to_owned())]),
+                    StreamType::UserDefined,
+                )
+                .unwrap();
+        }
+        let ids = || {
+            let mut ids = staging
+                .recordbatches_cloned(&schema)
+                .unwrap()
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(), vec![1, 2, 3, 4]);
+        staging.flush_with_clock(false, || now).unwrap();
+        assert_eq!(staging.writer.lock().unwrap().disk.len(), 2);
+        assert_eq!(
+            ids(),
+            vec![1, 2, 3, 4],
+            "attached and detached-but-unpublished writers must remain queryable"
+        );
+        staging.flush_with_clock(false, || now).unwrap();
+        assert_eq!(
+            ids(),
+            vec![1, 2, 3, 4],
+            "a second flush must neither lose nor duplicate rows"
+        );
+        staging.clear().unwrap();
+        assert!(ids().is_empty());
+        assert_eq!(staging.writer.lock().unwrap().disk.len(), 2);
+        let next = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![5]))])
+            .unwrap();
+        staging
+            .push(
+                "id-schema",
+                &next,
+                now.naive_utc(),
+                &HashMap::from([("tenant".to_owned(), "a".to_owned())]),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+        assert_eq!(ids(), vec![5]);
+        staging.flush_with_clock(true, || now).unwrap();
+        assert_eq!(ids(), vec![5]);
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
+        // A late append for a previously detached file starts a fresh segment.
+        staging
+            .push(
+                "id-schema",
+                &next,
+                (now - TimeDelta::minutes(2)).naive_utc(),
+                &HashMap::from([("tenant".to_owned(), "past".to_owned())]),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+        assert_eq!(ids(), vec![5, 5]);
+        staging.flush_with_clock(false, || now).unwrap();
+        assert_eq!(ids(), vec![5, 5]);
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
+    }
+
+    /// Sorted ids from one coherent capture: (memory, staging Parquet).
+    fn captured_ids(staging: &Stream, schema: &Arc<Schema>) -> (Vec<i32>, Vec<i32>) {
+        fn ids(batches: impl IntoIterator<Item = RecordBatch>) -> Vec<i32> {
+            let mut ids = batches
+                .into_iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        }
+        // Like a query, only list under the capture; read after releasing it.
+        let (memory, parquet_paths) = staging
+            .capture_staging(schema, |dir| {
+                fs::read_dir(dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let parquet = parquet_paths.into_iter().flat_map(|path| {
+            ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+                .unwrap()
+                .build()
+                .unwrap()
+                .map(Result::unwrap)
+        });
+        (ids(memory), ids(parquet))
+    }
+
+    /// Bounds every cross-thread wait so a failing converter cannot hang a test.
+    const CONVERSION_WAIT: Duration = Duration::from_secs(30);
+
+    fn conversion_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn conversion_stream(dir: &TempDir, name: &str) -> (StreamRef, Arc<Schema>) {
+        let staging = Stream::new(
+            Arc::new(Options {
+                local_staging_path: dir.path().to_path_buf(),
+                row_group_size: 1048576,
+                ..Default::default()
+            }),
+            name,
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        staging.writer.lock().unwrap().mem = Some(Default::default());
+        // Merging several Arrow sources orders them by the leading timestamp.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                DEFAULT_TIMESTAMP_KEY,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        (staging, schema)
+    }
+
+    fn push_ids(
+        staging: &Stream,
+        schema: &Arc<Schema>,
+        schema_key: &str,
+        ids: Vec<i32>,
+        timestamp: DateTime<Utc>,
+    ) {
+        let times = vec![timestamp.timestamp_millis(); ids.len()];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(times)),
+                Arc::new(Int32Array::from(ids)),
+            ],
+        )
+        .unwrap();
+        staging
+            .push(
+                schema_key,
+                &batch,
+                timestamp.naive_utc(),
+                &HashMap::new(),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+    }
+
+    fn part_files(staging: &Stream) -> Vec<PathBuf> {
+        let mut parts = fs::read_dir(&staging.data_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == PART_FILE_EXTENSION)
+            })
+            .collect::<Vec<_>>();
+        parts.sort();
+        parts
+    }
+
+    fn conversion_test_stream(dir: &TempDir, name: &str) -> (StreamRef, Arc<Schema>) {
+        let (staging, schema) = conversion_stream(dir, name);
+        let now = conversion_now();
+        // Two writer keys (schema keys) for one minute share an output group;
+        // the third is a separate output, so publishing one group must not
+        // release the other.
+        for (ids, minute, schema_key) in [
+            (vec![1, 2], 0, "schema-a"),
+            (vec![3], 0, "schema-b"),
+            (vec![4, 5, 6], 1, "schema-a"),
+        ] {
+            push_ids(
+                &staging,
+                &schema,
+                schema_key,
+                ids,
+                now + TimeDelta::minutes(minute),
+            );
+        }
+        assert_eq!(
+            captured_ids(&staging, &schema),
+            (vec![1, 2, 3, 4, 5, 6], vec![])
+        );
+        // Detach every writer: rows are sealed in root Arrow files only.
+        staging.flush_with_clock(true, || now).unwrap();
+        assert!(staging.writer.lock().unwrap().disk.is_empty());
+        assert_eq!(staging.arrow_files().len(), 3);
+        (staging, schema)
+    }
+
+    fn set_conversion_hook(
+        staging: &Stream,
+        hook: impl Fn(ConversionPhase<'_>) + Send + Sync + 'static,
+    ) {
+        *staging.conversion_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    #[test]
+    fn conversion_visibility_rows_counted_once_across_publication() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_test_stream(&dir, "publication");
+        let all = vec![1, 2, 3, 4, 5, 6];
+        assert_eq!(captured_ids(&staging, &schema), (all.clone(), vec![]));
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let (published_tx, published_rx) = std::sync::mpsc::channel::<bool>();
+        let resume_rx = Mutex::new(resume_rx);
+        let weak = Arc::downgrade(&staging);
+        set_conversion_hook(&staging, move |phase| match phase {
+            ConversionPhase::BeforeSealRename(_) => {}
+            ConversionPhase::BeforePublish(_) => {
+                paused_tx.send(()).unwrap();
+                resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(CONVERSION_WAIT)
+                    .expect("test did not resume publication");
+            }
+            ConversionPhase::Published => {
+                // The Parquet is visible and its sources' memory is not yet
+                // released: query capture must be excluded right now.
+                let stream = weak.upgrade().unwrap();
+                published_tx
+                    .send(stream.publication.try_read().is_err())
+                    .unwrap();
+            }
+        });
+
+        let converter = {
+            let staging = Arc::clone(&staging);
+            spawn(move || staging.prepare_parquet(false, true, &None))
+        };
+        let paused = || {
+            paused_rx
+                .recv_timeout(CONVERSION_WAIT)
+                .expect("conversion did not reach publication")
+        };
+        let published = || {
+            published_rx
+                .recv_timeout(CONVERSION_WAIT)
+                .expect("conversion did not publish")
+        };
+        // Each output group pauses before publication with its sources moved
+        // to the processing directory and its Parquet part fully written.
+        paused();
+        assert!(staging.arrow_files().is_empty());
+        assert_eq!(staging.inprocess_arrow_files().len(), 3);
+        assert_eq!(captured_ids(&staging, &schema), (all.clone(), vec![]));
+        resume_tx.send(()).unwrap();
+        assert!(published(), "publication must exclude capture");
+        // This capture waits for the publication above to release its sources.
+        // One group is published, the other is not: every row exactly once.
+        let (memory, parquet) = captured_ids(&staging, &schema);
+        assert!(
+            (memory == [1, 2, 3] && parquet == [4, 5, 6])
+                || (memory == [4, 5, 6] && parquet == [1, 2, 3]),
+            "memory={memory:?} parquet={parquet:?}"
+        );
+        paused();
+        resume_tx.send(()).unwrap();
+        assert!(published(), "publication must exclude capture");
+        converter.join().unwrap().unwrap();
+
+        assert_eq!(captured_ids(&staging, &schema), (vec![], all));
+        assert!(staging.inprocess_arrow_files().is_empty());
+    }
+
+    #[test]
+    fn conversion_capture_leases_wait_for_publication_and_survive_source_deletion() {
+        use crate::query::stream_schema_provider::staging_parquet::capture_staging_parquet_for_test;
+        use std::sync::mpsc::{TryRecvError, channel};
+
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_test_stream(&dir, "publication-lease");
+        let (before_tx, before_rx) = channel();
+        let (before_resume_tx, before_resume_rx) = channel();
+        let before_resume_rx = Mutex::new(before_resume_rx);
+        let (published_tx, published_rx) = channel();
+        let (published_resume_tx, published_resume_rx) = channel();
+        let published_resume_rx = Mutex::new(published_resume_rx);
+        let weak = Arc::downgrade(&staging);
+        set_conversion_hook(&staging, move |phase| match phase {
+            ConversionPhase::BeforeSealRename(_) => {}
+            ConversionPhase::BeforePublish(_) => {
+                before_tx.send(()).unwrap();
+                before_resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(CONVERSION_WAIT)
+                    .expect("test did not resume conversion before publication");
+            }
+            ConversionPhase::Published => {
+                assert!(weak.upgrade().unwrap().publication.try_read().is_err());
+                published_tx.send(()).unwrap();
+                published_resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(CONVERSION_WAIT)
+                    .expect("test did not resume published conversion");
+            }
+        });
+        let (done_tx, done_rx) = channel();
+        let converter = {
+            let staging = Arc::clone(&staging);
+            spawn(move || {
+                let result = staging.prepare_parquet(false, true, &None);
+                done_tx.send(()).unwrap();
+                result
+            })
+        };
+        before_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        before_resume_tx.send(()).unwrap();
+        published_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        // Renamed Parquet and pending memory coexist under the write lock.
+
+        let (started_tx, started_rx) = channel();
+        let (capture_tx, capture_rx) = channel();
+        let capture = {
+            let staging = Arc::clone(&staging);
+            let schema = Arc::clone(&schema);
+            spawn(move || {
+                // This lock assertion makes exclusion deterministic even if the
+                // worker is descheduled before entering capture_staging.
+                assert!(staging.publication.try_read().is_err());
+                started_tx.send(()).unwrap();
+                capture_tx
+                    .send(staging.capture_staging(&schema, capture_staging_parquet_for_test))
+                    .unwrap();
+            })
+        };
+        started_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        assert!(matches!(capture_rx.try_recv(), Err(TryRecvError::Empty)));
+        published_resume_tx.send(()).unwrap();
+        // The other group has its own before-publication gate, so its rows
+        // remain pending even when both groups convert concurrently.
+        before_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        let (memory, files) = capture_rx.recv_timeout(CONVERSION_WAIT).unwrap().unwrap();
+        let files = files.unwrap();
+        capture.join().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(!memory.is_empty());
+
+        let originals = fs::read_dir(&staging.data_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 1);
+        for original in originals {
+            fs::remove_file(original).unwrap();
+        }
+        let leased = files
+            .iter()
+            .map(|file| PathBuf::from("/").join(file.object_meta.location.as_ref()))
+            .collect::<Vec<_>>();
+        let lease_dirs = leased
+            .iter()
+            .map(|path| path.parent().unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert!(lease_dirs.iter().all(|path| path.is_dir()));
+        let mut ids = memory
+            .into_iter()
+            .chain(leased.iter().flat_map(|path| {
+                ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .map(Result::unwrap)
+            }))
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+        drop(files);
+        assert!(lease_dirs.iter().all(|path| !path.exists()));
+
+        before_resume_tx.send(()).unwrap();
+        published_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        published_resume_tx.send(()).unwrap();
+        // Both completion and hook waits are bounded before joining.
+        done_rx.recv_timeout(CONVERSION_WAIT).unwrap();
+        converter.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn conversion_visibility_failed_publication_retains_rows_for_retry() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_test_stream(&dir, "failed-publication");
+        let all = vec![1, 2, 3, 4, 5, 6];
+        let blockers = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&blockers);
+        set_conversion_hook(&staging, move |phase| {
+            if let ConversionPhase::BeforePublish(parquet) = phase {
+                // A non-empty directory at the target makes the real rename fail.
+                fs::create_dir(parquet).unwrap();
+                fs::write(parquet.join("blocker"), b"x").unwrap();
+                recorded.lock().unwrap().push(parquet.to_path_buf());
+            }
+        });
+        assert!(staging.prepare_parquet(false, true, &None).is_err());
+        let blockers = std::mem::take(&mut *blockers.lock().unwrap());
+        assert_eq!(blockers.len(), 2);
+        for blocker in blockers {
+            fs::remove_dir_all(blocker).unwrap();
+        }
+        // Sources stay in processing directories and their rows stay in memory.
+        assert_eq!(staging.inprocess_arrow_files().len(), 3);
+        assert_eq!(captured_ids(&staging, &schema), (all.clone(), vec![]));
+
+        // Startup retry converts the retained processing directories.
+        *staging.conversion_hook.lock().unwrap() = None;
+        staging.prepare_parquet(true, false, &None).unwrap();
+        assert_eq!(captured_ids(&staging, &schema), (vec![], all));
+        assert!(staging.inprocess_arrow_files().is_empty());
+    }
+
+    #[test]
+    fn conversion_visibility_late_append_after_failed_seal_rename() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_stream(&dir, "failed-seal");
+        let now = conversion_now();
+        push_ids(&staging, &schema, "schema-a", vec![1, 2], now);
+        let blockers = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&blockers);
+        set_conversion_hook(&staging, move |phase| {
+            if let ConversionPhase::BeforeSealRename(arrow) = phase {
+                // A non-empty directory at the target makes the real rename fail.
+                fs::create_dir(arrow).unwrap();
+                fs::write(arrow.join("blocker"), b"x").unwrap();
+                recorded.lock().unwrap().push(arrow.to_path_buf());
+            }
+        });
+        staging.flush_with_clock(true, || now).unwrap();
+        *staging.conversion_hook.lock().unwrap() = None;
+        let blockers = std::mem::take(&mut *blockers.lock().unwrap());
+        assert_eq!(blockers.len(), 1);
+        fs::remove_dir_all(&blockers[0]).unwrap();
+        // The failed part is left for recovery; its rows stay queryable.
+        let failed = part_files(&staging);
+        assert_eq!(failed.len(), 1);
+        let failed_len = fs::metadata(&failed[0]).unwrap().len();
+        assert!(staging.arrow_files().is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![]));
+
+        // A late event for the same writer key and minute must not reuse,
+        // truncate or share the failed part.
+        push_ids(&staging, &schema, "schema-a", vec![3], now);
+        let parts = part_files(&staging);
+        assert_eq!(parts.len(), 2);
+        assert!(parts.contains(&failed[0]));
+        assert_eq!(fs::metadata(&failed[0]).unwrap().len(), failed_len);
+        staging.flush_with_clock(true, || now).unwrap();
+        assert_eq!(part_files(&staging), failed);
+        assert_eq!(staging.arrow_files().len(), 1);
+
+        // Publishing the late file releases only its own rows.
+        staging.prepare_parquet(false, true, &None).unwrap();
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![3]));
+        assert_eq!(part_files(&staging), failed);
+
+        // Startup recovery on the same Stream exposes the failed part as Arrow;
+        // its rows must follow it and be published exactly once.
+        startup_then_shutdown_conversion(&staging);
+        assert!(part_files(&staging).is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![], vec![1, 2, 3]));
+    }
+
+    /// Runs startup preparation and its plan, then a shutdown conversion that
+    /// converts every root Arrow file, as a restart followed by sync would.
+    fn startup_then_shutdown_conversion(staging: &StreamRef) {
+        staging
+            .prepare_startup_sync(None)
+            .unwrap()
+            .execute()
+            .unwrap();
+        staging.prepare_parquet(false, true, &None).unwrap();
+    }
+
+    #[test]
+    fn conversion_visibility_startup_recovery_skips_attached_writer() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_stream(&dir, "startup-attached");
+        // Accepted before startup recovery reaches this stream: the writer is
+        // still attached and its part is live, not an orphan.
+        push_ids(&staging, &schema, "schema-a", vec![1, 2], conversion_now());
+        assert_eq!(part_files(&staging).len(), 1);
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![]));
+
+        startup_then_shutdown_conversion(&staging);
+        assert!(part_files(&staging).is_empty());
+        assert!(staging.arrow_files().is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![], vec![1, 2]));
+    }
+
+    #[test]
+    fn conversion_visibility_recovery_discard_releases_pending_rows() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_stream(&dir, "recovery-discard");
+        let now = conversion_now();
+        push_ids(&staging, &schema, "schema-a", vec![1, 2], now);
+        let blockers = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&blockers);
+        set_conversion_hook(&staging, move |phase| {
+            if let ConversionPhase::BeforeSealRename(arrow) = phase {
+                fs::create_dir(arrow).unwrap();
+                fs::write(arrow.join("blocker"), b"x").unwrap();
+                recorded.lock().unwrap().push(arrow.to_path_buf());
+            }
+        });
+        staging.flush_with_clock(true, || now).unwrap();
+        *staging.conversion_hook.lock().unwrap() = None;
+        for blocker in std::mem::take(&mut *blockers.lock().unwrap()) {
+            fs::remove_dir_all(blocker).unwrap();
+        }
+        let failed = part_files(&staging);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![]));
+
+        // Recovery discards a part with no complete batch; its rows are not
+        // persisted, so memory must stop serving them too.
+        fs::write(&failed[0], b"bad").unwrap();
+        startup_then_shutdown_conversion(&staging);
+        assert!(part_files(&staging).is_empty());
+        assert_eq!(captured_ids(&staging, &schema), (vec![], vec![]));
+    }
+
+    #[test]
+    fn conversion_visibility_overlapping_detach_keeps_part_ownership() {
+        let dir = TempDir::new().unwrap();
+        let (staging, schema) = conversion_stream(&dir, "overlapping-detach");
+        let now = conversion_now();
+        push_ids(&staging, &schema, "schema-a", vec![1, 2], now);
+        // A flush detached this writer but has not sealed it yet.
+        let mut detached = staging
+            .writer
+            .lock()
+            .unwrap()
+            .detach_flushable_disk_at(true, now);
+        assert_eq!(detached.len(), 1);
+        let first = part_files(&staging);
+        assert_eq!(first.len(), 1);
+
+        // A late event opens a second writer for the same key and minute, and
+        // an overlapping flush seals it first.
+        push_ids(&staging, &schema, "schema-a", vec![3], now);
+        assert_eq!(part_files(&staging).len(), 2);
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2, 3], vec![]));
+        staging.flush_with_clock(true, || now).unwrap();
+        assert_eq!(part_files(&staging), first);
+        staging.prepare_parquet(false, true, &None).unwrap();
+        assert_eq!(captured_ids(&staging, &schema), (vec![1, 2], vec![3]));
+
+        // The first flush finishes late and publishes only its own rows.
+        staging.seal_detached(std::mem::take(&mut detached));
+        assert!(part_files(&staging).is_empty());
+        staging.prepare_parquet(false, true, &None).unwrap();
+        assert_eq!(captured_ids(&staging, &schema), (vec![], vec![1, 2, 3]));
+    }
 
     #[test]
     fn parallel_metric_writer_creates_valid_ordered_row_groups() {
@@ -3943,6 +5283,595 @@ mod tests {
         assert!(staging.arrow_files().is_empty());
     }
 
+    fn lifecycle_stream(temp_dir: &TempDir) -> StreamRef {
+        let options = Arc::new(Options {
+            local_staging_path: temp_dir.path().to_path_buf(),
+            row_group_size: 1048576,
+            ..Default::default()
+        });
+        Stream::new(
+            options,
+            "test_stream",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        )
+    }
+
+    /// A fixed past event minute: never current, so no wall-clock dependence.
+    fn lifecycle_minute() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 10, 18)
+            .unwrap()
+            .and_hms_opt(0, 6, 30)
+            .unwrap()
+    }
+
+    fn lifecycle_push_ids(staging: &StreamRef, ids: std::ops::Range<i32>) {
+        push_ids_at(staging, ids, lifecycle_minute());
+    }
+
+    /// Converts all published Arrow files and returns every id stored in Parquet.
+    fn convert_and_read_ids(staging: &StreamRef) -> Vec<i32> {
+        staging
+            .convert_disk_files_to_parquet(None, None, false, true, &None)
+            .unwrap();
+        let mut ids = Vec::new();
+        for path in staging.parquet_files() {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                File::open(path).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let column = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                ids.extend(column.values().iter().copied());
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Reproduces the R6 loss: `flush` detaches a stale writer under the lock
+    /// but finishes and renames it after releasing the lock. A late event for
+    /// the same minute opened a new writer at the same `.part` path in that
+    /// window, truncating the detached writer's acknowledged data and leaving
+    /// a sparse file that conversion then deleted as corrupt.
+    #[test]
+    fn late_writer_for_detached_minute_does_not_truncate_finishing_part() {
+        for forced in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let staging = lifecycle_stream(&temp_dir);
+            lifecycle_push_ids(&staging, 0..1000);
+            let detached_part = part_files(&staging).pop().unwrap();
+            let detached_bytes = fs::read(&detached_part).unwrap();
+
+            // Exactly the critical section of `Stream::flush`.
+            let detached = staging.writer.lock().unwrap().take_flushable_disk(forced);
+            assert_eq!(detached.len(), 1);
+
+            // A late event for the detached minute arrives before its Drop.
+            lifecycle_push_ids(&staging, 1000..1500);
+            assert_eq!(fs::read(&detached_part).unwrap(), detached_bytes);
+
+            // `Stream::flush` drops outside the lock: finish and publish.
+            drop(detached);
+            let live_parts = part_files(&staging);
+            let published = staging.arrow_files();
+            assert_eq!(published.len(), 1);
+            let published_bytes = fs::read(&published[0]).unwrap();
+            assert!(published_bytes.starts_with(&detached_bytes));
+
+            // The replacement keeps writing; the published file is sealed.
+            lifecycle_push_ids(&staging, 1500..2000);
+            assert_eq!(fs::read(&published[0]).unwrap(), published_bytes);
+
+            // Converting it neither reads nor removes the live writer's part.
+            assert_eq!(
+                convert_and_read_ids(&staging),
+                (0..1000).collect::<Vec<_>>()
+            );
+            assert_eq!(live_parts.len(), 1);
+            assert_ne!(live_parts[0], detached_part);
+            assert_eq!(part_files(&staging), live_parts);
+
+            staging.flush(true).unwrap();
+            assert!(part_files(&staging).is_empty());
+            assert_eq!(
+                convert_and_read_ids(&staging),
+                (0..2000).collect::<Vec<_>>()
+            );
+            assert!(staging.arrow_files().is_empty());
+        }
+    }
+
+    /// Ingestion can start before startup recovery runs. Recovery must not
+    /// publish (or delete) a part that a live writer is still appending to.
+    #[test]
+    fn startup_recovery_skips_part_owned_by_live_writer() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        lifecycle_push_ids(&staging, 0..100);
+        let live_parts = part_files(&staging);
+        assert_eq!(live_parts.len(), 1);
+
+        staging.recover_orphan_part_files();
+        let converted_early = convert_and_read_ids(&staging);
+        lifecycle_push_ids(&staging, 100..200);
+        staging.flush(true).unwrap();
+
+        assert_eq!(convert_and_read_ids(&staging), (0..200).collect::<Vec<_>>());
+        assert!(converted_early.is_empty());
+        assert!(part_files(&staging).is_empty());
+    }
+
+    /// A crash leaves a `.part` without EOS or rename. If ingestion for the
+    /// same minute resumes before startup recovery, the new writer must not
+    /// truncate it, and recovery must still publish it.
+    #[test]
+    fn new_writer_preserves_crash_orphan_part_with_same_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        lifecycle_push_ids(&staging, 0..100);
+        let orphan = part_files(&staging).pop().unwrap();
+        // Simulate the crash: Drop (EOS + rename) never runs.
+        let crashed = staging.writer.lock().unwrap().take_flushable_disk(true);
+        std::mem::forget(crashed);
+
+        lifecycle_push_ids(&staging, 100..200);
+        let live_parts: Vec<_> = part_files(&staging)
+            .into_iter()
+            .filter(|path| *path != orphan)
+            .collect();
+
+        staging.recover_orphan_part_files();
+        staging.flush(true).unwrap();
+
+        assert_eq!(convert_and_read_ids(&staging), (0..200).collect::<Vec<_>>());
+        assert_eq!(live_parts.len(), 1);
+        assert!(!orphan.exists());
+        assert!(part_files(&staging).is_empty());
+    }
+
+    fn push_ids_at(staging: &StreamRef, ids: std::ops::Range<i32>, minute: NaiveDateTime) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                DEFAULT_TIMESTAMP_KEY,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMillisecondArray::from_iter_values(
+                    ids.clone().map(i64::from),
+                )),
+                Arc::new(Int32Array::from_iter_values(ids.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    ids.map(|id| format!("payload-{id}")),
+                )),
+            ],
+        )
+        .unwrap();
+        staging
+            .push(
+                "abc",
+                &batch,
+                minute,
+                &HashMap::new(),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+    }
+
+    /// The minute before `lifecycle_minute`, for crash orphans of another file.
+    fn orphan_minute() -> NaiveDateTime {
+        lifecycle_minute() - chrono::TimeDelta::minutes(1)
+    }
+
+    fn sorted_ids(ranges: &[std::ops::Range<i32>]) -> Vec<i32> {
+        let mut ids: Vec<i32> = ranges.iter().cloned().flatten().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn id_mismatch(stage: &str, got: &[i32], expected: &[i32]) -> Option<String> {
+        if got == expected {
+            return None;
+        }
+        let got_set: HashSet<i32> = got.iter().copied().collect();
+        let missing = expected.iter().filter(|id| !got_set.contains(id)).count();
+        Some(format!(
+            "{stage}: got {} ids ({} distinct), expected {}; {missing} expected ids missing",
+            got.len(),
+            got_set.len(),
+            expected.len()
+        ))
+    }
+
+    fn phase_kind(phase: &LifecyclePhase) -> &'static str {
+        match phase {
+            LifecyclePhase::FlushDetached => "FlushDetached",
+            LifecyclePhase::RecoveryStarted => "RecoveryStarted",
+            LifecyclePhase::RecoveryWaitingForFlush => "RecoveryWaitingForFlush",
+            LifecyclePhase::RecoveryCandidates(_) => "RecoveryCandidates",
+            LifecyclePhase::StartupRecovered => "StartupRecovered",
+            LifecyclePhase::RecoveryPublishing(_) => "RecoveryPublishing",
+            LifecyclePhase::ConversionClaimed(_) => "ConversionClaimed",
+            LifecyclePhase::ConversionReadersOpened { .. } => "ConversionReadersOpened",
+            LifecyclePhase::ParquetPartCreated(_) => "ParquetPartCreated",
+            LifecyclePhase::ParquetPartClosed(_) => "ParquetPartClosed",
+            LifecyclePhase::ParquetPartWritten(_) => "ParquetPartWritten",
+        }
+    }
+
+    type PhaseKey = (String, &'static str);
+
+    /// Reports every lifecycle phase with its thread name. A phase with a
+    /// registered gate blocks its thread until the gate is released (or the
+    /// harness is dropped). Timeouts only guard against a hung test.
+    struct LifecycleHarness {
+        events: std::sync::mpsc::Receiver<(String, LifecyclePhase)>,
+        log: Vec<(String, LifecyclePhase)>,
+        consumed: HashSet<usize>,
+        releases: HashMap<PhaseKey, std::sync::mpsc::Sender<()>>,
+    }
+
+    impl LifecycleHarness {
+        fn install(staging: &StreamRef, gated: &[(&str, &'static str)]) -> Self {
+            let (events_tx, events) = std::sync::mpsc::channel();
+            let mut gates = HashMap::new();
+            let mut releases = HashMap::new();
+            for (thread, kind) in gated {
+                let (release, gate) = std::sync::mpsc::channel::<()>();
+                gates.insert((thread.to_string(), *kind), gate);
+                releases.insert((thread.to_string(), *kind), release);
+            }
+            let gates = Mutex::new(gates);
+            let hook: LifecycleHook = Arc::new(move |phase: LifecyclePhase| {
+                let thread = std::thread::current().name().unwrap_or("").to_owned();
+                let key = (thread.clone(), phase_kind(&phase));
+                let _ = events_tx.send((thread, phase));
+                let gate = gates.lock().unwrap().remove(&key);
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+            });
+            *staging.lifecycle_hook.lock().unwrap() = Some(hook);
+            Self {
+                events,
+                log: Vec::new(),
+                consumed: HashSet::new(),
+                releases,
+            }
+        }
+
+        /// Returns the next unconsumed phase of one of `kinds` on `thread`.
+        fn wait_for(&mut self, thread: &str, kinds: &[&str]) -> LifecyclePhase {
+            let matches = |(name, phase): &(String, LifecyclePhase)| {
+                name == thread && kinds.contains(&phase_kind(phase))
+            };
+            let mut index = 0;
+            loop {
+                while index < self.log.len() {
+                    if !self.consumed.contains(&index) && matches(&self.log[index]) {
+                        self.consumed.insert(index);
+                        return self.log[index].1.clone();
+                    }
+                    index += 1;
+                }
+                match self.events.recv_timeout(Duration::from_secs(60)) {
+                    Ok(event) => self.log.push(event),
+                    Err(err) => panic!("no {kinds:?} on {thread} ({err}); seen {:?}", self.log),
+                }
+            }
+        }
+
+        fn release(&mut self, thread: &str, kind: &'static str) {
+            let release = self
+                .releases
+                .remove(&(thread.to_owned(), kind))
+                .expect("gate registered");
+            let _ = release.send(());
+        }
+
+        /// Every candidate set recovery has selected so far.
+        fn candidates_seen(&mut self) -> Vec<Vec<PathBuf>> {
+            while let Ok(event) = self.events.try_recv() {
+                self.log.push(event);
+            }
+            self.log
+                .iter()
+                .filter_map(|(_, phase)| match phase {
+                    LifecyclePhase::RecoveryCandidates(paths) => Some(paths.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn spawn_named<T: Send + 'static>(
+        name: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> std::thread::JoinHandle<T> {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(f)
+            .unwrap()
+    }
+
+    fn published_files(staging: &StreamRef) -> Vec<(PathBuf, Vec<u8>)> {
+        staging
+            .arrow_files()
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    fn changed_published(files: &[(PathBuf, Vec<u8>)]) -> Vec<PathBuf> {
+        files
+            .iter()
+            .filter(|(path, bytes)| fs::read(path).ok().as_ref() != Some(bytes))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Shutdown sync can run during startup recovery while an admitted request
+    /// is still ingesting. The shutdown flush detaches writer A, recovery
+    /// starts, A finishes and frees its deterministic part path, and the
+    /// request then opens writer B at that same path. Recovery must claim
+    /// neither A nor B, published files must never change, and every
+    /// acknowledged id must be converted exactly once.
+    #[test]
+    fn startup_recovery_never_claims_part_reused_after_shutdown_flush() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        // A crash orphan of another minute, which recovery must publish.
+        push_ids_at(&staging, 5000..5100, orphan_minute());
+        let orphan = part_files(&staging).pop().unwrap();
+        std::mem::forget(staging.writer.lock().unwrap().take_flushable_disk(true));
+
+        lifecycle_push_ids(&staging, 0..1000);
+        let a_part = part_files(&staging)
+            .into_iter()
+            .find(|path| *path != orphan)
+            .unwrap();
+        let a_bytes = fs::read(&a_part).unwrap();
+        let mut violations = Vec::new();
+
+        let mut harness = LifecycleHarness::install(
+            &staging,
+            &[
+                ("shutdown", "FlushDetached"),
+                ("startup", "RecoveryCandidates"),
+                ("startup", "StartupRecovered"),
+            ],
+        );
+        let shutdown = spawn_named("shutdown", {
+            let staging = staging.clone();
+            move || staging.flush(true).unwrap()
+        });
+        harness.wait_for("shutdown", &["FlushDetached"]);
+
+        let startup = spawn_named("startup", {
+            let staging = staging.clone();
+            move || drop(staging.prepare_startup_sync(None).unwrap())
+        });
+        // Recovery either selects candidates now or waits for the flush.
+        let first = harness.wait_for(
+            "startup",
+            &["RecoveryCandidates", "RecoveryWaitingForFlush"],
+        );
+
+        // A finishes and renames its part, which frees the path.
+        harness.release("shutdown", "FlushDetached");
+        shutdown.join().unwrap();
+        // An admitted request for the same key opens B at that path.
+        lifecycle_push_ids(&staging, 1000..1500);
+        let active = staging.writer.lock().unwrap().active_part_paths();
+        assert_eq!(active, HashSet::from([a_part.clone()]), "B reuses A's path");
+        let b_part = a_part.clone();
+
+        harness.release("startup", "RecoveryCandidates");
+        let candidates = match first {
+            LifecyclePhase::RecoveryCandidates(candidates) => candidates,
+            _ => match harness.wait_for("startup", &["RecoveryCandidates"]) {
+                LifecyclePhase::RecoveryCandidates(candidates) => candidates,
+                phase => unreachable!("{phase:?}"),
+            },
+        };
+        let candidates: HashSet<PathBuf> = candidates.into_iter().collect();
+        if candidates.contains(&a_part) {
+            violations.push(format!(
+                "recovery selected {a_part:?}, owned by detached writer A or live writer B"
+            ));
+        }
+        if !candidates.contains(&orphan) {
+            violations.push(format!("recovery skipped crash orphan {orphan:?}"));
+        }
+
+        // Startup has recovered and is paused before its own flush.
+        harness.wait_for("startup", &["StartupRecovered"]);
+        if !b_part.exists() {
+            violations.push(format!("recovery claimed live writer B's part {b_part:?}"));
+        }
+        let published = published_files(&staging);
+        let a_published = a_part.with_extension("");
+        match published.iter().find(|(path, _)| *path == a_published) {
+            Some((_, bytes)) if bytes.starts_with(&a_bytes) => {}
+            _ => violations.push(format!("A was not published intact as {a_published:?}")),
+        }
+        lifecycle_push_ids(&staging, 1500..1750);
+        for path in changed_published(&published) {
+            violations.push(format!("published {path:?} changed after publication"));
+        }
+        // Conversion while B ingests must only see sealed files.
+        let early = convert_and_read_ids(&staging);
+        violations.extend(id_mismatch(
+            "conversion while B is live",
+            &early,
+            &sorted_ids(&[0..1000, 5000..5100]),
+        ));
+        lifecycle_push_ids(&staging, 1750..2000);
+
+        // Startup's forced flush finishes and publishes B.
+        harness.release("startup", "StartupRecovered");
+        startup.join().unwrap();
+        let all = convert_and_read_ids(&staging);
+        violations.extend(id_mismatch(
+            "final conversion",
+            &all,
+            &sorted_ids(&[0..2000, 5000..5100]),
+        ));
+        if !part_files(&staging).is_empty() {
+            violations.push(format!("parts left: {:?}", part_files(&staging)));
+        }
+        if !staging.arrow_files().is_empty() {
+            violations.push(format!("arrows left: {:?}", staging.arrow_files()));
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// Recovery that overlaps two shutdown-style flushes must wait until both
+    /// have finished their detached writers, never selecting a detached
+    /// writer's part, and must still not alter anything published.
+    #[test]
+    fn startup_recovery_waits_for_every_detached_shutdown_writer() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        let mut violations = Vec::new();
+        let mut harness = LifecycleHarness::install(
+            &staging,
+            &[
+                ("shutdown-1", "FlushDetached"),
+                ("shutdown-2", "FlushDetached"),
+                ("startup", "StartupRecovered"),
+            ],
+        );
+
+        lifecycle_push_ids(&staging, 0..1000);
+        let a_part = part_files(&staging).pop().unwrap();
+        let first_flush = spawn_named("shutdown-1", {
+            let staging = staging.clone();
+            move || staging.flush(true).unwrap()
+        });
+        harness.wait_for("shutdown-1", &["FlushDetached"]);
+
+        // A's part still exists, so C gets its own part for the same key.
+        lifecycle_push_ids(&staging, 1000..1300);
+        let c_part = part_files(&staging)
+            .into_iter()
+            .find(|path| *path != a_part)
+            .unwrap();
+        let second_flush = spawn_named("shutdown-2", {
+            let staging = staging.clone();
+            move || staging.flush(true).unwrap()
+        });
+        harness.wait_for("shutdown-2", &["FlushDetached"]);
+        let a_bytes = fs::read(&a_part).unwrap();
+        let c_bytes = fs::read(&c_part).unwrap();
+
+        let startup = spawn_named("startup", {
+            let staging = staging.clone();
+            move || drop(staging.prepare_startup_sync(None).unwrap())
+        });
+        // Either recovery has finished, or it is waiting for the flushes.
+        let first = harness.wait_for("startup", &["StartupRecovered", "RecoveryWaitingForFlush"]);
+        for (part, bytes) in [(&a_part, &a_bytes), (&c_part, &c_bytes)] {
+            if fs::read(part).ok().as_ref() != Some(bytes) {
+                violations.push(format!(
+                    "recovery took detached writer's part {part:?} before it finished"
+                ));
+            }
+        }
+
+        harness.release("shutdown-1", "FlushDetached");
+        first_flush.join().unwrap();
+        // The second flush still holds its detached writer.
+        if fs::read(&c_part).ok().as_ref() != Some(&c_bytes) {
+            violations.push(format!(
+                "recovery took {c_part:?} while the second flush still owned it"
+            ));
+        }
+        harness.release("shutdown-2", "FlushDetached");
+        second_flush.join().unwrap();
+        let published = published_files(&staging);
+
+        if first != LifecyclePhase::StartupRecovered {
+            harness.wait_for("startup", &["StartupRecovered"]);
+        }
+        for candidates in harness.candidates_seen() {
+            for part in [&a_part, &c_part] {
+                if candidates.contains(part) {
+                    violations.push(format!("recovery selected detached writer's part {part:?}"));
+                }
+            }
+        }
+        harness.release("startup", "StartupRecovered");
+        startup.join().unwrap();
+        for path in changed_published(&published) {
+            violations.push(format!("published {path:?} changed after publication"));
+        }
+
+        let all = convert_and_read_ids(&staging);
+        violations.extend(id_mismatch(
+            "final conversion",
+            &all,
+            &sorted_ids(&[0..1300]),
+        ));
+        if !part_files(&staging).is_empty() {
+            violations.push(format!("parts left: {:?}", part_files(&staging)));
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// The lifecycle lock guards no data. A recovery that panicked must not
+    /// stop later flushes or recoveries, nor lose acknowledged rows.
+    #[test]
+    fn poisoned_part_lifecycle_lock_keeps_flush_and_recovery_working() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        lifecycle_push_ids(&staging, 0..100);
+        let hook: LifecycleHook = Arc::new(|phase| {
+            if matches!(phase, LifecyclePhase::RecoveryCandidates(_))
+                && std::thread::current().name() == Some("poisoner")
+            {
+                panic!("injected recovery panic");
+            }
+        });
+        *staging.lifecycle_hook.lock().unwrap() = Some(hook);
+        let poisoner = spawn_named("poisoner", {
+            let staging = staging.clone();
+            move || staging.recover_orphan_part_files()
+        });
+        assert!(poisoner.join().is_err());
+        assert!(staging.part_lifecycle.is_poisoned());
+
+        lifecycle_push_ids(&staging, 100..200);
+        staging.flush(true).unwrap();
+        push_ids_at(&staging, 300..400, orphan_minute());
+        std::mem::forget(staging.writer.lock().unwrap().take_flushable_disk(true));
+        staging.recover_orphan_part_files();
+
+        assert_eq!(
+            convert_and_read_ids(&staging),
+            sorted_ids(&[0..200, 300..400])
+        );
+        assert!(part_files(&staging).is_empty());
+    }
+
     #[test]
     fn corrupt_orphan_part_is_removed() {
         let temp_dir = TempDir::new().unwrap();
@@ -4259,5 +6188,976 @@ mod tests {
         // Verify the map contains only one entry
         let guard = streams.read().expect("Failed to acquire read lock");
         assert_eq!(guard.len(), 1);
+    }
+
+    type PhaseMatcher = Box<dyn Fn(&str, &LifecyclePhase) -> bool + Send>;
+
+    enum GateAction {
+        Block(std::sync::mpsc::Receiver<()>),
+        Panic,
+    }
+
+    /// Like `LifecycleHarness`, but gates are added while threads run and
+    /// match on phase contents, because parallel conversion groups run on
+    /// unnamed Rayon workers. Each gate fires once. Dropping the harness
+    /// releases every blocked thread. Timeouts only guard against a hang.
+    struct ConversionHarness {
+        events: std::sync::mpsc::Receiver<(String, LifecyclePhase)>,
+        log: Vec<(String, LifecyclePhase)>,
+        consumed: HashSet<usize>,
+        gates: Arc<Mutex<Vec<(usize, PhaseMatcher, GateAction)>>>,
+        releases: HashMap<usize, std::sync::mpsc::Sender<()>>,
+        next_gate: usize,
+    }
+
+    impl ConversionHarness {
+        fn install(staging: &StreamRef) -> Self {
+            let (events_tx, events) = std::sync::mpsc::channel();
+            let gates: Arc<Mutex<Vec<(usize, PhaseMatcher, GateAction)>>> = Arc::default();
+            let hook_gates = Arc::clone(&gates);
+            let hook: LifecycleHook = Arc::new(move |phase: LifecyclePhase| {
+                let thread = std::thread::current().name().unwrap_or("").to_owned();
+                let _ = events_tx.send((thread.clone(), phase.clone()));
+                let action = {
+                    let mut gates = hook_gates.lock().unwrap();
+                    let index = gates
+                        .iter()
+                        .position(|(_, matches, _)| matches(&thread, &phase));
+                    index.map(|index| gates.remove(index).2)
+                };
+                match action {
+                    Some(GateAction::Block(gate)) => {
+                        let _ = gate.recv();
+                    }
+                    Some(GateAction::Panic) => panic!("injected panic at {phase:?}"),
+                    None => {}
+                }
+            });
+            *staging.lifecycle_hook.lock().unwrap() = Some(hook);
+            Self {
+                events,
+                log: Vec::new(),
+                consumed: HashSet::new(),
+                gates,
+                releases: HashMap::new(),
+                next_gate: 0,
+            }
+        }
+
+        /// Blocks the first future phase that `matches` until `release`.
+        fn gate(&mut self, matches: PhaseMatcher) -> usize {
+            let (release, gate) = std::sync::mpsc::channel();
+            self.next_gate += 1;
+            self.gates
+                .lock()
+                .unwrap()
+                .push((self.next_gate, matches, GateAction::Block(gate)));
+            self.releases.insert(self.next_gate, release);
+            self.next_gate
+        }
+
+        /// Panics the thread reaching the first future phase that `matches`.
+        fn panic_at(&mut self, matches: PhaseMatcher) {
+            self.next_gate += 1;
+            self.gates
+                .lock()
+                .unwrap()
+                .push((self.next_gate, matches, GateAction::Panic));
+        }
+
+        fn release(&mut self, gate: usize) {
+            let _ = self.releases.remove(&gate).expect("gate added").send(());
+        }
+
+        /// Returns the next unconsumed phase that `matches`, waiting for it.
+        fn wait(
+            &mut self,
+            what: &str,
+            matches: impl Fn(&str, &LifecyclePhase) -> bool,
+        ) -> LifecyclePhase {
+            let mut index = 0;
+            loop {
+                while index < self.log.len() {
+                    let (thread, phase) = &self.log[index];
+                    if !self.consumed.contains(&index) && matches(thread, phase) {
+                        self.consumed.insert(index);
+                        return phase.clone();
+                    }
+                    index += 1;
+                }
+                match self.events.recv_timeout(Duration::from_secs(60)) {
+                    Ok(event) => self.log.push(event),
+                    Err(err) => panic!("no {what} ({err}); seen {:#?}", self.log),
+                }
+            }
+        }
+
+        /// Every phase reported so far by `thread`.
+        fn phases_of(&mut self, thread: &str) -> Vec<LifecyclePhase> {
+            while let Ok(event) = self.events.try_recv() {
+                self.log.push(event);
+            }
+            self.log
+                .iter()
+                .filter(|(name, _)| name == thread)
+                .map(|(_, phase)| phase.clone())
+                .collect()
+        }
+
+        /// Every Arrow source the conversions on `thread` have claimed.
+        fn claimed_sources_of(&mut self, thread: &str) -> HashSet<PathBuf> {
+            self.phases_of(thread)
+                .into_iter()
+                .filter_map(|phase| match phase {
+                    LifecyclePhase::ConversionClaimed(groups) => Some(groups),
+                    _ => None,
+                })
+                .flatten()
+                .flat_map(|(_, sources)| sources)
+                .collect()
+        }
+
+        /// Every part recovery on `thread` has selected as an orphan.
+        fn recovery_candidates_of(&mut self, thread: &str) -> HashSet<PathBuf> {
+            self.phases_of(thread)
+                .into_iter()
+                .filter_map(|phase| match phase {
+                    LifecyclePhase::RecoveryCandidates(paths) => Some(paths),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        }
+    }
+
+    fn on_thread(thread: &'static str, kind: &'static str) -> PhaseMatcher {
+        Box::new(move |name: &str, phase: &LifecyclePhase| {
+            name == thread && phase_kind(phase) == kind
+        })
+    }
+
+    fn readers_opened_for(outputs: Vec<PathBuf>) -> PhaseMatcher {
+        Box::new(move |_: &str, phase: &LifecyclePhase| match phase {
+            LifecyclePhase::ConversionReadersOpened { output, .. } => outputs.contains(output),
+            _ => false,
+        })
+    }
+
+    fn temp_output_phase(kind: &'static str, temp: PathBuf) -> PhaseMatcher {
+        Box::new(move |_: &str, phase: &LifecyclePhase| {
+            phase_kind(phase) == kind
+                && matches!(
+                    phase,
+                    LifecyclePhase::ParquetPartCreated(path)
+                        | LifecyclePhase::ParquetPartClosed(path)
+                        | LifecyclePhase::ParquetPartWritten(path)
+                        if *path == temp
+                )
+        })
+    }
+
+    fn claimed_groups(phase: LifecyclePhase) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        match phase {
+            LifecyclePhase::ConversionClaimed(groups) => groups,
+            phase => unreachable!("{phase:?}"),
+        }
+    }
+
+    /// The temporary file a conversion writes `output` to before renaming it.
+    fn temp_output(output: &Path) -> PathBuf {
+        let mut temp = output.to_path_buf();
+        temp.add_extension(PART_FILE_EXTENSION);
+        temp
+    }
+
+    /// Simulates processing directories left by a crashed process: the given
+    /// ids are published as Arrow files and moved into `name`.
+    fn crash_orphan_dir(
+        staging: &StreamRef,
+        name: &str,
+        batches: &[(std::ops::Range<i32>, NaiveDateTime)],
+    ) -> PathBuf {
+        for (ids, minute) in batches {
+            push_ids_at(staging, ids.clone(), *minute);
+        }
+        staging.flush(true).unwrap();
+        let dir = staging.data_path.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        for file in staging.arrow_files() {
+            fs::rename(&file, dir.join(file.file_name().unwrap())).unwrap();
+        }
+        dir
+    }
+
+    fn file_contents(paths: &HashSet<PathBuf>) -> HashMap<PathBuf, Option<Vec<u8>>> {
+        paths
+            .iter()
+            .map(|path| (path.clone(), fs::read(path).ok()))
+            .collect()
+    }
+
+    fn changed_files(before: &HashMap<PathBuf, Option<Vec<u8>>>) -> Vec<PathBuf> {
+        let mut changed: Vec<PathBuf> = before
+            .iter()
+            .filter(|(path, bytes)| fs::read(path).ok() != **bytes)
+            .map(|(path, _)| path.clone())
+            .collect();
+        changed.sort();
+        changed
+    }
+
+    /// Every id in the published Parquet files, sorted, with multiplicity.
+    fn published_ids(staging: &StreamRef) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for path in staging.parquet_files() {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                File::open(path).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let column = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                ids.extend(column.values().iter().copied());
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Anything a finished, successful sync must not leave behind: parts,
+    /// Arrow files, processing directories and Parquet files without a valid
+    /// footer.
+    fn staging_leftovers(staging: &StreamRef) -> Vec<PathBuf> {
+        let valid: HashSet<PathBuf> = staging.parquet_files().into_iter().collect();
+        let mut leftovers: Vec<PathBuf> = fs::read_dir(&staging.data_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                path.is_dir()
+                    || name.ends_with(".part")
+                    || name.ends_with(".arrows")
+                    || (name.ends_with(".parquet") && !valid.contains(path))
+            })
+            .collect();
+        leftovers.sort();
+        leftovers
+    }
+
+    fn inode(path: &Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|meta| meta.ino())
+    }
+
+    /// Shutdown sync converts its own processing directory while startup
+    /// executes its plan for crash-orphaned directories and a second sync run
+    /// converts newer files. Both shutdown groups convert in parallel and are
+    /// held after opening their readers. Startup must claim only the orphans,
+    /// must not delete the shutdown sources, and every id must be committed to
+    /// exactly one Parquet file. The second run must not wait for the paused
+    /// shutdown conversion.
+    #[test]
+    fn startup_plan_never_converts_sources_of_a_running_shutdown_conversion() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        let minute_a = lifecycle_minute() - TimeDelta::minutes(10);
+        let minute_b = lifecycle_minute() - TimeDelta::minutes(11);
+        // One orphan minute spans both directories.
+        crash_orphan_dir(
+            &staging,
+            "processing_1",
+            &[(9000..9100, minute_a), (9100..9200, minute_b)],
+        );
+        crash_orphan_dir(&staging, "processing_2", &[(9200..9300, minute_a)]);
+        lifecycle_push_ids(&staging, 0..1000);
+        push_ids_at(
+            &staging,
+            1000..1500,
+            lifecycle_minute() - TimeDelta::minutes(2),
+        );
+        let mut violations = Vec::new();
+        let mut harness = ConversionHarness::install(&staging);
+
+        let claimed = harness.gate(on_thread("shutdown", "ConversionClaimed"));
+        let shutdown = spawn_named("shutdown", {
+            let staging = staging.clone();
+            move || staging.flush_and_convert(false, true, &None)
+        });
+        let groups = claimed_groups(harness.wait("shutdown claim", |thread, phase| {
+            thread == "shutdown" && phase_kind(phase) == "ConversionClaimed"
+        }));
+        assert_eq!(groups.len(), 2, "two minute groups: {groups:?}");
+        let outputs: Vec<PathBuf> = groups.iter().map(|(output, _)| output.clone()).collect();
+        let shutdown_sources: HashSet<PathBuf> = groups
+            .iter()
+            .flat_map(|(_, sources)| sources.clone())
+            .collect();
+        let readers = [
+            harness.gate(readers_opened_for(outputs.clone())),
+            harness.gate(readers_opened_for(outputs.clone())),
+        ];
+        harness.release(claimed);
+        for _ in 0..2 {
+            harness.wait("shutdown readers", |_, phase| {
+                matches!(phase, LifecyclePhase::ConversionReadersOpened { output, .. } if outputs.contains(output))
+            });
+        }
+        let shutdown_bytes = file_contents(&shutdown_sources);
+
+        // Startup prepares and executes its plan while shutdown converts.
+        let startup = spawn_named("startup", {
+            let staging = staging.clone();
+            move || staging.prepare_startup_sync(None).unwrap().execute()
+        });
+        if let Err(err) = startup.join().unwrap() {
+            violations.push(format!("startup conversion failed: {err}"));
+        }
+        let stolen: Vec<_> = harness
+            .claimed_sources_of("startup")
+            .intersection(&shutdown_sources)
+            .cloned()
+            .collect();
+        if !stolen.is_empty() {
+            violations.push(format!(
+                "startup claimed sources owned by the running shutdown conversion: {stolen:?}"
+            ));
+        }
+        let changed = changed_files(&shutdown_bytes);
+        if !changed.is_empty() {
+            violations.push(format!(
+                "sources changed or removed before their conversion published: {changed:?}"
+            ));
+        }
+        violations.extend(id_mismatch(
+            "published while shutdown converts",
+            &published_ids(&staging),
+            &sorted_ids(&[9000..9300]),
+        ));
+
+        // A second sync run converts newer files without waiting.
+        push_ids_at(
+            &staging,
+            2000..2100,
+            lifecycle_minute() - TimeDelta::minutes(3),
+        );
+        let second = spawn_named("shutdown-2", {
+            let staging = staging.clone();
+            move || staging.flush_and_convert(false, true, &None)
+        });
+        if let Err(err) = second.join().unwrap() {
+            violations.push(format!("second sync run failed: {err}"));
+        }
+        let overlap: Vec<_> = harness
+            .claimed_sources_of("shutdown-2")
+            .intersection(&shutdown_sources)
+            .cloned()
+            .collect();
+        if !overlap.is_empty() {
+            violations.push(format!("second run claimed shutdown sources: {overlap:?}"));
+        }
+        violations.extend(id_mismatch(
+            "published while shutdown still converts",
+            &published_ids(&staging),
+            &sorted_ids(&[2000..2100, 9000..9300]),
+        ));
+
+        for gate in readers {
+            harness.release(gate);
+        }
+        if let Err(err) = shutdown.join().unwrap() {
+            violations.push(format!("shutdown conversion failed: {err}"));
+        }
+        violations.extend(id_mismatch(
+            "final",
+            &published_ids(&staging),
+            &sorted_ids(&[0..1500, 2000..2100, 9000..9300]),
+        ));
+        let leftovers = staging_leftovers(&staging);
+        if !leftovers.is_empty() {
+            violations.push(format!("left behind: {leftovers:?}"));
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// Recovery runs (through the init entry or a startup plan) while a
+    /// shutdown conversion holds its temporary Parquet output, either just
+    /// created and empty or written and validated but not yet renamed. The
+    /// output must not be selected, deleted or replaced, the conversion must
+    /// publish it, and its sources must remain until that publication.
+    #[test]
+    fn recovery_never_removes_the_temporary_output_of_a_running_conversion() {
+        for held_at in ["ParquetPartCreated", "ParquetPartWritten"] {
+            for competitor in ["init", "startup"] {
+                let case = format!("{competitor} during {held_at}");
+                let temp_dir = TempDir::new().unwrap();
+                let staging = lifecycle_stream(&temp_dir);
+                crash_orphan_dir(
+                    &staging,
+                    "processing_1",
+                    &[(9000..9100, lifecycle_minute() - TimeDelta::minutes(10))],
+                );
+                lifecycle_push_ids(&staging, 0..1000);
+                let mut violations = Vec::new();
+                let mut harness = ConversionHarness::install(&staging);
+
+                let claimed = harness.gate(on_thread("shutdown", "ConversionClaimed"));
+                let shutdown = spawn_named("shutdown", {
+                    let staging = staging.clone();
+                    move || staging.flush_and_convert(false, true, &None)
+                });
+                let groups = claimed_groups(harness.wait("shutdown claim", |thread, phase| {
+                    thread == "shutdown" && phase_kind(phase) == "ConversionClaimed"
+                }));
+                assert_eq!(groups.len(), 1, "{case}: {groups:?}");
+                let temp = temp_output(&groups[0].0);
+                let shutdown_sources: HashSet<PathBuf> = groups[0].1.iter().cloned().collect();
+                let shutdown_bytes = file_contents(&shutdown_sources);
+                let held = harness.gate(temp_output_phase(held_at, temp.clone()));
+                harness.release(claimed);
+                harness.wait("held temporary output", |_, phase| {
+                    phase_kind(phase) == held_at
+                });
+                let temp_inode = inode(&temp);
+                let temp_bytes = fs::read(&temp).ok();
+                if temp_inode.is_none() {
+                    violations.push(format!("{case}: temporary output missing at {temp:?}"));
+                }
+                if changed_files(&shutdown_bytes) != Vec::<PathBuf>::new() {
+                    violations.push(format!("{case}: sources changed before publication"));
+                }
+
+                let thread = competitor;
+                let run = spawn_named(thread, {
+                    let staging = staging.clone();
+                    move || {
+                        if competitor == "init" {
+                            staging.flush_and_convert(true, false, &None)
+                        } else {
+                            staging.prepare_startup_sync(None).unwrap().execute()
+                        }
+                    }
+                });
+                if let Err(err) = run.join().unwrap() {
+                    violations.push(format!("{case}: competitor failed: {err}"));
+                }
+                if harness.recovery_candidates_of(thread).contains(&temp) {
+                    violations.push(format!("{case}: recovery selected live output {temp:?}"));
+                }
+                if inode(&temp) != temp_inode || fs::read(&temp).ok() != temp_bytes {
+                    violations.push(format!(
+                        "{case}: live output {temp:?} was removed or replaced"
+                    ));
+                }
+                let stolen: Vec<_> = harness
+                    .claimed_sources_of(thread)
+                    .intersection(&shutdown_sources)
+                    .cloned()
+                    .collect();
+                if !stolen.is_empty() {
+                    violations.push(format!("{case}: competitor claimed {stolen:?}"));
+                }
+                let changed = changed_files(&shutdown_bytes);
+                if !changed.is_empty() {
+                    violations.push(format!(
+                        "{case}: sources removed before publication: {changed:?}"
+                    ));
+                }
+
+                harness.release(held);
+                if let Err(err) = shutdown.join().unwrap() {
+                    violations.push(format!("{case}: shutdown publication failed: {err}"));
+                }
+                if fs::metadata(&groups[0].0).is_err() {
+                    violations.push(format!("{case}: {:?} was not published", groups[0].0));
+                }
+                violations.extend(id_mismatch(
+                    &format!("{case}: final"),
+                    &published_ids(&staging),
+                    &sorted_ids(&[0..1000, 9000..9100]),
+                ));
+                let leftovers = staging_leftovers(&staging);
+                if !leftovers.is_empty() {
+                    violations.push(format!("{case}: left behind: {leftovers:?}"));
+                }
+                assert!(violations.is_empty(), "{violations:#?}");
+            }
+        }
+    }
+
+    /// A startup plan is prepared on one thread and executed later. Until it
+    /// is executed or dropped, the direct init entries (`flush_and_convert`,
+    /// `prepare_parquet`, `convert_disk_files_to_parquet`) and shutdown sync
+    /// must not convert its sources. A dropped plan releases them for retry.
+    #[test]
+    fn deferred_startup_plan_owns_its_sources_until_executed_or_dropped() {
+        for finish in ["execute", "drop"] {
+            let temp_dir = TempDir::new().unwrap();
+            let staging = lifecycle_stream(&temp_dir);
+            crash_orphan_dir(
+                &staging,
+                "processing_1",
+                &[
+                    (9000..9100, lifecycle_minute() - TimeDelta::minutes(10)),
+                    (9100..9200, lifecycle_minute() - TimeDelta::minutes(11)),
+                ],
+            );
+            let mut violations = Vec::new();
+            let mut harness = ConversionHarness::install(&staging);
+
+            let plan = spawn_named("planner", {
+                let staging = staging.clone();
+                move || staging.prepare_startup_sync(None).unwrap()
+            })
+            .join()
+            .unwrap();
+            let plan_sources = harness.claimed_sources_of("planner");
+            assert_eq!(plan_sources.len(), 2, "{finish}: {plan_sources:?}");
+            let plan_bytes = file_contents(&plan_sources);
+
+            // The init entry, held after opening readers if it took the plan's
+            // sources, so an overlap converts both copies concurrently.
+            let claimed = harness.gate(on_thread("init", "ConversionClaimed"));
+            let init = spawn_named("init", {
+                let staging = staging.clone();
+                move || staging.flush_and_convert(true, false, &None)
+            });
+            let groups = claimed_groups(harness.wait("init claim", |thread, phase| {
+                thread == "init" && phase_kind(phase) == "ConversionClaimed"
+            }));
+            let overlap = groups
+                .iter()
+                .any(|(_, sources)| sources.iter().any(|source| plan_sources.contains(source)));
+            let outputs: Vec<PathBuf> = groups.iter().map(|(output, _)| output.clone()).collect();
+            let mut held = Vec::new();
+            if overlap {
+                violations.push(format!("{finish}: init claimed the plan's sources"));
+                for _ in &outputs {
+                    held.push(harness.gate(readers_opened_for(outputs.clone())));
+                }
+            }
+            harness.release(claimed);
+            let init = if overlap {
+                // Init converts its groups on Rayon workers.
+                for _ in &outputs {
+                    harness.wait("init readers", |_, phase| {
+                        matches!(phase, LifecyclePhase::ConversionReadersOpened { output, .. } if outputs.contains(output))
+                    });
+                }
+                Some(init)
+            } else {
+                if let Err(err) = init.join().unwrap() {
+                    violations.push(format!("{finish}: init failed: {err}"));
+                }
+                None
+            };
+
+            if !overlap {
+                for entry in ["prepare_parquet", "convert_disk_files_to_parquet"] {
+                    let result = spawn_named(entry, {
+                        let staging = staging.clone();
+                        move || {
+                            if entry == "prepare_parquet" {
+                                staging.prepare_parquet(true, false, &None)
+                            } else {
+                                staging
+                                    .convert_disk_files_to_parquet(None, None, true, false, &None)
+                                    .map(drop)
+                            }
+                        }
+                    })
+                    .join()
+                    .unwrap();
+                    if let Err(err) = result {
+                        violations.push(format!("{finish}: {entry} failed: {err}"));
+                    }
+                    if !harness.claimed_sources_of(entry).is_disjoint(&plan_sources) {
+                        violations.push(format!("{finish}: {entry} claimed the plan's sources"));
+                    }
+                }
+                // Shutdown sync converts new files meanwhile.
+                lifecycle_push_ids(&staging, 0..100);
+                if let Err(err) = staging.flush_and_convert(false, true, &None) {
+                    violations.push(format!("{finish}: shutdown sync failed: {err}"));
+                }
+                let changed = changed_files(&plan_bytes);
+                if !changed.is_empty() {
+                    violations.push(format!(
+                        "{finish}: plan sources changed while it was pending: {changed:?}"
+                    ));
+                }
+                violations.extend(id_mismatch(
+                    &format!("{finish}: published while the plan is pending"),
+                    &published_ids(&staging),
+                    &sorted_ids(&[0..100]),
+                ));
+            } else {
+                lifecycle_push_ids(&staging, 0..100);
+                staging.flush_and_convert(false, true, &None).unwrap();
+            }
+
+            if finish == "execute" {
+                if let Err(err) = plan.execute() {
+                    violations.push(format!("{finish}: plan failed: {err}"));
+                }
+            } else {
+                drop(plan);
+            }
+            for gate in held {
+                harness.release(gate);
+            }
+            if let Some(init) = init
+                && let Err(err) = init.join().unwrap()
+            {
+                violations.push(format!("{finish}: init failed: {err}"));
+            }
+            if finish == "drop" {
+                // The dropped plan's sources are free for the next init.
+                staging.flush_and_convert(true, false, &None).unwrap();
+            }
+            violations.extend(id_mismatch(
+                &format!("{finish}: final"),
+                &published_ids(&staging),
+                &sorted_ids(&[0..100, 9000..9200]),
+            ));
+            let leftovers = staging_leftovers(&staging);
+            if !leftovers.is_empty() {
+                violations.push(format!("{finish}: left behind: {leftovers:?}"));
+            }
+            assert!(violations.is_empty(), "{violations:#?}");
+        }
+    }
+
+    /// A shutdown conversion fails to rename one output and fails to validate
+    /// another; a startup plan panics while converting. Each must keep its
+    /// sources, leave no temporary output, and release only what it claimed:
+    /// the init entry must retry the failed shutdown directory while the
+    /// pending plan's directories stay untouched, and a later startup retry
+    /// converts those. Every id ends up committed exactly once.
+    #[test]
+    fn failed_conversions_retain_sources_and_release_only_their_own_claims() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        crash_orphan_dir(
+            &staging,
+            "processing_1",
+            &[
+                (9000..9100, lifecycle_minute() - TimeDelta::minutes(10)),
+                (9100..9200, lifecycle_minute() - TimeDelta::minutes(11)),
+            ],
+        );
+        let mut violations = Vec::new();
+        let mut harness = ConversionHarness::install(&staging);
+        let plan = spawn_named("planner", {
+            let staging = staging.clone();
+            move || staging.prepare_startup_sync(None).unwrap()
+        })
+        .join()
+        .unwrap();
+        let plan_sources = harness.claimed_sources_of("planner");
+        assert_eq!(plan_sources.len(), 2, "{plan_sources:?}");
+        let plan_bytes = file_contents(&plan_sources);
+
+        lifecycle_push_ids(&staging, 0..100);
+        push_ids_at(
+            &staging,
+            100..200,
+            lifecycle_minute() - TimeDelta::minutes(2),
+        );
+        let claimed = harness.gate(on_thread("shutdown", "ConversionClaimed"));
+        let shutdown = spawn_named("shutdown", {
+            let staging = staging.clone();
+            move || staging.flush_and_convert(false, true, &None)
+        });
+        let groups = claimed_groups(harness.wait("shutdown claim", |thread, phase| {
+            thread == "shutdown" && phase_kind(phase) == "ConversionClaimed"
+        }));
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        let shutdown_sources: HashSet<PathBuf> = groups
+            .iter()
+            .flat_map(|(_, sources)| sources.clone())
+            .collect();
+        let shutdown_bytes = file_contents(&shutdown_sources);
+        let rename_fails = temp_output(&groups[0].0);
+        let validation_fails = temp_output(&groups[1].0);
+        let written = harness.gate(temp_output_phase(
+            "ParquetPartWritten",
+            rename_fails.clone(),
+        ));
+        let closed = harness.gate(temp_output_phase(
+            "ParquetPartClosed",
+            validation_fails.clone(),
+        ));
+        harness.release(claimed);
+        // The groups convert in parallel, so handle them in either order.
+        for _ in 0..2 {
+            let phase = harness.wait("injected failure point", |_, phase| {
+                *phase == LifecyclePhase::ParquetPartWritten(rename_fails.clone())
+                    || *phase == LifecyclePhase::ParquetPartClosed(validation_fails.clone())
+            });
+            if !changed_files(&shutdown_bytes).is_empty() {
+                violations.push(format!("sources changed before publication at {phase:?}"));
+            }
+            if let LifecyclePhase::ParquetPartWritten(temp) = phase {
+                // The final rename will fail.
+                fs::remove_file(&temp).unwrap();
+                harness.release(written);
+            } else {
+                // Validation will fail.
+                File::create(&validation_fails).unwrap();
+                harness.release(closed);
+            }
+        }
+        if shutdown.join().unwrap().is_ok() {
+            violations.push("shutdown reported success for a failed rename".to_owned());
+        }
+        let changed = changed_files(&shutdown_bytes);
+        if !changed.is_empty() {
+            violations.push(format!("failed conversion lost sources: {changed:?}"));
+        }
+        if !published_ids(&staging).is_empty() {
+            violations.push("failed conversion published output".to_owned());
+        }
+        for temp in [&rename_fails, &validation_fails] {
+            if temp.exists() {
+                violations.push(format!("failed conversion left {temp:?}"));
+            }
+        }
+
+        // Init retries the failed shutdown directory, not the pending plan's.
+        let init = spawn_named("init", {
+            let staging = staging.clone();
+            move || staging.flush_and_convert(true, false, &None)
+        });
+        if let Err(err) = init.join().unwrap() {
+            violations.push(format!("init retry failed: {err}"));
+        }
+        let init_sources = harness.claimed_sources_of("init");
+        if init_sources != shutdown_sources {
+            violations.push(format!(
+                "init claimed {init_sources:?}, expected the released {shutdown_sources:?}"
+            ));
+        }
+        let changed = changed_files(&plan_bytes);
+        if !changed.is_empty() {
+            violations.push(format!("pending plan sources changed: {changed:?}"));
+        }
+        violations.extend(id_mismatch(
+            "after init retry",
+            &published_ids(&staging),
+            &sorted_ids(&[0..200]),
+        ));
+        let retried = published_files_by_name(&staging);
+
+        // The plan panics in conversion; its claim must be released.
+        harness.panic_at(on_thread("startup", "ConversionReadersOpened"));
+        let startup = spawn_named("startup", move || plan.execute());
+        if startup.join().is_ok() {
+            violations.push("startup plan did not reach its injected panic".to_owned());
+        }
+        let changed = changed_files(&plan_bytes);
+        if !changed.is_empty() {
+            violations.push(format!("panicked plan lost sources: {changed:?}"));
+        }
+        if published_files_by_name(&staging) != retried {
+            violations.push("panicked plan changed published outputs".to_owned());
+        }
+
+        let retry = spawn_named("startup-retry", {
+            let staging = staging.clone();
+            move || staging.prepare_startup_sync(None).unwrap().execute()
+        });
+        if let Err(err) = retry.join().unwrap() {
+            violations.push(format!("startup retry failed: {err}"));
+        }
+        if harness.claimed_sources_of("startup-retry") != plan_sources {
+            violations.push("startup retry did not reclaim the panicked plan's sources".to_owned());
+        }
+        violations.extend(id_mismatch(
+            "final",
+            &published_ids(&staging),
+            &sorted_ids(&[0..200, 9000..9200]),
+        ));
+        let leftovers = staging_leftovers(&staging);
+        if !leftovers.is_empty() {
+            violations.push(format!("left behind: {leftovers:?}"));
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    fn published_files_by_name(staging: &StreamRef) -> HashMap<PathBuf, Vec<u8>> {
+        staging
+            .parquet_files()
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    /// Recovery publishes a legacy bare `.part` orphan under the `.arrows`
+    /// name that a new writer for the same key also publishes to when it is
+    /// dropped under the writer lock (as push does when a first write fails).
+    /// Neither publication may replace the other.
+    #[test]
+    fn recovered_legacy_part_never_replaces_a_concurrent_publication() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        lifecycle_push_ids(&staging, 9000..9100);
+        let orphan = part_files(&staging).pop().unwrap();
+        std::mem::forget(staging.writer.lock().unwrap().take_flushable_disk(true));
+        // `name.data.arrows.part` -> legacy `name.data.part`.
+        let legacy = orphan
+            .with_extension("")
+            .with_extension(PART_FILE_EXTENSION);
+        fs::rename(&orphan, &legacy).unwrap();
+        let shared_name = orphan.with_extension("");
+        let mut violations = Vec::new();
+        let mut harness = ConversionHarness::install(&staging);
+
+        let publishing = harness.gate(on_thread("recovery", "RecoveryPublishing"));
+        let recovery = spawn_named("recovery", {
+            let staging = staging.clone();
+            move || staging.recover_orphan_part_files()
+        });
+        let chosen = harness.wait("recovery publishing", |thread, phase| {
+            thread == "recovery" && phase_kind(phase) == "RecoveryPublishing"
+        });
+        assert_eq!(
+            chosen,
+            LifecyclePhase::RecoveryPublishing(shared_name.clone())
+        );
+
+        let publish_competitor = {
+            let staging = staging.clone();
+            let base = shared_name.clone();
+            move || {
+                let _writer = staging.writer.lock().unwrap();
+                let schema = Schema::new(vec![
+                    Field::new(
+                        DEFAULT_TIMESTAMP_KEY,
+                        DataType::Timestamp(TimeUnit::Millisecond, None),
+                        false,
+                    ),
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("value", DataType::Utf8, false),
+                ]);
+                let batch = RecordBatch::try_new(
+                    Arc::new(schema.clone()),
+                    vec![
+                        Arc::new(TimestampMillisecondArray::from_iter_values(0..100)),
+                        Arc::new(Int32Array::from_iter_values(0..100)),
+                        Arc::new(StringArray::from_iter_values(
+                            (0..100).map(|id| format!("payload-{id}")),
+                        )),
+                    ],
+                )
+                .unwrap();
+                let range = TimeRange::granularity_range(
+                    lifecycle_minute().and_local_timezone(Utc).unwrap(),
+                    OBJECT_STORE_DATA_GRANULARITY,
+                );
+                let mut writer =
+                    crate::parseable::staging::writer::DiskWriter::try_new(base, &schema, range)
+                        .unwrap();
+                writer.write(&batch).unwrap();
+            }
+        };
+        let competitor = match staging.writer.try_lock() {
+            // Recovery does not hold the writer lock across its name choice.
+            Ok(guard) => {
+                drop(guard);
+                publish_competitor();
+                None
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Some(spawn_named("ingest", publish_competitor))
+            }
+            Err(err) => panic!("{err}"),
+        };
+        harness.release(publishing);
+        recovery.join().unwrap();
+        if let Some(competitor) = competitor {
+            competitor.join().unwrap();
+        }
+
+        if staging.arrow_files().len() != 2 {
+            violations.push(format!(
+                "expected two published files, found {:?}",
+                staging.arrow_files()
+            ));
+        }
+        violations.extend(id_mismatch(
+            "final",
+            &convert_and_read_ids(&staging),
+            &sorted_ids(&[0..100, 9000..9100]),
+        ));
+        let leftovers = staging_leftovers(&staging);
+        if !leftovers.is_empty() {
+            violations.push(format!("left behind: {leftovers:?}"));
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// A claim releases only the entries still registered to it, and a
+    /// claimed processing-directory name is never handed out again, even
+    /// after its owner has removed the directory.
+    #[test]
+    fn conversion_claim_releases_only_its_own_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = lifecycle_stream(&temp_dir);
+        fs::create_dir_all(&staging.data_path).unwrap();
+        let minute = 7;
+        let preferred = Stream::inprocess_folder(&staging.data_path, minute);
+
+        let mut first = ConversionClaim::new(&staging.conversion_claims);
+        assert_eq!(
+            staging
+                .claim_new_inprocess_folder(&mut first, minute)
+                .unwrap(),
+            preferred
+        );
+        // The owner finished with the directory but still holds the claim.
+        fs::remove_dir(&preferred).unwrap();
+        let mut second = ConversionClaim::new(&staging.conversion_claims);
+        let second_dir = staging
+            .claim_new_inprocess_folder(&mut second, minute)
+            .unwrap();
+        assert_ne!(second_dir, preferred);
+        // Startup cannot take a directory a running conversion owns.
+        let mut startup = ConversionClaim::new(&staging.conversion_claims);
+        assert!(
+            staging
+                .claim_unowned_inprocess_dirs(&mut startup)
+                .is_empty()
+        );
+
+        // A stale entry for `first` that now belongs to `second` survives
+        // `first` being dropped.
+        let output = staging.data_path.join("x.data.ulid.parquet.part");
+        first.outputs.push(output.clone());
+        lock_conversion_claims(&staging.conversion_claims)
+            .outputs
+            .insert(output.clone(), second.id);
+        drop(first);
+        {
+            let registry = lock_conversion_claims(&staging.conversion_claims);
+            assert!(!registry.dirs.contains_key(&preferred));
+            assert_eq!(registry.dirs.get(&second_dir), Some(&second.id));
+            assert_eq!(registry.outputs.get(&output), Some(&second.id));
+        }
+        second.outputs.push(output.clone());
+        drop(second);
+        drop(startup);
+        let registry = lock_conversion_claims(&staging.conversion_claims);
+        assert!(registry.dirs.is_empty());
+        assert!(registry.outputs.is_empty());
     }
 }

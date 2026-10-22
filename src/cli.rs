@@ -166,13 +166,12 @@ pub struct Options {
     )]
     pub allow_origins: Vec<Url>,
 
-    // Unset means native. Kept apart so a build without the native frontend only
-    // warns when the operator asked for it.
+    // Retained to reject an obsolete classic override with an actionable error.
     #[arg(
         long,
         env = "P_UI_ROOT",
         value_parser = validation::ui_root,
-        help = "UI served at /: native (default), or classic to restore the Prism UI with the native frontend under /next"
+        help = "UI served at /: native (default). The classic UI has been removed"
     )]
     pub ui_root: Option<UiRoot>,
 

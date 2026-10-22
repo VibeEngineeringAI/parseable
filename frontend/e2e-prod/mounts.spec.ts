@@ -11,14 +11,15 @@ function problems(page: Page): string[] {
   return seen;
 }
 
-for (const mount of ['', '/next']) {
-  test.describe(`the production build mounted at ${mount || '/'}`, () => {
+for (const entry of ['', '/next']) {
+  const mount = '';
+  test.describe(`the production build opened from ${entry || '/'}`, () => {
     test('opens the shared agent setup guide from Get started under its mount', async ({
       page,
     }) => {
       const failed = problems(page);
       await page.addInitScript(() => sessionStorage.setItem('parseable-mode', 'demo'));
-      await page.goto(`${mount}/onboarding`);
+      await page.goto(`${entry}/onboarding`);
       await page.getByRole('link', { name: 'Set up Claude Code or Codex' }).click();
       await expect(page).toHaveURL(`${mount}/agents?setup=1`);
       const guide = page.getByRole('dialog', { name: 'Set up agent telemetry' });
@@ -45,7 +46,7 @@ for (const mount of ['', '/next']) {
 
       // A hard load two segments deep: relative asset URLs resolve against
       // `<base>`, not the document.
-      await page.goto(`${mount}/dashboards/01M4J000000000000000000002`);
+      await page.goto(`${entry}/dashboards/01M4J000000000000000000002`);
       await expect(page.locator('[data-tile-id]').first()).toBeVisible();
       await page.getByRole('link', { name: 'Logs', exact: true }).click();
       await expect(page).toHaveURL(`${mount}/logs`);
@@ -54,10 +55,10 @@ for (const mount of ['', '/next']) {
       await expect(page).toHaveURL(new RegExp(`^[^?]*${mount}/metrics(\\?|$)`));
       await expect(page.getByRole('heading').first()).toBeVisible();
 
-      await page.goto(`${mount}/traces/explore/demo_traces`);
+      await page.goto(`${entry}/traces/explore/demo_traces`);
       await expect(page.getByRole('heading', { name: 'Traces', exact: true })).toBeVisible();
       await expect(page.getByRole('button', { name: /Open trace/ }).first()).toBeVisible();
-      await page.goto(`${mount}/apm/demo_traces/checkout`);
+      await page.goto(`${entry}/apm/demo_traces/checkout`);
       await expect(page.getByRole('heading', { name: 'checkout', exact: true })).toBeVisible();
       await expect(page.getByRole('link', { name: 'Explore service traces' })).toHaveAttribute(
         'href',
@@ -77,7 +78,7 @@ for (const mount of ['', '/next']) {
         ['/settings/llm-key', 'LLM settings'],
         ['/settings/network-access', 'Network access'],
       ]) {
-        await page.goto(`${mount}${path}`);
+        await page.goto(`${entry}${path}`);
         await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
       }
       await expect(page.getByLabel('Allowed domains', { exact: true })).toBeVisible();
@@ -90,20 +91,20 @@ for (const mount of ['', '/next']) {
     });
 
     test('resolves against its mount whichever path serves index.html', async ({ page }) => {
-      for (const path of [`${mount}/`, `${mount}/index.html`, `${mount}/a/b/c`]) {
+      for (const path of [`${entry}/`, `${entry}/index.html`, `${entry}/a/b/c`]) {
         const response = await page.request.get(path);
         expect(response.status(), path).toBe(200);
         expect(await response.text(), path).toContain(`<base href="${mount}/"`);
       }
       const failed = problems(page);
-      await page.goto(`${mount}/index.html`);
+      await page.goto(`${entry}/index.html`);
       expect(await page.evaluate(() => document.baseURI)).toMatch(new RegExp(`${mount}/$`));
       await expect(page.locator('#root > *').first()).toBeVisible();
       expect(failed).toEqual([]);
     });
 
     test('links a favicon that resolves under its mount', async ({ page, request }) => {
-      await page.goto(`${mount}/logs/explore/application_logs`);
+      await page.goto(`${entry}/logs/explore/application_logs`);
       const icons = await page
         .locator('link[rel="icon"]')
         .evaluateAll((links) => links.map((link) => (link as HTMLLinkElement).href));
@@ -117,3 +118,15 @@ for (const mount of ['', '/next']) {
     });
   });
 }
+
+test('legacy links preserve queries, while stale prefixed assets fail', async ({ request }) => {
+  const redirect = await request.get('/next/oidc-not-configured?returnTo=%2Flogs', {
+    maxRedirects: 0,
+  });
+  expect(redirect.status()).toBe(307);
+  expect(redirect.headers().location).toBe('/oidc-not-configured?returnTo=%2Flogs');
+  expect(redirect.headers()['cache-control']).toBe('no-store');
+  const asset = await request.get('/next/assets/LogsPage-gone.js', { maxRedirects: 0 });
+  expect(asset.status()).toBe(404);
+  expect(asset.headers().location).toBeUndefined();
+});

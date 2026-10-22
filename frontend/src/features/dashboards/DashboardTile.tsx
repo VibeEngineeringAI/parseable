@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ActionsMenu, Button, Card, Dialog } from '../../components/ui';
-import { ExternalLink } from 'lucide-react';
-import { classicUiAvailable, classicUiPath } from '../../lib/classicUi';
 import { useApp } from '../../app/AppProvider';
 import { useDashboardQuery } from './DashboardRefresh';
 import { timeBounds } from '../../lib/query';
@@ -80,7 +78,7 @@ export function DashboardTile({
   onAction: (action: 'edit' | 'duplicate' | 'earlier' | 'later' | 'delete', tile: Tile) => void;
   onZoomRange?: TimeSeriesChartProps['onZoomRange'];
 }) {
-  const { client, mode } = useApp(),
+  const { client } = useApp(),
     navigate = useNavigate();
   const [viewQuery, setViewQuery] = useState(false);
   const supported = knownTile(tile) && supportedCharts.includes(text(tile.chartType, 'timeseries'));
@@ -160,16 +158,6 @@ export function DashboardTile({
     results.data ??
     (lastResult?.key === resultKey && lastResult.client === client ? lastResult : undefined);
   const handoff = tileHandoffs(tile, variables, values, effectiveBounds, promqlAlerts);
-  const classic =
-    classicUiAvailable && mode !== 'demo'
-      ? classicUiPath(`/dashboards/${encodeURIComponent(dashboardId)}`)
-      : undefined;
-  const classicLink = classic && (
-    <a className="text-link" href={classic} target="_blank" rel="noopener noreferrer">
-      Open in classic UI <ExternalLink size={14} aria-hidden="true" />
-      <span className="sr-only"> (opens in a new tab)</span>
-    </a>
-  );
   return (
     <Card
       className="dashboard-server-tile"
@@ -265,7 +253,6 @@ export function DashboardTile({
               {typeLabel(tile.tileType)} tiles cannot be shown in this UI. The tile is kept
               unchanged.
             </p>
-            {classicLink}
           </div>
         ) : !supported ? (
           <div className="dashboard-placeholder">
@@ -274,7 +261,6 @@ export function DashboardTile({
               unchanged.
             </p>
             <pre>{handoff.queries.join('\n\n') || JSON.stringify(tile.chartQuery, null, 2)}</pre>
-            {classicLink}
           </div>
         ) : unavailable ? (
           <TileChart
