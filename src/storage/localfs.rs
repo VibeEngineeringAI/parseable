@@ -257,6 +257,27 @@ impl ObjectStorage for LocalFS {
         tenant_id: &Option<String>,
     ) -> Result<(), ObjectStorageError> {
         let mut file = OpenOptions::new().read(true).open(path).await?;
+        if !is_dashboard_metadata(key) {
+            let to_path = self.path_in_root(key);
+            match copy_into_new_file(file, &to_path).await? {
+                None => {
+                    let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+                    increment_files_scanned_in_object_store_calls_by_date(
+                        "PUT",
+                        1,
+                        &Utc::now().date_naive().to_string(),
+                        tenant_str,
+                    );
+                    increment_object_store_calls_by_date(
+                        "PUT",
+                        &Utc::now().date_naive().to_string(),
+                        tenant_str,
+                    );
+                    return Ok(());
+                }
+                Some(source) => file = source,
+            }
+        }
         let mut data = Vec::new();
         file.read_to_end(&mut data).await?;
         self.put_object(key, data.into(), tenant_id).await
@@ -1120,6 +1141,55 @@ async fn dir_name(entry: DirEntry) -> Result<Option<String>, ObjectStorageError>
         Ok(None)
     }
 }
+
+// BEGIN localfs-copy helper (extracted verbatim by the standalone upload harness)
+
+/// Streams a regular `source` file into `to_path` without buffering it in memory, but
+/// only when `to_path` does not exist yet.
+///
+/// Returns the untouched source handle (`Some`) when the caller must fall back to the
+/// buffered read + `put_object` write: non-regular sources, which the buffered path
+/// rejects before touching the destination, and every case where a new destination
+/// cannot be created exclusively (existing objects, directories, symlinks, aliases of
+/// the source itself), so overwrite and error behavior stays the buffered one. A copy
+/// failure removes the partially written new file and returns the copy error.
+async fn copy_into_new_file(
+    source: fs::File,
+    to_path: &Path,
+) -> Result<Option<fs::File>, ObjectStorageError> {
+    if !source.metadata().await.is_ok_and(|meta| meta.is_file()) {
+        return Ok(Some(source));
+    }
+    if let Some(parent) = to_path.parent()
+        && fs::create_dir_all(parent).await.is_err()
+    {
+        // The buffered path reads first, so a source read failure must
+        // retain priority over an invalid destination parent.
+        return Ok(Some(source));
+    }
+    let mut source = source.into_std().await;
+    let to_path = to_path.to_path_buf();
+    let copied = tokio::task::spawn_blocking(move || {
+        let mut dest = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&to_path)
+        {
+            Ok(dest) => dest,
+            Err(_) => return Ok(Some(source)),
+        };
+        if let Err(err) = std::io::copy(&mut source, &mut dest) {
+            drop(dest);
+            let _ = std::fs::remove_file(&to_path);
+            return Err(err);
+        }
+        Ok(None)
+    })
+    .await??;
+    Ok(copied.map(fs::File::from_std))
+}
+
+// END localfs-copy helper
 
 impl From<fs_extra::error::Error> for ObjectStorageError {
     fn from(e: fs_extra::error::Error) -> Self {
@@ -2101,5 +2171,193 @@ mod conditional_metadata_tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_dir(locks).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod upload_multipart_tests {
+    use super::*;
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn upload(root: &Path, key: &str, source: &Path) -> Result<(), ObjectStorageError> {
+        LocalFS::new(root.to_path_buf())
+            .upload_multipart(RelativePath::new(key), source, &None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn new_object_is_streamed_with_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staging.parquet");
+        let data = pattern(3 * 1024 * 1024 + 5);
+        std::fs::write(&source, &data).unwrap();
+        let root = dir.path().join("store");
+
+        upload(&root, "stream/date=x/file.parquet", &source)
+            .await
+            .unwrap();
+
+        let object = root.join("stream/date=x/file.parquet");
+        assert_eq!(std::fs::read(&object).unwrap(), data);
+        assert_eq!(std::fs::read(&source).unwrap(), data);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let written = dir.path().join("written");
+            std::fs::write(&written, b"x").unwrap();
+            assert_eq!(
+                std::fs::metadata(&object).unwrap().permissions().mode(),
+                std::fs::metadata(&written).unwrap().permissions().mode()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_new_destinations_are_streamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"payload").unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::write(&existing, b"old").unwrap();
+
+        let open = || fs::File::open(&source);
+        let streamed = copy_into_new_file(open().await.unwrap(), &dir.path().join("a/new"))
+            .await
+            .unwrap();
+        assert!(streamed.is_none());
+        assert_eq!(std::fs::read(dir.path().join("a/new")).unwrap(), b"payload");
+
+        let fallback = copy_into_new_file(open().await.unwrap(), &existing)
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        fallback.unwrap().read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"payload");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn empty_source_creates_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("empty");
+        std::fs::write(&source, b"").unwrap();
+
+        upload(dir.path(), "out/empty", &source).await.unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("out/empty")).unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn existing_object_is_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::create_dir_all(dir.path().join("out")).unwrap();
+        std::fs::write(dir.path().join("out/object"), b"much longer old object").unwrap();
+
+        upload(dir.path(), "out/object", &source).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("out/object")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_aliasing_destination_keeps_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("same");
+        std::fs::write(&source, b"payload").unwrap();
+
+        upload(dir.path(), "same", &source).await.unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destination_symlink_to_source_keeps_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"payload").unwrap();
+        std::os::unix::fs::symlink(&source, dir.path().join("link")).unwrap();
+
+        upload(dir.path(), "link", &source).await.unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_destination_fails_and_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"payload").unwrap();
+        std::fs::create_dir_all(dir.path().join("out/object")).unwrap();
+
+        let err = upload(dir.path(), "out/object", &source).await.unwrap_err();
+
+        assert!(matches!(err, ObjectStorageError::IoError(_)), "{err:?}");
+        assert!(dir.path().join("out/object").is_dir());
+    }
+
+    #[tokio::test]
+    async fn directory_source_fails_before_creating_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source-dir");
+        std::fs::create_dir(&source).unwrap();
+
+        let err = upload(dir.path(), "out/object", &source).await.unwrap_err();
+
+        assert!(matches!(err, ObjectStorageError::IoError(_)), "{err:?}");
+        assert!(!dir.path().join("out").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_source_fails_before_creating_destination() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = upload(dir.path(), "out/object", &dir.path().join("missing"))
+            .await
+            .unwrap_err();
+
+        match err {
+            ObjectStorageError::IoError(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::NotFound)
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+        assert!(!dir.path().join("out").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_read_error_precedes_invalid_destination_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blocked"), b"not a directory").unwrap();
+        // Linux exposes this as a regular file, but offset zero is unreadable.
+        let source = Path::new("/proc/self/mem");
+        let baseline = std::fs::read(source).unwrap_err();
+        let err = upload(dir.path(), "blocked/object", source)
+            .await
+            .unwrap_err();
+        match err {
+            ObjectStorageError::IoError(err) => {
+                assert_eq!(err.raw_os_error(), baseline.raw_os_error());
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("blocked")).unwrap(),
+            b"not a directory"
+        );
     }
 }
