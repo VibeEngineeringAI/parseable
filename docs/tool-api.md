@@ -203,17 +203,22 @@ traces dataset:
 }
 ```
 
-`dataset`, `startTime` and `endTime` are required. `groupBy` takes up to 5
+`dataset`, `startTime` and `endTime` are required. `startTime` must be before
+`endTime`; both are resolved once and applied as exact, half-open bounds (start
+inclusive, end exclusive) on the dataset's time partition, so subminute ranges
+keep their full precision. `groupBy` takes up to 5
 exact field names. `filters` maps exact field names to JSON scalars: strings,
 numbers and booleans test equality, and `null` tests `IS NULL`. `bucketCount`
 is 1–100, default 60. It approximates the number of `DATE_BIN` buckets over the
-dataset's time partition, or `p_timestamp` if none is configured. The dataset
+dataset's time partition, or `p_timestamp` if none is configured. Buckets are
+whole seconds, sized from the exact range and aligned to `startTime`. The dataset
 must have traces telemetry and contain `span_span_id` and `span_trace_id`.
 Unknown fields are rejected. `span_count` is `COUNT(DISTINCT span_span_id)` and
 `trace_count` is `COUNT(DISTINCT span_trace_id)`, so duplicate span rows are
 not double counted. The result contains the exact executed SQL as `query`,
-along with `bucketInterval`, `semantics` and up to 500 `rows`. Clients can
-rerun that SQL unchanged, for example in a dashboard tile.
+along with `bucketInterval`, `semantics` and up to 500 `rows`. The SQL embeds the exact
+time bounds. Clients can rerun it unchanged, for example in a dashboard tile,
+provided the query's time range covers those bounds.
 
 ## Argument schema validation
 

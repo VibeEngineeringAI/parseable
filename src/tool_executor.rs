@@ -1347,24 +1347,36 @@ async fn execute_trace_tool(
     Ok(json!({ "results": results, "errors": errors }))
 }
 
-fn time_bucket_interval(start: &str, end: &str, bucket_count: u64) -> String {
-    let seconds = TimeRange::parse_human_time(start, end)
-        .map(|range| (range.end - range.start).num_seconds().max(1) as u64)
-        .unwrap_or(3_600);
+fn time_bucket_interval(range: &TimeRange, bucket_count: u64) -> String {
+    let seconds = (range.end - range.start).num_seconds().max(1) as u64;
     format!("{} seconds", (seconds / bucket_count.max(1)).max(1))
+}
+
+fn trace_activity_range(arguments: &Value, now: DateTime<Utc>) -> Result<TimeRange, String> {
+    let start = parse_start_time_expression(required_string(arguments, "startTime")?, now)
+        .map_err(|error| format!("invalid trace activity start time: {error}"))?;
+    let end = parse_time_expression(required_string(arguments, "endTime")?, now)
+        .map_err(|error| format!("invalid trace activity end time: {error}"))?;
+    if start >= end {
+        return Err("trace activity start time must be before end time".to_owned());
+    }
+    Ok(TimeRange { start, end })
 }
 
 fn trace_activity_query(
     dataset: &str,
     time_field: &str,
     interval: &str,
+    range: &TimeRange,
     group_by: &[String],
     clauses: &[String],
 ) -> String {
+    let time_column = quote_identifier(time_field);
+    let start = quote_literal(&range.start.to_rfc3339());
+    // Bucket from the requested start so the first bucket is not partial.
     let bucket = format!(
-        "CAST(DATE_BIN({}, {}, TIMESTAMP '1970-01-01T00:00:00Z') AS TEXT)",
+        "CAST(DATE_BIN({}, {time_column}, TIMESTAMP {start}) AS TEXT)",
         quote_literal(interval),
-        quote_identifier(time_field),
     );
     let mut select = vec![format!("{bucket} AS \"time\"")];
     select.extend(group_by.iter().map(|field| quote_identifier(field)));
@@ -1374,10 +1386,17 @@ fn trace_activity_query(
         .map(|position| position.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let where_clause = clauses
-        .first()
-        .map(|_| format!(" WHERE {}", clauses.join(" AND ")))
-        .unwrap_or_default();
+    // The query API rounds its transport range to minutes, so keep the exact
+    // half-open requested range in the SQL.
+    let mut predicates = vec![
+        format!("{time_column} >= TIMESTAMP {start}"),
+        format!(
+            "{time_column} < TIMESTAMP {}",
+            quote_literal(&range.end.to_rfc3339())
+        ),
+    ];
+    predicates.extend(clauses.iter().cloned());
+    let where_clause = format!(" WHERE {}", predicates.join(" AND "));
     format!(
         "SELECT {} FROM {}{} GROUP BY {} ORDER BY 1 LIMIT 500",
         select.join(", "),
@@ -1488,29 +1507,36 @@ fn trace_activity_filter_clauses(
         .collect()
 }
 
+fn trace_activity_request(query: &str, range: &TimeRange) -> Result<query::Query, String> {
+    // Widen the minute-rounded transport envelope to cover the exact range.
+    let transport_end = truncate_to_minute(range.end)
+        .checked_add_signed(Duration::minutes(1))
+        .ok_or_else(|| "trace activity end time is outside the supported range".to_owned())?;
+    Ok(query::Query {
+        query: bounded_select(query)?,
+        start_time: truncate_to_minute(range.start).to_rfc3339(),
+        end_time: transport_end.to_rfc3339(),
+        send_null: true,
+        fields: false,
+        streaming: false,
+        filter_tags: None,
+    })
+}
+
 async fn execute_trace_activity_tool(
     arguments: &Value,
     context: OssToolContext<'_>,
 ) -> Result<Value, String> {
     let dataset = required_string(arguments, "dataset")?;
-    let start_time = required_string(arguments, "startTime")?;
-    let end_time = required_string(arguments, "endTime")?;
+    let range = trace_activity_range(arguments, Utc::now())?;
     let (fields, time_field) = trace_activity_fields(dataset, context).await?;
     let group_by = trace_activity_group_by(arguments, &fields)?;
     let clauses = trace_activity_filter_clauses(arguments, &fields)?;
     let bucket_count = bounded_integer(arguments, "bucketCount", 60, 1, 100);
-    let interval = time_bucket_interval(start_time, end_time, bucket_count);
-    let query = trace_activity_query(dataset, &time_field, &interval, &group_by, &clauses);
+    let interval = time_bucket_interval(&range, bucket_count);
+    let query = trace_activity_query(dataset, &time_field, &interval, &range, &group_by, &clauses);
     let response = query::query_internal(
-        query::Query {
-            query: bounded_select(&query)?,
-            start_time: start_time.to_owned(),
-            end_time: end_time.to_owned(),
-            send_null: true,
-            fields: false,
-            streaming: false,
-            filter_tags: None,
-        },
+        trace_activity_request(&query, &range)?,
         context.session_key,
         context.tenant_id,
     )
@@ -2086,6 +2112,7 @@ mod tests {
             "astronomy-shop-traces",
             "p_timestamp",
             "60 seconds",
+            &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z"),
             &["service.name".to_owned()],
             &[],
         );
@@ -2096,7 +2123,34 @@ mod tests {
         assert!(!query.contains("COUNT(*)"));
     }
 
+    fn trace_activity_test_range(start: &str, end: &str) -> crate::utils::time::TimeRange {
+        crate::utils::time::TimeRange {
+            start: start.parse().unwrap(),
+            end: end.parse().unwrap(),
+        }
+    }
+
     async fn run_trace_activity_fixture(group_by: &[String], clauses: &[String]) -> Vec<Value> {
+        let arguments = json!({
+            "startTime": "2026-10-22T00:00:00Z",
+            "endTime": "2026-10-22T00:02:00Z",
+        });
+        let (interval, rows) =
+            run_trace_activity_fixture_with(&arguments, 2, group_by, clauses).await;
+        assert_eq!(interval, "60 seconds");
+        rows
+    }
+
+    /// Runs the tool's request against a fixture, applying the query API's
+    /// minute-aligned transport range before the generated SQL.
+    async fn run_trace_activity_fixture_with(
+        arguments: &Value,
+        bucket_count: u64,
+        group_by: &[String],
+        clauses: &[String],
+    ) -> (String, Vec<Value>) {
+        let range = super::trace_activity_range(arguments, "2026-10-22T00:05:00Z".parse().unwrap())
+            .unwrap();
         let context = datafusion::prelude::SessionContext::new();
         let fixture = context
             .sql(
@@ -2111,21 +2165,44 @@ mod tests {
             )
             .await
             .unwrap();
+        let interval = super::time_bucket_interval(&range, bucket_count);
+        let request = super::trace_activity_request(
+            &trace_activity_query(
+                "traces",
+                "p_timestamp",
+                &interval,
+                &range,
+                group_by,
+                clauses,
+            ),
+            &range,
+        )
+        .unwrap();
+        let envelope =
+            crate::utils::time::TimeRange::parse_human_time(&request.start_time, &request.end_time)
+                .unwrap();
+        assert!(envelope.start <= range.start && envelope.end >= range.end);
+        context
+            .register_table("raw_traces", fixture.into_view())
+            .unwrap();
+        let fixture = context
+            .sql(&format!(
+                "SELECT * FROM raw_traces WHERE p_timestamp >= TIMESTAMP '{}' AND p_timestamp < TIMESTAMP '{}'",
+                envelope.start.to_rfc3339(),
+                envelope.end.to_rfc3339(),
+            ))
+            .await
+            .unwrap();
         context
             .register_table("traces", fixture.into_view())
             .unwrap();
-        let interval =
-            super::time_bucket_interval("2026-10-22T00:00:00Z", "2026-10-22T00:02:00Z", 2);
-        assert_eq!(interval, "60 seconds");
-        let query = bounded_tool_sql(&trace_activity_query(
-            "traces",
-            "p_timestamp",
-            &interval,
-            group_by,
-            clauses,
-        ))
-        .unwrap();
-        let batches = context.sql(&query).await.unwrap().collect().await.unwrap();
+        let batches = context
+            .sql(&request.query)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         let mut writer = arrow_json::ArrayWriter::new(Vec::new());
         writer
             .write_batches(&batches.iter().collect::<Vec<_>>())
@@ -2133,7 +2210,7 @@ mod tests {
         writer.finish().unwrap();
         let mut rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).unwrap();
         rows.sort_by_key(|row| row.to_string());
-        rows
+        (interval, rows)
     }
 
     #[actix_web::test]
@@ -2215,20 +2292,131 @@ mod tests {
         .unwrap();
         assert!(clauses.contains(&"\"odd\"\"field\" = 'it''s'".to_owned()));
         assert!(clauses.contains(&"\"service.name\" IS NULL".to_owned()));
-        let query = trace_activity_query("traces", "p_timestamp", "1 seconds", &[], &clauses);
+        let query = trace_activity_query(
+            "traces",
+            "p_timestamp",
+            "1 seconds",
+            &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T00:01:00Z"),
+            &[],
+            &clauses,
+        );
         assert!(bounded_tool_sql(&query).is_ok());
     }
 
     #[actix_web::test]
     async fn trace_activity_bucket_interval_is_bounded() {
         assert_eq!(
-            super::time_bucket_interval("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z", 60),
+            super::time_bucket_interval(
+                &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z"),
+                60
+            ),
             "60 seconds"
         );
         assert_eq!(
-            super::time_bucket_interval("2026-10-22T00:00:00Z", "2026-10-22T00:00:30Z", 100),
+            super::time_bucket_interval(
+                &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T00:00:30Z"),
+                100
+            ),
             "1 seconds"
         );
+        // Subminute ranges size buckets from their exact, unrounded duration.
+        assert_eq!(
+            super::time_bucket_interval(
+                &trace_activity_test_range("2026-10-22T00:00:10Z", "2026-10-22T00:00:50Z"),
+                4
+            ),
+            "10 seconds"
+        );
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_subminute_range_returns_exact_rows() {
+        let summarize = |rows: Vec<Value>| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row["time"].as_str().unwrap().to_owned(),
+                        row["span_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // Both bounds fall inside one minute; start inclusive, end exclusive,
+        // buckets aligned to the requested start.
+        let (interval, rows) = run_trace_activity_fixture_with(
+            &json!({
+                "startTime": "2026-10-22T00:00:15Z",
+                "endTime": "2026-10-22T00:00:40Z",
+            }),
+            5,
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(interval, "5 seconds");
+        assert_eq!(
+            summarize(rows),
+            [
+                ("2026-10-22T00:00:20".to_owned(), 1),
+                ("2026-10-22T00:00:30".to_owned(), 1),
+            ]
+        );
+        let (interval, rows) = run_trace_activity_fixture_with(
+            &json!({
+                "startTime": "2026-10-22T00:00:20Z",
+                "endTime": "2026-10-22T00:00:30Z",
+            }),
+            1,
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(interval, "10 seconds");
+        assert_eq!(summarize(rows), [("2026-10-22T00:00:20".to_owned(), 1)]);
+        // A range crossing a minute boundary keeps its exact edges too.
+        let (interval, rows) = run_trace_activity_fixture_with(
+            &json!({
+                "startTime": "2026-10-22T00:00:35Z",
+                "endTime": "2026-10-22T00:01:15Z",
+            }),
+            1,
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(interval, "40 seconds");
+        assert_eq!(summarize(rows), [("2026-10-22T00:00:35".to_owned(), 2)]);
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_request_validates_exact_ranges_and_widens_transport() {
+        let now = "2026-10-22T00:00:30.123456Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let range =
+            super::trace_activity_range(&json!({"startTime": "now-15s", "endTime": "now"}), now)
+                .unwrap();
+        assert_eq!(range.start, now - Duration::seconds(15));
+        assert_eq!(range.end, now);
+        let query = trace_activity_query("traces", "p_timestamp", "1 seconds", &range, &[], &[]);
+        assert!(query.contains(
+            "\"p_timestamp\" >= TIMESTAMP '2026-10-22T00:00:15.123456+00:00' AND \"p_timestamp\" < TIMESTAMP '2026-10-22T00:00:30.123456+00:00'"
+        ));
+        assert!(query.contains("TIMESTAMP '2026-10-22T00:00:15.123456+00:00') AS TEXT)"));
+        let request = super::trace_activity_request(&query, &range).unwrap();
+        assert_eq!(request.start_time, "2026-10-22T00:00:00+00:00");
+        assert_eq!(request.end_time, "2026-10-22T00:01:00+00:00");
+        for (start, end) in [
+            ("2026-10-22T00:00:30Z", "2026-10-22T00:00:30Z"),
+            ("2026-10-22T00:00:30Z", "2026-10-22T00:00:15Z"),
+            ("invalid", "now"),
+            ("now-15s", "invalid"),
+        ] {
+            assert!(
+                super::trace_activity_range(&json!({"startTime": start, "endTime": end}), now)
+                    .is_err()
+            );
+        }
     }
 
     #[actix_web::test]
