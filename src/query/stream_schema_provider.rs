@@ -45,7 +45,9 @@ use datafusion::{
         physical_planning_context::PhysicalPlanningContext, utils::conjunction,
     },
     physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, Statistics, empty::EmptyExec, union::UnionExec},
+    physical_plan::{
+        ExecutionPlan, Statistics, empty::EmptyExec, filter::FilterExecBuilder, union::UnionExec,
+    },
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -160,6 +162,68 @@ pub fn exact_source_filters(filters: &[Expr]) -> Vec<Expr> {
         .filter(|filter| expr_in_boundary(filter))
         .cloned()
         .collect()
+}
+
+/// Scans `table`, whose scan ignores pushed filters, and enforces the filters
+/// `StandardTableProvider` reports as `Exact`.
+///
+/// DataFusion removes the `FilterExec` above the scan for `Exact` filters. Parquet
+/// scans enforce them through the source predicate (see `exact_source_filters`),
+/// but `MemTable` and `ListingTable` do not, so their rows are filtered here. The
+/// limit is applied after the filter, and the filter's columns are scanned even
+/// when they are not projected.
+async fn scan_enforcing_exact_filters(
+    table: &dyn TableProvider,
+    state: &dyn Session,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let Some(predicate) = conjunction(exact_source_filters(filters)) else {
+        return table.scan(state, projection, filters, limit).await;
+    };
+
+    let schema = table.schema();
+    let scan_projection = projection
+        .map(|projection| {
+            let mut columns = projection.clone();
+            for column in predicate.column_refs() {
+                columns.push(schema.index_of(&column.name)?);
+            }
+            columns.sort_unstable();
+            columns.dedup();
+            Ok::<_, DataFusionError>(columns)
+        })
+        .transpose()?;
+    // Positions of the requested columns in the scan's output.
+    let output_projection =
+        projection
+            .zip(scan_projection.as_ref())
+            .map(|(projection, scanned)| {
+                projection
+                    .iter()
+                    .map(|index| {
+                        scanned
+                            .binary_search(index)
+                            .expect("projected column is scanned")
+                    })
+                    .collect_vec()
+            });
+
+    let input = table
+        .scan(state, scan_projection.as_ref(), filters, None)
+        .await?;
+    let predicate = create_physical_expr(
+        &predicate,
+        &input.schema().to_dfschema()?,
+        state.execution_props(),
+        &PhysicalPlanningContext::default(),
+    )?;
+    let filter = FilterExecBuilder::new(predicate, input)
+        .apply_projection(output_projection)?
+        .with_fetch(limit)
+        .build()?;
+    Ok(Arc::new(filter))
 }
 
 pub fn build_parquet_scan_components(
@@ -404,9 +468,9 @@ impl StandardTableProvider {
     ) -> Result<(), DataFusionError> {
         // Both sources were captured before the remote snapshot was read.
         let (records, partitioned_files) = captured;
-        let arrow_exec = reversed_mem_table(records, self.schema.clone())?
-            .scan(state, projection, filters, limit)
-            .await?;
+        let mem_table = reversed_mem_table(records, self.schema.clone())?;
+        let arrow_exec =
+            scan_enforcing_exact_filters(&mem_table, state, projection, filters, limit).await?;
         execution_plans.push(arrow_exec);
 
         // Keep the native scan and its file extensions: each extension owns the
@@ -442,7 +506,14 @@ impl StandardTableProvider {
                 let table =
                     builder.build(self.schema.clone(), |x| glob_storage.query_prefixes(x))?;
                 if let Some(table) = table {
-                    let plan = table.scan(state, projection, filters, limit).await?;
+                    let plan = scan_enforcing_exact_filters(
+                        table.as_ref(),
+                        state,
+                        projection,
+                        filters,
+                        limit,
+                    )
+                    .await?;
                     execution_plans.push(plan);
                 }
 
@@ -1931,3 +2002,6 @@ mod tests {
 
 #[cfg(test)]
 mod ordering_tests;
+
+#[cfg(test)]
+mod exact_filter_tests;
