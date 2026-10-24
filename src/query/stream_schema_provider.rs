@@ -96,13 +96,14 @@ impl SchemaProvider for GlobalSchemaProvider {
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         if self.table_exist(name) {
+            let stream = PARSEABLE
+                .get_stream(name, &self.tenant_id)
+                .expect(STREAM_EXISTS);
             Ok(Some(Arc::new(StandardTableProvider {
-                schema: PARSEABLE
-                    .get_stream(name, &self.tenant_id)
-                    .expect(STREAM_EXISTS)
-                    .get_schema(),
+                schema: stream.get_schema(),
                 stream: name.to_owned(),
                 tenant_id: self.tenant_id.clone(),
+                time_partition: stream.get_time_partition(),
                 hot_tier_guarded: false,
             })))
         } else {
@@ -121,6 +122,8 @@ struct StandardTableProvider {
     // prefix under which to find snapshot
     stream: String,
     tenant_id: Option<String>,
+    // Column the stream's data files are partitioned by; `p_timestamp` when `None`.
+    time_partition: Option<String>,
     hot_tier_guarded: bool,
 }
 
@@ -152,6 +155,7 @@ pub(super) fn guarded_hot_tier_table_source(
         schema: provider.schema.clone(),
         stream: provider.stream.clone(),
         tenant_id: provider.tenant_id.clone(),
+        time_partition: provider.time_partition.clone(),
         hot_tier_guarded: true,
     })))
 }
@@ -165,7 +169,8 @@ pub fn exact_source_filters(filters: &[Expr]) -> Vec<Expr> {
 }
 
 /// Scans `table`, whose scan ignores pushed filters, and enforces the filters
-/// `StandardTableProvider` reports as `Exact`.
+/// `StandardTableProvider` reports as `Exact` (`exact_source_filters` is a
+/// superset of them: see `filter_pushdown`).
 ///
 /// DataFusion removes the `FilterExec` above the scan for `Exact` filters. Parquet
 /// scans enforce them through the source predicate (see `exact_source_filters`),
@@ -989,20 +994,10 @@ impl TableProvider for StandardTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        let res_vec = filters
+        Ok(filters
             .iter()
-            .map(|filter| {
-                if expr_in_boundary(filter) {
-                    // if filter can be handled by time partiton pruning, it is exact
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    // otherwise, we still might be able to handle the filter with file
-                    // level mechanisms such as Parquet row group pruning.
-                    TableProviderFilterPushDown::Inexact
-                }
-            })
-            .collect_vec();
-        Ok(res_vec)
+            .map(|filter| filter_pushdown(filter, &self.time_partition))
+            .collect_vec())
     }
 }
 
@@ -1185,6 +1180,30 @@ pub fn is_within_staging_window(time_filters: &[PartialTimeFilter]) -> bool {
         .any(|filter| matches!(filter, PartialTimeFilter::High(_)));
 
     !has_upper_bound
+}
+
+/// How `StandardTableProvider` can handle `filter`.
+///
+/// Data files hold one minute of the stream's time partition column, so a
+/// minute-aligned bound on that column either keeps or prunes each file whole.
+/// Only then is the filter `Exact`: DataFusion drops the `FilterExec` above the
+/// scan and may push `LIMIT` into it, and `collect_from_snapshot` truncates the
+/// file list by row counts assuming every row of a surviving file matches. A
+/// bound on any other column (including `p_timestamp` on a stream with a custom
+/// time partition) only prunes files partially, so it stays `Inexact`.
+fn filter_pushdown(filter: &Expr, time_partition: &Option<String>) -> TableProviderFilterPushDown {
+    let partition_column = time_partition.as_deref().unwrap_or(DEFAULT_TIMESTAMP_KEY);
+    let is_partition_column = matches!(
+        filter,
+        Expr::BinaryExpr(BinaryExpr { left, .. })
+            if matches!(left.as_ref(), Expr::Column(column) if column.name == partition_column)
+    );
+    if is_partition_column && expr_in_boundary(filter) {
+        TableProviderFilterPushDown::Exact
+    } else {
+        // File level mechanisms such as Parquet row group pruning may still apply.
+        TableProviderFilterPushDown::Inexact
+    }
 }
 
 pub fn expr_in_boundary(filter: &Expr) -> bool {
@@ -1408,6 +1427,7 @@ mod tests {
             schema: Arc::new(Schema::empty()),
             stream: "logs".to_owned(),
             tenant_id: Some("other-tenant".to_owned()),
+            time_partition: Some("event_time".to_owned()),
             hot_tier_guarded: false,
         }));
 
@@ -1423,6 +1443,10 @@ mod tests {
         let guarded_provider = standard_table_provider(&guarded_source).unwrap();
         assert_eq!(guarded_provider.stream, "logs");
         assert_eq!(guarded_provider.tenant_id.as_deref(), Some("other-tenant"));
+        assert_eq!(
+            guarded_provider.time_partition.as_deref(),
+            Some("event_time")
+        );
         assert!(guarded_provider.hot_tier_guarded);
     }
 
@@ -1505,13 +1529,7 @@ mod tests {
         ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
             Ok(filters
                 .iter()
-                .map(|filter| {
-                    if super::expr_in_boundary(filter) {
-                        TableProviderFilterPushDown::Exact
-                    } else {
-                        TableProviderFilterPushDown::Inexact
-                    }
-                })
+                .map(|filter| super::filter_pushdown(filter, &None))
                 .collect())
         }
     }
@@ -1614,6 +1632,88 @@ mod tests {
         assert!(predicate.contains("p_timestamp"));
         assert!(predicate.contains("job"));
         assert!(predicate.contains("api"));
+    }
+
+    #[test]
+    fn only_minute_aligned_partition_column_bounds_are_exact() {
+        let minute = ScalarValue::TimestampMillisecond(Some(1_672_531_200_000), None);
+        let mid_minute = ScalarValue::TimestampMillisecond(Some(1_672_531_230_000), None);
+        let bound = |column: &str, value: &ScalarValue| {
+            Expr::Column(column.into()).gt_eq(Expr::Literal(value.clone(), None))
+        };
+        let event_time = Some("event_time".to_owned());
+
+        let cases = [
+            (bound("p_timestamp", &minute), &None, true),
+            (bound("p_timestamp", &mid_minute), &None, false),
+            (bound("created_at", &minute), &None, false),
+            (bound("event_time", &minute), &event_time, true),
+            // Ingestion time on a stream partitioned by event time.
+            (bound("p_timestamp", &minute), &event_time, false),
+            (
+                Expr::Literal(minute.clone(), None).lt(Expr::Column("p_timestamp".into())),
+                &None,
+                false,
+            ),
+        ];
+        for (filter, time_partition, exact) in cases {
+            assert_eq!(
+                matches!(
+                    super::filter_pushdown(&filter, time_partition),
+                    TableProviderFilterPushDown::Exact
+                ),
+                exact,
+                "{filter} with time partition {time_partition:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_is_pushed_into_scan_only_for_exact_partition_bounds() {
+        // `collect_from_snapshot` truncates the file list by row counts when a
+        // limit reaches the scan, so it must not see one when a filter only
+        // partially matches the surviving files.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "p_timestamp",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]));
+        let context = SessionContext::new();
+        context
+            .register_table("logs", Arc::new(TestParquetProvider { schema }))
+            .unwrap();
+
+        for (column, limit_pushed) in [("p_timestamp", true), ("created_at", false)] {
+            let plan = context
+                .sql(&format!(
+                    "SELECT * FROM logs WHERE {column} >= '2023-01-01T00:00:00' LIMIT 5"
+                ))
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let plan = displayable(plan.as_ref()).indent(true).to_string();
+            let source_line = plan
+                .lines()
+                .find(|line| line.contains("DataSourceExec"))
+                .expect("parquet source line");
+
+            assert_eq!(source_line.contains("limit=5"), limit_pushed, "{plan}");
+            assert_eq!(
+                plan.lines()
+                    .any(|line| line.contains("FilterExec") && line.contains(column)),
+                !limit_pushed,
+                "{plan}"
+            );
+        }
     }
 
     #[tokio::test]
