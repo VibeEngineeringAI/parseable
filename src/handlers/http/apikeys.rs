@@ -438,15 +438,21 @@ pub async fn get_api_key(
 
 #[cfg(test)]
 mod tests {
+    use actix_web::{App, cookie::Cookie, http::StatusCode, test as actix_test};
     use parking_lot::RwLock;
+    use tokio::sync::Mutex;
 
     use super::*;
+    use crate::handlers::http::modal::server::Server;
     use crate::rbac::{
         map::{
-            self, ROLES, USER_GROUPS, USERS, UserGroups, mut_roles, mut_users, write_user_groups,
+            self, ROLES, SESSIONS, SessionKey, USER_GROUPS, USERS, UserGroups, mut_roles,
+            mut_users, write_user_groups,
         },
         role::ParseableResourceType,
     };
+
+    static SERIAL: Mutex<()> = Mutex::const_new(());
 
     #[test]
     fn expired_key_remains_visible_with_expiry_in_detail_and_list() {
@@ -523,12 +529,23 @@ mod tests {
     }
 
     #[test]
+    fn list_query_accepts_superadmin_privilege() {
+        let parsed = parse_query("privilege=superadmin").unwrap().privilege;
+        assert_eq!(parsed, Some(DefaultPrivilege::SuperAdmin));
+    }
+
+    #[test]
+    fn list_query_accepts_superadmin_priviledge_alias() {
+        let parsed = parse_query("priviledge=superadmin").unwrap().privilege;
+        assert_eq!(parsed, Some(DefaultPrivilege::SuperAdmin));
+    }
+
+    #[test]
     fn list_query_rejects_unknown_privilege_with_bad_request() {
         let cases = [
             ("privilege=owner", "unknown variant `owner`"),
             ("priviledge=owner", "unknown variant `owner`"),
             ("privilege=Reader", "unknown variant `Reader`"),
-            ("privilege=superadmin", "unknown variant `superadmin`"),
             ("privilege=", "unknown variant ``"),
             ("privilege=reader&priviledge=reader", "duplicate field"),
             ("privilege=reader&privilege=admin", "duplicate field"),
@@ -658,6 +675,101 @@ mod tests {
             names(&tenant, Some(DefaultPrivilege::Editor)),
             ["editor-key"]
         );
+    }
+
+    #[test]
+    fn privilege_filter_matches_superadmin_direct_and_group_roles_exactly() {
+        let tenant = tenant(
+            vec![
+                ("superadmins", vec![DefaultPrivilege::SuperAdmin]),
+                ("admins", vec![DefaultPrivilege::Admin]),
+            ],
+            &[("superadmins-group", "superadmins")],
+        );
+        add_key(&tenant, "superadmin-key", &["superadmins"], &[]);
+        add_key(&tenant, "superadmin-group-key", &[], &["superadmins-group"]);
+        add_key(&tenant, "admin-key", &["admins"], &[]);
+        assert_eq!(
+            names(&tenant, Some(DefaultPrivilege::SuperAdmin)),
+            ["superadmin-group-key", "superadmin-key"]
+        );
+        assert_eq!(names(&tenant, Some(DefaultPrivilege::Admin)), ["admin-key"]);
+    }
+
+    #[actix_web::test]
+    async fn list_route_filters_privilege_and_requires_admin() {
+        let _serial = SERIAL.lock().await;
+        let tenant = tenant(
+            vec![
+                ("admins", vec![DefaultPrivilege::Admin]),
+                ("readers", vec![DefaultPrivilege::Reader { resource: None }]),
+            ],
+            &[],
+        );
+        SESSIONS.get_or_init(|| RwLock::new(map::Sessions::default()));
+        add_key(&tenant, "admin-key", &["admins"], &[]);
+        add_key(&tenant, "reader-key", &["readers"], &[]);
+        let mut cookies = Vec::new();
+        for role in ["admins", "readers"] {
+            let (mut user, _) = User::new_basic(
+                format!("apikeys-{}", Ulid::new()).to_lowercase(),
+                Some(tenant.clone()),
+                false,
+            );
+            user.roles.insert(role.into());
+            mut_users().insert(user.clone());
+            let session = Ulid::new();
+            Users.new_session(
+                &user,
+                SessionKey::SessionId(session),
+                chrono::TimeDelta::hours(1),
+            );
+            cookies.push(Cookie::new("session", session.to_string()));
+        }
+        let app = actix_test::init_service(
+            App::new().service(web::scope("/api/prism/v1").service(Server::get_apikeys_webscope())),
+        )
+        .await;
+        for (query, expected) in [
+            ("", vec!["admin-key", "reader-key"]),
+            ("?privilege=admin", vec!["admin-key"]),
+        ] {
+            let req = actix_test::TestRequest::get()
+                .uri(&format!("/api/prism/v1/apikeys{query}"))
+                .cookie(cookies[0].clone())
+                .to_request();
+            let response = actix_test::call_service(&app, req).await;
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            let body: serde_json::Value = actix_test::read_body_json(response).await;
+            let mut names: Vec<_> = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["keyName"].as_str().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(names, expected, "{query}");
+        }
+        for (query, cookie, expected) in [
+            (
+                "?privilege=bogus",
+                Some(&cookies[0]),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("", None, StatusCode::UNAUTHORIZED),
+            ("", Some(&cookies[1]), StatusCode::FORBIDDEN),
+        ] {
+            let mut req =
+                actix_test::TestRequest::get().uri(&format!("/api/prism/v1/apikeys{query}"));
+            if let Some(cookie) = cookie {
+                req = req.cookie(cookie.clone());
+            }
+            let status = match actix_test::try_call_service(&app, req.to_request()).await {
+                Ok(response) => response.status(),
+                Err(error) => error.as_response_error().status_code(),
+            };
+            assert_eq!(status, expected, "{query}");
+        }
     }
 
     #[test]
