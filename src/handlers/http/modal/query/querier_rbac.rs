@@ -33,6 +33,7 @@ use crate::{
     rbac::{
         Users,
         map::{read_user_groups, roles, users, write_user_groups},
+        role::model::RoleType,
         user::{self, UserType},
     },
     tenants::TENANT_METADATA,
@@ -51,7 +52,7 @@ pub async fn post_user(
     let tenant_id = get_tenant_id_from_request(&req);
     let caller_userid = get_user_from_request(&req)?;
     validator::user_role_name(&username)?;
-    let mut metadata = get_metadata(&tenant_id).await?;
+    let _guard = UPDATE_LOCK.lock().await;
 
     let user_roles: HashSet<String> = if let Some(body) = body {
         serde_json::from_value(body.into_inner())?
@@ -73,7 +74,16 @@ pub async fn post_user(
     if !non_existent_roles.is_empty() {
         return Err(RBACError::RolesDoNotExist(non_existent_roles));
     }
-    let _guard = UPDATE_LOCK.lock().await;
+    if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
+        && user_roles.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &RoleType::Internal || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(RBACError::ProtectedRole);
+    }
+    let mut metadata = get_metadata(&tenant_id).await?;
     if Users.contains(&username, &tenant_id)
         || metadata
             .users
@@ -245,6 +255,16 @@ pub async fn add_roles_to_user(
 
     if !non_existent_roles.is_empty() {
         return Err(RBACError::RolesDoNotExist(non_existent_roles));
+    }
+
+    if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
+        && roles_to_add.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &RoleType::Internal || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(RBACError::ProtectedRole);
     }
 
     // update parseable.json first
@@ -431,4 +451,115 @@ pub async fn post_gen_password(
     };
 
     Ok(new_password)
+}
+
+#[cfg(test)]
+mod role_escalation {
+    use std::collections::HashMap;
+
+    use actix_web::{HttpMessage, ResponseError, http::StatusCode, test::TestRequest};
+    use chrono::TimeDelta;
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::{
+        handlers::TENANT_ID,
+        rbac::{
+            map::{
+                ROLES, SESSIONS, SessionKey, Sessions, USER_GROUPS, USERS, UserGroups,
+                Users as UserMap, mut_roles, mut_users,
+            },
+            role::model::{DefaultPrivilege, Role},
+            user::{Basic, User},
+        },
+    };
+
+    fn tenant_request(role: Role) -> (String, String, HttpRequest) {
+        USERS.get_or_init(|| RwLock::new(UserMap::default()));
+        SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+        let tenant = format!("querier-user-{}", Ulid::new());
+        mut_roles().insert(
+            tenant.clone(),
+            HashMap::from([
+                ("elevated".to_owned(), role),
+                (
+                    "admin".to_owned(),
+                    Role::create_user_role(vec![DefaultPrivilege::Admin]),
+                ),
+            ]),
+        );
+        let caller = User {
+            ty: UserType::Native(Basic {
+                username: format!("admin-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: HashSet::from(["admin".to_owned()]),
+            user_groups: HashSet::new(),
+            tenant: Some(tenant.clone()),
+            protected: false,
+        };
+        mut_users().insert(caller.clone());
+        let session = SessionKey::SessionId(Ulid::new());
+        Users.new_session(&caller, session.clone(), TimeDelta::minutes(5));
+        let req = TestRequest::default()
+            .insert_header((TENANT_ID, tenant.as_str()))
+            .to_http_request();
+        req.extensions_mut().insert(session);
+        (tenant, caller.userid().to_owned(), req)
+    }
+
+    async fn rejects_creation(role: Role) {
+        let (tenant, _, req) = tenant_request(role);
+        let body = web::Json(serde_json::json!(["elevated"]));
+        let Err(err) = post_user(req, web::Path::from("new-user".to_owned()), Some(body)).await
+        else {
+            panic!("protected role assignment must be rejected before storage");
+        };
+        assert!(matches!(err, RBACError::ProtectedRole), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert!(!Users.contains("new-user", &Some(tenant)));
+    }
+
+    async fn rejects_addition(role: Role) {
+        let (tenant, userid, req) = tenant_request(role);
+        let Err(err) = add_roles_to_user(
+            req,
+            web::Path::from(userid.clone()),
+            web::Json(HashSet::from(["elevated".to_owned()])),
+        )
+        .await
+        else {
+            panic!("protected role assignment must be rejected before storage");
+        };
+        assert!(matches!(err, RBACError::ProtectedRole), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            Users.get_user(&userid, &Some(tenant)).unwrap().roles,
+            HashSet::from(["admin".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn post_user_rejects_internal_role() {
+        rejects_creation(Role::create_internal_role(vec![DefaultPrivilege::Admin])).await;
+    }
+
+    #[tokio::test]
+    async fn post_user_rejects_super_admin_role() {
+        rejects_creation(Role::create_user_role(vec![DefaultPrivilege::SuperAdmin])).await;
+    }
+
+    #[tokio::test]
+    async fn add_roles_rejects_internal_role() {
+        rejects_addition(Role::create_internal_role(vec![DefaultPrivilege::Admin])).await;
+    }
+
+    #[tokio::test]
+    async fn add_roles_rejects_super_admin_role() {
+        rejects_addition(Role::create_user_role(vec![DefaultPrivilege::SuperAdmin])).await;
+    }
 }

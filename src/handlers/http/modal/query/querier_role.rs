@@ -27,6 +27,7 @@ use crate::{
     handlers::http::{
         cluster::{sync_role_delete, sync_role_update},
         modal::utils::rbac_utils::{get_metadata, put_metadata},
+        rbac::UPDATE_LOCK,
         role::RoleError,
     },
     parseable::DEFAULT_TENANT,
@@ -44,8 +45,16 @@ use crate::{
 pub async fn put(
     req: HttpRequest,
     name: web::Path<String>,
-    Json(body): Json<Role>,
+    Json(role): Json<Role>,
 ) -> Result<impl Responder, RoleError> {
+    let guard = UPDATE_LOCK.lock().await;
+    // internal role manipulation not allowed
+    if role.role_type().eq(&RoleType::Internal) {
+        return Err(RoleError::ProtectedRole);
+    }
+    if role.deny_super_admin() {
+        return Err(RoleError::SuperAdminPrivilege);
+    }
     let name = name.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
@@ -56,22 +65,11 @@ pub async fn put(
     validator::user_role_name(&name).map_err(RoleError::ValidationError)?;
 
     // if role exists, then it should not be an internal role
-    let role = if let Some(tenant_roles) = mut_roles().get_mut(tenant)
-        && let Some(role) = tenant_roles.get_mut(&name)
+    if let Some(tenant_roles) = roles().get(tenant)
+        && let Some(existing_role) = tenant_roles.get(&name)
+        && existing_role.role_type().eq(&RoleType::Internal)
     {
-        if role.role_type().eq(&RoleType::Internal) {
-            return Err(RoleError::ProtectedRole);
-        } else {
-            // role exists and is not internal, can proceed with modification
-            *role = body;
-            role.clone()
-        }
-    } else {
-        body
-    };
-
-    if role.deny_super_admin() {
-        return Err(RoleError::SuperAdminPrivilege);
+        return Err(RoleError::ProtectedRole);
     }
 
     let mut metadata = get_metadata(&tenant_id).await?;
@@ -115,6 +113,8 @@ pub async fn put(
             }
         }
     }
+
+    drop(guard);
 
     if let Err(e) = sync_role_update(&req, name.clone(), role, &tenant_id, &caller_userid).await {
         tracing::error!("Failed to sync role update to cluster nodes: {e}");
@@ -201,4 +201,113 @@ pub async fn delete(
     }
 
     Ok(HttpResponse::Ok().finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use actix_web::{HttpMessage, ResponseError, http::StatusCode, test::TestRequest};
+    use chrono::TimeDelta;
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::{
+        handlers::TENANT_ID,
+        rbac::{
+            Users,
+            map::{
+                ROLES, SESSIONS, SessionKey, Sessions, USER_GROUPS, USERS, UserGroups,
+                Users as UserMap, mut_users,
+            },
+            role::model::DefaultPrivilege,
+            user::{Basic, User, UserType},
+        },
+    };
+
+    const ROLE: &str = "readers";
+
+    // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+    fn init_auth_maps() {
+        USERS.get_or_init(|| RwLock::new(UserMap::default()));
+        SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+    }
+
+    fn reader_role() -> Role {
+        Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }])
+    }
+
+    /// A fresh tenant holding one ordinary role, and a request from a user with
+    /// a live session in that tenant.
+    fn tenant_request() -> (String, HttpRequest) {
+        init_auth_maps();
+        let tenant = format!("querier-role-{}", Ulid::new());
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), reader_role());
+        let caller = User {
+            ty: UserType::Native(Basic {
+                username: format!("caller-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: HashSet::from([ROLE.to_owned()]),
+            user_groups: HashSet::new(),
+            tenant: Some(tenant.clone()),
+            protected: false,
+        };
+        mut_users().insert(caller.clone());
+        let session = SessionKey::SessionId(Ulid::new());
+        Users.new_session(&caller, session.clone(), TimeDelta::minutes(5));
+        let req = TestRequest::default()
+            .insert_header((TENANT_ID, tenant.as_str()))
+            .to_http_request();
+        req.extensions_mut().insert(session);
+        (tenant, req)
+    }
+
+    #[tokio::test]
+    async fn rejected_super_admin_update_leaves_live_role_unchanged() {
+        let (tenant, req) = tenant_request();
+        let body = Role::create_user_role(vec![DefaultPrivilege::SuperAdmin]);
+
+        let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(body)).await else {
+            panic!("SuperAdmin role update must be rejected");
+        };
+        assert!(matches!(err, RoleError::SuperAdminPrivilege), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+
+        let live = roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned();
+        assert_eq!(
+            live,
+            Some(reader_role()),
+            "rejected update must not change the live role"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_internal_update_leaves_live_role_unchanged() {
+        for privilege in [
+            DefaultPrivilege::SuperAdmin,
+            DefaultPrivilege::Reader { resource: None },
+        ] {
+            let (tenant, req) = tenant_request();
+            let body = Role::create_internal_role(vec![privilege]);
+
+            let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(body)).await else {
+                panic!("internal role update must be rejected");
+            };
+            assert!(matches!(err, RoleError::ProtectedRole), "{err:?}");
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned(),
+                Some(reader_role()),
+                "rejected update must not change the live role"
+            );
+        }
+    }
 }

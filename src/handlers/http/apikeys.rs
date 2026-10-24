@@ -15,6 +15,7 @@ use crate::{
     rbac::{
         Users,
         map::{roles, users},
+        role::model::RoleType,
         user::{User, UserType},
     },
     utils::{get_user_and_tenant_from_request, is_admin},
@@ -140,7 +141,7 @@ fn collect_tenant_api_keys(tenant_id: &Option<String>) -> Vec<User> {
         .collect()
 }
 
-/// Validate that every role in the request exists in the tenant's role map.
+/// Validate that every requested role exists and can be assigned in this tenant.
 /// Mirrors the check performed by the native-user CRUD endpoint.
 fn validate_roles(
     role_names: &HashSet<String>,
@@ -158,11 +159,19 @@ fn validate_roles(
         })
         .cloned()
         .collect();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(ApiKeyError::Rbac(RBACError::RolesDoNotExist(missing)))
+    if !missing.is_empty() {
+        return Err(ApiKeyError::Rbac(RBACError::RolesDoNotExist(missing)));
     }
+    if let Some(tenant_roles) = tenant_roles.get(tenant)
+        && role_names.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &RoleType::Internal || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(ApiKeyError::Rbac(RBACError::ProtectedRole));
+    }
+    Ok(())
 }
 
 /// POST /api/prism/v1/apikeys
@@ -176,8 +185,8 @@ pub async fn create_api_key(
 
     let guard = UPDATE_LOCK.lock().await;
 
-    // Reject any role names that don't exist in this tenant while holding the
-    // update lock so a concurrent role update cannot invalidate the check.
+    // Validate role assignments under the update lock so a concurrent role
+    // update cannot invalidate the check.
     validate_roles(&body.roles, &tenant_id)?;
 
     // Duplicate key-name detection inside the same tenant.
@@ -388,5 +397,155 @@ mod tests {
         let entry = serde_json::to_value(ApiKeyListEntry::from_user(&user).unwrap()).unwrap();
         assert!(detail.get("expiresAt").unwrap().is_null());
         assert!(entry.get("expiresAt").unwrap().is_null());
+    }
+
+    mod role_escalation {
+        use std::collections::HashMap;
+
+        use actix_web::{HttpMessage, ResponseError, http::StatusCode, test::TestRequest};
+        use chrono::TimeDelta;
+        use parking_lot::RwLock;
+
+        use super::*;
+        use crate::rbac::{
+            map::{
+                ROLES, SESSIONS, SessionKey, Sessions, USER_GROUPS, USERS, UserGroups,
+                Users as UserMap, mut_roles, mut_users,
+            },
+            role::model::{DefaultPrivilege, Role},
+            user::Basic,
+        };
+
+        const ADMIN_ROLE: &str = "tenant-admin";
+        const READER_ROLE: &str = "reader";
+        const INTERNAL_ROLE: &str = "internal";
+        // Mirrors the internal role `rbac::map::init` adds to the default tenant.
+        const SUPER_ADMIN_ROLE: &str = "super-admin";
+        // A user-typed role holding SuperAdmin, e.g. from legacy metadata.
+        const ELEVATED_ROLE: &str = "elevated";
+
+        // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+        fn init_auth_maps() {
+            USERS.get_or_init(|| RwLock::new(UserMap::default()));
+            SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+            USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+            ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+        }
+
+        /// A fresh tenant laid out like the default tenant after `map::init`.
+        fn tenant() -> String {
+            init_auth_maps();
+            let tenant = format!("apikey-escalation-{}", Ulid::new());
+            mut_roles().insert(
+                tenant.clone(),
+                HashMap::from([
+                    (
+                        ADMIN_ROLE.to_owned(),
+                        Role::create_user_role(vec![DefaultPrivilege::Admin]),
+                    ),
+                    (
+                        READER_ROLE.to_owned(),
+                        Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }]),
+                    ),
+                    (
+                        INTERNAL_ROLE.to_owned(),
+                        Role::create_internal_role(vec![DefaultPrivilege::Admin]),
+                    ),
+                    (
+                        SUPER_ADMIN_ROLE.to_owned(),
+                        Role::create_internal_role(vec![DefaultPrivilege::SuperAdmin]),
+                    ),
+                    (
+                        ELEVATED_ROLE.to_owned(),
+                        Role::create_user_role(vec![DefaultPrivilege::SuperAdmin]),
+                    ),
+                ]),
+            );
+            tenant
+        }
+
+        fn role_set(name: &str) -> HashSet<String> {
+            HashSet::from([name.to_owned()])
+        }
+
+        /// A request from a tenant admin (Admin, not SuperAdmin) with a live session.
+        fn tenant_admin_request(tenant: &str) -> HttpRequest {
+            let admin = User {
+                ty: UserType::Native(Basic {
+                    username: format!("admin-{}", Ulid::new()),
+                    password_hash: String::new(),
+                    email: None,
+                }),
+                roles: role_set(ADMIN_ROLE),
+                user_groups: HashSet::new(),
+                tenant: Some(tenant.to_owned()),
+                protected: false,
+            };
+            mut_users().insert(admin.clone());
+            let session = SessionKey::SessionId(Ulid::new());
+            Users.new_session(&admin, session.clone(), TimeDelta::minutes(5));
+            let req = TestRequest::default().to_http_request();
+            req.extensions_mut().insert(session);
+            req
+        }
+
+        #[test]
+        fn validate_roles_accepts_ordinary_role() {
+            let tenant = Some(tenant());
+            assert!(validate_roles(&role_set(READER_ROLE), &tenant).is_ok());
+        }
+
+        #[test]
+        fn validate_roles_rejects_internal_role() {
+            let tenant = Some(tenant());
+            let result = validate_roles(&role_set(INTERNAL_ROLE), &tenant);
+            assert!(
+                matches!(result, Err(ApiKeyError::Rbac(RBACError::ProtectedRole))),
+                "internal role must be rejected like the native-user path, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn validate_roles_rejects_super_admin_privilege_role() {
+            let tenant = Some(tenant());
+            let result = validate_roles(&role_set(ELEVATED_ROLE), &tenant);
+            assert!(
+                matches!(result, Err(ApiKeyError::Rbac(RBACError::ProtectedRole))),
+                "role holding SuperAdmin must be rejected like the native-user path, got {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn tenant_admin_cannot_create_super_admin_api_key() {
+            let tenant = tenant();
+            let req = tenant_admin_request(&tenant);
+            // An existing key with the same name makes the vulnerable handler stop
+            // with 409 before it reaches storage, which tests cannot initialise.
+            let key_name = "escalation".to_owned();
+            mut_users().insert(User::new_api_key(
+                Ulid::new(),
+                format!("existing-{}", Ulid::new()),
+                key_name.clone(),
+                HashSet::new(),
+                "admin".into(),
+                Some(tenant.clone()),
+            ));
+
+            for role in [SUPER_ADMIN_ROLE, ELEVATED_ROLE] {
+                let body = CreateApiKeyRequest {
+                    key_name: key_name.clone(),
+                    roles: role_set(role),
+                    ttl_seconds: None,
+                };
+                let Err(err) = create_api_key(req.clone(), web::Json(body)).await else {
+                    panic!("API key with role {role} must be rejected");
+                };
+                assert!(
+                    matches!(err, ApiKeyError::Rbac(RBACError::ProtectedRole)),
+                    "role {role}: expected ProtectedRole, got {err:?}"
+                );
+                assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "role {role}");
+            }
+        }
     }
 }
