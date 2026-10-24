@@ -455,20 +455,18 @@ mod tests {
 
     use actix_web::{App, cookie::Cookie, http::StatusCode, test as actix_test};
     use parking_lot::RwLock;
-    use tokio::sync::Mutex;
+    use tokio::sync::MutexGuard;
 
     use super::*;
     use crate::handlers::http::modal::server::Server;
     use crate::rbac::{
         map::{
-            self, ROLES, SESSIONS, SessionKey, USER_GROUPS, USERS, UserGroups, mut_roles,
-            mut_users, write_user_groups,
+            self, ROLES, SESSIONS, SessionKey, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
+            mut_roles, mut_users, write_user_groups,
         },
         role::ParseableResourceType,
         user::UserGroup,
     };
-
-    static SERIAL: Mutex<()> = Mutex::const_new(());
 
     #[test]
     fn expired_key_remains_visible_with_expiry_in_detail_and_list() {
@@ -577,12 +575,30 @@ mod tests {
         }
     }
 
-    // `map::init` needs `PARSEABLE`, so tests create the maps directly. Each
-    // test uses its own tenant, so they don't see each other's keys or roles.
-    fn tenant(roles: Vec<(&str, Vec<DefaultPrivilege>)>, groups: &[(&str, &str)]) -> String {
+    // `map::init` needs `PARSEABLE`, so tests create the maps directly. Tests
+    // that write them hold `map::TEST_SERIAL`, as other modules' tests watch the
+    // map locks. Each test uses its own tenant, so they don't see each other's
+    // keys or roles.
+    async fn rbac_state() -> MutexGuard<'static, ()> {
+        let serial = TEST_SERIAL.lock().await;
+        init_rbac_maps();
+        serial
+    }
+
+    fn blocking_rbac_state() -> MutexGuard<'static, ()> {
+        let serial = TEST_SERIAL.blocking_lock();
+        init_rbac_maps();
+        serial
+    }
+
+    fn init_rbac_maps() {
         USERS.get_or_init(|| RwLock::new(map::Users::default()));
+        SESSIONS.get_or_init(|| RwLock::new(map::Sessions::default()));
         USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
         ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+    }
+
+    fn tenant(roles: Vec<(&str, Vec<DefaultPrivilege>)>, groups: &[(&str, &str)]) -> String {
         let tenant = format!("apikeys-{}", Ulid::new());
         mut_roles().insert(
             tenant.clone(),
@@ -626,6 +642,7 @@ mod tests {
 
     #[test]
     fn list_without_privilege_returns_every_key_masked() {
+        let _serial = blocking_rbac_state();
         let tenant = tenant(
             vec![("readers", vec![DefaultPrivilege::Reader { resource: None }])],
             &[],
@@ -643,6 +660,7 @@ mod tests {
 
     #[test]
     fn privilege_filter_matches_keys_by_role_privileges() {
+        let _serial = blocking_rbac_state();
         let tenant = tenant(
             vec![
                 (
@@ -695,6 +713,7 @@ mod tests {
 
     #[test]
     fn privilege_filter_matches_superadmin_direct_and_group_roles_exactly() {
+        let _serial = blocking_rbac_state();
         let tenant = tenant(
             vec![
                 ("superadmins", vec![DefaultPrivilege::SuperAdmin]),
@@ -714,7 +733,7 @@ mod tests {
 
     #[actix_web::test]
     async fn list_route_filters_privilege_and_requires_admin() {
-        let _serial = SERIAL.lock().await;
+        let _serial = rbac_state().await;
         let tenant = tenant(
             vec![
                 ("admins", vec![DefaultPrivilege::Admin]),
@@ -722,7 +741,6 @@ mod tests {
             ],
             &[],
         );
-        SESSIONS.get_or_init(|| RwLock::new(map::Sessions::default()));
         add_key(&tenant, "admin-key", &["admins"], &[]);
         add_key(&tenant, "reader-key", &["readers"], &[]);
         let mut cookies = Vec::new();
@@ -790,6 +808,7 @@ mod tests {
 
     #[test]
     fn privilege_filter_includes_group_inherited_roles() {
+        let _serial = blocking_rbac_state();
         let tenant = tenant(
             vec![("readers", vec![DefaultPrivilege::Reader { resource: None }])],
             &[
@@ -809,6 +828,7 @@ mod tests {
 
     #[test]
     fn privilege_filter_uses_the_callers_tenant_roles() {
+        let _serial = blocking_rbac_state();
         // Same role and group names, different privileges per tenant.
         let readers = tenant(
             vec![("team", vec![DefaultPrivilege::Reader { resource: None }])],

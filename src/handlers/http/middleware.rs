@@ -1118,13 +1118,13 @@ mod api_key_auth_tests {
     use base64::{Engine, prelude::BASE64_STANDARD};
     use chrono::DateTime;
     use parking_lot::RwLock;
-    use tokio::sync::{Mutex, MutexGuard};
+    use tokio::sync::MutexGuard;
 
     use super::*;
     use crate::rbac::{
         map::{
-            ROLES, SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups, Users as UserMap, mut_roles,
-            mut_users,
+            ROLES, SESSIONS, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
+            Users as UserMap, mut_roles, mut_users,
         },
         role::model::{DefaultPrivilege, Role},
     };
@@ -1134,19 +1134,17 @@ mod api_key_auth_tests {
 
     type AuthMethod = fn(&mut ServiceRequest, Action) -> Result<rbac::Response, Error>;
 
-    static SERIAL: Mutex<()> = Mutex::const_new(());
-
     // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
     // Tests use their own users but run one at a time: concurrent first Basic
     // logins and session checks take the user and session locks in opposite order.
     async fn auth_state() -> MutexGuard<'static, ()> {
-        let serial = SERIAL.lock().await;
+        let serial = TEST_SERIAL.lock().await;
         init_auth_maps();
         serial
     }
 
     fn blocking_auth_state() -> MutexGuard<'static, ()> {
-        let serial = SERIAL.blocking_lock();
+        let serial = TEST_SERIAL.blocking_lock();
         init_auth_maps();
         serial
     }
