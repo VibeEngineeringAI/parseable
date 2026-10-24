@@ -268,7 +268,10 @@ pub fn resolve_time_range_at(arguments: &Value, reference: DateTime<Utc>) -> Res
             .map_err(|error| format!("invalid time duration: {error}"))?;
         let duration = Duration::from_std(duration)
             .map_err(|error| format!("time duration is too large: {error}"))?;
-        TimeRange::new(reference - duration, reference)
+        let start = reference
+            .checked_sub_signed(duration)
+            .ok_or_else(|| "time duration is too large".to_owned())?;
+        TimeRange::new(start, reference)
     } else if let Some((start, end)) = expression.split_once(" to ") {
         TimeRange::parse_human_time(start.trim(), end.trim()).map_err(|error| error.to_string())?
     } else if DateTime::parse_from_rfc3339(expression).is_ok() {
@@ -613,6 +616,25 @@ async fn discover_datasets(
         .collect::<Vec<_>>()
         .await;
 
+    Ok(summarize_dataset_activity(
+        activity,
+        limit,
+        visible_datasets,
+        &telemetry_type,
+        &start_time,
+        &end_time,
+    ))
+}
+
+/// Builds the `discover_datasets` result from per-dataset activity.
+fn summarize_dataset_activity(
+    activity: Vec<DatasetActivity>,
+    limit: usize,
+    visible_datasets: usize,
+    telemetry_type: &str,
+    start_time: &str,
+    end_time: &str,
+) -> Value {
     let mut active = Vec::new();
     let mut queried_datasets = 0_usize;
     let mut errors = Vec::new();
@@ -641,7 +663,7 @@ async fn discover_datasets(
             unavailable_datasets,
             "dataset activity discovery was incomplete"
         );
-        return Ok(json!({
+        return json!({
             "status": "error",
             "message": "Dataset activity could not be determined reliably for the requested telemetry type and time range.",
             "telemetryType": telemetry_type,
@@ -650,7 +672,7 @@ async fn discover_datasets(
             "visibleDatasets": visible_datasets,
             "queriedDatasets": queried_datasets,
             "unavailableDatasets": errors.into_iter().take(20).collect::<Vec<_>>(),
-        }));
+        });
     }
 
     let active_count = active.len();
@@ -663,7 +685,7 @@ async fn discover_datasets(
         .iter()
         .filter_map(|dataset| dataset.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    Ok(json!({
+    json!({
         "status": if selected.is_empty() { "not_found" } else { "resolved" },
         "selectionSource": "activity_in_resolved_time_range",
         "telemetryType": telemetry_type,
@@ -676,7 +698,7 @@ async fn discover_datasets(
         "datasets": selected,
         "selectedDatasets": selected_names,
         "unavailableDatasets": errors.into_iter().take(20).collect::<Vec<_>>(),
-    }))
+    })
 }
 
 fn schema_tool_result(schema: &arrow_schema::Schema, arguments: &Value) -> Result<Value, String> {
@@ -839,16 +861,16 @@ pub fn log_context_request(arguments: &Value) -> Result<Value, String> {
         ("dataset".to_owned(), json!(dataset)),
         ("pTimestamp".to_owned(), json!(timestamp)),
     ]);
-    let mut has_match_field = false;
+    let mut match_fields = 0;
     for name in ["log", "body", "message"] {
         if let Some(value) = arguments.get(name).and_then(Value::as_str) {
             body.insert(name.to_owned(), json!(value));
-            has_match_field = true;
+            match_fields += 1;
         }
     }
-    if !has_match_field {
+    if match_fields != 1 {
         return Err(
-            "get_log_context requires at least one exact `log`, `body`, or `message` value from the anchor row"
+            "get_log_context requires exactly one exact `log`, `body`, or `message` value from the anchor row"
                 .to_owned(),
         );
     }
@@ -1439,6 +1461,17 @@ async fn trace_activity_fields(
         .iter()
         .map(|field| field.name().to_owned())
         .collect::<Vec<_>>();
+    let time_field = trace_activity_time_field(dataset, &fields, stream.get_time_partition())?;
+    Ok((fields, time_field))
+}
+
+/// Checks that a traces dataset's fields support activity counts and returns
+/// the time column to bucket on.
+fn trace_activity_time_field(
+    dataset: &str,
+    fields: &[String],
+    time_partition: Option<String>,
+) -> Result<String, String> {
     for required in ["span_span_id", "span_trace_id"] {
         if !fields.iter().any(|field| field == required) {
             return Err(format!(
@@ -1446,15 +1479,13 @@ async fn trace_activity_fields(
             ));
         }
     }
-    let time_field = stream
-        .get_time_partition()
-        .unwrap_or_else(|| "p_timestamp".to_owned());
+    let time_field = time_partition.unwrap_or_else(|| "p_timestamp".to_owned());
     if !fields.contains(&time_field) {
         return Err(format!(
             "trace dataset `{dataset}` is missing time field `{time_field}`"
         ));
     }
-    Ok((fields, time_field))
+    Ok(time_field)
 }
 
 fn trace_activity_group_by(arguments: &Value, fields: &[String]) -> Result<Vec<String>, String> {
@@ -1940,6 +1971,8 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use serde_json::{Value, json};
 
+    use crate::handlers::http::query_context::LogContextRequest;
+
     use super::{
         bounded_tool_sql, call_tool_registry, list_log_errors_query, log_context_request,
         log_error_query_request, project_log_context_result, resolve_dataset_candidates,
@@ -1990,6 +2023,82 @@ mod tests {
         assert!(bounded_tool_sql("SELECT a,b,c,d,e,f,g,h,i,j,k FROM logs").is_err());
         let bounded = bounded_tool_sql("SELECT a FROM logs -- recent events").unwrap();
         assert!(bounded.contains("-- recent events\n) AS"));
+    }
+
+    #[actix_web::test]
+    async fn sql_validator_accepts_and_rejects_query_forms() {
+        for accepted in [
+            "SELECT COUNT(*) FROM t",
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "SELECT CAST(a AS BIGINT), TRY_CAST(b AS DOUBLE) FROM t",
+        ] {
+            assert!(super::validate_tool_sql(accepted).is_ok(), "{accepted}");
+        }
+        for (rejected, message) in [
+            (
+                "SELECT a FROM t UNION SELECT * FROM u",
+                "wildcard selection is not allowed",
+            ),
+            ("(SELECT * FROM t)", "wildcard selection is not allowed"),
+            ("SELECT t.* FROM t", "wildcard selection is not allowed"),
+            (
+                "SELECT a::INT64 FROM t",
+                "unsupported DataFusion SQL cast type `INT64`; use `BIGINT` instead",
+            ),
+            (
+                "SELECT TRY_CAST(a AS FLOAT64) FROM t",
+                "unsupported DataFusion SQL cast type `FLOAT64`; use `DOUBLE` instead",
+            ),
+            (
+                "SELECT CAST(a AS UINT64) FROM t",
+                "unsupported DataFusion SQL cast type `UInt64`; use `BIGINT` instead",
+            ),
+            ("VALUES (1)", "unsupported SQL query form"),
+            (
+                "EXPLAIN SELECT a FROM t",
+                "only SQL SELECT queries are allowed",
+            ),
+            ("DELETE FROM t", "only SQL SELECT queries are allowed"),
+            (
+                "SELECT a FROM t; SELECT b FROM t",
+                "exactly one SQL statement is required",
+            ),
+        ] {
+            let error = super::validate_tool_sql(rejected).unwrap_err();
+            assert!(error.contains(message), "{rejected}: {error}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn dataset_resolution_reports_ties_case_insensitive_and_invisible_selections() {
+        let datasets = json!([
+            { "name": "logs" },
+            { "name": "app-logs" },
+            { "name": "logs-archive" }
+        ]);
+        let tied = resolve_dataset_candidates(
+            datasets.clone(),
+            &json!({ "query": "app-logs and logs-archive" }),
+        );
+        assert_eq!(tied["status"], "ambiguous");
+        assert_eq!(tied["datasets"], json!([]));
+        assert_eq!(
+            tied["candidates"][0]["score"],
+            tied["candidates"][1]["score"]
+        );
+
+        let selected =
+            resolve_dataset_candidates(datasets.clone(), &json!({ "selectedDataset": "APP-LOGS" }));
+        assert_eq!(selected["status"], "resolved");
+        assert_eq!(selected["selectedDatasets"], json!(["app-logs"]));
+
+        let invisible =
+            resolve_dataset_candidates(datasets, &json!({ "selectedDataset": "secret-logs" }));
+        assert_eq!(invisible["status"], "error");
+        assert_eq!(
+            invisible["message"],
+            "Dataset `secret-logs` is not visible to this caller"
+        );
     }
 
     #[actix_web::test]
@@ -2055,15 +2164,68 @@ mod tests {
 
     #[actix_web::test]
     async fn log_context_projection_prefers_observability_fields() {
-        let projected = project_log_context_result(json!([{
-            "p_timestamp": "2026-10-22T00:00:00Z",
-            "service.name": "checkout",
-            "body": "failed",
-            "unrelated": "drop"
-        }]));
-        assert!(projected[0].get("p_timestamp").is_some());
-        assert!(projected[0].get("service.name").is_some());
-        assert!(projected[0].get("unrelated").is_some());
+        // Unrelated fields sort before, and are inserted before, the preferred
+        // ones, so the kept set does not depend on map ordering.
+        let mut row = serde_json::Map::new();
+        for index in 0..12 {
+            row.insert(format!("a{index:02}"), json!(index));
+        }
+        row.insert("body".to_owned(), json!("failed"));
+        row.insert("p_timestamp".to_owned(), json!("2026-10-22T00:00:00Z"));
+        row.insert("service.name".to_owned(), json!("checkout"));
+        let row = Value::Object(row);
+
+        for (shape, projected) in [
+            ("array", project_log_context_result(json!([row.clone()]))),
+            (
+                "records",
+                project_log_context_result(json!({ "anchorIndex": 0, "records": [row] }))
+                    ["records"]
+                    .clone(),
+            ),
+        ] {
+            let projected = projected[0].as_object().unwrap();
+            assert_eq!(projected.len(), 10, "{shape}");
+            for kept in ["p_timestamp", "service.name", "body", "a00", "a06"] {
+                assert!(projected.contains_key(kept), "{shape}: {kept}");
+            }
+            for dropped in ["a07", "a11"] {
+                assert!(!projected.contains_key(dropped), "{shape}: {dropped}");
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn log_context_request_defaults_and_bounds() {
+        let anchor = json!({
+            "dataset": "logs",
+            "pTimestamp": "2026-10-22T00:00:00Z",
+            "body": "failed"
+        });
+        let request = log_context_request(&anchor).unwrap();
+        assert_eq!(request["contextWindow"], "5 minutes");
+        assert_eq!(request["pageSize"], 100);
+        let parsed = serde_json::from_value::<LogContextRequest>(request).unwrap();
+        assert_eq!(parsed.context_window.as_deref(), Some("5 minutes"));
+        assert_eq!(parsed.body.as_deref(), Some("failed"));
+
+        let mut explicit = anchor.clone();
+        explicit["contextStartTime"] = json!("2026-10-21T23:50:00Z");
+        explicit["contextEndTime"] = json!("2026-10-22T00:10:00Z");
+        explicit["pageSize"] = json!(9999);
+        let request = log_context_request(&explicit).unwrap();
+        assert!(request.get("contextWindow").is_none());
+        assert_eq!(request["pageSize"], 500);
+        let parsed = serde_json::from_value::<LogContextRequest>(request).unwrap();
+        assert_eq!(
+            parsed.context_start_time.as_deref(),
+            Some("2026-10-21T23:50:00Z")
+        );
+        assert_eq!(
+            parsed.context_end_time.as_deref(),
+            Some("2026-10-22T00:10:00Z")
+        );
+        assert_eq!(parsed.page_size, Some(500));
     }
 
     #[actix_web::test]
@@ -2096,14 +2258,32 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn log_context_requires_an_exact_anchor_value() {
-        assert!(
-            log_context_request(&json!({
+    async fn log_context_requires_exactly_one_exact_anchor_value() {
+        for anchors in [
+            json!({}),
+            json!({ "log": "a", "body": "b" }),
+            json!({ "log": "a", "body": "b", "message": "c" }),
+        ] {
+            let mut arguments = json!({
                 "dataset": "logs",
                 "pTimestamp": "2026-10-22T00:00:00Z"
+            });
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(anchors.as_object().unwrap().clone());
+            let error = log_context_request(&arguments).unwrap_err();
+            assert!(error.contains("exactly one"), "{anchors}: {error}");
+        }
+        for anchor in ["log", "body", "message"] {
+            let request = log_context_request(&json!({
+                "dataset": "logs",
+                "pTimestamp": "2026-10-22T00:00:00Z",
+                anchor: "failed"
             }))
-            .is_err()
-        );
+            .unwrap();
+            assert_eq!(request[anchor], "failed");
+        }
     }
 
     #[actix_web::test]
@@ -2130,39 +2310,47 @@ mod tests {
         }
     }
 
-    async fn run_trace_activity_fixture(group_by: &[String], clauses: &[String]) -> Vec<Value> {
+    async fn run_trace_activity_fixture(
+        group_by: &[String],
+        clauses: &[String],
+        status_type: &str,
+    ) -> Vec<Value> {
         let arguments = json!({
             "startTime": "2026-10-22T00:00:00Z",
             "endTime": "2026-10-22T00:02:00Z",
         });
         let (interval, rows) =
-            run_trace_activity_fixture_with(&arguments, 2, group_by, clauses).await;
+            run_trace_activity_fixture_with(&arguments, 2, group_by, clauses, status_type).await;
         assert_eq!(interval, "60 seconds");
         rows
     }
 
-    /// Runs the tool's request against a fixture, applying the query API's
-    /// minute-aligned transport range before the generated SQL.
+    /// Runs the tool's request over a fixture with Parseable's millisecond
+    /// timestamps, applying the query API's minute-aligned transport range
+    /// before the generated SQL, and checks that rows come back ordered by bucket.
     async fn run_trace_activity_fixture_with(
         arguments: &Value,
         bucket_count: u64,
         group_by: &[String],
         clauses: &[String],
+        status_type: &str,
     ) -> (String, Vec<Value>) {
         let range = super::trace_activity_range(arguments, "2026-10-22T00:05:00Z".parse().unwrap())
             .unwrap();
         let context = datafusion::prelude::SessionContext::new();
+        // Later buckets come first so that ordering depends on the query.
         let fixture = context
-            .sql(
-                r#"SELECT CAST(at AS TIMESTAMP) AS p_timestamp, trace AS span_trace_id,
-                    span AS span_span_id, service AS "service.name", status AS span_status_code
-                   FROM (VALUES ('2026-10-22T00:00:10Z', 't1', 's1', 'checkout', 0),
-                                ('2026-10-22T00:00:20Z', 't1', 's1', 'checkout', 0),
-                                ('2026-10-22T00:00:30Z', 't1', 's2', 'checkout', 2),
+            .sql(&format!(
+                r#"SELECT arrow_cast(at, 'Timestamp(Millisecond, None)') AS p_timestamp,
+                    trace AS span_trace_id, span AS span_span_id, service AS "service.name",
+                    CAST(status AS {status_type}) AS span_status_code
+                   FROM (VALUES ('2026-10-22T00:01:10Z', 't3', 's4', 'checkout', 2),
                                 ('2026-10-22T00:00:40Z', 't2', 's3', 'cart', 0),
-                                ('2026-10-22T00:01:10Z', 't3', 's4', 'checkout', 2))
-                   AS f(at, trace, span, service, status)"#,
-            )
+                                ('2026-10-22T00:00:30Z', 't1', 's2', 'checkout', 2),
+                                ('2026-10-22T00:00:20Z', 't1', 's1', 'checkout', 0),
+                                ('2026-10-22T00:00:10Z', 't1', 's1', 'checkout', 0))
+                   AS f(at, trace, span, service, status)"#
+            ))
             .await
             .unwrap();
         let interval = super::time_bucket_interval(&range, bucket_count);
@@ -2208,15 +2396,22 @@ mod tests {
             .write_batches(&batches.iter().collect::<Vec<_>>())
             .unwrap();
         writer.finish().unwrap();
-        let mut rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).unwrap();
-        rows.sort_by_key(|row| row.to_string());
+        let rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).unwrap();
+        let times = rows
+            .iter()
+            .map(|row| row["time"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            times.is_sorted(),
+            "trace activity must be ordered by time: {times:?}"
+        );
         (interval, rows)
     }
 
     #[actix_web::test]
     async fn trace_activity_query_executes_with_distinct_bucketed_counts() {
-        let rows = run_trace_activity_fixture(&["service.name".to_owned()], &[]).await;
-        let summary = rows
+        let rows = run_trace_activity_fixture(&["service.name".to_owned()], &[], "BIGINT").await;
+        let mut summary = rows
             .iter()
             .map(|row| {
                 (
@@ -2227,6 +2422,8 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        // Rows are ordered by bucket only; order groups within a bucket here.
+        summary.sort();
         assert_eq!(
             summary,
             [
@@ -2252,12 +2449,18 @@ mod tests {
             &fields,
         )
         .unwrap();
-        let rows = run_trace_activity_fixture(&[], &clauses).await;
-        assert_eq!(rows.len(), 2);
-        assert!(
-            rows.iter()
-                .all(|row| row["span_count"] == 1 && row["trace_count"] == 1)
-        );
+        // Status codes are integers in some trace datasets and Float64 in others.
+        for status_type in ["BIGINT", "DOUBLE"] {
+            let rows = run_trace_activity_fixture(&[], &clauses, status_type).await;
+            assert_eq!(
+                rows,
+                [
+                    json!({ "time": "2026-10-22T00:00:00", "span_count": 1, "trace_count": 1 }),
+                    json!({ "time": "2026-10-22T00:01:00", "span_count": 1, "trace_count": 1 }),
+                ],
+                "{status_type}"
+            );
+        }
     }
 
     #[actix_web::test]
@@ -2301,6 +2504,94 @@ mod tests {
             &clauses,
         );
         assert!(bounded_tool_sql(&query).is_ok());
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_requires_span_columns_and_uses_the_time_partition() {
+        let fields =
+            ["p_timestamp", "span_span_id", "span_trace_id", "event_time"].map(str::to_owned);
+        let time_field = |fields: &[String], partition: Option<&str>| {
+            super::trace_activity_time_field("traces", fields, partition.map(str::to_owned))
+        };
+        assert_eq!(time_field(&fields, None).unwrap(), "p_timestamp");
+        assert_eq!(
+            time_field(&fields, Some("event_time")).unwrap(),
+            "event_time"
+        );
+        assert_eq!(
+            time_field(&fields, Some("start_time")).unwrap_err(),
+            "trace dataset `traces` is missing time field `start_time`"
+        );
+        for missing in ["span_span_id", "span_trace_id"] {
+            let fields = fields
+                .iter()
+                .filter(|field| *field != missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                time_field(&fields, None).unwrap_err(),
+                format!("trace dataset `traces` is missing required field `{missing}`")
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn dataset_activity_summary_orders_truncates_and_reports_failures() {
+        use super::DatasetActivity;
+        let count = |name: &str, events| DatasetActivity::Count {
+            name: name.to_owned(),
+            events,
+        };
+        let error = |index: usize| DatasetActivity::Error {
+            name: format!("broken-{index}"),
+            message: "unavailable".to_owned(),
+        };
+        let summarize = |activity, limit| {
+            super::summarize_dataset_activity(
+                activity,
+                limit,
+                30,
+                "logs",
+                "2026-10-22T00:00:00Z",
+                "2026-10-22T01:00:00Z",
+            )
+        };
+
+        let summary = summarize(
+            vec![
+                count("b", 5),
+                count("a", 5),
+                count("c", 0),
+                count("d", 9),
+                DatasetActivity::Skipped,
+                error(0),
+            ],
+            2,
+        );
+        assert_eq!(summary["status"], "resolved");
+        assert_eq!(summary["selectedDatasets"], json!(["d", "a"]));
+        assert_eq!(
+            summary["datasets"],
+            json!([
+                { "name": "d", "eventsInRange": 9 },
+                { "name": "a", "eventsInRange": 5 }
+            ])
+        );
+        assert_eq!(summary["activeDatasetCount"], 3);
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(summary["queriedDatasets"], 4);
+        assert_eq!(summary["visibleDatasets"], 30);
+        assert_eq!(summary["unavailableDatasets"].as_array().unwrap().len(), 1);
+
+        let quiet = summarize(vec![count("a", 0), DatasetActivity::Skipped], 5);
+        assert_eq!(quiet["status"], "not_found");
+        assert_eq!(quiet["truncated"], false);
+
+        let failed = summarize((0..25).map(error).chain([count("a", 0)]).collect(), 5);
+        assert_eq!(failed["status"], "error");
+        assert!(failed.get("datasets").is_none());
+        assert_eq!(failed["queriedDatasets"], 1);
+        assert_eq!(failed["unavailableDatasets"].as_array().unwrap().len(), 20);
     }
 
     #[actix_web::test]
@@ -2351,6 +2642,7 @@ mod tests {
             5,
             &[],
             &[],
+            "BIGINT",
         )
         .await;
         assert_eq!(interval, "5 seconds");
@@ -2369,6 +2661,7 @@ mod tests {
             1,
             &[],
             &[],
+            "BIGINT",
         )
         .await;
         assert_eq!(interval, "10 seconds");
@@ -2382,6 +2675,7 @@ mod tests {
             1,
             &[],
             &[],
+            "BIGINT",
         )
         .await;
         assert_eq!(interval, "40 seconds");
@@ -2446,6 +2740,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[actix_web::test]
+    async fn sample_events_selects_at_most_ten_columns() {
+        let fields = (0..15)
+            .map(|index| format!("f{index}"))
+            .chain(["p_timestamp".to_owned()])
+            .collect::<Vec<_>>();
+        let query =
+            sample_events_query(&json!({ "dataset": "logs" }), &fields, Utc::now()).unwrap();
+        let projection = query
+            .query
+            .strip_prefix("SELECT ")
+            .and_then(|query| query.split_once(" FROM "))
+            .unwrap()
+            .0
+            .split(", ")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projection,
+            [
+                "\"p_timestamp\"",
+                "\"f0\"",
+                "\"f1\"",
+                "\"f2\"",
+                "\"f3\"",
+                "\"f4\"",
+                "\"f5\"",
+                "\"f6\"",
+                "\"f7\"",
+                "\"f8\""
+            ]
+        );
+        assert!(
+            query
+                .query
+                .ends_with(" ORDER BY \"p_timestamp\" DESC LIMIT 10")
+        );
+    }
+
+    #[actix_web::test]
+    async fn time_resolution_rejects_durations_beyond_the_supported_range() {
+        let reference = DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        for expression in ["last 1000000 years", "now-300000y"] {
+            let error =
+                resolve_time_range_at(&json!({ "expression": expression }), reference).unwrap_err();
+            assert!(error.contains("too large"), "{expression}: {error}");
+        }
     }
 
     #[actix_web::test]
