@@ -148,7 +148,8 @@ top-level set operation such as `UNION` and to a parenthesized outer query.
 Projections inside CTE definitions, derived tables and subqueries are not
 checked. Casts to `INT64`, `UINT64` or `FLOAT64` anywhere in the statement are
 rejected with a hint to use `BIGINT` or `DOUBLE`. The statement is wrapped with
-an outer `LIMIT 500`. `sample_events`
+an outer `LIMIT 500`, except in `get_trace_activity`, whose generated SQL carries
+its own limit (see below). `sample_events`
 returns at most 10 columns, choosing common observability fields such as
 `p_timestamp`, `service.name`, `severity_text`, `body` and `trace_id` before
 other fields.
@@ -247,14 +248,18 @@ whole seconds, sized from the exact range and aligned to `startTime`. The datase
 must have traces telemetry and contain `span_span_id` and `span_trace_id`.
 Unknown fields are rejected. `span_count` is `COUNT(DISTINCT span_span_id)` and
 `trace_count` is `COUNT(DISTINCT span_trace_id)`, so duplicate span rows are
-not double counted. Rows are ordered by bucket. The result contains `query`,
-`bucketInterval`, `semantics` and up to 500 `rows`.
+not double counted. Rows are ordered by bucket, oldest first. The result
+contains `query`, `bucketInterval`, `semantics`, up to 500 `rows` and
+`truncated`.
 
-`query` is the aggregation SQL before the tool wraps it with `LIMIT 500`. It
-embeds the exact time bounds as a half-open predicate on the time field. The
-query API rounds a request's `startTime` and `endTime` down to the minute, so
-to reproduce the result, for example in a dashboard tile, run `query` through
-the query API with a time range that covers those bounds.
+`query` is the exact SQL the tool runs; it ends in `LIMIT 501` so the tool can
+detect overflow. When more than 500 rows match, the newest buckets are dropped
+and `truncated` is `true`; reduce `bucketCount`, `groupBy` or the time range to
+get the full series. `query` embeds the exact time bounds as a half-open
+predicate on the time field. The query API rounds a request's `startTime` and
+`endTime` down to the minute, so to reproduce the result, for example in a
+dashboard tile, run `query` through the query API with a time range that covers
+those bounds.
 
 ## Argument schema validation
 

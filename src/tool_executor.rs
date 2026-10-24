@@ -1419,13 +1419,30 @@ fn trace_activity_query(
     ];
     predicates.extend(clauses.iter().cloned());
     let where_clause = format!(" WHERE {}", predicates.join(" AND "));
+    // One row past the tool limit lets the caller detect truncation.
     format!(
-        "SELECT {} FROM {}{} GROUP BY {} ORDER BY 1 LIMIT 500",
+        "SELECT {} FROM {}{} GROUP BY {} ORDER BY 1 LIMIT {}",
         select.join(", "),
         quote_identifier(dataset),
         where_clause,
         groups,
+        MAX_TOOL_ROWS + 1,
     )
+}
+
+/// Caps trace activity rows at the tool limit and reports whether any were dropped.
+fn truncate_trace_activity_rows(rows: &mut Value) -> bool {
+    let rows = match rows {
+        Value::Array(rows) => rows,
+        Value::Object(object) => match object.get_mut("records").and_then(Value::as_array_mut) {
+            Some(rows) => rows,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let truncated = rows.len() > MAX_TOOL_ROWS as usize;
+    rows.truncate(MAX_TOOL_ROWS as usize);
+    truncated
 }
 
 async fn trace_activity_fields(
@@ -1543,8 +1560,11 @@ fn trace_activity_request(query: &str, range: &TimeRange) -> Result<query::Query
     let transport_end = truncate_to_minute(range.end)
         .checked_add_signed(Duration::minutes(1))
         .ok_or_else(|| "trace activity end time is outside the supported range".to_owned())?;
+    // The generated query carries its own LIMIT; wrapping it in the generic
+    // 500-row bound would hide the extra row used to detect truncation.
+    validate_tool_sql(query)?;
     Ok(query::Query {
-        query: bounded_select(query)?,
+        query: query.to_owned(),
         start_time: truncate_to_minute(range.start).to_rfc3339(),
         end_time: transport_end.to_rfc3339(),
         send_null: true,
@@ -1573,7 +1593,8 @@ async fn execute_trace_activity_tool(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let rows = response_value(response).await?;
+    let mut rows = response_value(response).await?;
+    let truncated = truncate_trace_activity_rows(&mut rows);
     Ok(json!({
         "dataset": dataset,
         "queryType": "sql",
@@ -1584,6 +1605,7 @@ async fn execute_trace_activity_tool(
             "trace_count": "COUNT(DISTINCT span_trace_id)"
         },
         "rows": rows,
+        "truncated": truncated,
     }))
 }
 
@@ -2384,19 +2406,7 @@ mod tests {
         context
             .register_table("traces", fixture.into_view())
             .unwrap();
-        let batches = context
-            .sql(&request.query)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-        writer
-            .write_batches(&batches.iter().collect::<Vec<_>>())
-            .unwrap();
-        writer.finish().unwrap();
-        let rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).unwrap();
+        let rows = execute_trace_activity_sql(&context, &request.query).await;
         let times = rows
             .iter()
             .map(|row| row["time"].as_str().unwrap())
@@ -2406,6 +2416,70 @@ mod tests {
             "trace activity must be ordered by time: {times:?}"
         );
         (interval, rows)
+    }
+
+    /// Runs trace activity SQL the way the tool does: validated, without the
+    /// generic 500-row wrapper.
+    async fn execute_trace_activity_sql(
+        context: &datafusion::prelude::SessionContext,
+        query: &str,
+    ) -> Vec<Value> {
+        super::validate_tool_sql(query).unwrap();
+        let batches = context.sql(query).await.unwrap().collect().await.unwrap();
+        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+        writer
+            .write_batches(&batches.iter().collect::<Vec<_>>())
+            .unwrap();
+        writer.finish().unwrap();
+        serde_json::from_slice(&writer.into_inner()).unwrap()
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_signals_truncation_past_the_row_limit() {
+        // 20 services x 60 one-minute buckets = 1200 groups x buckets.
+        let context = datafusion::prelude::SessionContext::new();
+        let fixture = context
+            .sql(
+                r#"SELECT CAST(TO_TIMESTAMP_SECONDS(1792627200 + (value / 20) * 60) AS TIMESTAMP)
+                        AS p_timestamp,
+                    CONCAT('t', value) AS span_trace_id, CONCAT('s', value) AS span_span_id,
+                    CONCAT('svc-', value % 20) AS "service.name"
+                   FROM range(1200)"#,
+            )
+            .await
+            .unwrap();
+        context
+            .register_table("traces", fixture.into_view())
+            .unwrap();
+        let range = trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z");
+        let interval = super::time_bucket_interval(&range, 60);
+        assert_eq!(interval, "60 seconds");
+        let query = trace_activity_query(
+            "traces",
+            "p_timestamp",
+            &interval,
+            &range,
+            &["service.name".to_owned()],
+            &[],
+        );
+        let mut rows = Value::Array(execute_trace_activity_sql(&context, &query).await);
+        assert!(super::truncate_trace_activity_rows(&mut rows));
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 500);
+        // Ascending order keeps the oldest 25 buckets; the newest are the ones dropped.
+        assert_eq!(rows[499]["time"], "2026-10-22T00:24:00");
+
+        // A result that fits is returned whole and not flagged.
+        let query = trace_activity_query("traces", "p_timestamp", &interval, &range, &[], &[]);
+        let mut rows = Value::Array(execute_trace_activity_sql(&context, &query).await);
+        assert!(!super::truncate_trace_activity_rows(&mut rows));
+        assert_eq!(rows.as_array().unwrap().len(), 60);
+
+        let mut exact = Value::Array(vec![json!({}); 500]);
+        assert!(!super::truncate_trace_activity_rows(&mut exact));
+        let mut records = json!({ "records": vec![json!({}); 501] });
+        assert!(super::truncate_trace_activity_rows(&mut records));
+        assert_eq!(records["records"].as_array().unwrap().len(), 500);
     }
 
     #[actix_web::test]
