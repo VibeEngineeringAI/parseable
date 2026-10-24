@@ -106,6 +106,17 @@ describe('saved view HTTP contract', () => {
           : client.convertLogViewToSql('id'),
     ).rejects.toBeInstanceOf(ApiError);
   });
+  it('accepts saved PromQL filters in the shared list without failing log views', async () => {
+    const promql: SavedLogView = {
+      ...body,
+      filter_id: 'promql-id',
+      stream_name: 'otel_metrics',
+      query: { filter_type: 'promql', filter_query: 'sum(rate(http_requests_total[5m]))' },
+    };
+    const saved = { ...body, filter_id: 'server-id' };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json([saved, promql])));
+    expect(await createClient({ mode: 'live' }).listLogViews()).toEqual([saved, promql]);
+  });
   it('validates optional explorer state while retaining classic metadata', () => {
     for (const explorer_state of [undefined, null, 'encoded'])
       expect(savedLogView({ ...body, explorer_state, classic_metadata: { anything: true } })).toBe(

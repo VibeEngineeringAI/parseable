@@ -39,16 +39,19 @@ use datafusion::{
 };
 use futures::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use object_store::{
-    BackoffConfig, ClientOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutPayload,
-    RetryConfig,
+    BackoffConfig, ClientOptions, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutPayload, RetryConfig,
     aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, Checksum},
     buffered::BufReader,
     limit::LimitStore,
     path::Path as StorePath,
 };
 use relative_path::{RelativePath, RelativePathBuf};
-use tokio::{fs::OpenOptions, io::AsyncReadExt};
-use tracing::error;
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncRead, AsyncReadExt},
+};
+use tracing::{error, warn};
 
 use crate::{
     metrics::{
@@ -733,8 +736,14 @@ impl S3 {
         let meta = file.metadata().await?;
         let total_size = meta.len() as usize;
         let min_multipart_size = PARSEABLE.options.min_multipart_size as usize;
-        if total_size < min_multipart_size || !PARSEABLE.options.enable_multipart {
-            let mut data = Vec::new();
+        if use_single_put(
+            total_size,
+            min_multipart_size,
+            PARSEABLE.options.enable_multipart,
+        ) {
+            // The reported length is only a capacity hint: the body is still whatever
+            // read_to_end returns, as before.
+            let mut data = Vec::with_capacity(total_size);
             file.read_to_end(&mut data).await?;
 
             // Track single PUT operation for small files
@@ -761,58 +770,32 @@ impl S3 {
             return Ok(());
         } else {
             let async_writer = self.client.put_multipart(location).await;
-            let mut async_writer = match async_writer {
+            let async_writer = match async_writer {
                 Ok(writer) => writer,
                 Err(err) => {
                     return Err(err.into());
                 }
             };
 
-            let mut data = Vec::new();
-            file.read_to_end(&mut data).await?;
-
-            // let mut upload_parts = Vec::new();
-
-            let has_final_partial_part = !total_size.is_multiple_of(min_multipart_size);
-            let num_full_parts = total_size / min_multipart_size;
-            let total_parts = num_full_parts + if has_final_partial_part { 1 } else { 0 };
+            let total_parts = total_size.div_ceil(min_multipart_size);
             tracing::Span::current()
                 .record("total_bytes", total_size)
                 .record("parts", total_parts);
 
-            // Upload each part with metrics
-            for part_number in 0..(total_parts) {
-                let start_pos = part_number * min_multipart_size;
-                let end_pos = if part_number == num_full_parts && has_final_partial_part {
-                    // Last part might be smaller than 5MB (which is allowed)
-                    total_size
-                } else {
-                    // All other parts must be at least 5MB
-                    start_pos + min_multipart_size
-                };
-
-                // Extract this part's data
-                let part_data = data[start_pos..end_pos].to_vec();
-
-                // Track individual part upload
-                let result = async_writer.put_part(part_data.into()).await;
-                if result.is_err() {
-                    return Err(result.err().unwrap().into());
-                }
-                increment_object_store_calls_by_date(
-                    "PUT_MULTIPART",
-                    &Utc::now().date_naive().to_string(),
-                    tenant_str,
-                );
-            }
-
-            // Track multipart completion
-            let complete_result = async_writer.complete().await;
-            if let Err(err) = complete_result {
-                error!("Failed to complete multipart upload. {:?}", err);
-                async_writer.abort().await?;
-                return Err(err.into());
-            }
+            upload_file_parts(
+                &mut file,
+                async_writer,
+                total_size,
+                min_multipart_size,
+                || {
+                    increment_object_store_calls_by_date(
+                        "PUT_MULTIPART",
+                        &Utc::now().date_naive().to_string(),
+                        tenant_str,
+                    )
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1462,6 +1445,136 @@ impl ObjectStorage for S3 {
     }
 }
 
+// BEGIN multipart-part-upload helper (extracted verbatim by the standalone upload harness)
+
+/// Files smaller than the multipart threshold, or every file when multipart is
+/// disabled, are sent with a single PUT.
+fn use_single_put(total_size: usize, min_multipart_size: usize, enable_multipart: bool) -> bool {
+    total_size < min_multipart_size || !enable_multipart
+}
+
+/// Aborts a multipart upload dropped before completion or an explicit abort
+/// resolves, e.g. when the owning upload task is cancelled during either await.
+///
+/// Best effort only: the abort is spawned onto the current tokio runtime, so it is
+/// skipped without a runtime and may itself be cancelled during runtime shutdown.
+/// Stores without lifecycle cleanup can still retain parts in those cases.
+struct AbortOnDrop(Option<Box<dyn MultipartUpload>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        let Some(mut upload) = self.0.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(err) = upload.abort().await {
+                    warn!("Failed to abort cancelled multipart upload. {:?}", err);
+                }
+            });
+        }
+    }
+}
+
+/// Uploads exactly `total_size` bytes from `reader` as sequential, ordered parts of
+/// `part_size` bytes (the last part may be smaller), then completes the upload.
+///
+/// Only one part buffer is held at a time and each part is awaited before the next is
+/// read. `on_part` runs after each successful part. A short read, extra trailing
+/// bytes, or a read/part/complete failure aborts the upload. Read/part failures
+/// retain their original error. As before, an abort failure after a completion
+/// failure is returned instead of the completion error.
+async fn upload_file_parts<R>(
+    reader: &mut R,
+    upload: Box<dyn MultipartUpload>,
+    total_size: usize,
+    part_size: usize,
+    on_part: impl FnMut(),
+) -> Result<(), ObjectStorageError>
+where
+    R: AsyncRead + Unpin,
+{
+    assert!(part_size > 0, "multipart part size must be non-zero");
+    let mut guard = AbortOnDrop(Some(upload));
+    let upload = guard.0.as_mut().expect("upload is present until completed");
+    let result = put_file_parts(reader, upload, total_size, part_size, on_part).await;
+    let completing = result.is_ok();
+    let result = match result {
+        Ok(()) => upload.complete().await.map(|_| ()).map_err(|err| {
+            error!("Failed to complete multipart upload. {:?}", err);
+            ObjectStorageError::from(err)
+        }),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = result {
+        // Keep ownership in the guard throughout the await. If a sibling upload
+        // failure cancels this task mid-abort, Drop can retry best-effort cleanup.
+        let aborted = guard
+            .0
+            .as_mut()
+            .expect("upload is present until cleanup resolves")
+            .abort()
+            .await;
+        guard.0 = None;
+        if let Err(abort_err) = aborted {
+            error!("Failed to abort multipart upload. {:?}", abort_err);
+            if completing {
+                return Err(abort_err.into());
+            }
+        }
+        return Err(err);
+    }
+    guard.0 = None;
+    Ok(())
+}
+
+async fn put_file_parts<R>(
+    reader: &mut R,
+    upload: &mut Box<dyn MultipartUpload>,
+    total_size: usize,
+    part_size: usize,
+    mut on_part: impl FnMut(),
+) -> Result<(), ObjectStorageError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut remaining = total_size;
+    while remaining > 0 {
+        let len = remaining.min(part_size);
+        let mut part = Vec::with_capacity(len);
+        (&mut *reader)
+            .take(len as u64)
+            .read_to_end(&mut part)
+            .await?;
+        if part.len() != len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file ended after {} of {total_size} bytes during multipart upload",
+                    total_size - remaining + part.len()
+                ),
+            )
+            .into());
+        }
+        upload.put_part(part.into()).await?;
+        on_part();
+        remaining -= len;
+    }
+
+    let mut probe = [0u8; 1];
+    if reader.read(&mut probe).await? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file grew beyond {total_size} bytes during multipart upload"),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+// END multipart-part-upload helper
+
 impl From<object_store::Error> for ObjectStorageError {
     fn from(error: object_store::Error) -> Self {
         match error {
@@ -1478,4 +1591,432 @@ impl From<serde_json::Error> for ObjectStorageError {
     fn from(error: serde_json::Error) -> Self {
         ObjectStorageError::UnhandledError(Box::new(error))
     }
+}
+
+#[cfg(test)]
+mod multipart_upload_tests {
+    // BEGIN multipart-part-upload tests (extracted verbatim by the standalone upload harness)
+    use std::{
+        io,
+        pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use object_store::{MultipartUpload, PutPayload, PutResult, UploadPart};
+    use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+
+    use super::{ObjectStorageError, upload_file_parts, use_single_put};
+
+    #[derive(Debug, Default)]
+    struct FakeState {
+        parts: Vec<Bytes>,
+        fail_part_at: Option<usize>,
+        hang_part_at: Option<usize>,
+        fail_complete: bool,
+        fail_abort: bool,
+        completed: usize,
+        aborted: usize,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeUpload(Arc<Mutex<FakeState>>);
+
+    fn fake_error(msg: &str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "fake",
+            source: msg.to_string().into(),
+        }
+    }
+
+    #[async_trait]
+    impl MultipartUpload for FakeUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            let mut state = self.0.lock().unwrap();
+            let index = state.parts.len();
+            if state.hang_part_at == Some(index) {
+                return Box::pin(futures::future::pending());
+            }
+            if state.fail_part_at == Some(index) {
+                return Box::pin(async { Err(fake_error("part failed")) });
+            }
+            let mut bytes = Vec::new();
+            for chunk in data.iter() {
+                bytes.extend_from_slice(chunk);
+            }
+            state.parts.push(bytes.into());
+            Box::pin(async { Ok(()) })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            let mut state = self.0.lock().unwrap();
+            state.completed += 1;
+            if state.fail_complete {
+                return Err(fake_error("complete failed"));
+            }
+            Ok(PutResult {
+                e_tag: None,
+                version: None,
+            })
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.aborted += 1;
+            if state.fail_abort {
+                return Err(fake_error("abort failed"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Yields `data`, then optionally fails instead of reporting EOF.
+    struct ScriptedReader {
+        data: Vec<u8>,
+        pos: usize,
+        fail_at_end: bool,
+    }
+
+    impl AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.pos == self.data.len() {
+                if self.fail_at_end {
+                    return Poll::Ready(Err(io::Error::other("read failed")));
+                }
+                return Poll::Ready(Ok(()));
+            }
+            // Short reads exercise the per-part read loop.
+            let n = buf.remaining().min(self.data.len() - self.pos).min(7);
+            let start = self.pos;
+            buf.put_slice(&self.data[start..start + n]);
+            self.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn reader(data: Vec<u8>, fail_at_end: bool) -> ScriptedReader {
+        ScriptedReader {
+            data,
+            pos: 0,
+            fail_at_end,
+        }
+    }
+
+    async fn run(
+        fake: &FakeUpload,
+        data: Vec<u8>,
+        fail_at_end: bool,
+        total_size: usize,
+        part_size: usize,
+    ) -> (Result<(), ObjectStorageError>, usize) {
+        let mut parts = 0;
+        let result = upload_file_parts(
+            &mut reader(data, fail_at_end),
+            Box::new(fake.clone()),
+            total_size,
+            part_size,
+            || parts += 1,
+        )
+        .await;
+        (result, parts)
+    }
+
+    fn uploaded(fake: &FakeUpload) -> (Vec<u8>, Vec<usize>) {
+        let state = fake.0.lock().unwrap();
+        let sizes = state.parts.iter().map(Bytes::len).collect();
+        (state.parts.concat(), sizes)
+    }
+
+    fn counts(fake: &FakeUpload) -> (usize, usize) {
+        let state = fake.0.lock().unwrap();
+        (state.completed, state.aborted)
+    }
+
+    #[test]
+    fn single_put_threshold_routing() {
+        assert!(use_single_put(99, 100, true));
+        assert!(!use_single_put(100, 100, true));
+        assert!(!use_single_put(101, 100, true));
+        assert!(use_single_put(100, 100, false));
+        assert!(use_single_put(1000, 100, false));
+        assert!(use_single_put(0, 100, true));
+    }
+
+    #[tokio::test]
+    async fn exact_multiple_uploads_ordered_full_parts() {
+        let fake = FakeUpload::default();
+        let data = pattern(300);
+        let (result, parts) = run(&fake, data.clone(), false, 300, 100).await;
+        result.unwrap();
+        let (bytes, sizes) = uploaded(&fake);
+        assert_eq!(bytes, data);
+        assert_eq!(sizes, vec![100, 100, 100]);
+        assert_eq!(parts, 3);
+        assert_eq!(counts(&fake), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn final_partial_part_is_smaller() {
+        let fake = FakeUpload::default();
+        let data = pattern(301);
+        let (result, parts) = run(&fake, data.clone(), false, 301, 100).await;
+        result.unwrap();
+        let (bytes, sizes) = uploaded(&fake);
+        assert_eq!(bytes, data);
+        assert_eq!(sizes, vec![100, 100, 100, 1]);
+        assert_eq!(parts, 4);
+        assert_eq!(counts(&fake), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn threshold_sized_file_is_one_part() {
+        let fake = FakeUpload::default();
+        let data = pattern(100);
+        let (result, parts) = run(&fake, data.clone(), false, 100, 100).await;
+        result.unwrap();
+        assert_eq!(uploaded(&fake), (data, vec![100]));
+        assert_eq!(parts, 1);
+        assert_eq!(counts(&fake), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn real_file_reader_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.parquet");
+        let data = pattern(1024 * 1024 + 17);
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        file.write_all(&data).await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let fake = FakeUpload::default();
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        let total_size = file.metadata().await.unwrap().len() as usize;
+        upload_file_parts(
+            &mut file,
+            Box::new(fake.clone()),
+            total_size,
+            256 * 1024,
+            || {},
+        )
+        .await
+        .unwrap();
+        let (bytes, sizes) = uploaded(&fake);
+        assert_eq!(bytes, data);
+        assert_eq!(sizes, vec![262144, 262144, 262144, 262144, 17]);
+        assert_eq!(counts(&fake), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn read_failure_aborts_without_completing() {
+        let fake = FakeUpload::default();
+        let (result, parts) = run(&fake, pattern(150), true, 300, 100).await;
+        match result {
+            Err(ObjectStorageError::IoError(err)) => assert_eq!(err.to_string(), "read failed"),
+            other => panic!("unexpected result {other:?}"),
+        }
+        assert_eq!(parts, 1);
+        assert_eq!(uploaded(&fake).1, vec![100]);
+        assert_eq!(counts(&fake), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn short_file_aborts_with_unexpected_eof() {
+        let fake = FakeUpload::default();
+        let (result, parts) = run(&fake, pattern(250), false, 300, 100).await;
+        match result {
+            Err(ObjectStorageError::IoError(err)) => {
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof)
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+        assert_eq!(parts, 2);
+        assert_eq!(counts(&fake), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn grown_file_aborts_before_completing() {
+        let fake = FakeUpload::default();
+        let (result, parts) = run(&fake, pattern(301), false, 300, 100).await;
+        match result {
+            Err(ObjectStorageError::IoError(err)) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData)
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+        assert_eq!(parts, 3);
+        assert_eq!(counts(&fake), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn put_part_failure_aborts_and_stops() {
+        let fake = FakeUpload::default();
+        fake.0.lock().unwrap().fail_part_at = Some(1);
+        let (result, parts) = run(&fake, pattern(300), false, 300, 100).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Unhandled Error: part failed"
+        );
+        assert_eq!(parts, 1);
+        assert_eq!(uploaded(&fake).1, vec![100]);
+        assert_eq!(counts(&fake), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn put_part_failure_keeps_error_when_abort_fails() {
+        let fake = FakeUpload::default();
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.fail_part_at = Some(0);
+            state.fail_abort = true;
+        }
+        let (result, parts) = run(&fake, pattern(300), false, 300, 100).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Unhandled Error: part failed"
+        );
+        assert_eq!(parts, 0);
+        assert_eq!(counts(&fake), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn complete_failure_aborts() {
+        let fake = FakeUpload::default();
+        fake.0.lock().unwrap().fail_complete = true;
+        let (result, parts) = run(&fake, pattern(300), false, 300, 100).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Unhandled Error: complete failed"
+        );
+        assert_eq!(parts, 3);
+        assert_eq!(counts(&fake), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn complete_failure_returns_abort_error_when_abort_fails() {
+        let fake = FakeUpload::default();
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.fail_complete = true;
+            state.fail_abort = true;
+        }
+        let (result, _) = run(&fake, pattern(300), false, 300, 100).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Unhandled Error: abort failed"
+        );
+        assert_eq!(counts(&fake), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn cancellation_spawns_best_effort_abort() {
+        let fake = FakeUpload::default();
+        fake.0.lock().unwrap().hang_part_at = Some(1);
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(50),
+            run(&fake, pattern(300), false, 300, 100),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        for _ in 0..100 {
+            if counts(&fake).1 == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(counts(&fake), (0, 1));
+        assert_eq!(uploaded(&fake).1, vec![100]);
+    }
+
+    #[derive(Debug)]
+    struct GatedAbortUpload {
+        inner: FakeUpload,
+        attempts: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        finished: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for GatedAbortUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                futures::future::pending::<()>().await;
+            }
+            let result = self.inner.abort().await;
+            self.finished.notify_one();
+            result
+        }
+    }
+
+    async fn cancel_during_abort_retries_cleanup(fail_complete: bool) {
+        let inner = FakeUpload::default();
+        {
+            let mut state = inner.0.lock().unwrap();
+            state.fail_complete = fail_complete;
+            state.fail_part_at = (!fail_complete).then_some(0);
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let upload = GatedAbortUpload {
+            inner: inner.clone(),
+            attempts: attempts.clone(),
+            started: started.clone(),
+            finished: finished.clone(),
+        };
+        let task = tokio::spawn(async move {
+            upload_file_parts(
+                &mut reader(pattern(300), false),
+                Box::new(upload),
+                300,
+                100,
+                || {},
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("inline abort must start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), finished.notified())
+            .await
+            .expect("drop guard must retry the interrupted abort");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(counts(&inner), (usize::from(fail_complete), 1));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_part_error_abort_retries_cleanup() {
+        cancel_during_abort_retries_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_complete_error_abort_retries_cleanup() {
+        cancel_during_abort_retries_cleanup(true).await;
+    }
+    // END multipart-part-upload tests
 }

@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(converted, once);
         converted.stream_name = legacy.stream_name.clone();
         assert_eq!(converted, legacy);
-        for kind in [FilterType::Filter, FilterType::Search] {
+        for kind in [FilterType::Filter, FilterType::Search, FilterType::Promql] {
             converted.query.filter_type = kind;
             let unchanged = converted.clone();
             assert!(super::convert_filter_to_sql(&mut converted).is_err());
@@ -331,6 +331,16 @@ mod tests {
             assert!(validate_stream_name(stream_name, &FilterType::SQL).is_err());
         }
         assert!(validate_stream_name(SQL_FILTER_STREAM_NAME, &FilterType::Search).is_err());
+    }
+
+    #[test]
+    fn promql_filters_require_a_concrete_dataset_name() {
+        // PromQL evaluation is scoped to one dataset, and listing authorizes
+        // the saved filter by that dataset, so the SQL sentinel is not valid.
+        assert!(validate_stream_name("otel_metrics", &FilterType::Promql).is_ok());
+        for stream_name in [SQL_FILTER_STREAM_NAME, "", "team1/serviceA", "../metrics"] {
+            assert!(validate_stream_name(stream_name, &FilterType::Promql).is_err());
+        }
     }
 
     #[test]

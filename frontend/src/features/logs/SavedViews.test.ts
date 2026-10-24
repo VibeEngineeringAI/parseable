@@ -87,6 +87,12 @@ describe('server saved views', () => {
     ]);
     expect(available.map(({ decoded }) => decoded?.dataset)).toEqual(['app', 'app', undefined]);
     expect(savedLogViewsForDataset([canonical], 'sql')).toEqual([]);
+    const promql = {
+      ...classic,
+      filter_name: 'Request rate',
+      query: { filter_type: 'promql' as const, filter_query: 'rate(requests_total[5m])' },
+    };
+    expect(savedLogViewsForDataset([promql], 'app')).toEqual([]);
   });
   it('rejects classic formats and mismatched dataset metadata', () => {
     const { explorer_state: _state, ...classic } = savedLogViewBody(state, 'Classic');
