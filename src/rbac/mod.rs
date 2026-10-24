@@ -490,7 +490,7 @@ mod lock_order_tests {
 
     use std::io::Write;
     use std::sync::{
-        Arc, Mutex, MutexGuard,
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
@@ -500,13 +500,15 @@ mod lock_order_tests {
     use actix_web::cookie::Cookie;
     use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version, password_hash::SaltString};
     use parking_lot::RwLock;
+    use tokio::sync::MutexGuard;
     use ulid::Ulid;
 
     use super::*;
     use crate::handlers::http::modal::query::querier_rbac::remove_user_from_groups;
     use crate::handlers::http::oidc::exchange_basic_for_cookie;
     use crate::rbac::map::{
-        ROLES, SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups, mut_roles, write_user_groups,
+        ROLES, SESSIONS, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups, mut_roles,
+        write_user_groups,
     };
     use crate::rbac::role::model::{DefaultPrivilege, Role};
     use crate::rbac::user::{Basic, GroupUser, UserGroup};
@@ -515,14 +517,11 @@ mod lock_order_tests {
     // Generous for debug builds; a deadlocked thread never finishes.
     const DEADLINE: Duration = Duration::from_secs(20);
 
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     // `map::init` needs `PARSEABLE`, so tests create the maps directly. They hold
-    // the shared locks on purpose, so they run one at a time.
+    // the shared locks on purpose, so they run one at a time and apart from every
+    // other test that writes the maps (`map::TEST_SERIAL`).
     fn auth_state() -> MutexGuard<'static, ()> {
-        let serial = SERIAL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let serial = TEST_SERIAL.blocking_lock();
         USERS.get_or_init(|| RwLock::new(map::Users::default()));
         SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
         USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));

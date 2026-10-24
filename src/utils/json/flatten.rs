@@ -78,6 +78,11 @@ pub fn flatten(
                 validate_time_partition(nested_dict, time_partition, time_partition_limit)?;
                 validate_custom_partition(nested_dict, custom_partition)?;
             }
+            // Rebuilding a map without nested objects or arrays of objects re-inserts every
+            // key unchanged and in the same order, so skip it.
+            if !object_needs_flattening(nested_dict) {
+                return Ok(());
+            }
             let original = std::mem::take(nested_dict);
             let mut map = Map::with_capacity(original.len());
             flatten_object(&mut map, None, original, separator)?;
@@ -219,6 +224,16 @@ pub fn validate_time_partition(
     }
 }
 
+// Returns true when `flatten_object` would change the map, i.e. it has a nested object
+// (including an empty one, which is dropped) or an array containing an object
+fn object_needs_flattening(map: &Map<String, Value>) -> bool {
+    map.values().any(|value| match value {
+        Value::Object(_) => true,
+        Value::Array(arr) => arr.iter().any(Value::is_object),
+        _ => false,
+    })
+}
+
 // Flattens a nested JSON Object/Map into another target Map
 fn flatten_object(
     output_map: &mut Map<String, Value>,
@@ -316,6 +331,8 @@ fn generic_flattening_inner(
     normalize_empty_array: bool,
 ) -> Result<Vec<Value>, JsonFlattenError> {
     match value {
+        // Without arrays the fold below rebuilds an exact copy of the object
+        Value::Object(map) if !map_contains_array(map) => Ok(vec![value.clone()]),
         Value::Array(arr) if arr.is_empty() && normalize_empty_array => Ok(vec![Value::Null]),
         Value::Array(arr) => Ok(arr
             .iter()
@@ -381,6 +398,38 @@ fn generic_flattening_inner(
     }
 }
 
+// Returns true if any value nested anywhere below this map is an array
+pub(crate) fn map_contains_array(map: &Map<String, Value>) -> bool {
+    map.values().any(|value| match value {
+        Value::Array(_) => true,
+        Value::Object(nested) => map_contains_array(nested),
+        _ => false,
+    })
+}
+
+/// Returns `Ok` with the result of `convert_to_array(generic_flattening(&value)?)` when
+/// generic flattening would leave every record unchanged, consuming `value` instead of
+/// cloning it. That holds for an object, or an array of objects, with no arrays nested
+/// anywhere inside. Returns `Err` with `value` untouched for every other shape, which
+/// must take the generic path (arrays expand into rows, nested top-level arrays are
+/// spliced, empty arrays become null and non-objects are errors).
+pub fn generic_flattening_noop(value: Value) -> Result<Value, Value> {
+    match value {
+        Value::Object(map) if !map_contains_array(&map) => {
+            Ok(Value::Array(vec![Value::Object(map)]))
+        }
+        Value::Array(arr)
+            if arr.iter().all(|item| match item {
+                Value::Object(map) => !map_contains_array(map),
+                _ => false,
+            }) =>
+        {
+            Ok(Value::Array(arr))
+        }
+        other => Err(other),
+    }
+}
+
 /// recursively checks the level of nesting for the serde Value
 /// if Value has more than configured `P_MAX_FLATTEN_LEVEL` levels of hierarchy, returns true
 /// example - if `P_MAX_FLATTEN_LEVEL` is 4, and the JSON is
@@ -410,12 +459,524 @@ pub fn convert_to_array(flattened: Vec<Value>) -> Result<Value, JsonFlattenError
     Ok(Value::Array(flattened))
 }
 
+/// Verbatim copies of the flattening functions before the no-op fast paths, kept as a
+/// differential oracle for tests.
+#[cfg(test)]
+pub(crate) mod legacy {
+    use std::collections::BTreeMap;
+
+    use serde_json::{Map, Value};
+
+    use super::{JsonFlattenError, validate_custom_partition};
+
+    // Time partition validation depends on global state, so the oracle only covers custom
+    // partitions; the fast path runs after both validations and does not change them.
+    pub fn flatten(
+        nested_value: &mut Value,
+        separator: &str,
+        custom_partition: Option<&String>,
+        validation_required: bool,
+    ) -> Result<(), JsonFlattenError> {
+        match nested_value {
+            Value::Object(nested_dict) => {
+                if validation_required {
+                    validate_custom_partition(nested_dict, custom_partition)?;
+                }
+                let original = std::mem::take(nested_dict);
+                let mut map = Map::with_capacity(original.len());
+                flatten_object(&mut map, None, original, separator)?;
+                *nested_dict = map;
+            }
+            Value::Array(arr) => {
+                for nested_value in arr {
+                    flatten(
+                        nested_value,
+                        separator,
+                        custom_partition,
+                        validation_required,
+                    )?;
+                }
+            }
+            _ => return Err(JsonFlattenError::CannotFlatten),
+        }
+
+        Ok(())
+    }
+
+    fn flatten_object(
+        output_map: &mut Map<String, Value>,
+        parent_key: Option<&str>,
+        nested_map: Map<String, Value>,
+        separator: &str,
+    ) -> Result<(), JsonFlattenError> {
+        for (key, mut value) in nested_map {
+            let new_key = match parent_key {
+                Some(parent) => format!("{parent}{separator}{key}"),
+                None => key,
+            };
+
+            match &mut value {
+                Value::Object(obj) => {
+                    let obj = std::mem::take(obj);
+                    flatten_object(output_map, Some(&new_key), obj, separator)?;
+                }
+                Value::Array(arr) if arr.iter().any(Value::is_object) => {
+                    flatten_array_objects(output_map, &new_key, arr, separator)?;
+                }
+                _ => {
+                    output_map.insert(new_key, value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flatten_array_objects(
+        output_map: &mut Map<String, Value>,
+        parent_key: &str,
+        arr: &mut [Value],
+        separator: &str,
+    ) -> Result<(), JsonFlattenError> {
+        let mut columns: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+
+        for (index, value) in arr.iter_mut().enumerate() {
+            match value {
+                Value::Object(nested_object) => {
+                    let mut output_map = Map::new();
+                    let nested_object = std::mem::take(nested_object);
+                    flatten_object(&mut output_map, Some(parent_key), nested_object, separator)?;
+                    for (key, value) in output_map {
+                        let column = columns
+                            .entry(key)
+                            .or_insert_with(|| vec![Value::Null; index]);
+                        column.push(value);
+                    }
+                }
+                Value::Null => {
+                    for column in columns.values_mut() {
+                        column.push(Value::Null);
+                    }
+                }
+                _ => return Err(JsonFlattenError::NonObjectInArray),
+            }
+
+            let max_len = index + 1;
+            for column in columns.values_mut() {
+                while column.len() < max_len {
+                    column.push(Value::Null);
+                }
+            }
+        }
+
+        for (key, values) in columns {
+            output_map.insert(key, Value::Array(values));
+        }
+
+        Ok(())
+    }
+
+    pub fn generic_flattening(value: &Value) -> Result<Vec<Value>, JsonFlattenError> {
+        generic_flattening_inner(value, false)
+    }
+
+    fn generic_flattening_inner(
+        value: &Value,
+        normalize_empty_array: bool,
+    ) -> Result<Vec<Value>, JsonFlattenError> {
+        match value {
+            Value::Array(arr) if arr.is_empty() && normalize_empty_array => Ok(vec![Value::Null]),
+            Value::Array(arr) => Ok(arr
+                .iter()
+                .flat_map(|flatten_item| {
+                    generic_flattening_inner(flatten_item, normalize_empty_array)
+                        .unwrap_or_default()
+                })
+                .collect()),
+            Value::Object(map) => {
+                let results = map
+                    .iter()
+                    .fold(vec![Map::new()], |results, (key, val)| match val {
+                        Value::Array(arr) => {
+                            if arr.is_empty() {
+                                results
+                                    .into_iter()
+                                    .map(|mut result| {
+                                        result.insert(key.clone(), Value::Null);
+                                        result
+                                    })
+                                    .collect()
+                            } else {
+                                arr.iter()
+                                    .flat_map(|flatten_item| {
+                                        generic_flattening_inner(flatten_item, true)
+                                            .unwrap_or_default()
+                                    })
+                                    .flat_map(|flattened_item| {
+                                        results.iter().map(move |result| {
+                                            let mut new_obj = result.clone();
+                                            new_obj.insert(key.clone(), flattened_item.clone());
+                                            new_obj
+                                        })
+                                    })
+                                    .collect()
+                            }
+                        }
+                        Value::Object(_) => generic_flattening(val)
+                            .unwrap_or_default()
+                            .iter()
+                            .flat_map(|nested_result| {
+                                results.iter().map(move |result| {
+                                    let mut new_obj = result.clone();
+                                    new_obj.insert(key.clone(), nested_result.clone());
+                                    new_obj
+                                })
+                            })
+                            .collect(),
+                        _ => results
+                            .into_iter()
+                            .map(|mut result| {
+                                result.insert(key.clone(), val.clone());
+                                result
+                            })
+                            .collect(),
+                    });
+
+                Ok(results.into_iter().map(Value::Object).collect())
+            }
+            _ => Ok(vec![value.clone()]),
+        }
+    }
+}
+
+/// Deterministic generator of varied JSON shapes for differential tests.
+#[cfg(test)]
+pub(crate) mod shapes {
+    use serde_json::{Map, Value, json};
+
+    pub struct Gen(u64);
+
+    // Keys chosen so that nested keys collide after flattening with `_`
+    const KEYS: &[&str] = &["a", "b", "a_b", "b_a", "a_b_a", "c", "", "_", "a.b"];
+
+    impl Gen {
+        pub fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        pub fn next(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        pub fn scalar(&mut self) -> Value {
+            match self.next(8) {
+                0 => Value::Null,
+                1 => json!(true),
+                2 => json!(-3),
+                3 => json!(1.5),
+                4 => json!(""),
+                5 => json!("x.y"),
+                6 => json!(u64::MAX),
+                _ => json!("v"),
+            }
+        }
+
+        // `arrays` controls how likely arrays are, so that both the array-free fast path
+        // and the generic path get exercised
+        pub fn value(&mut self, depth: u32, arrays: u64) -> Value {
+            if depth == 0 {
+                return self.scalar();
+            }
+            let roll = self.next(10);
+            if roll < 4 {
+                self.scalar()
+            } else if roll < 7 || self.next(10) >= arrays {
+                self.object(depth - 1, arrays)
+            } else {
+                let len = self.next(4);
+                let mut arr = Vec::new();
+                for _ in 0..len {
+                    arr.push(match self.next(5) {
+                        0 => Value::Null,
+                        1 => self.scalar(),
+                        2 => Value::Array(vec![]),
+                        _ => self.object(depth - 1, arrays),
+                    });
+                }
+                if self.next(3) == 0 {
+                    // Homogeneous arrays of objects, the case flatten turns into columns
+                    arr.retain(|v| v.is_object() || v.is_null());
+                }
+                Value::Array(arr)
+            }
+        }
+
+        pub fn object(&mut self, depth: u32, arrays: u64) -> Value {
+            let len = self.next(5);
+            let mut map = Map::new();
+            for _ in 0..len {
+                let key = KEYS[self.next(KEYS.len() as u64) as usize];
+                map.insert(key.to_owned(), self.value(depth, arrays));
+            }
+            Value::Object(map)
+        }
+
+        pub fn body(&mut self, arrays: u64) -> Value {
+            match self.next(6) {
+                0 => {
+                    let len = self.next(4);
+                    let mut arr = Vec::new();
+                    for _ in 0..len {
+                        arr.push(match self.next(8) {
+                            0 => self.value(3, arrays),
+                            _ => self.object(3, arrays),
+                        });
+                    }
+                    Value::Array(arr)
+                }
+                1 => self.value(4, arrays),
+                _ => self.object(4, arrays),
+            }
+        }
+    }
+
+    pub fn fixtures() -> Vec<Value> {
+        vec![
+            json!({}),
+            json!([]),
+            json!([{}]),
+            json!([[]]),
+            json!([[{"a": 1}], {"b": 2}]),
+            json!([1]),
+            json!(1),
+            json!(null),
+            json!("s"),
+            json!({"a": 1, "b": "x", "c": null, "d": true, "e": 1.5}),
+            json!({"a": {}}),
+            json!({"a": {"b": {}}, "c": 1}),
+            json!({"a": {"b": {"c": {"d": 1}}}}),
+            json!({"a_b": 1, "a": {"b": 2}}),
+            json!({"a": {"b": 2}, "a_b": 1}),
+            json!({"a": {"b_c": 1}, "a_b": {"c": 2}}),
+            json!({"a_b": 0, "a": [{"b": 1}, {"b": 2}]}),
+            json!({"a": [{"b": 1}, {"b": 2}], "a_b": 0}),
+            json!({"a": []}),
+            json!({"a": [[]]}),
+            json!({"a": [null]}),
+            json!({"a": [1, 2], "b": [3, 4]}),
+            json!({"a": [{"b": 1}, 2]}),
+            json!({"a": [{"b": []}]}),
+            json!({"a": [{}, {}]}),
+            json!({"a": {"b": [1, {"c": 2}]}}),
+            json!({"a": {"b": [{"c": [{"d": 1}]}]}}),
+            json!([{"a": 1}, {"a": {"b": 2}}, {"a_b": 3, "a": {"b": 4}}]),
+            json!([{"a": 1}, {"b": [1, 2]}]),
+            json!([{"a": 1}, 2]),
+            json!([{"a": 1}, null]),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::utils::json::flatten::{flatten_array_objects, generic_flattening};
 
     use super::{JsonFlattenError, flatten};
     use serde_json::{Map, Value, json};
+
+    // Serialization keeps key order, which `==` on maps may ignore
+    fn ordered(result: Result<Vec<Value>, JsonFlattenError>) -> Result<String, String> {
+        result
+            .map(|values| serde_json::to_string(&values).unwrap())
+            .map_err(|err| err.to_string())
+    }
+
+    fn flatten_ordered(
+        mut value: Value,
+        separator: &str,
+        custom_partition: Option<&String>,
+        validation_required: bool,
+        legacy: bool,
+    ) -> Result<String, String> {
+        let result = if legacy {
+            super::legacy::flatten(&mut value, separator, custom_partition, validation_required)
+        } else {
+            flatten(
+                &mut value,
+                separator,
+                None,
+                None,
+                custom_partition,
+                validation_required,
+            )
+        };
+        result
+            .map(|()| serde_json::to_string(&value).unwrap())
+            .map_err(|err| format!("{err:?}"))
+    }
+
+    fn corpus() -> Vec<Value> {
+        let mut values = super::shapes::fixtures();
+        for arrays in [0, 3, 10] {
+            let mut generator = super::shapes::Gen::new(arrays + 1);
+            for _ in 0..1500 {
+                values.push(generator.body(arrays));
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn generic_flattening_matches_legacy() {
+        for value in corpus() {
+            assert_eq!(
+                ordered(generic_flattening(&value)),
+                ordered(super::legacy::generic_flattening(&value)),
+                "input: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_flattening_noop_matches_legacy() {
+        let mut fast = 0;
+        for value in corpus() {
+            let expected = super::legacy::generic_flattening(&value)
+                .and_then(super::convert_to_array)
+                .map(|v| serde_json::to_string(&v).unwrap());
+            match super::generic_flattening_noop(value.clone()) {
+                Ok(result) => {
+                    fast += 1;
+                    assert_eq!(
+                        Ok(serde_json::to_string(&result).unwrap()),
+                        expected.map_err(|e| e.to_string()),
+                        "input: {value}"
+                    );
+                }
+                Err(returned) => assert_eq!(returned, value),
+            }
+        }
+        assert!(fast > 1000, "fast path exercised only {fast} times");
+    }
+
+    #[test]
+    fn flatten_matches_legacy() {
+        let partitions =
+            [None, Some("a"), Some("a, b"), Some("a_b"), Some("c")].map(|p| p.map(str::to_owned));
+        let mut unchanged = 0;
+        for value in corpus() {
+            // Exercise flatten on both raw bodies and generic flattening output
+            let mut inputs = vec![value.clone()];
+            if let Ok(rows) = super::legacy::generic_flattening(&value) {
+                inputs.push(Value::Array(rows));
+            }
+            for input in inputs {
+                for separator in ["_", "."] {
+                    for partition in &partitions {
+                        for validation_required in [false, true] {
+                            let result = flatten_ordered(
+                                input.clone(),
+                                separator,
+                                partition.as_ref(),
+                                validation_required,
+                                false,
+                            );
+                            assert_eq!(
+                                result,
+                                flatten_ordered(
+                                    input.clone(),
+                                    separator,
+                                    partition.as_ref(),
+                                    validation_required,
+                                    true,
+                                ),
+                                "input: {input} separator: {separator} partition: {partition:?}"
+                            );
+                            if result == Ok(serde_json::to_string(&input).unwrap()) {
+                                unchanged += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            unchanged > 1000,
+            "no-op flatten exercised only {unchanged} times"
+        );
+    }
+
+    #[test]
+    fn flatten_preserves_collision_order() {
+        // The later key wins, at the position where the key was first inserted (with the
+        // `preserve_order` map that the server builds with)
+        let preserves_order =
+            json!({"b": 0, "a": 0}).as_object().unwrap().keys().next() == Some(&"b".to_owned());
+        for (input, expected) in [
+            (
+                json!({"a_b": 1, "a": {"b": 2}, "c": 3}),
+                json!({"a_b": 2, "c": 3}),
+            ),
+            (json!({"a": {"b": 2}, "a_b": 1}), json!({"a_b": 1})),
+        ] {
+            let mut obj = input.clone();
+            flatten(&mut obj, "_", None, None, None, false).unwrap();
+            if preserves_order {
+                assert_eq!(obj, expected);
+            }
+            assert_eq!(
+                Ok(serde_json::to_string(&obj).unwrap()),
+                flatten_ordered(input, "_", None, false, true)
+            );
+        }
+    }
+
+    #[test]
+    fn flatten_drops_nested_empty_object() {
+        let mut obj = json!({"a": {}, "b": {"c": {}}, "d": 1});
+        flatten(&mut obj, "_", None, None, None, false).unwrap();
+        assert_eq!(obj, json!({"d": 1}));
+    }
+
+    #[test]
+    fn flatten_flat_object_still_validates() {
+        let mut obj = json!({"a": "x.y", "b": 1});
+        assert!(matches!(
+            flatten(&mut obj, "_", None, None, Some(&"a".to_owned()), true),
+            Err(JsonFlattenError::FieldContainsPeriod(_))
+        ));
+        let mut obj = json!({"b": 1});
+        assert!(matches!(
+            flatten(&mut obj, "_", None, None, Some(&"a".to_owned()), true),
+            Err(JsonFlattenError::FieldNotPartOfLog(_))
+        ));
+        let mut obj = json!(1);
+        assert!(matches!(
+            flatten(&mut obj, "_", None, None, None, false),
+            Err(JsonFlattenError::CannotFlatten)
+        ));
+    }
+
+    #[test]
+    fn generic_flattening_noop_rejects_expanding_shapes() {
+        for value in [
+            json!({"a": []}),
+            json!({"a": {"b": [1]}}),
+            json!([[{"a": 1}]]),
+            json!([{"a": 1}, 1]),
+            json!(1),
+            json!(null),
+        ] {
+            assert_eq!(super::generic_flattening_noop(value.clone()), Err(value));
+        }
+        assert_eq!(
+            super::generic_flattening_noop(json!({"a": {"b": {}}})),
+            Ok(json!([{"a": {"b": {}}}]))
+        );
+        assert_eq!(super::generic_flattening_noop(json!([])), Ok(json!([])));
+    }
 
     #[test]
     fn flatten_single_key_string() {
