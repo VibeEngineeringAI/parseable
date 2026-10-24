@@ -27,6 +27,7 @@ use crate::{
     handlers::http::{
         cluster::{sync_role_delete, sync_role_update},
         modal::utils::rbac_utils::{get_metadata, put_metadata},
+        rbac::UPDATE_LOCK,
         role::RoleError,
     },
     parseable::DEFAULT_TENANT,
@@ -44,8 +45,16 @@ use crate::{
 pub async fn put(
     req: HttpRequest,
     name: web::Path<String>,
-    Json(body): Json<Role>,
+    Json(role): Json<Role>,
 ) -> Result<impl Responder, RoleError> {
+    let guard = UPDATE_LOCK.lock().await;
+    // internal role manipulation not allowed
+    if role.role_type().eq(&RoleType::Internal) {
+        return Err(RoleError::ProtectedRole);
+    }
+    if role.deny_super_admin() {
+        return Err(RoleError::SuperAdminPrivilege);
+    }
     let name = name.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
@@ -56,22 +65,11 @@ pub async fn put(
     validator::user_role_name(&name).map_err(RoleError::ValidationError)?;
 
     // if role exists, then it should not be an internal role
-    let role = if let Some(tenant_roles) = mut_roles().get_mut(tenant)
-        && let Some(role) = tenant_roles.get_mut(&name)
+    if let Some(tenant_roles) = roles().get(tenant)
+        && let Some(existing_role) = tenant_roles.get(&name)
+        && existing_role.role_type().eq(&RoleType::Internal)
     {
-        if role.role_type().eq(&RoleType::Internal) {
-            return Err(RoleError::ProtectedRole);
-        } else {
-            // role exists and is not internal, can proceed with modification
-            *role = body;
-            role.clone()
-        }
-    } else {
-        body
-    };
-
-    if role.deny_super_admin() {
-        return Err(RoleError::SuperAdminPrivilege);
+        return Err(RoleError::ProtectedRole);
     }
 
     let mut metadata = get_metadata(&tenant_id).await?;
@@ -115,6 +113,8 @@ pub async fn put(
             }
         }
     }
+
+    drop(guard);
 
     if let Err(e) = sync_role_update(&req, name.clone(), role, &tenant_id, &caller_userid).await {
         tracing::error!("Failed to sync role update to cluster nodes: {e}");
