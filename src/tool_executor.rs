@@ -1457,6 +1457,16 @@ fn trace_activity_group_by(arguments: &Value, fields: &[String]) -> Result<Vec<S
     if let Some(field) = group_by.iter().find(|field| !fields.contains(field)) {
         return Err(format!("groupBy field `{field}` does not exist"));
     }
+    for (index, field) in group_by.iter().enumerate() {
+        if group_by[..index].contains(field) {
+            return Err(format!("groupBy field `{field}` is listed more than once"));
+        }
+        if ["time", "span_count", "trace_count"].contains(&field.as_str()) {
+            return Err(format!(
+                "groupBy field `{field}` collides with the `{field}` output column"
+            ));
+        }
+    }
     Ok(group_by)
 }
 
@@ -2217,6 +2227,31 @@ mod tests {
         assert!(clauses.contains(&"\"service.name\" IS NULL".to_owned()));
         let query = trace_activity_query("traces", "p_timestamp", "1 seconds", &[], &clauses);
         assert!(bounded_tool_sql(&query).is_ok());
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_rejects_repeated_and_output_colliding_group_by() {
+        let fields = ["service.name", "time", "span_count", "trace_count"].map(str::to_owned);
+        assert_eq!(
+            super::trace_activity_group_by(
+                &json!({ "groupBy": ["service.name", "service.name"] }),
+                &fields
+            ),
+            Err("groupBy field `service.name` is listed more than once".to_owned())
+        );
+        for field in ["time", "span_count", "trace_count"] {
+            assert_eq!(
+                super::trace_activity_group_by(&json!({ "groupBy": [field] }), &fields),
+                Err(format!(
+                    "groupBy field `{field}` collides with the `{field}` output column"
+                ))
+            );
+        }
+        assert_eq!(
+            super::trace_activity_group_by(&json!({ "groupBy": ["service.name"] }), &fields)
+                .unwrap(),
+            ["service.name".to_owned()]
+        );
     }
 
     #[actix_web::test]

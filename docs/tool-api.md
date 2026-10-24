@@ -204,8 +204,10 @@ traces dataset:
 ```
 
 `dataset`, `startTime` and `endTime` are required. `groupBy` takes up to 5
-exact field names. `filters` maps exact field names to JSON scalars: strings,
-numbers and booleans test equality, and `null` tests `IS NULL`. `bucketCount`
+exact field names. Each field may appear only once, and `time`, `span_count`
+and `trace_count` are rejected because they are output column names. `filters`
+maps exact field names to JSON scalars: strings, numbers and booleans test
+equality, and `null` tests `IS NULL`. `bucketCount`
 is 1–100, default 60. It approximates the number of `DATE_BIN` buckets over the
 dataset's time partition, or `p_timestamp` if none is configured. The dataset
 must have traces telemetry and contain `span_span_id` and `span_trace_id`.
