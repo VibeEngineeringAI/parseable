@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
@@ -101,10 +101,17 @@ pub struct ValidateApiKeyRequest {
     api_key: String,
 }
 
+/// Query params for `GET /apikeys`. `privilege` is the canonical name;
+/// `priviledge` is accepted as an alias for compatibility with upstream
+/// Parseable clients, which use that spelling.
 #[derive(Debug, Deserialize)]
 pub struct ListApiKeysQuery {
-    #[serde(default, deserialize_with = "deserialize_api_key_privilege")]
-    priviledge: Option<DefaultPrivilege>,
+    #[serde(
+        default,
+        alias = "priviledge",
+        deserialize_with = "deserialize_api_key_privilege"
+    )]
+    privilege: Option<DefaultPrivilege>,
 }
 
 fn deserialize_api_key_privilege<'de, D>(
@@ -132,6 +139,20 @@ fn role_has_privilege(role: &Role, privilege: &DefaultPrivilege) -> bool {
     role.privileges()
         .iter()
         .any(|candidate| std::mem::discriminant(candidate) == std::mem::discriminant(privilege))
+}
+
+/// Whether any of the user's roles in `tenant_roles` grants `privilege`.
+/// Roles missing from the map never match.
+fn user_has_privilege(
+    user: &User,
+    tenant_roles: Option<&HashMap<String, Role>>,
+    privilege: &DefaultPrivilege,
+) -> bool {
+    user.roles.iter().any(|role_name| {
+        tenant_roles
+            .and_then(|roles| roles.get(role_name))
+            .is_some_and(|role| role_has_privilege(role, privilege))
+    })
 }
 
 impl ApiKeyListEntry {
@@ -330,25 +351,23 @@ pub async fn delete_api_key(
 /// GET /api/prism/v1/apikeys
 ///
 /// List all API keys (masked). Only admins can list keys. Optionally filter by
-/// role privilege with `?priviledge=reader|ingestor|admin|writer|editor`.
+/// role privilege with `?privilege=reader|ingestor|admin|writer|editor`
+/// (`?priviledge=` is accepted too). An unknown value is rejected with 400.
 pub async fn list_api_keys(
     req: HttpRequest,
     web::Query(query): web::Query<ListApiKeysQuery>,
 ) -> Result<impl Responder, ApiKeyError> {
     let (_, tenant_id) = verify_admin(&req)?;
-    let tenant = tenant_or_default(&tenant_id);
-    let tenant_roles = roles();
-    let entries: Vec<ApiKeyListEntry> = collect_tenant_api_keys(&tenant_id)
+    let keys = collect_tenant_api_keys(&tenant_id);
+    let all_roles = roles();
+    let tenant_roles = all_roles.get(tenant_or_default(&tenant_id));
+    let entries: Vec<ApiKeyListEntry> = keys
         .iter()
         .filter(|user| {
-            query.priviledge.as_ref().is_none_or(|privilege| {
-                user.roles.iter().any(|role_name| {
-                    tenant_roles
-                        .get(tenant)
-                        .and_then(|roles| roles.get(role_name))
-                        .is_some_and(|role| role_has_privilege(role, privilege))
-                })
-            })
+            query
+                .privilege
+                .as_ref()
+                .is_none_or(|privilege| user_has_privilege(user, tenant_roles, privilege))
         })
         .filter_map(ApiKeyListEntry::from_user)
         .collect();
@@ -397,6 +416,7 @@ pub async fn get_api_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rbac::role::ParseableResourceType;
 
     #[test]
     fn expired_key_remains_visible_with_expiry_in_detail_and_list() {
@@ -438,5 +458,132 @@ mod tests {
         let entry = serde_json::to_value(ApiKeyListEntry::from_user(&user).unwrap()).unwrap();
         assert!(detail.get("expiresAt").unwrap().is_null());
         assert!(entry.get("expiresAt").unwrap().is_null());
+    }
+
+    fn parse_query(query: &str) -> Result<ListApiKeysQuery, actix_web::Error> {
+        web::Query::<ListApiKeysQuery>::from_query(query)
+            .map(web::Query::into_inner)
+            .map_err(Into::into)
+    }
+
+    fn key_with_roles(name: &str, roles: &[&str]) -> User {
+        User::new_api_key(
+            Ulid::new(),
+            format!("{name}-secret"),
+            name.into(),
+            roles.iter().map(|r| r.to_string()).collect(),
+            "admin".into(),
+            None,
+        )
+    }
+
+    fn filtered_names(
+        keys: &[User],
+        tenant_roles: Option<&HashMap<String, Role>>,
+        privilege: &DefaultPrivilege,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = keys
+            .iter()
+            .filter(|user| user_has_privilege(user, tenant_roles, privilege))
+            .filter_map(|user| user.as_api_key().map(|k| k.key_name.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn list_query_without_privilege_is_unfiltered() {
+        assert!(parse_query("").unwrap().privilege.is_none());
+    }
+
+    #[test]
+    fn list_query_accepts_every_privilege_under_both_spellings() {
+        let cases = [
+            ("reader", DefaultPrivilege::Reader { resource: None }),
+            ("ingestor", DefaultPrivilege::Ingestor { resource: None }),
+            ("admin", DefaultPrivilege::Admin),
+            ("writer", DefaultPrivilege::Writer { resource: None }),
+            ("editor", DefaultPrivilege::Editor),
+        ];
+        for (value, expected) in cases {
+            for param in ["privilege", "priviledge"] {
+                let parsed = parse_query(&format!("{param}={value}"))
+                    .unwrap_or_else(|err| panic!("{param}={value}: {err}"))
+                    .privilege;
+                assert_eq!(parsed, Some(expected.clone()), "{param}={value}");
+            }
+        }
+    }
+
+    #[test]
+    fn list_query_rejects_unknown_privilege_with_bad_request() {
+        for query in [
+            "privilege=owner",
+            "priviledge=owner",
+            "privilege=Reader",
+            "privilege=",
+            "privilege=reader&priviledge=reader",
+        ] {
+            let err = parse_query(query).expect_err(query);
+            assert_eq!(
+                err.as_response_error().status_code(),
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn privilege_filter_matches_keys_by_role_privileges() {
+        let tenant_roles: HashMap<String, Role> = [
+            (
+                "readers".to_string(),
+                Role::create_user_role(vec![DefaultPrivilege::Reader {
+                    resource: Some(ParseableResourceType::Stream("logs".into())),
+                }]),
+            ),
+            (
+                "ingest-and-read".to_string(),
+                Role::create_user_role(vec![
+                    DefaultPrivilege::Ingestor { resource: None },
+                    DefaultPrivilege::Reader { resource: None },
+                ]),
+            ),
+            (
+                "admins".to_string(),
+                Role::create_user_role(vec![DefaultPrivilege::Admin]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let keys = [
+            key_with_roles("reader-key", &["readers"]),
+            key_with_roles("pipeline-key", &["ingest-and-read"]),
+            key_with_roles("admin-key", &["admins"]),
+            key_with_roles("dangling-key", &["deleted-role"]),
+            key_with_roles("roleless-key", &[]),
+        ];
+
+        let reader = DefaultPrivilege::Reader { resource: None };
+        // Resource-scoped privileges still match the bare privilege filter.
+        assert_eq!(
+            filtered_names(&keys, Some(&tenant_roles), &reader),
+            ["pipeline-key", "reader-key"]
+        );
+        assert_eq!(
+            filtered_names(
+                &keys,
+                Some(&tenant_roles),
+                &DefaultPrivilege::Ingestor { resource: None }
+            ),
+            ["pipeline-key"]
+        );
+        assert_eq!(
+            filtered_names(&keys, Some(&tenant_roles), &DefaultPrivilege::Admin),
+            ["admin-key"]
+        );
+        assert!(filtered_names(&keys, Some(&tenant_roles), &DefaultPrivilege::Editor).is_empty());
+        // A tenant without a role map matches nothing.
+        assert!(filtered_names(&keys, None, &reader).is_empty());
     }
 }
