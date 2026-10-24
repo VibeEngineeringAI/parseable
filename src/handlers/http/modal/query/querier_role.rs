@@ -202,3 +202,90 @@ pub async fn delete(
 
     Ok(HttpResponse::Ok().finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use actix_web::{HttpMessage, ResponseError, http::StatusCode, test::TestRequest};
+    use chrono::TimeDelta;
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::{
+        handlers::TENANT_ID,
+        rbac::{
+            Users,
+            map::{
+                ROLES, SESSIONS, SessionKey, Sessions, USER_GROUPS, USERS, UserGroups,
+                Users as UserMap, mut_users,
+            },
+            role::model::DefaultPrivilege,
+            user::{Basic, User, UserType},
+        },
+    };
+
+    const ROLE: &str = "readers";
+
+    // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+    fn init_auth_maps() {
+        USERS.get_or_init(|| RwLock::new(UserMap::default()));
+        SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+    }
+
+    fn reader_role() -> Role {
+        Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }])
+    }
+
+    /// A fresh tenant holding one ordinary role, and a request from a user with
+    /// a live session in that tenant.
+    fn tenant_request() -> (String, HttpRequest) {
+        init_auth_maps();
+        let tenant = format!("querier-role-{}", Ulid::new());
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), reader_role());
+        let caller = User {
+            ty: UserType::Native(Basic {
+                username: format!("caller-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: HashSet::from([ROLE.to_owned()]),
+            user_groups: HashSet::new(),
+            tenant: Some(tenant.clone()),
+            protected: false,
+        };
+        mut_users().insert(caller.clone());
+        let session = SessionKey::SessionId(Ulid::new());
+        Users.new_session(&caller, session.clone(), TimeDelta::minutes(5));
+        let req = TestRequest::default()
+            .insert_header((TENANT_ID, tenant.as_str()))
+            .to_http_request();
+        req.extensions_mut().insert(session);
+        (tenant, req)
+    }
+
+    #[tokio::test]
+    async fn rejected_super_admin_update_leaves_live_role_unchanged() {
+        let (tenant, req) = tenant_request();
+        let body = Role::create_user_role(vec![DefaultPrivilege::SuperAdmin]);
+
+        let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(body)).await else {
+            panic!("SuperAdmin role update must be rejected");
+        };
+        assert!(matches!(err, RoleError::SuperAdminPrivilege), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+
+        let live = roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned();
+        assert_eq!(
+            live,
+            Some(reader_role()),
+            "rejected update must not change the live role"
+        );
+    }
+}
