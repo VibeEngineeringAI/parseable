@@ -1840,6 +1840,26 @@ async fn execute_oss_tool_inner(
 /// Execute a registered OSS tool in-process. Enterprise uses this only after
 /// applying its own agent policy and action-confirmation checks, so catalog
 /// validation and the underlying platform implementation remain canonical.
+///
+/// # Caller obligations
+///
+/// Unlike [`call_tool_registry`], this function applies only catalog argument
+/// validation and each tool's own per-resource `authorize()` check. Before
+/// calling it, the caller must:
+///
+/// - confirm the session is still valid (`Users.session_exists`);
+/// - reject suspended tenants with
+///   `middleware::check_suspension_for_tenant(tenant_id, Action::Query)`;
+/// - authorize the global `Action::Query` gate for the session;
+/// - restrict which tools may run. Lookup uses the full [`oss_tool_specs`],
+///   including action tools such as `create_alert`, `enable_alert`,
+///   `disable_alert`, `evaluate_alert` and `create_alert_target`, whereas the
+///   HTTP route exposes only [`oss_read_tool_specs`] (plus dashboard writes
+///   when enabled). Action tools need the caller's own confirmation policy.
+///
+/// The same obligations apply to [`execute_oss_tool_with_query_headers`].
+///
+/// [`oss_read_tool_specs`]: crate::tool_catalog::oss_read_tool_specs
 pub async fn execute_oss_tool(
     name: &str,
     arguments: &Value,
@@ -1854,6 +1874,10 @@ pub async fn execute_oss_tool(
 /// Execute a registered OSS tool with separate headers for internal query-node
 /// requests. Prism callers use this to preserve their server-authenticated
 /// routing headers without changing the external MCP execution path.
+///
+/// Callers must apply the session, tenant-suspension, global `Query` and
+/// tool-restriction gates listed on [`execute_oss_tool`]; none are enforced
+/// here.
 pub async fn execute_oss_tool_with_query_headers(
     name: &str,
     arguments: &Value,
