@@ -248,8 +248,10 @@ traces dataset:
 `endTime`; both are resolved once and applied as exact, half-open bounds (start
 inclusive, end exclusive) on the dataset's time partition, so subminute ranges
 keep their full precision. `groupBy` takes up to 5
-exact field names. `filters` maps exact field names to JSON scalars: strings,
-numbers and booleans test equality, and `null` tests `IS NULL`. `bucketCount`
+exact field names. Each field may appear only once, and `time`, `span_count`
+and `trace_count` are rejected because they are output column names. `filters`
+maps exact field names to JSON scalars: strings, numbers and booleans test
+equality, and `null` tests `IS NULL`. `bucketCount`
 is 1–100, default 60. It approximates the number of `DATE_BIN` buckets over the
 dataset's time partition, or `p_timestamp` if none is configured. Buckets are
 whole seconds, sized from the exact range and aligned to `startTime`. The dataset
