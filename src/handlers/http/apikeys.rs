@@ -409,6 +409,7 @@ mod tests {
 
         const ADMIN_ROLE: &str = "tenant-admin";
         const READER_ROLE: &str = "reader";
+        const INTERNAL_ROLE: &str = "internal";
         // Mirrors the internal role `rbac::map::init` adds to the default tenant.
         const SUPER_ADMIN_ROLE: &str = "super-admin";
         // A user-typed role holding SuperAdmin, e.g. from legacy metadata.
@@ -436,6 +437,10 @@ mod tests {
                     (
                         READER_ROLE.to_owned(),
                         Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }]),
+                    ),
+                    (
+                        INTERNAL_ROLE.to_owned(),
+                        Role::create_internal_role(vec![DefaultPrivilege::Admin]),
                     ),
                     (
                         SUPER_ADMIN_ROLE.to_owned(),
@@ -484,7 +489,7 @@ mod tests {
         #[test]
         fn validate_roles_rejects_internal_role() {
             let tenant = Some(tenant());
-            let result = validate_roles(&role_set(SUPER_ADMIN_ROLE), &tenant);
+            let result = validate_roles(&role_set(INTERNAL_ROLE), &tenant);
             assert!(
                 matches!(result, Err(ApiKeyError::Rbac(RBACError::ProtectedRole))),
                 "internal role must be rejected like the native-user path, got {result:?}"
