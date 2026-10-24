@@ -376,11 +376,23 @@ fn log_context_window_bounds(
 
     let duration = chrono::Duration::from_std(duration)
         .map_err(|err| QueryError::CustomError(format!("Invalid contextWindow: {err}")))?;
-    let start = truncate_to_minute(anchor_timestamp - duration);
-    let mut end = truncate_to_minute(anchor_timestamp + duration);
+    let out_of_range =
+        || QueryError::CustomError("contextWindow is outside the supported range".to_string());
+    let start = truncate_to_minute(
+        anchor_timestamp
+            .checked_sub_signed(duration)
+            .ok_or_else(out_of_range)?,
+    );
+    let mut end = truncate_to_minute(
+        anchor_timestamp
+            .checked_add_signed(duration)
+            .ok_or_else(out_of_range)?,
+    );
 
     if start >= end {
-        end = start + chrono::Duration::minutes(1);
+        end = start
+            .checked_add_signed(chrono::Duration::minutes(1))
+            .ok_or_else(out_of_range)?;
     }
 
     Ok((start, end))
@@ -1200,6 +1212,19 @@ mod tests {
         let (start, end) = log_context_window_bounds(anchor_timestamp(), "5s").unwrap();
         assert_eq!(format_log_context_api_time(start), "2026-06-17T10:15:00Z");
         assert_eq!(format_log_context_api_time(end), "2026-06-17T10:16:00Z");
+    }
+
+    #[test]
+    fn log_context_window_bounds_reject_windows_beyond_the_supported_range() {
+        for window in ["300000y", "1000000 years"] {
+            let error = log_context_window_bounds(anchor_timestamp(), window)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("contextWindow is outside the supported range"),
+                "{window}: {error}"
+            );
+        }
     }
 
     #[test]

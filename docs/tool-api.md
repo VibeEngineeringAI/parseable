@@ -36,6 +36,11 @@ Response:
 }
 ```
 
+A listed `inputSchema` never has a root-level `oneOf`, `anyOf` or `allOf`,
+because several LLM tool APIs reject tool input schemas with root combinators.
+Where the catalog schema has one, the server still enforces it when the tool is
+called, and the affected property descriptions state the constraint.
+
 The response includes an `ETag` and
 `Cache-Control: private, max-age=300, must-revalidate`. A request with a
 matching `If-None-Match` receives `304 Not Modified`.
@@ -135,11 +140,15 @@ and pagination are not identical to this summary tool.
 
 `query_sql`, `explain_query` and other tools that run SQL internally parse the
 statement with DataFusion's SQL parser and accept exactly one `SELECT` or `WITH`
-query. A trailing semicolon and trailing comments are allowed. Every `SELECT`
-projection, including those inside nested queries and set operations, must
-name at most 10 explicit columns. `*` and `table.*` are rejected. Casts to
-`INT64`, `UINT64` or `FLOAT64` are rejected with a hint to use `BIGINT` or
-`DOUBLE`. The statement is wrapped with an outer `LIMIT 500`. `sample_events`
+query. A trailing semicolon or trailing comments are allowed, but a semicolon
+followed by a comment passes validation and then fails when the query runs.
+The outermost projection must name at most 10 explicit columns, and `*` and
+`table.*` are rejected there. The same limit applies to each branch of a
+top-level set operation such as `UNION` and to a parenthesized outer query.
+Projections inside CTE definitions, derived tables and subqueries are not
+checked. Casts to `INT64`, `UINT64` or `FLOAT64` anywhere in the statement are
+rejected with a hint to use `BIGINT` or `DOUBLE`. The statement is wrapped with
+an outer `LIMIT 500`. `sample_events`
 returns at most 10 columns, choosing common observability fields such as
 `p_timestamp`, `service.name`, `severity_text`, `body` and `trace_id` before
 other fields.
@@ -150,15 +159,26 @@ other fields.
 datasets.
 
 `resolve_dataset` accepts an optional `telemetryType` (`logs`, `metrics` or
-`traces`) and `limit` (1–20, default 5). It resolves a `selectedDataset` or
-`contextDataset` exactly, or resolves the only visible dataset. Otherwise it
-ranks visible datasets by name match against `query`. It resolves only a
-unique high-confidence name match. A dataset name counts as mentioned in
-`query` only as a whole word, where `-` and `_` are part of a name, so `api`
-is not mentioned in `rapid` or `api-gateway`. In every other case it returns
-`status: "ambiguous"` with up to `limit` scored `candidates`, or `"not_found"`.
-It never falls back to an arbitrary dataset. A selected dataset whose telemetry
-type does not match `telemetryType` returns `not_found`.
+`traces`) and `limit` (1–20, default 5). Its `status` is `resolved`,
+`ambiguous`, `not_found` or `error`. Dataset names are matched
+case-insensitively.
+
+- A `selectedDataset` or `contextDataset` resolves to the visible dataset with
+  that name. If no visible dataset has that name, the result has
+  `status: "error"`. If its telemetry type does not match `telemetryType`, the
+  result is `not_found`.
+- Otherwise, if exactly one dataset is visible, it resolves to that dataset, or
+  returns `not_found` if its telemetry type does not match.
+- Otherwise it scores the visible datasets that match `telemetryType` by name
+  against `query`: 1000 if the name equals the query, 750 if the query contains
+  the name as a whole word (`-` and `_` count as part of a name, so `api` is not
+  in `rapid` or `api-gateway`), or 500 if the name contains the query, plus 25
+  for each query term longer than two characters that the name contains, plus
+  15 when `telemetryType` is given. It resolves only a unique top score of at least
+  500. In every other case it returns `ambiguous` with up to `limit` scored
+  `candidates`, or `not_found` if no visible dataset matches `telemetryType`.
+
+It never falls back to an arbitrary dataset.
 
 `discover_datasets` counts events in the requested range for each visible
 dataset of the requested telemetry type that the caller can query. It returns
@@ -179,12 +199,23 @@ provided together. They take precedence over `minutes`.
 
 `get_log_context` uses the same implementation as `POST /api/v1/query/context`.
 Arguments must include exactly one of `log`, `body` or `message`, holding the
-anchor row's exact value. The schema enforces this with `oneOf`, so calls with
-none or more than one are rejected with `400`. If no context bounds are given,
-the window defaults to `contextWindow: "5 minutes"`. Returned records keep at
-most 10 fields per row, preferring `p_timestamp`, service, severity, message
-and trace identifiers. The response also includes the anchor index, scope and
-the executed queries.
+anchor row's exact value. The catalog schema enforces this with a root `oneOf`,
+so calls with none or more than one are rejected with `400`. The listed
+`inputSchema` omits that `oneOf` (see [List tools](#list-tools)) and states the
+rule in the property descriptions.
+
+Context bounds are either `contextWindow` or both `contextStartTime` and
+`contextEndTime`. Giving only one explicit bound, or a window together with an
+explicit bound, is an error. If no bounds are given, the tool uses
+`contextWindow: "5 minutes"`. A window extends that duration on each side of
+`pTimestamp`, and both ends are rounded down to the minute; if they round to the
+same minute, the end is one minute after the start. Explicit bounds are used at
+millisecond precision without rounding, and `pTimestamp` must be at or after
+the start and before the end. `pageSize` is 1–500, default 100.
+
+Returned records keep at most 10 fields per row, preferring `p_timestamp`,
+service, severity, message and trace identifiers. The response also includes
+the anchor index, scope and the executed queries.
 
 ## Trace activity
 
@@ -213,9 +244,14 @@ dataset's time partition, or `p_timestamp` if none is configured. The dataset
 must have traces telemetry and contain `span_span_id` and `span_trace_id`.
 Unknown fields are rejected. `span_count` is `COUNT(DISTINCT span_span_id)` and
 `trace_count` is `COUNT(DISTINCT span_trace_id)`, so duplicate span rows are
-not double counted. The result contains the exact executed SQL as `query`,
-along with `bucketInterval`, `semantics` and up to 500 `rows`. Clients can
-rerun that SQL unchanged, for example in a dashboard tile.
+not double counted. Rows are ordered by bucket. The result contains `query`,
+`bucketInterval`, `semantics` and up to 500 `rows`.
+
+`query` is the aggregation SQL before the tool wraps it with `LIMIT 500`. It
+has no time predicate: the time range comes from the request's `startTime` and
+`endTime`, which the query API rounds down to the minute. To reproduce the
+result, for example in a dashboard tile, run `query` through the query API with
+the same `startTime` and `endTime`.
 
 ## Argument schema validation
 
@@ -223,4 +259,6 @@ rerun that SQL unchanged, for example in a dashboard tile.
 `additionalProperties`, `enum`, `const`, `minLength`/`maxLength`,
 `minimum`/`maximum`, `minItems`/`maxItems`, `items`, `anyOf` and `oneOf`.
 `oneOf` passes only when exactly one variant matches. Combinators are checked
-in addition to sibling keywords; they do not replace them.
+in addition to sibling keywords; they do not replace them. Validation uses the
+catalog schema, including any root combinators omitted from the listed
+`inputSchema`.
