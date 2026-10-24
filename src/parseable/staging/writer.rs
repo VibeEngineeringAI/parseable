@@ -41,7 +41,7 @@ use ulid::Ulid;
 
 use crate::{
     parseable::{ARROW_FILE_EXTENSION, PART_FILE_EXTENSION},
-    utils::{arrow::adapt_batch, time::TimeRange},
+    utils::{arrow::batch_adapter::BatchAdapter, time::TimeRange},
 };
 
 use super::StagingError;
@@ -353,7 +353,8 @@ fn sealed_arrow_path(part: &Path) -> PathBuf {
 /// Structure to keep recordbatches in memory.
 ///
 /// Any new schema is updated in the schema map.
-/// Recordbatches are pushed to mutable buffer first and then concated together and pushed to read buffer
+/// Small recordbatches are coalesced through the mutable buffer. Oversized
+/// inputs become bounded single-source read batches, including their tails.
 #[derive(Debug)]
 pub struct MemWriter<const N: usize> {
     // Private file-owned buffers preserve the existing public MemWriter shape.
@@ -417,9 +418,9 @@ impl<const N: usize> MemWriter<N> {
             // Each chunk holds at most N rows, so no concatenation under the
             // writer lock copies more than N rows. A chunk that is a single
             // slice of `rb` is concatenated without copying.
-            let schema = Arc::new(self.schema.clone());
+            let mut adapter = BatchAdapter::new(Arc::new(self.schema.clone()));
             for chunk in chunks {
-                let record = concat_records(&schema, &chunk)?;
+                let record = concat_records(&mut adapter, &chunk)?;
                 self.read_buffer.push(record);
             }
         }
@@ -466,36 +467,48 @@ impl<const N: usize> MemWriter<N> {
         &self,
         schema: &Arc<Schema>,
     ) -> Result<Vec<RecordBatch>, StagingError> {
-        let mut read_buffer = self.read_buffer.clone();
-        if !self.mutable_buffer.inner.is_empty() {
-            let rb = concat_records(schema, &self.mutable_buffer.inner)?;
-            read_buffer.push(rb)
-        }
+        let mut adapter = BatchAdapter::new(Arc::clone(schema));
+        let mut batches = Vec::new();
+        self.append_recordbatches(&mut adapter, &mut batches)?;
+        Ok(batches)
+    }
 
-        let mut batches = read_buffer
-            .into_iter()
-            .map(|rb| adapt_batch(schema.clone(), &rb))
-            .collect::<Vec<_>>();
+    // One bounded last-layout cache covers this capture's attached and pending
+    // segments. Borrow stored batches to avoid cloning every ArrayRef before
+    // adaptation immediately clones the selected columns again.
+    fn append_recordbatches(
+        &self,
+        adapter: &mut BatchAdapter,
+        batches: &mut Vec<RecordBatch>,
+    ) -> Result<(), StagingError> {
+        let mutable = if self.mutable_buffer.inner.is_empty() {
+            None
+        } else {
+            Some(concat_records(adapter, &self.mutable_buffer.inner)?)
+        };
+        batches.extend(
+            self.read_buffer
+                .iter()
+                .chain(mutable.iter())
+                .map(|rb| adapter.adapt(rb)),
+        );
         for segment in self
             .segments
             .values()
             .chain(self.pending.values().flatten())
         {
-            batches.extend(segment.recordbatch_cloned(schema)?);
+            segment.append_recordbatches(adapter, batches)?;
         }
-        Ok(batches)
+        Ok(())
     }
 }
 
 fn concat_records(
-    schema: &Arc<Schema>,
+    adapter: &mut BatchAdapter,
     record: &[RecordBatch],
 ) -> Result<RecordBatch, StagingError> {
-    let records = record
-        .iter()
-        .map(|x| adapt_batch(schema.clone(), x))
-        .collect_vec();
-    Ok(concat_batches(schema, records.iter())?)
+    let records = record.iter().map(|x| adapter.adapt(x)).collect_vec();
+    Ok(concat_batches(adapter.schema(), records.iter())?)
 }
 
 /// Batches not yet concatenated into the read buffer, holding fewer than `N`
@@ -519,10 +532,12 @@ impl<const N: usize> MutableBuffer<N> {
         self.rows = 0;
     }
 
-    /// Appends `rb` and returns, in row order, every chunk that became full:
-    /// exactly `N` rows, or `N` batches when zero-row batches fill it first.
-    /// A batch larger than the free space is split by zero-copy slicing, so
-    /// an oversized batch yields several chunks and leaves its tail buffered.
+    /// Appends `rb` and returns chunks in row order, each holding at most `N`
+    /// rows. Small inputs coalesce until `N` rows or `N` batches are buffered.
+    /// An oversized input flushes earlier fragments separately and emits only
+    /// single-source slices, including its tail. None of that parent's slices
+    /// may be buffered and copied with a later input while sibling slices keep
+    /// the parent allocation alive.
     fn push(&mut self, rb: &RecordBatch) -> Vec<Vec<RecordBatch>> {
         const { assert!(N > 0, "MutableBuffer capacity must be positive") };
         if self.inner.is_empty() {
@@ -530,6 +545,17 @@ impl<const N: usize> MutableBuffer<N> {
         }
         let mut full = Vec::new();
         let total = rb.num_rows();
+        if total > N {
+            if !self.inner.is_empty() {
+                let src = Vec::with_capacity(self.inner.len());
+                full.push(std::mem::replace(&mut self.inner, src));
+                self.rows = 0;
+            }
+            for offset in (0..total).step_by(N) {
+                full.push(vec![rb.slice(offset, N.min(total - offset))]);
+            }
+            return full;
+        }
         let mut offset = 0;
         loop {
             let len = (N - self.rows).min(total - offset);
@@ -556,15 +582,23 @@ impl<const N: usize> MutableBuffer<N> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, sync::Arc};
+    use std::{collections::HashMap, fs::File, path::PathBuf, sync::Arc};
 
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow::array::ArrayData;
+    use arrow_array::{
+        Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    };
     use arrow_ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field, Schema};
     use chrono::Utc;
     use temp_dir::TempDir;
 
-    use crate::{OBJECT_STORE_DATA_GRANULARITY, utils::time::TimeRange};
+    use crate::{
+        OBJECT_STORE_DATA_GRANULARITY,
+        event::format::{EventFormat, json::Event},
+        metadata::SchemaVersion,
+        utils::time::TimeRange,
+    };
 
     use super::{DiskWriter, MemWriter, MutableBuffer, Writer};
 
@@ -598,6 +632,103 @@ mod tests {
         batches.iter().map(RecordBatch::num_rows).sum()
     }
 
+    #[test]
+    fn capture_shares_last_layout_plan_across_attached_and_pending_segments() {
+        let source = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int32, true),
+            Field::new("a", DataType::Int32, true),
+            Field::new("a", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            source.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![20, 21, 22])),
+                Arc::new(Int32Array::from(vec![10, 11, 12])),
+                Arc::new(Int64Array::from(vec![30, 31, 32])),
+            ],
+        )
+        .unwrap();
+        let query = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("missing", DataType::Utf8, true),
+            Field::new("b", DataType::Int32, true),
+            Field::new("a", DataType::Int32, true),
+        ]));
+        let mut mem = MemWriter::<4096>::default();
+        mem.read_buffer = vec![batch.slice(0, 0), batch.slice(0, 1)];
+        let mut attached = MemWriter::default();
+        // Schema clones share Fields even when their Schema Arcs differ.
+        attached.read_buffer.push(
+            RecordBatch::try_new(Arc::new(source.as_ref().clone()), batch.columns().to_vec())
+                .unwrap(),
+        );
+        mem.segments.insert("attached".to_owned(), attached);
+        let mut pending = MemWriter::default();
+        pending.read_buffer.push(batch.slice(1, 2));
+        mem.pending.insert(PathBuf::from("pending"), vec![pending]);
+
+        let mut adapter = super::BatchAdapter::new(query.clone());
+        let mut captured = Vec::new();
+        mem.append_recordbatches(&mut adapter, &mut captured)
+            .unwrap();
+        assert_eq!(adapter.plan_builds(), 1);
+        assert_eq!(captured, mem.recordbatch_cloned(&query).unwrap());
+        assert_eq!(
+            captured
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [0, 1, 3, 2]
+        );
+        assert_eq!(ids_of(&captured), [10, 10, 11, 12, 11, 12]);
+        for out in &captured {
+            assert!(Arc::ptr_eq(&out.schema(), &query));
+            assert!(Arc::ptr_eq(out.column(0), out.column(3)));
+            assert_eq!(out.column(1).data_type(), &DataType::Utf8);
+            assert_eq!(out.column(1).null_count(), out.num_rows());
+        }
+        // A later capture owns a new plan; changed query order must be honored.
+        let reversed = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int32, true),
+            Field::new("a", DataType::Int32, true),
+        ]));
+        assert_eq!(
+            ids_of(&mem.recordbatch_cloned(&reversed).unwrap()),
+            [20, 20, 21, 22, 21, 22]
+        );
+    }
+
+    // Count owners, not logical slice lengths: multiple slices/columns can
+    // refer to the same allocation. Include validity and nested child buffers.
+    fn allocations<'a>(
+        batches: impl IntoIterator<Item = &'a RecordBatch>,
+    ) -> HashMap<usize, usize> {
+        fn visit(data: &ArrayData, result: &mut HashMap<usize, usize>) {
+            for buffer in data
+                .buffers()
+                .iter()
+                .chain(data.nulls().map(|n| n.buffer()))
+            {
+                if buffer.capacity() != 0 {
+                    let base = buffer.data_ptr().as_ptr() as usize;
+                    if let Some(capacity) = result.insert(base, buffer.capacity()) {
+                        assert_eq!(capacity, buffer.capacity());
+                    }
+                }
+            }
+            for child in data.child_data() {
+                visit(child, result);
+            }
+        }
+        let mut result = HashMap::new();
+        for batch in batches {
+            for column in batch.columns() {
+                visit(&column.to_data(), &mut result);
+            }
+        }
+        result
+    }
+
     /// Pushes batches of `sizes` rows with consecutive ids and checks the
     /// buffer bounds, its row count and that all rows keep their order.
     fn check_row_accounting<const N: usize>(sizes: &[usize]) {
@@ -614,7 +745,7 @@ mod tests {
                 mem.mutable_buffer.num_rows(),
                 rows(&mem.mutable_buffer.inner)
             );
-            // Chunks are N rows unless N zero-row batches filled them first.
+            // Oversized inputs may emit a short tail and flush earlier rows.
             assert!(mem.read_buffer.iter().all(|rb| rb.num_rows() <= N));
             assert_eq!(
                 rows(&mem.read_buffer) + mem.mutable_buffer.num_rows(),
@@ -652,15 +783,27 @@ mod tests {
     }
 
     #[test]
+    fn mutable_buffer_boundary_shapes_preserve_rows_and_order() {
+        for prefix in [0, 1, 1000, 4095] {
+            for size in [0, 1, 4095, 4096, 4097, 8191, 8192, 8204, 12286] {
+                check_row_accounting::<4096>(&[prefix, size, 0, 1000, 1000, 4096, 8204, 1]);
+            }
+        }
+    }
+
+    #[test]
     fn oversized_batch_is_split_without_copying() {
         let schema = id_schema();
         let mut mem = MemWriter::<16>::default();
-        mem.push("id", &ids_batch(&schema, 0..5)).unwrap();
+        mem.push("id", &ids_batch(&schema, 0..2)).unwrap();
+        mem.push("id", &ids_batch(&schema, 2..5)).unwrap();
         let big = ids_batch(&schema, 5..5 + 16 * 10 + 3);
         mem.push("id", &big).unwrap();
-        assert_eq!(mem.read_buffer.len(), 10);
-        assert!(mem.read_buffer.iter().all(|rb| rb.num_rows() == 16));
-        // Only the first chunk merges buffered rows; the others are slices.
+        assert_eq!(mem.read_buffer.len(), 12);
+        assert_eq!(mem.read_buffer[0].num_rows(), 5);
+        assert!(mem.read_buffer[1..11].iter().all(|rb| rb.num_rows() == 16));
+        assert_eq!(mem.read_buffer[11].num_rows(), 3);
+        // Neither edge of the large input is copied with another input.
         let base = big
             .column(0)
             .as_any()
@@ -670,14 +813,175 @@ mod tests {
             .as_ptr();
         for (i, rb) in mem.read_buffer.iter().enumerate().skip(1) {
             let values = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(values.values().as_ptr(), base.wrapping_add((i - 1) * 16));
+        }
+        assert_eq!(mem.mutable_buffer.num_rows(), 0);
+        assert!(mem.mutable_buffer.inner.is_empty());
+        // A later small request must not pull that large parent's tail back
+        // into coalescing, and small requests must still coalesce together.
+        mem.push("id", &ids_batch(&schema, 168..175)).unwrap();
+        mem.push("id", &ids_batch(&schema, 175..184)).unwrap();
+        assert_eq!(mem.read_buffer.len(), 13);
+        assert_eq!(mem.read_buffer[12].num_rows(), 16);
+        let all = mem.recordbatch_cloned(&schema).unwrap();
+        assert_eq!(ids_of(&all), (0..184).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn repeated_8204_primitive_inputs_retain_only_input_allocations() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let mut mem = MemWriter::<4096>::default();
+        let mut input_allocations = HashMap::new();
+        for push in 0..8 {
+            let start = push * 8204;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + 8204))],
+            )
+            .unwrap();
+            input_allocations.extend(allocations([&batch]));
+            mem.push("n", &batch).unwrap();
+            drop(batch);
+            assert!(mem.mutable_buffer.inner.is_empty());
+            assert_eq!(allocations(&mem.read_buffer), input_allocations);
+        }
+        let captured = mem.recordbatch_cloned(&schema).unwrap();
+        assert_eq!(allocations(&captured), input_allocations);
+        // The deliberate cost: one 12-row tail per input, alongside two full
+        // chunks. The reviewed splitter returned 17 batches for this shape.
+        assert_eq!(captured.len(), 24);
+        for chunks in captured.chunks_exact(3) {
             assert_eq!(
-                values.values().as_ptr(),
-                base.wrapping_add(11 + (i - 1) * 16)
+                chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+                [4096, 4096, 12]
             );
         }
-        assert_eq!(mem.mutable_buffer.num_rows(), 8);
-        let all = mem.recordbatch_cloned(&schema).unwrap();
-        assert_eq!(ids_of(&all), (0..5 + 16 * 10 + 3).collect::<Vec<_>>());
+        let mut next = 0;
+        for batch in captured {
+            assert!(Arc::ptr_eq(&batch.schema(), &schema));
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for value in column.values() {
+                assert_eq!(*value, next);
+                next += 1;
+            }
+        }
+        assert_eq!(next, 8 * 8204);
+    }
+
+    #[test]
+    fn repeated_8204_decoded_inputs_retain_only_input_allocations() {
+        let stored = HashMap::from([
+            (
+                "message".to_owned(),
+                Arc::new(Field::new("message", DataType::Utf8, true)),
+            ),
+            (
+                "n".to_owned(),
+                Arc::new(Field::new("n", DataType::Int64, true)),
+            ),
+        ]);
+        let timestamp = chrono::DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
+        let mut mem = MemWriter::<4096>::default();
+        let mut input_allocations = HashMap::new();
+        let mut query_schema = None;
+        for push in 0..8 {
+            let start = push * 8204;
+            let json = serde_json::Value::Array(
+                (start..start + 8204)
+                    .map(|n| serde_json::json!({
+                        "message": if n % 19 == 0 { None } else { Some(format!("message {n:08}")) },
+                        "n": n,
+                    }))
+                    .collect(),
+            );
+            let (batch, _) = Event::new(json, timestamp)
+                .into_recordbatch(
+                    &stored,
+                    false,
+                    None,
+                    SchemaVersion::V1,
+                    &HashMap::new(),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(batch.schema().field(0).name(), "p_timestamp");
+            if query_schema.is_none() {
+                let mut fields = batch.schema().fields().to_vec();
+                fields.sort_by(|a, b| a.name().cmp(b.name()));
+                query_schema = Some(Arc::new(Schema::new(fields)));
+            }
+            input_allocations.extend(allocations([&batch]));
+            mem.push("same", &batch).unwrap();
+            drop(batch);
+            assert!(mem.mutable_buffer.inner.is_empty());
+            assert_eq!(allocations(&mem.read_buffer), input_allocations);
+        }
+        let query_schema = query_schema.unwrap();
+        let captured = mem.recordbatch_cloned(&query_schema).unwrap();
+        assert_eq!(captured.len(), 24);
+        assert_eq!(allocations(&captured), input_allocations);
+        let mut next = 0;
+        for batch in captured {
+            assert!(Arc::ptr_eq(&batch.schema(), &query_schema));
+            assert!(batch.num_rows() <= 4096);
+            let message = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let time = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                assert_eq!(ids.value(row), next);
+                assert_eq!(message.is_null(row), next % 19 == 0);
+                if message.is_valid(row) {
+                    assert_eq!(message.value(row), format!("message {next:08}"));
+                }
+                assert!(time.is_valid(row));
+                assert_eq!(time.value(row), timestamp.timestamp_millis());
+                next += 1;
+            }
+        }
+        assert_eq!(next, 8 * 8204);
+    }
+
+    #[test]
+    fn oversized_pending_snapshot_owns_allocations_until_dropped() {
+        let schema = id_schema();
+        let mut mem = MemWriter::<4096>::default();
+        let batch = ids_batch(&schema, 0..8204);
+        // This test guard deliberately keeps one buffer reference so its
+        // strong count can prove that staging and snapshot owners are gone.
+        let allocation = batch.column(0).to_data().buffers()[0].clone();
+        mem.push_for_file("old", "id", &batch).unwrap();
+        drop(batch);
+        let segment = mem.segments.remove("old").unwrap();
+        let part = std::path::PathBuf::from("pending.arrows.part");
+        let processing = std::path::PathBuf::from("processing/pending.arrows");
+        mem.pending.insert(part.clone(), vec![segment]);
+        let snapshot = mem.recordbatch_cloned(&schema).unwrap();
+        mem.rekey_pending(&part, &processing);
+        mem.release_pending(&[part]);
+        assert_eq!(rows(&mem.recordbatch_cloned(&schema).unwrap()), 8204);
+        mem.release_pending(&[processing]);
+        assert!(mem.recordbatch_cloned(&schema).unwrap().is_empty());
+        mem.clear();
+        assert!(allocation.strong_count() > 1);
+        assert_eq!(ids_of(&snapshot), (0..8204).collect::<Vec<_>>());
+        drop(snapshot);
+        assert_eq!(allocation.strong_count(), 1);
     }
 
     #[test]
@@ -732,14 +1036,17 @@ mod tests {
         )
         .unwrap();
         mem.push("extended", &wide).unwrap();
-        mem.push("id", &ids_batch(&schema, 12..14)).unwrap();
-        assert_eq!(mem.read_buffer.len(), 3);
-        assert!(mem.read_buffer.iter().all(|rb| rb.num_rows() == 4));
+        // The older narrow schema needs typed nulls in each bounded chunk.
+        mem.push("id", &ids_batch(&schema, 12..21)).unwrap();
+        mem.push("id", &ids_batch(&schema, 21..23)).unwrap();
+        assert_eq!(mem.read_buffer.len(), 7);
+        assert!(mem.read_buffer.iter().all(|rb| rb.num_rows() <= 4));
+        assert_eq!(rows(&mem.read_buffer), 21);
         assert_eq!(mem.mutable_buffer.num_rows(), 2);
 
         let all = mem.recordbatch_cloned(&query_schema).unwrap();
         assert!(all.iter().all(|rb| rb.schema() == query_schema));
-        assert_eq!(ids_of(&all), (0..14).collect::<Vec<_>>());
+        assert_eq!(ids_of(&all), (0..23).collect::<Vec<_>>());
         let extras = all
             .iter()
             .flat_map(|rb| {
@@ -749,7 +1056,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let expected = (0..14)
+        let expected = (0..23)
             .map(|id| (3..12).contains(&id).then_some(id + 100))
             .collect::<Vec<_>>();
         assert_eq!(extras, expected);
@@ -824,9 +1131,10 @@ mod tests {
                 .unwrap();
         }
         let segment = &writer.mem.as_ref().unwrap().segments[old];
-        assert_eq!(segment.read_buffer.len(), 3);
-        assert!(segment.read_buffer.iter().all(|rb| rb.num_rows() == 4096));
-        assert_eq!(segment.mutable_buffer.num_rows(), 14000 - 3 * 4096);
+        assert_eq!(segment.read_buffer.len(), 5);
+        assert!(segment.read_buffer.iter().all(|rb| rb.num_rows() <= 4096));
+        assert_eq!(rows(&segment.read_buffer), 14000);
+        assert_eq!(segment.mutable_buffer.num_rows(), 0);
 
         let detached = writer.detach_flushable_disk_at(false, now);
         assert_eq!(detached.len(), 1);

@@ -3,6 +3,59 @@
 import argparse, http.client, json, pathlib
 from run import AUTH, run_arm
 
+# Independent expectations: equal failures in the two binaries are not success.
+EXPECTED_STATUSES = {
+    'flat': [200, 200], 'nested': [200, 200], 'collision': [200],
+    'arrays': [200], 'nestedarrays': [200], 'evolution': [200, 200, 200],
+    'renames': [200, 400], 'duplicates': [400, 400, 400, 400],
+    'numbers': [200, 200, 400], 'timestamps': [200, 200],
+    'partitioned': [200, 400, 400],
+    # Inherited partial-ingest failure, deliberately pinned rather than allowing 5xx.
+    'partitiontypes': [500], 'invalidinferheader': [],
+    'static': [200, 200, 400, 400, 400],
+    'otlpempty': [200], 'otlpoverflow': [400],
+    'otlpduplicates': [200], 'otlpsnake': [400],
+    'otlpvalidlogs': [200], 'otlpvalidmetrics': [200], 'otlpvalidtraces': [200],
+}
+EXPECTED_COUNTS = {
+    'flat': 2, 'nested': 2, 'collision': 2, 'arrays': 5, 'nestedarrays': 4,
+    'evolution': 4, 'renames': 1, 'duplicates': 0, 'numbers': 2,
+    'timestamps': 3, 'partitioned': 3, 'partitiontypes': 1, 'static': 2,
+    'otlpvalidlogs': 1, 'otlpvalidmetrics': 2, 'otlpvalidtraces': 1,
+}
+
+def validate_result(item):
+    name = item['name']
+    responses = [item['response']] if 'response' in item else item['responses']
+    assert [r[0] for r in responses] == EXPECTED_STATUSES[name], item
+    if 'creation' in item:
+        assert item['creation'][0] == (400 if name == 'invalidinferheader' else 200), item
+    if name == 'invalidinferheader':
+        assert [item[k][0] for k in ('schema', 'ingestion', 'rows')] == [404, 404, 400], item
+    if name in EXPECTED_COUNTS:
+        count = EXPECTED_COUNTS[name]
+        assert all(item[k][0] == 200 for k in ('schema', 'ingestion', 'rows')), item
+        assert isinstance(item['rows'][1], list) and len(item['rows'][1]) == count, item
+        assert isinstance(item['schema'][1], dict) and isinstance(item['schema'][1].get('fields'), list), item
+        stats = item['ingestion'][1]
+        assert isinstance(stats, dict) and stats.get('count') == stats.get('lifetime_count') == count, item
+    if name == 'static':
+        fields = item['schema'][1]['fields']
+        types = {
+            'id': 'Int64', 'v': 'Float64', 'when': {'Timestamp': ['Millisecond', None]},
+            'day': 'Date32', 'ok': 'Boolean', 'text': 'Utf8',
+            'p_timestamp': {'Timestamp': ['Millisecond', None]},
+        }
+        assert len(fields) == len(types) and {f['name']: f['data_type'] for f in fields} == types, item
+        assert all(f['nullable'] for f in fields), item
+        expected = [
+            {'id': 1, 'v': 1.5, 'when': '2026-10-23T18:30:00', 'day': '2026-10-23', 'ok': True, 'text': 'hello'},
+            {'id': 2, 'v': 3.5, 'when': None, 'day': None, 'ok': None, 'text': 'numeric strings'},
+        ]
+        # Match types too: Python otherwise considers True == 1 and 2.0 == 2.
+        canonical = lambda rows: sorted(json.dumps(row, sort_keys=True) for row in rows)
+        assert canonical(item['rows'][1]) == canonical(expected), item
+
 def raw(port, method, path, body=b'', headers=None):
     conn = http.client.HTTPConnection('127.0.0.1', port, timeout=60)
     conn.request(method,path,body,{'Authorization':AUTH,'Content-Type':'application/json', **(headers or {})})
@@ -48,10 +101,6 @@ def run(port, pid):
         assert item['creation'][0] == (400 if name=='invalidinferheader' else 200), item
         for body in bodies: item['responses'].append(raw(port,'POST','/api/v1/ingest',body,{'x-p-stream':stream}))
         item.update(inspect(port,stream))
-        expected_counts={'flat':2,'nested':2,'collision':2,'arrays':5,'nestedarrays':4,'evolution':4,'renames':1,'duplicates':0,'numbers':2,'timestamps':3,'partitioned':3,'partitiontypes':1}
-        if name in expected_counts:
-            assert item['rows'][0]==200 and len(item['rows'][1])==expected_counts[name],item
-            assert item['schema'][0]==200 and item['ingestion'][0]==200,item
         results.append(item)
     stream='compatstatic'
     static={'fields':[{'name':name,'data_type':kind} for name,kind in [('id','int'),('v','double'),('when','datetime'),('day','date'),('ok','boolean'),('text','string')]]}
@@ -92,6 +141,9 @@ def run(port, pid):
         assert creation[0]==200 and item['schema'][0]==200 and item['rows'][0]==200,item
         assert len(item['rows'][1])=={'logs':1,'metrics':2,'traces':1}[signal],item
         results.append(item)
+    assert {item['name'] for item in results} == EXPECTED_STATUSES.keys(), results
+    for item in results:
+        validate_result(item)
     return results
 
 def main():

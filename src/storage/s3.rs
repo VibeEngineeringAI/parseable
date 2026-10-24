@@ -1453,8 +1453,8 @@ fn use_single_put(total_size: usize, min_multipart_size: usize, enable_multipart
     total_size < min_multipart_size || !enable_multipart
 }
 
-/// Aborts a multipart upload that is dropped before it was completed or explicitly
-/// aborted, e.g. when the owning upload task is cancelled.
+/// Aborts a multipart upload dropped before completion or an explicit abort
+/// resolves, e.g. when the owning upload task is cancelled during either await.
 ///
 /// Best effort only: the abort is spawned onto the current tokio runtime, so it is
 /// skipped without a runtime and may itself be cancelled during runtime shutdown.
@@ -1506,9 +1506,17 @@ where
         }),
         Err(err) => Err(err),
     };
-    let mut upload = guard.0.take().expect("upload is present until completed");
     if let Err(err) = result {
-        if let Err(abort_err) = upload.abort().await {
+        // Keep ownership in the guard throughout the await. If a sibling upload
+        // failure cancels this task mid-abort, Drop can retry best-effort cleanup.
+        let aborted = guard
+            .0
+            .as_mut()
+            .expect("upload is present until cleanup resolves")
+            .abort()
+            .await;
+        guard.0 = None;
+        if let Err(abort_err) = aborted {
             error!("Failed to abort multipart upload. {:?}", abort_err);
             if completing {
                 return Err(abort_err.into());
@@ -1516,6 +1524,7 @@ where
         }
         return Err(err);
     }
+    guard.0 = None;
     Ok(())
 }
 
@@ -1590,7 +1599,10 @@ mod multipart_upload_tests {
     use std::{
         io,
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll},
         time::Duration,
     };
@@ -1928,6 +1940,83 @@ mod multipart_upload_tests {
         }
         assert_eq!(counts(&fake), (0, 1));
         assert_eq!(uploaded(&fake).1, vec![100]);
+    }
+
+    #[derive(Debug)]
+    struct GatedAbortUpload {
+        inner: FakeUpload,
+        attempts: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        finished: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for GatedAbortUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                futures::future::pending::<()>().await;
+            }
+            let result = self.inner.abort().await;
+            self.finished.notify_one();
+            result
+        }
+    }
+
+    async fn cancel_during_abort_retries_cleanup(fail_complete: bool) {
+        let inner = FakeUpload::default();
+        {
+            let mut state = inner.0.lock().unwrap();
+            state.fail_complete = fail_complete;
+            state.fail_part_at = (!fail_complete).then_some(0);
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let upload = GatedAbortUpload {
+            inner: inner.clone(),
+            attempts: attempts.clone(),
+            started: started.clone(),
+            finished: finished.clone(),
+        };
+        let task = tokio::spawn(async move {
+            upload_file_parts(
+                &mut reader(pattern(300), false),
+                Box::new(upload),
+                300,
+                100,
+                || {},
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("inline abort must start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), finished.notified())
+            .await
+            .expect("drop guard must retry the interrupted abort");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(counts(&inner), (usize::from(fail_complete), 1));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_part_error_abort_retries_cleanup() {
+        cancel_during_abort_retries_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_complete_error_abort_retries_cleanup() {
+        cancel_during_abort_retries_cleanup(true).await;
     }
     // END multipart-part-upload tests
 }

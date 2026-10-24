@@ -21,8 +21,104 @@ use datafusion::arrow::array::new_null_array;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Reuses name resolution for adjacent batches with the same source layout.
+/// The target schema is fixed for this adapter's capture (or bounded push).
+/// Only the last layout is retained, independently of the number of batches.
+pub(crate) struct BatchAdapter {
+    table_schema: Arc<Schema>,
+    last_plan: Option<AdaptationPlan>,
+    #[cfg(test)]
+    plan_builds: usize,
+}
+
+struct AdaptationPlan {
+    // Retain the Fields allocation whose identity we compare. A naked pointer
+    // could otherwise alias a later layout after its allocation was freed.
+    source_schema: Arc<Schema>,
+    columns: ColumnMapping,
+}
+
+enum ColumnMapping {
+    Identity,
+    Indices(Vec<Option<usize>>),
+}
+
+impl BatchAdapter {
+    pub(crate) fn new(table_schema: Arc<Schema>) -> Self {
+        Self {
+            table_schema,
+            last_plan: None,
+            #[cfg(test)]
+            plan_builds: 0,
+        }
+    }
+
+    pub(crate) fn schema(&self) -> &Arc<Schema> {
+        &self.table_schema
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plan_builds(&self) -> usize {
+        self.plan_builds
+    }
+
+    pub(crate) fn adapt(&mut self, batch: &RecordBatch) -> RecordBatch {
+        let source_schema = batch.schema_ref();
+        let same_layout = self.last_plan.as_ref().is_some_and(|plan| {
+            // Arrow Fields is an immutable Arc<[FieldRef]>. Schema clones
+            // share it, even when their Schema Arcs or metadata differ.
+            let previous = plan.source_schema.fields();
+            let current = source_schema.fields();
+            previous.len() == current.len() && previous.as_ptr() == current.as_ptr()
+        });
+        if !same_layout {
+            #[cfg(test)]
+            {
+                self.plan_builds += 1;
+            }
+            let mut first_index = HashMap::with_capacity(source_schema.fields().len());
+            for (index, field) in source_schema.fields().iter().enumerate() {
+                first_index.entry(field.name().as_str()).or_insert(index);
+            }
+            let indices: Vec<_> = self
+                .table_schema
+                .fields()
+                .iter()
+                .map(|field| first_index.get(field.name().as_str()).copied())
+                .collect();
+            // Prove positional equivalence from first-occurrence resolution.
+            // Schema pointer/value equality alone is insufficient for duplicates.
+            let identity = indices.len() == source_schema.fields().len()
+                && indices.iter().enumerate().all(|(i, idx)| *idx == Some(i));
+            self.last_plan = Some(AdaptationPlan {
+                source_schema: Arc::clone(source_schema),
+                columns: if identity {
+                    ColumnMapping::Identity
+                } else {
+                    ColumnMapping::Indices(indices)
+                },
+            });
+        }
+
+        let cols = match &self.last_plan.as_ref().unwrap().columns {
+            ColumnMapping::Identity => batch.columns().to_vec(),
+            ColumnMapping::Indices(indices) => indices
+                .iter()
+                .zip(self.table_schema.fields())
+                .map(|(index, field)| match index {
+                    Some(index) => Arc::clone(batch.column(*index)),
+                    None => new_null_array(field.data_type(), batch.num_rows()),
+                })
+                .collect(),
+        };
+        // Cache only the mapping: every batch still validates its actual arrays
+        // and receives fresh typed null arrays sized for its own row count.
+        RecordBatch::try_new(Arc::clone(&self.table_schema), cols).unwrap()
+    }
+}
 
 // This function takes a new event's record batch and the
 // current schema of the log stream. It returns a new record
@@ -42,12 +138,18 @@ pub fn adapt_batch(table_schema: Arc<Schema>, batch: &RecordBatch) -> RecordBatc
         return RecordBatch::try_new(table_schema, batch.columns().to_vec()).unwrap();
     }
 
-    let batch_cols = batch.columns().to_vec();
+    // Arrow permits duplicate names. Match column_with_name's first occurrence
+    // while resolving the source layout once, rather than scanning it for each
+    // target field (quadratic work for reordered/wider query schemas).
+    let mut first_index = HashMap::with_capacity(batch_schema.fields().len());
+    for (index, field) in batch_schema.fields().iter().enumerate() {
+        first_index.entry(field.name().as_str()).or_insert(index);
+    }
 
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(table_schema.fields().len());
     for table_field in table_schema.fields() {
-        if let Some((batch_idx, _)) = batch_schema.column_with_name(table_field.name().as_str()) {
-            cols.push(Arc::clone(&batch_cols[batch_idx]));
+        if let Some(&batch_idx) = first_index.get(table_field.name().as_str()) {
+            cols.push(Arc::clone(batch.column(batch_idx)));
         } else {
             cols.push(new_null_array(table_field.data_type(), batch.num_rows()))
         }
@@ -84,8 +186,10 @@ mod tests {
     use std::collections::HashMap;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::arrow::array::{
+        Array, Int32Array, Int64Array, StringArray, TimestampMillisecondArray,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
     use datafusion::arrow::record_batch::RecordBatchOptions;
 
     use super::*;
@@ -121,6 +225,22 @@ mod tests {
     // the legacy output reused an input column (equal by value otherwise).
     fn assert_matches_legacy(schema: &Arc<Schema>, batch: &RecordBatch) -> Option<RecordBatch> {
         let new = run(adapt_batch, schema, batch);
+        assert_output_matches_legacy(new, schema, batch)
+    }
+
+    fn assert_plan_matches_legacy(
+        adapter: &mut BatchAdapter,
+        batch: &RecordBatch,
+    ) -> Option<RecordBatch> {
+        let new = catch_unwind(AssertUnwindSafe(|| adapter.adapt(batch))).ok();
+        assert_output_matches_legacy(new, adapter.schema(), batch)
+    }
+
+    fn assert_output_matches_legacy(
+        new: Option<RecordBatch>,
+        schema: &Arc<Schema>,
+        batch: &RecordBatch,
+    ) -> Option<RecordBatch> {
         let old = run(legacy_adapt_batch, schema, batch);
         let (new, old) = match (new, old) {
             (None, None) => return None,
@@ -312,6 +432,230 @@ mod tests {
         assert!(assert_matches_legacy(&table, &batch).is_none());
     }
 
+    #[test]
+    fn reordered_duplicates_and_missing_typed_nulls_match_legacy() {
+        // A later duplicate has a different type and must never win the index.
+        let batch = batch_of(
+            vec![
+                int_field("b", true),
+                int_field("a", true),
+                Field::new("a", DataType::Int64, true),
+            ],
+            vec![
+                int_col(&[Some(20), Some(21)]),
+                int_col(&[Some(10), None]),
+                Arc::new(Int64Array::from(vec![30, 31])),
+            ],
+        );
+        let table = Arc::new(Schema::new(vec![
+            int_field("a", true),
+            Field::new(
+                "missing",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            int_field("b", true),
+            int_field("a", true),
+        ]));
+        assert!(!has_same_unique_field_names(&table, &batch.schema()));
+        let out = assert_matches_legacy(&table, &batch).unwrap();
+        assert!(Arc::ptr_eq(out.column(0), batch.column(1)));
+        assert!(Arc::ptr_eq(out.column(3), batch.column(1)));
+        assert_eq!(out.column(1).data_type(), table.field(1).data_type());
+        assert_eq!(out.column(1).null_count(), 2);
+
+        let empty = batch.slice(0, 0);
+        assert_eq!(assert_matches_legacy(&table, &empty).unwrap().num_rows(), 0);
+        let non_nullable = Arc::new(Schema::new(vec![Field::new(
+            "missing",
+            DataType::Int64,
+            false,
+        )]));
+        assert!(assert_matches_legacy(&non_nullable, &batch).is_none());
+    }
+
+    #[test]
+    fn planned_layout_reuses_schema_clones_with_fresh_nulls_for_each_rowcount() {
+        let source = Arc::new(Schema::new(vec![
+            int_field("b", true),
+            int_field("a", true),
+            Field::new("a", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            source.clone(),
+            vec![
+                int_col(&[Some(20), Some(21), Some(22)]),
+                int_col(&[Some(10), None, Some(12)]),
+                Arc::new(Int64Array::from(vec![30, 31, 32])),
+            ],
+        )
+        .unwrap();
+        let mut table = Schema::new(vec![
+            int_field("a", true),
+            Field::new(
+                "missing",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            int_field("b", true),
+            int_field("a", true),
+        ]);
+        table.metadata.insert("target".into(), "kept".into());
+        let mut adapter = BatchAdapter::new(Arc::new(table));
+        let mut outputs = Vec::new();
+        for rows in [3, 0, 1, 2, 3] {
+            // Distinct Schema Arc, identical Fields backing allocation. Schema
+            // metadata may change without changing the immutable source layout.
+            let mut cloned = source.as_ref().clone();
+            cloned.metadata.insert("rows".into(), rows.to_string());
+            let cloned = Arc::new(cloned);
+            assert!(!Arc::ptr_eq(&source, &cloned));
+            assert_eq!(source.fields().as_ptr(), cloned.fields().as_ptr());
+            let slice = batch.slice(0, rows);
+            let input = RecordBatch::try_new(cloned, slice.columns().to_vec()).unwrap();
+            let out = assert_plan_matches_legacy(&mut adapter, &input).unwrap();
+            for previous in &outputs {
+                assert!(!Arc::ptr_eq(out.column(1), previous));
+            }
+            outputs.push(out.column(1).clone());
+            assert_eq!(adapter.plan_builds(), 1);
+        }
+
+        // Keeping the last source alive prevents freed-pointer reuse. Replacing
+        // it releases that owner, so the cache retains only one source layout.
+        let retained = Arc::downgrade(&adapter.last_plan.as_ref().unwrap().source_schema);
+        drop(batch);
+        drop(source);
+        assert_eq!(retained.strong_count(), 1);
+        let evolved = batch_of(
+            vec![int_field("a", true), int_field("b", true)],
+            vec![int_col(&[Some(41)]), int_col(&[Some(42)])],
+        );
+        assert_plan_matches_legacy(&mut adapter, &evolved).unwrap();
+        assert_eq!(adapter.plan_builds(), 2);
+        assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn planned_layout_changes_and_per_batch_validation_match_legacy() {
+        let table = Arc::new(Schema::new(vec![
+            int_field("a", true),
+            int_field("b", false),
+        ]));
+        let mut adapter = BatchAdapter::new(table);
+        let source = Arc::new(Schema::new(vec![
+            int_field("b", true),
+            int_field("a", true),
+        ]));
+        let valid = RecordBatch::try_new(
+            source.clone(),
+            vec![int_col(&[Some(2)]), int_col(&[Some(1)])],
+        )
+        .unwrap();
+        assert_plan_matches_legacy(&mut adapter, &valid).unwrap();
+        let invalid =
+            RecordBatch::try_new(source, vec![int_col(&[None]), int_col(&[Some(1)])]).unwrap();
+        assert!(assert_plan_matches_legacy(&mut adapter, &invalid).is_none());
+        assert_eq!(adapter.plan_builds(), 1);
+
+        // Equal names with a changed type are not a cache identity. Their
+        // arrays must reach try_new and panic just as the legacy adapter does.
+        let wrong_type = batch_of(
+            vec![Field::new("b", DataType::Int64, true), int_field("a", true)],
+            vec![Arc::new(Int64Array::from(vec![2])), int_col(&[Some(1)])],
+        );
+        assert!(assert_plan_matches_legacy(&mut adapter, &wrong_type).is_none());
+        assert_eq!(adapter.plan_builds(), 2);
+        assert_plan_matches_legacy(&mut adapter, &valid).unwrap();
+        assert_eq!(adapter.plan_builds(), 3);
+
+        let reordered = batch_of(
+            vec![int_field("a", true), int_field("b", true)],
+            vec![int_col(&[Some(11)]), int_col(&[Some(12)])],
+        );
+        assert_plan_matches_legacy(&mut adapter, &reordered).unwrap();
+        assert_eq!(adapter.plan_builds(), 4);
+        // Structurally equal schemas with separately allocated Fields safely
+        // miss the identity cache; there is no names-only or global cache.
+        let separate = batch_of(
+            vec![int_field("a", true), int_field("b", true)],
+            vec![int_col(&[Some(21)]), int_col(&[Some(22)])],
+        );
+        assert_plan_matches_legacy(&mut adapter, &separate).unwrap();
+        assert_eq!(adapter.plan_builds(), 5);
+    }
+
+    #[test]
+    fn planned_equal_duplicate_schemas_and_zero_columns_match_legacy() {
+        for second_type in [DataType::Int32, DataType::Int64] {
+            let schema = Arc::new(Schema::new(vec![
+                int_field("a", true),
+                Field::new("a", second_type.clone(), true),
+            ]));
+            let second: ArrayRef = match second_type {
+                DataType::Int32 => int_col(&[Some(2)]),
+                _ => Arc::new(Int64Array::from(vec![2])),
+            };
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![int_col(&[Some(1)]), second]).unwrap();
+            let mut adapter = BatchAdapter::new(schema);
+            for _ in 0..2 {
+                assert_plan_matches_legacy(&mut adapter, &batch);
+            }
+            assert_eq!(adapter.plan_builds(), 1);
+        }
+
+        let schema = Arc::new(Schema::empty());
+        let mut adapter = BatchAdapter::new(schema.clone());
+        for rows in [0, 3, 1] {
+            let batch = RecordBatch::try_new_with_options(
+                schema.clone(),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .unwrap();
+            assert!(assert_plan_matches_legacy(&mut adapter, &batch).is_none());
+        }
+        assert_eq!(adapter.plan_builds(), 1);
+    }
+
+    #[test]
+    fn wide_sorted_and_permuted_targets_match_legacy() {
+        for width in [128, 512] {
+            let mut fields = vec![Field::new(
+                "p_timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            )];
+            fields.extend((0..width - 1).map(|i| int_field(&format!("f{i:03}"), true)));
+            let mut cols: Vec<ArrayRef> = vec![Arc::new(TimestampMillisecondArray::from(vec![
+                Some(1_700_000_000_123),
+                None,
+                Some(1_700_000_000_125),
+            ]))];
+            cols.extend((0..width - 1).map(|i| int_col(&[Some(i), None, Some(i + 1)])));
+            let batch = batch_of(fields.clone(), cols);
+            fields.sort_by(|a, b| a.name().cmp(b.name()));
+            // Exercise production sorted order and full permutations, rather
+            // than only swapping one pair in an otherwise aligned schema.
+            for shift in [0, 1, width as usize / 2, width as usize - 1] {
+                let mut target = fields.clone();
+                target.rotate_left(shift);
+                if shift % 2 == 1 {
+                    target.reverse();
+                }
+                let table = Arc::new(Schema::new(target));
+                assert!(!has_same_unique_field_names(&table, &batch.schema()));
+                assert_matches_legacy(&table, &batch).unwrap();
+                let mut adapter = BatchAdapter::new(table);
+                for rows in [3, 0, 1, 3] {
+                    assert_plan_matches_legacy(&mut adapter, &batch.slice(0, rows)).unwrap();
+                }
+                assert_eq!(adapter.plan_builds(), 1);
+            }
+        }
+    }
+
     // Random table/batch schema pairs: subsets, reorders, extra fields,
     // duplicate names, type and nullability changes, and metadata.
     #[test]
@@ -395,6 +739,11 @@ mod tests {
                 fast += 1;
             }
             assert_matches_legacy(&table, &batch);
+            let mut adapter = BatchAdapter::new(table);
+            assert_plan_matches_legacy(&mut adapter, &batch);
+            assert_plan_matches_legacy(&mut adapter, &batch.slice(0, 0));
+            assert_plan_matches_legacy(&mut adapter, &batch);
+            assert_eq!(adapter.plan_builds(), 1);
         }
         assert!(fast > 500, "fast path exercised only {fast} times");
     }

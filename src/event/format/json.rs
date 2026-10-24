@@ -868,7 +868,9 @@ mod tests {
                 assert!(!is_first, "{context}");
             }
 
-            // An empty batch never reaches the decoder in production.
+            // Both decoders currently panic on an empty nonpartitioned batch.
+            // Skip decoding here: this compares schema conversion, not that
+            // inherited empty-input API behavior.
             if values.is_empty() {
                 return fast.is_some();
             }
