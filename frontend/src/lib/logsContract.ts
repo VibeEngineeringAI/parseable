@@ -40,7 +40,7 @@ export function savedLogView(value: unknown): value is SavedLogView {
     optionalString(value.explorer_state) &&
     object(value.query) &&
     typeof value.query.filter_type === 'string' &&
-    ['filter', 'sql', 'search'].includes(value.query.filter_type) &&
+    ['filter', 'sql', 'search', 'promql'].includes(value.query.filter_type) &&
     optionalString(value.query.filter_query) &&
     (value.query.filter_builder == null || builder(value.query.filter_builder)) &&
     (value.time_filter == null ||

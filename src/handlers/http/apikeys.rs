@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use ulid::Ulid;
 
 use crate::{
@@ -14,7 +14,8 @@ use crate::{
     parseable::DEFAULT_TENANT,
     rbac::{
         Users,
-        map::{roles, users},
+        map::{read_user_groups, roles, users},
+        role::model::{DefaultPrivilege, Role},
         user::{User, UserType},
     },
     utils::{get_user_and_tenant_from_request, is_admin},
@@ -98,6 +99,105 @@ struct ValidateApiKeyResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ValidateApiKeyRequest {
     api_key: String,
+}
+
+/// Query params for `GET /apikeys`. `privilege` takes one of `reader`,
+/// `ingestor`, `admin`, `writer`, `editor` or `superadmin`, matched by kind.
+/// `privilege` is the canonical name; `priviledge` is accepted as an alias for
+/// compatibility with upstream Parseable clients, which use that spelling.
+/// Unknown parameter names, such as `Privilege`, are ignored and leave the list
+/// unfiltered.
+#[derive(Debug, Deserialize)]
+pub struct ListApiKeysQuery {
+    #[serde(
+        default,
+        alias = "priviledge",
+        deserialize_with = "deserialize_api_key_privilege"
+    )]
+    privilege: Option<DefaultPrivilege>,
+}
+
+fn deserialize_api_key_privilege<'de, D>(
+    deserializer: D,
+) -> Result<Option<DefaultPrivilege>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|privilege| match privilege.as_str() {
+            "reader" => Ok(DefaultPrivilege::Reader { resource: None }),
+            "ingestor" => Ok(DefaultPrivilege::Ingestor { resource: None }),
+            "admin" => Ok(DefaultPrivilege::Admin),
+            "writer" => Ok(DefaultPrivilege::Writer { resource: None }),
+            "editor" => Ok(DefaultPrivilege::Editor),
+            "superadmin" => Ok(DefaultPrivilege::SuperAdmin),
+            _ => Err(de::Error::unknown_variant(
+                &privilege,
+                &[
+                    "reader",
+                    "ingestor",
+                    "admin",
+                    "writer",
+                    "editor",
+                    "superadmin",
+                ],
+            )),
+        })
+        .transpose()
+}
+
+fn role_has_privilege(role: &Role, privilege: &DefaultPrivilege) -> bool {
+    role.privileges()
+        .iter()
+        .any(|candidate| std::mem::discriminant(candidate) == std::mem::discriminant(privilege))
+}
+
+/// Masked list entries for the tenant's API keys whose direct or group-inherited
+/// roles grant `privilege`, or all of them when `privilege` is `None`.
+/// Groups and roles missing from the tenant maps never match.
+fn tenant_entries(
+    tenant_id: &Option<String>,
+    privilege: Option<&DefaultPrivilege>,
+) -> Vec<ApiKeyListEntry> {
+    let keys = collect_tenant_api_keys(tenant_id);
+    let matching: Vec<&User> = match privilege {
+        None => keys.iter().collect(),
+        Some(privilege) => {
+            let tenant = tenant_or_default(tenant_id);
+            // Lock order: user groups before roles. Only the granting role and
+            // group names are computed under the guards; both drop before the
+            // per-key scan so it never blocks writers or the readers behind them.
+            let (granting_roles, granting_groups) = {
+                let all_groups = read_user_groups();
+                let all_roles = roles();
+                let granting_roles: HashSet<String> = all_roles
+                    .get(tenant)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, role)| role_has_privilege(role, privilege))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let granting_groups: HashSet<String> = all_groups
+                    .get(tenant)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, group)| !group.roles.is_disjoint(&granting_roles))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                (granting_roles, granting_groups)
+            };
+            keys.iter()
+                .filter(|user| {
+                    !user.roles.is_disjoint(&granting_roles)
+                        || !user.user_groups.is_disjoint(&granting_groups)
+                })
+                .collect()
+        }
+    };
+    matching
+        .into_iter()
+        .filter_map(ApiKeyListEntry::from_user)
+        .collect()
 }
 
 impl ApiKeyListEntry {
@@ -295,13 +395,18 @@ pub async fn delete_api_key(
 
 /// GET /api/prism/v1/apikeys
 ///
-/// List all API keys (masked). Only admins can list keys.
-pub async fn list_api_keys(req: HttpRequest) -> Result<impl Responder, ApiKeyError> {
+/// List all API keys (masked). Only admins can list keys. Optionally filter by
+/// role privilege with
+/// `?privilege=reader|ingestor|admin|writer|editor|superadmin` (`?priviledge=`
+/// is accepted too). Privileges match by kind, so `admin` does not match
+/// super-admin keys. An unknown value is rejected with 400.
+/// Unknown parameter names are ignored and return the unfiltered list.
+pub async fn list_api_keys(
+    req: HttpRequest,
+    web::Query(query): web::Query<ListApiKeysQuery>,
+) -> Result<impl Responder, ApiKeyError> {
     let (_, tenant_id) = verify_admin(&req)?;
-    let entries: Vec<ApiKeyListEntry> = collect_tenant_api_keys(&tenant_id)
-        .iter()
-        .filter_map(ApiKeyListEntry::from_user)
-        .collect();
+    let entries = tenant_entries(&tenant_id, query.privilege.as_ref());
     Ok(HttpResponse::Ok().json(entries))
 }
 
@@ -346,7 +451,22 @@ pub async fn get_api_key(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use actix_web::{App, cookie::Cookie, http::StatusCode, test as actix_test};
+    use parking_lot::RwLock;
+    use tokio::sync::MutexGuard;
+
     use super::*;
+    use crate::handlers::http::modal::server::Server;
+    use crate::rbac::{
+        map::{
+            self, ROLES, SESSIONS, SessionKey, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
+            mut_roles, mut_users, write_user_groups,
+        },
+        role::ParseableResourceType,
+        user::UserGroup,
+    };
 
     #[test]
     fn expired_key_remains_visible_with_expiry_in_detail_and_list() {
@@ -388,5 +508,357 @@ mod tests {
         let entry = serde_json::to_value(ApiKeyListEntry::from_user(&user).unwrap()).unwrap();
         assert!(detail.get("expiresAt").unwrap().is_null());
         assert!(entry.get("expiresAt").unwrap().is_null());
+    }
+
+    fn parse_query(query: &str) -> Result<ListApiKeysQuery, actix_web::Error> {
+        web::Query::<ListApiKeysQuery>::from_query(query)
+            .map(web::Query::into_inner)
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn list_query_without_privilege_is_unfiltered() {
+        for query in ["", "Privilege=reader", "privilage=reader", "_=123"] {
+            assert!(parse_query(query).unwrap().privilege.is_none(), "{query}");
+        }
+    }
+
+    #[test]
+    fn list_query_accepts_every_privilege_under_both_spellings() {
+        let cases = [
+            ("reader", DefaultPrivilege::Reader { resource: None }),
+            ("ingestor", DefaultPrivilege::Ingestor { resource: None }),
+            ("admin", DefaultPrivilege::Admin),
+            ("writer", DefaultPrivilege::Writer { resource: None }),
+            ("editor", DefaultPrivilege::Editor),
+        ];
+        for (value, expected) in cases {
+            for param in ["privilege", "priviledge"] {
+                let parsed = parse_query(&format!("{param}={value}"))
+                    .unwrap_or_else(|err| panic!("{param}={value}: {err}"))
+                    .privilege;
+                assert_eq!(parsed, Some(expected.clone()), "{param}={value}");
+            }
+        }
+    }
+
+    #[test]
+    fn list_query_accepts_superadmin_privilege() {
+        let parsed = parse_query("privilege=superadmin").unwrap().privilege;
+        assert_eq!(parsed, Some(DefaultPrivilege::SuperAdmin));
+    }
+
+    #[test]
+    fn list_query_accepts_superadmin_priviledge_alias() {
+        let parsed = parse_query("priviledge=superadmin").unwrap().privilege;
+        assert_eq!(parsed, Some(DefaultPrivilege::SuperAdmin));
+    }
+
+    #[test]
+    fn list_query_rejects_unknown_privilege_with_bad_request() {
+        let cases = [
+            ("privilege=owner", "unknown variant `owner`"),
+            ("priviledge=owner", "unknown variant `owner`"),
+            ("privilege=Reader", "unknown variant `Reader`"),
+            ("privilege=", "unknown variant ``"),
+            ("privilege=reader&priviledge=reader", "duplicate field"),
+            ("privilege=reader&privilege=admin", "duplicate field"),
+        ];
+        for (query, message) in cases {
+            let err = parse_query(query).expect_err(query);
+            assert_eq!(
+                err.as_response_error().status_code(),
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "{query}"
+            );
+            assert!(err.to_string().contains(message), "{query}: {err}");
+        }
+    }
+
+    // `map::init` needs `PARSEABLE`, so tests create the maps directly. Tests
+    // that write them hold `map::TEST_SERIAL`, as other modules' tests watch the
+    // map locks. Each test uses its own tenant, so they don't see each other's
+    // keys or roles.
+    async fn rbac_state() -> MutexGuard<'static, ()> {
+        let serial = TEST_SERIAL.lock().await;
+        init_rbac_maps();
+        serial
+    }
+
+    fn blocking_rbac_state() -> MutexGuard<'static, ()> {
+        let serial = TEST_SERIAL.blocking_lock();
+        init_rbac_maps();
+        serial
+    }
+
+    fn init_rbac_maps() {
+        USERS.get_or_init(|| RwLock::new(map::Users::default()));
+        SESSIONS.get_or_init(|| RwLock::new(map::Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+    }
+
+    fn tenant(roles: Vec<(&str, Vec<DefaultPrivilege>)>, groups: &[(&str, &str)]) -> String {
+        let tenant = format!("apikeys-{}", Ulid::new());
+        mut_roles().insert(
+            tenant.clone(),
+            roles
+                .into_iter()
+                .map(|(name, privileges)| (name.to_owned(), Role::create_user_role(privileges)))
+                .collect(),
+        );
+        for (name, role) in groups {
+            let group = UserGroup {
+                name: (*name).to_owned(),
+                roles: HashSet::from([(*role).to_owned()]),
+                ..Default::default()
+            };
+            write_user_groups().insert(group, &tenant);
+        }
+        tenant
+    }
+
+    fn add_key(tenant: &str, name: &str, roles: &[&str], groups: &[&str]) {
+        let mut key = User::new_api_key(
+            Ulid::new(),
+            format!("{name}-secret"),
+            name.into(),
+            roles.iter().map(|r| r.to_string()).collect(),
+            "admin".into(),
+            Some(tenant.to_owned()),
+        );
+        key.user_groups = groups.iter().map(|g| g.to_string()).collect();
+        mut_users().insert(key);
+    }
+
+    fn names(tenant: &str, privilege: Option<DefaultPrivilege>) -> Vec<String> {
+        let mut names: Vec<String> = tenant_entries(&Some(tenant.to_owned()), privilege.as_ref())
+            .into_iter()
+            .map(|entry| entry.key_name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn list_without_privilege_returns_every_key_masked() {
+        let _serial = blocking_rbac_state();
+        let tenant = tenant(
+            vec![("readers", vec![DefaultPrivilege::Reader { resource: None }])],
+            &[],
+        );
+        add_key(&tenant, "reader-key", &["readers"], &[]);
+        add_key(&tenant, "dangling-key", &["deleted-role"], &[]);
+        add_key(&tenant, "roleless-key", &[], &[]);
+        let entries = tenant_entries(&Some(tenant.clone()), None);
+        assert!(entries.iter().all(|entry| entry.api_key == "****cret"));
+        assert_eq!(
+            names(&tenant, None),
+            ["dangling-key", "reader-key", "roleless-key"]
+        );
+    }
+
+    #[test]
+    fn privilege_filter_matches_keys_by_role_privileges() {
+        let _serial = blocking_rbac_state();
+        let tenant = tenant(
+            vec![
+                (
+                    "readers",
+                    vec![DefaultPrivilege::Reader {
+                        resource: Some(ParseableResourceType::Stream("logs".into())),
+                    }],
+                ),
+                (
+                    "ingest-and-read",
+                    vec![
+                        DefaultPrivilege::Ingestor { resource: None },
+                        DefaultPrivilege::Reader { resource: None },
+                    ],
+                ),
+                ("admins", vec![DefaultPrivilege::Admin]),
+                ("writers", vec![DefaultPrivilege::Writer { resource: None }]),
+                ("editors", vec![DefaultPrivilege::Editor]),
+            ],
+            &[],
+        );
+        add_key(&tenant, "reader-key", &["readers"], &[]);
+        add_key(&tenant, "pipeline-key", &["ingest-and-read"], &[]);
+        add_key(&tenant, "admin-key", &["admins"], &[]);
+        add_key(&tenant, "writer-key", &["writers"], &[]);
+        add_key(&tenant, "editor-key", &["editors"], &[]);
+        add_key(&tenant, "dangling-key", &["deleted-role"], &[]);
+        add_key(&tenant, "roleless-key", &[], &[]);
+
+        // Resource-scoped privileges still match the bare privilege filter.
+        assert_eq!(
+            names(&tenant, Some(DefaultPrivilege::Reader { resource: None })),
+            ["pipeline-key", "reader-key"]
+        );
+        assert_eq!(
+            names(&tenant, Some(DefaultPrivilege::Ingestor { resource: None })),
+            ["pipeline-key"]
+        );
+        // Privileges match by kind, not hierarchy: admin keys are not readers.
+        assert_eq!(names(&tenant, Some(DefaultPrivilege::Admin)), ["admin-key"]);
+        assert_eq!(
+            names(&tenant, Some(DefaultPrivilege::Writer { resource: None })),
+            ["writer-key"]
+        );
+        assert_eq!(
+            names(&tenant, Some(DefaultPrivilege::Editor)),
+            ["editor-key"]
+        );
+    }
+
+    #[test]
+    fn privilege_filter_matches_superadmin_direct_and_group_roles_exactly() {
+        let _serial = blocking_rbac_state();
+        let tenant = tenant(
+            vec![
+                ("superadmins", vec![DefaultPrivilege::SuperAdmin]),
+                ("admins", vec![DefaultPrivilege::Admin]),
+            ],
+            &[("superadmins-group", "superadmins")],
+        );
+        add_key(&tenant, "superadmin-key", &["superadmins"], &[]);
+        add_key(&tenant, "superadmin-group-key", &[], &["superadmins-group"]);
+        add_key(&tenant, "admin-key", &["admins"], &[]);
+        assert_eq!(
+            names(&tenant, Some(DefaultPrivilege::SuperAdmin)),
+            ["superadmin-group-key", "superadmin-key"]
+        );
+        assert_eq!(names(&tenant, Some(DefaultPrivilege::Admin)), ["admin-key"]);
+    }
+
+    #[actix_web::test]
+    async fn list_route_filters_privilege_and_requires_admin() {
+        let _serial = rbac_state().await;
+        let tenant = tenant(
+            vec![
+                ("admins", vec![DefaultPrivilege::Admin]),
+                ("readers", vec![DefaultPrivilege::Reader { resource: None }]),
+            ],
+            &[],
+        );
+        add_key(&tenant, "admin-key", &["admins"], &[]);
+        add_key(&tenant, "reader-key", &["readers"], &[]);
+        let mut cookies = Vec::new();
+        for role in ["admins", "readers"] {
+            let (mut user, _) = User::new_basic(
+                format!("apikeys-{}", Ulid::new()).to_lowercase(),
+                Some(tenant.clone()),
+                false,
+            );
+            user.roles.insert(role.into());
+            mut_users().insert(user.clone());
+            let session = Ulid::new();
+            Users.new_session(
+                &user,
+                SessionKey::SessionId(session),
+                chrono::TimeDelta::hours(1),
+            );
+            cookies.push(Cookie::new("session", session.to_string()));
+        }
+        let app = actix_test::init_service(
+            App::new().service(web::scope("/api/prism/v1").service(Server::get_apikeys_webscope())),
+        )
+        .await;
+        for (query, expected) in [
+            ("", vec!["admin-key", "reader-key"]),
+            ("?privilege=admin", vec!["admin-key"]),
+        ] {
+            let req = actix_test::TestRequest::get()
+                .uri(&format!("/api/prism/v1/apikeys{query}"))
+                .cookie(cookies[0].clone())
+                .to_request();
+            let response = actix_test::call_service(&app, req).await;
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            let body: serde_json::Value = actix_test::read_body_json(response).await;
+            let mut names: Vec<_> = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["keyName"].as_str().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(names, expected, "{query}");
+        }
+        for (query, cookie, expected) in [
+            (
+                "?privilege=bogus",
+                Some(&cookies[0]),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("", None, StatusCode::UNAUTHORIZED),
+            ("", Some(&cookies[1]), StatusCode::FORBIDDEN),
+        ] {
+            let mut req =
+                actix_test::TestRequest::get().uri(&format!("/api/prism/v1/apikeys{query}"));
+            if let Some(cookie) = cookie {
+                req = req.cookie(cookie.clone());
+            }
+            let status = match actix_test::try_call_service(&app, req.to_request()).await {
+                Ok(response) => response.status(),
+                Err(error) => error.as_response_error().status_code(),
+            };
+            assert_eq!(status, expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn privilege_filter_includes_group_inherited_roles() {
+        let _serial = blocking_rbac_state();
+        let tenant = tenant(
+            vec![("readers", vec![DefaultPrivilege::Reader { resource: None }])],
+            &[
+                ("readers-group", "readers"),
+                ("dangling-group", "deleted-role"),
+            ],
+        );
+        add_key(&tenant, "group-key", &[], &["readers-group"]);
+        add_key(&tenant, "dangling-group-key", &[], &["dangling-group"]);
+        add_key(&tenant, "missing-group-key", &[], &["missing-group"]);
+        assert_eq!(
+            names(&tenant, Some(DefaultPrivilege::Reader { resource: None })),
+            ["group-key"]
+        );
+        assert!(names(&tenant, Some(DefaultPrivilege::Admin)).is_empty());
+    }
+
+    #[test]
+    fn privilege_filter_resolves_roles_in_the_given_tenant() {
+        let _serial = blocking_rbac_state();
+        // Same role and group names, different privileges per tenant.
+        let readers = tenant(
+            vec![("team", vec![DefaultPrivilege::Reader { resource: None }])],
+            &[("team-group", "team")],
+        );
+        let admins = tenant(
+            vec![("team", vec![DefaultPrivilege::Admin])],
+            &[("team-group", "team")],
+        );
+        add_key(&readers, "reader-key", &["team"], &[]);
+        add_key(&readers, "reader-group-key", &[], &["team-group"]);
+        add_key(&admins, "admin-key", &["team"], &[]);
+        add_key(&admins, "admin-group-key", &[], &["team-group"]);
+
+        let reader = || Some(DefaultPrivilege::Reader { resource: None });
+        assert_eq!(
+            names(&readers, reader()),
+            ["reader-group-key", "reader-key"]
+        );
+        assert!(names(&readers, Some(DefaultPrivilege::Admin)).is_empty());
+        assert_eq!(
+            names(&admins, Some(DefaultPrivilege::Admin)),
+            ["admin-group-key", "admin-key"]
+        );
+        assert!(names(&admins, reader()).is_empty());
+
+        // Keys in a tenant without a role map match no filter.
+        let unknown = format!("apikeys-{}", Ulid::new());
+        add_key(&unknown, "orphan-key", &["team"], &[]);
+        assert_eq!(names(&unknown, None), ["orphan-key"]);
+        assert!(names(&unknown, reader()).is_empty());
     }
 }

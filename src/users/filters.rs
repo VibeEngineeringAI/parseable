@@ -81,6 +81,7 @@ pub enum FilterType {
     Filter,
     SQL,
     Search,
+    Promql,
 }
 
 impl FilterType {
@@ -89,6 +90,7 @@ impl FilterType {
             FilterType::Filter => "filter",
             FilterType::SQL => "sql",
             FilterType::Search => "search",
+            FilterType::Promql => "promql",
         }
     }
 }
@@ -190,23 +192,26 @@ impl Filters {
                 let query: &str = f.query.filter_query.as_deref().unwrap_or("");
                 let filter_type = &f.query.filter_type;
 
-                // if filter type is SQL, check if the user has access to the dataset based on the query string
-                // if filter type is search or filter, check if the user has access to the dataset based on the dataset name
-                if *filter_type == FilterType::SQL {
-                    if (user_auth_for_query(key, query).await).is_ok() {
-                        _filters.push(f.clone())
+                match filter_type {
+                    // SQL queries can reference multiple datasets, so authorize the query itself.
+                    FilterType::SQL => {
+                        if (user_auth_for_query(key, query).await).is_ok() {
+                            _filters.push(f.clone())
+                        }
                     }
-                } else if *filter_type == FilterType::Search || *filter_type == FilterType::Filter {
-                    let dataset_name = &f.stream_name;
-                    if user_auth_for_datasets(
-                        &permissions,
-                        std::slice::from_ref(dataset_name),
-                        &tenant_id,
-                    )
-                    .await
-                    .is_ok()
-                    {
-                        _filters.push(f.clone())
+                    // Other filter types are scoped by the saved filter's dataset.
+                    FilterType::Search | FilterType::Filter | FilterType::Promql => {
+                        let dataset_name = &f.stream_name;
+                        if user_auth_for_datasets(
+                            &permissions,
+                            std::slice::from_ref(dataset_name),
+                            &tenant_id,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            _filters.push(f.clone())
+                        }
                     }
                 }
             }
@@ -245,6 +250,63 @@ mod tests {
             "query":{"filter_type":"sql","filter_query":"select * from orders","filter_builder":null},
             "time_filter":null
         })).unwrap()
+    }
+
+    fn promql_filter(stream_name: &str) -> Filter {
+        serde_json::from_value(serde_json::json!({
+            "version":"v2", "user_id":"owner", "filter_id":format!("promql-{stream_name}"),
+            "stream_name":stream_name, "filter_name":"Request rate", "tenant_id":null,
+            "query":{"filter_type":"promql","filter_query":"sum(rate(http_requests_total[5m]))","filter_builder":null},
+            "time_filter":null
+        })).unwrap()
+    }
+
+    // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+    // A user without groups never reads `ROLES`, which other tests seed.
+    fn session_with(permissions: Vec<crate::rbac::role::Permission>) -> SessionKey {
+        use crate::rbac::map::{SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups};
+        USERS.get_or_init(|| parking_lot::RwLock::new(crate::rbac::map::Users::default()));
+        SESSIONS.get_or_init(|| parking_lot::RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| parking_lot::RwLock::new(UserGroups::default()));
+        let key = SessionKey::SessionId(ulid::Ulid::new());
+        crate::rbac::map::mut_sessions().track_new(
+            format!("user-{key:?}"),
+            key.clone(),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            permissions,
+            &None,
+        );
+        key
+    }
+
+    #[test]
+    fn promql_filter_type_round_trips_as_lowercase() {
+        let filter = promql_filter("otel_metrics");
+        assert_eq!(filter.query.filter_type, FilterType::Promql);
+        assert_eq!(filter.query.filter_type.to_str(), "promql");
+        let value = serde_json::to_value(&filter).unwrap();
+        assert_eq!(value["query"]["filter_type"], "promql");
+        assert_eq!(serde_json::from_value::<Filter>(value).unwrap(), filter);
+    }
+
+    #[tokio::test]
+    async fn promql_filters_are_authorized_by_dataset_not_parsed_as_sql() {
+        use crate::rbac::role::{Action, Permission};
+        let cache = Filters::default();
+        let filter = promql_filter("otel_metrics");
+        cache.update(&filter, &None).await;
+
+        // PromQL is not SQL: routing it through SQL table extraction would
+        // fail and silently hide the filter from authorized users.
+        let reader = session_with(vec![Permission::Resource(Action::Query, None)]);
+        assert_eq!(cache.list_filters(&reader).await, vec![filter]);
+
+        let unauthorized = session_with(vec![]);
+        assert!(cache.list_filters(&unauthorized).await.is_empty());
+
+        for key in [reader, unauthorized] {
+            crate::rbac::map::mut_sessions().remove_session(&key);
+        }
     }
 
     #[tokio::test]
