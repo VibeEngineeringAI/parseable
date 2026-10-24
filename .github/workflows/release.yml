@@ -7,7 +7,7 @@
 # repository, so that job runs only in parseablehq/parseable.
 # It also creates a checksum file for the artifacts and publishes it to the release page.
 # It also builds and pushes a Docker image to Docker Hub with the same version tag.
-# Linux jobs run on Blacksmith runners. The build-profile input can select the
+# Linux jobs run on GitHub-hosted Ubuntu 24.04 runners. The build-profile input can select the
 # experimental release-thin-lto profile; such runs upload workflow artifacts
 # only and never publish to the release page or registry.
 
@@ -42,7 +42,7 @@ env:
 jobs:
   build-frontend:
     name: Package frontend
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: write
@@ -100,16 +100,31 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: blacksmith-8vcpu-ubuntu-2404
+            os: ubuntu-24.04
           # A hosted runner lost contact during the cross-compiled LTO build,
           # so aarch64 builds natively on an Arm runner.
           - target: aarch64-unknown-linux-gnu
-            os: blacksmith-8vcpu-ubuntu-2404-arm
-    timeout-minutes: 90
+            os: ubuntu-24.04-arm
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
+
+      - name: Prepare Linux build resources
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          if sudo fallocate -l 16G /swap.build && sudo chmod 600 /swap.build \
+            && sudo mkswap /swap.build && sudo swapon /swap.build; then
+            echo "Added 16G swap"
+          else
+            sudo rm -f /swap.build
+            echo "::warning title=Swap::Could not add swap; continuing without it"
+          fi
+          free -h
+          df -h /
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -139,21 +154,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-default-${{ env.RELEASE_PROFILE }}
-
-      # The aarch64 runner lost contact during the fat-LTO build twice, which
-      # GitHub attributes to CPU or memory starvation. Free disk, add swap and
-      # record the resources as annotations, which survive a lost runner.
-      # Swap is best effort because runner disk layouts differ.
-      - name: Free disk and add swap
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          if sudo fallocate -l 16G /swap.release && sudo chmod 600 /swap.release \
-            && sudo mkswap /swap.release && sudo swapon /swap.release; then
-            echo "Added 16G swap"
-          else
-            echo "::warning title=Swap::Could not add swap; continuing without it"
-          fi
-          echo "::notice title=Runner resources::$(nproc) CPUs; $(free -h | awk '/Mem/{print $2" RAM"} /Swap/{print $2" swap"}' | paste -sd ' '); $(df -h --output=avail / | tail -1 | tr -d ' ') free on /"
 
       - name: Build native
         run: cargo build --profile "$RELEASE_PROFILE" --target ${{ matrix.target }}
@@ -332,8 +332,8 @@ jobs:
 
   build-kafka-linux:
     name: Build Kafka for x86_64-unknown-linux-gnu
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     permissions:
       id-token: write
       contents: write
@@ -342,6 +342,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.build-profile == 'release-thin-lto' && inputs.tag || format('refs/tags/{0}', inputs.tag) }}
+
+      - name: Prepare Linux build resources
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          if sudo fallocate -l 16G /swap.build && sudo chmod 600 /swap.build \
+            && sudo mkswap /swap.build && sudo swapon /swap.build; then
+            echo "Added 16G swap"
+          else
+            sudo rm -f /swap.build
+            echo "::warning title=Swap::Could not add swap; continuing without it"
+          fi
+          free -h
+          df -h /
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -538,7 +553,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   create-checksum:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: [build-linux, build-windows, build-mac, build-kafka-linux, build-kafka-mac]
     permissions:
