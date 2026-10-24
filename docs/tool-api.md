@@ -217,7 +217,7 @@ rerun that SQL unchanged, for example in a dashboard tile.
 
 ## Argument schema validation
 
-`inputSchema` is enforced server-side for `type`, `required`,
+`inputSchema` is enforced server-side for `type` (a single type or a list of types), `required`,
 `additionalProperties`, `enum`, `const`, `minLength`/`maxLength`,
 `minimum`/`maximum`, `minItems`/`maxItems`, `items`, `anyOf` and `oneOf`.
 `oneOf` passes only when exactly one variant matches. Combinators are checked

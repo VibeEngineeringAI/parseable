@@ -194,10 +194,14 @@ fn validate_enum(schema: &Value, value: &Value, path: &str) -> Result<(), String
 }
 
 fn validate_type(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
-    let Some(expected_type) = schema.get("type").and_then(Value::as_str) else {
-        return Ok(());
+    let expected_types = match schema.get("type") {
+        Some(Value::String(expected_type)) => vec![expected_type.as_str()],
+        Some(Value::Array(expected_types)) => {
+            expected_types.iter().filter_map(Value::as_str).collect()
+        }
+        _ => return Ok(()),
     };
-    let type_matches = match expected_type {
+    let type_matches = |expected_type: &str| match expected_type {
         "object" => value.is_object(),
         "array" => value.is_array(),
         "string" => value.is_string(),
@@ -207,10 +211,10 @@ fn validate_type(schema: &Value, value: &Value, path: &str) -> Result<(), String
         "null" => value.is_null(),
         _ => true,
     };
-    if type_matches {
+    if expected_types.is_empty() || expected_types.iter().any(|kind| type_matches(kind)) {
         Ok(())
     } else {
-        Err(format!("{path} must be a {expected_type}"))
+        Err(format!("{path} must be a {}", expected_types.join(" or ")))
     }
 }
 
@@ -1261,6 +1265,23 @@ mod tests {
             validate_tool_arguments(
                 &serde_json::json!({"anyOf":[{"type":"string"}],"maxLength":2}),
                 &serde_json::json!("long")
+            )
+            .is_err()
+        );
+    }
+
+    #[actix_web::test]
+    async fn schema_type_unions_accept_any_listed_type() {
+        let schema = serde_json::json!({ "type": ["string", "null"] });
+        for value in [serde_json::json!("x"), serde_json::json!(null)] {
+            assert!(validate_tool_arguments(&schema, &value).is_ok(), "{value}");
+        }
+        let error = validate_tool_arguments(&schema, &serde_json::json!(1)).unwrap_err();
+        assert_eq!(error, "arguments must be a string or null");
+        assert!(
+            validate_tool_arguments(
+                &serde_json::json!({ "type": "integer" }),
+                &serde_json::json!(1.5)
             )
             .is_err()
         );
