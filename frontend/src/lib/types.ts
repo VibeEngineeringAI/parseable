@@ -130,7 +130,7 @@ export type SavedLogView = {
   filter_name: string;
   stream_name: string;
   query: {
-    filter_type: 'filter' | 'sql' | 'search';
+    filter_type: 'filter' | 'sql' | 'search' | 'promql';
     filter_query?: string | null;
     filter_builder?: SavedLogViewBuilder | null;
   };

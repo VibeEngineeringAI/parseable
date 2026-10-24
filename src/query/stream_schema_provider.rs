@@ -45,7 +45,9 @@ use datafusion::{
         physical_planning_context::PhysicalPlanningContext, utils::conjunction,
     },
     physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, Statistics, empty::EmptyExec, union::UnionExec},
+    physical_plan::{
+        ExecutionPlan, Statistics, empty::EmptyExec, filter::FilterExecBuilder, union::UnionExec,
+    },
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -94,13 +96,14 @@ impl SchemaProvider for GlobalSchemaProvider {
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         if self.table_exist(name) {
+            let stream = PARSEABLE
+                .get_stream(name, &self.tenant_id)
+                .expect(STREAM_EXISTS);
             Ok(Some(Arc::new(StandardTableProvider {
-                schema: PARSEABLE
-                    .get_stream(name, &self.tenant_id)
-                    .expect(STREAM_EXISTS)
-                    .get_schema(),
+                schema: stream.get_schema(),
                 stream: name.to_owned(),
                 tenant_id: self.tenant_id.clone(),
+                time_partition: stream.get_time_partition(),
                 hot_tier_guarded: false,
             })))
         } else {
@@ -119,6 +122,8 @@ struct StandardTableProvider {
     // prefix under which to find snapshot
     stream: String,
     tenant_id: Option<String>,
+    // Column the stream's data files are partitioned by; `p_timestamp` when `None`.
+    time_partition: Option<String>,
     hot_tier_guarded: bool,
 }
 
@@ -150,6 +155,7 @@ pub(super) fn guarded_hot_tier_table_source(
         schema: provider.schema.clone(),
         stream: provider.stream.clone(),
         tenant_id: provider.tenant_id.clone(),
+        time_partition: provider.time_partition.clone(),
         hot_tier_guarded: true,
     })))
 }
@@ -160,6 +166,69 @@ pub fn exact_source_filters(filters: &[Expr]) -> Vec<Expr> {
         .filter(|filter| expr_in_boundary(filter))
         .cloned()
         .collect()
+}
+
+/// Scans `table`, whose scan ignores pushed filters, and enforces the filters
+/// `StandardTableProvider` reports as `Exact` (`exact_source_filters` is a
+/// superset of them: see `filter_pushdown`).
+///
+/// DataFusion removes the `FilterExec` above the scan for `Exact` filters. Parquet
+/// scans enforce them through the source predicate (see `exact_source_filters`),
+/// but `MemTable` and `ListingTable` do not, so their rows are filtered here. The
+/// limit is applied after the filter, and the filter's columns are scanned even
+/// when they are not projected.
+async fn scan_enforcing_exact_filters(
+    table: &dyn TableProvider,
+    state: &dyn Session,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let Some(predicate) = conjunction(exact_source_filters(filters)) else {
+        return table.scan(state, projection, filters, limit).await;
+    };
+
+    let schema = table.schema();
+    let scan_projection = projection
+        .map(|projection| {
+            let mut columns = projection.clone();
+            for column in predicate.column_refs() {
+                columns.push(schema.index_of(&column.name)?);
+            }
+            columns.sort_unstable();
+            columns.dedup();
+            Ok::<_, DataFusionError>(columns)
+        })
+        .transpose()?;
+    // Positions of the requested columns in the scan's output.
+    let output_projection =
+        projection
+            .zip(scan_projection.as_ref())
+            .map(|(projection, scanned)| {
+                projection
+                    .iter()
+                    .map(|index| {
+                        scanned
+                            .binary_search(index)
+                            .expect("projected column is scanned")
+                    })
+                    .collect_vec()
+            });
+
+    let input = table
+        .scan(state, scan_projection.as_ref(), filters, None)
+        .await?;
+    let predicate = create_physical_expr(
+        &predicate,
+        &input.schema().to_dfschema()?,
+        state.execution_props(),
+        &PhysicalPlanningContext::default(),
+    )?;
+    let filter = FilterExecBuilder::new(predicate, input)
+        .apply_projection(output_projection)?
+        .with_fetch(limit)
+        .build()?;
+    Ok(Arc::new(filter))
 }
 
 pub fn build_parquet_scan_components(
@@ -404,9 +473,9 @@ impl StandardTableProvider {
     ) -> Result<(), DataFusionError> {
         // Both sources were captured before the remote snapshot was read.
         let (records, partitioned_files) = captured;
-        let arrow_exec = reversed_mem_table(records, self.schema.clone())?
-            .scan(state, projection, filters, limit)
-            .await?;
+        let mem_table = reversed_mem_table(records, self.schema.clone())?;
+        let arrow_exec =
+            scan_enforcing_exact_filters(&mem_table, state, projection, filters, limit).await?;
         execution_plans.push(arrow_exec);
 
         // Keep the native scan and its file extensions: each extension owns the
@@ -442,7 +511,14 @@ impl StandardTableProvider {
                 let table =
                     builder.build(self.schema.clone(), |x| glob_storage.query_prefixes(x))?;
                 if let Some(table) = table {
-                    let plan = table.scan(state, projection, filters, limit).await?;
+                    let plan = scan_enforcing_exact_filters(
+                        table.as_ref(),
+                        state,
+                        projection,
+                        filters,
+                        limit,
+                    )
+                    .await?;
                     execution_plans.push(plan);
                 }
 
@@ -918,20 +994,10 @@ impl TableProvider for StandardTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        let res_vec = filters
+        Ok(filters
             .iter()
-            .map(|filter| {
-                if expr_in_boundary(filter) {
-                    // if filter can be handled by time partiton pruning, it is exact
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    // otherwise, we still might be able to handle the filter with file
-                    // level mechanisms such as Parquet row group pruning.
-                    TableProviderFilterPushDown::Inexact
-                }
-            })
-            .collect_vec();
-        Ok(res_vec)
+            .map(|filter| filter_pushdown(filter, &self.time_partition))
+            .collect_vec())
     }
 }
 
@@ -959,6 +1025,19 @@ impl PartialTimeFilter {
         let Expr::BinaryExpr(binexpr) = expr else {
             return None;
         };
+
+        // Manifests (and staging/listing prefixes) are bucketed by the stream's
+        // time partition column, or `p_timestamp` when none is configured. A
+        // bound on any other column, including `p_timestamp` on a stream with a
+        // custom time partition, says nothing about which manifests hold
+        // matching rows and must not be used to prune them.
+        let partition_column = time_partition.as_deref().unwrap_or(DEFAULT_TIMESTAMP_KEY);
+        let Expr::Column(column) = binexpr.left.as_ref() else {
+            return None;
+        };
+        if column.name != partition_column {
+            return None;
+        }
         let (op, time) = extract_timestamp_bound(binexpr, time_partition)?;
         let value = match op {
             Operator::Gt => PartialTimeFilter::Low(Bound::Excluded(time)),
@@ -1116,6 +1195,30 @@ pub fn is_within_staging_window(time_filters: &[PartialTimeFilter]) -> bool {
     !has_upper_bound
 }
 
+/// How `StandardTableProvider` can handle `filter`.
+///
+/// Data files hold one minute of the stream's time partition column, so a
+/// minute-aligned bound on that column either keeps or prunes each file whole.
+/// Only then is the filter `Exact`: DataFusion drops the `FilterExec` above the
+/// scan and may push `LIMIT` into it, and `collect_from_snapshot` truncates the
+/// file list by row counts assuming every row of a surviving file matches. A
+/// bound on any other column (including `p_timestamp` on a stream with a custom
+/// time partition) only prunes files partially, so it stays `Inexact`.
+fn filter_pushdown(filter: &Expr, time_partition: &Option<String>) -> TableProviderFilterPushDown {
+    let partition_column = time_partition.as_deref().unwrap_or(DEFAULT_TIMESTAMP_KEY);
+    let is_partition_column = matches!(
+        filter,
+        Expr::BinaryExpr(BinaryExpr { left, .. })
+            if matches!(left.as_ref(), Expr::Column(column) if column.name == partition_column)
+    );
+    if is_partition_column && expr_in_boundary(filter) {
+        TableProviderFilterPushDown::Exact
+    } else {
+        // File level mechanisms such as Parquet row group pruning may still apply.
+        TableProviderFilterPushDown::Inexact
+    }
+}
+
 pub fn expr_in_boundary(filter: &Expr) -> bool {
     let Expr::BinaryExpr(binexpr) = filter else {
         return false;
@@ -1148,10 +1251,11 @@ pub fn extract_timestamp_bound(
     };
 
     match value {
-        ScalarValue::TimestampMillisecond(Some(value), _) => Some((
-            binexpr.op,
-            DateTime::from_timestamp_millis(*value).unwrap().naive_utc(),
-        )),
+        // Out-of-range literals (reachable from SQL, e.g.
+        // `to_timestamp_millis(9223372036854775807)`) yield no bound.
+        ScalarValue::TimestampMillisecond(Some(value), _) => {
+            DateTime::from_timestamp_millis(*value).map(|time| (binexpr.op, time.naive_utc()))
+        }
         ScalarValue::TimestampNanosecond(Some(value), _) => Some((
             binexpr.op,
             DateTime::from_timestamp_nanos(*value).naive_utc(),
@@ -1319,16 +1423,19 @@ mod tests {
     };
 
     use crate::catalog::{
+        Snapshot as _,
         column::{Column, Int64Type, TypedStatistics},
         manifest::{File, SortOrder},
-        snapshot::ManifestItem,
+        snapshot::{ManifestItem, Snapshot},
     };
+    use crate::event::DEFAULT_TIMESTAMP_KEY;
 
     use super::{
         HotTierStreamKey, PartialTimeFilter, StandardTableProvider, balanced_file_groups,
         build_parquet_scan_components, build_parquet_scan_components_with_full_filters,
-        exact_source_filters, extract_timestamp_bound, guarded_hot_tier_table_source,
-        hot_tier_stream_key, is_overlapping_query, standard_table_provider,
+        exact_source_filters, extract_primary_filter, extract_timestamp_bound,
+        guarded_hot_tier_table_source, hot_tier_stream_key, is_overlapping_query,
+        standard_table_provider,
     };
 
     #[test]
@@ -1337,6 +1444,7 @@ mod tests {
             schema: Arc::new(Schema::empty()),
             stream: "logs".to_owned(),
             tenant_id: Some("other-tenant".to_owned()),
+            time_partition: Some("event_time".to_owned()),
             hot_tier_guarded: false,
         }));
 
@@ -1352,6 +1460,10 @@ mod tests {
         let guarded_provider = standard_table_provider(&guarded_source).unwrap();
         assert_eq!(guarded_provider.stream, "logs");
         assert_eq!(guarded_provider.tenant_id.as_deref(), Some("other-tenant"));
+        assert_eq!(
+            guarded_provider.time_partition.as_deref(),
+            Some("event_time")
+        );
         assert!(guarded_provider.hot_tier_guarded);
     }
 
@@ -1434,13 +1546,7 @@ mod tests {
         ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
             Ok(filters
                 .iter()
-                .map(|filter| {
-                    if super::expr_in_boundary(filter) {
-                        TableProviderFilterPushDown::Exact
-                    } else {
-                        TableProviderFilterPushDown::Inexact
-                    }
-                })
+                .map(|filter| super::filter_pushdown(filter, &None))
                 .collect())
         }
     }
@@ -1543,6 +1649,88 @@ mod tests {
         assert!(predicate.contains("p_timestamp"));
         assert!(predicate.contains("job"));
         assert!(predicate.contains("api"));
+    }
+
+    #[test]
+    fn only_minute_aligned_partition_column_bounds_are_exact() {
+        let minute = ScalarValue::TimestampMillisecond(Some(1_672_531_200_000), None);
+        let mid_minute = ScalarValue::TimestampMillisecond(Some(1_672_531_230_000), None);
+        let bound = |column: &str, value: &ScalarValue| {
+            Expr::Column(column.into()).gt_eq(Expr::Literal(value.clone(), None))
+        };
+        let event_time = Some("event_time".to_owned());
+
+        let cases = [
+            (bound("p_timestamp", &minute), &None, true),
+            (bound("p_timestamp", &mid_minute), &None, false),
+            (bound("created_at", &minute), &None, false),
+            (bound("event_time", &minute), &event_time, true),
+            // Ingestion time on a stream partitioned by event time.
+            (bound("p_timestamp", &minute), &event_time, false),
+            (
+                Expr::Literal(minute.clone(), None).lt(Expr::Column("p_timestamp".into())),
+                &None,
+                false,
+            ),
+        ];
+        for (filter, time_partition, exact) in cases {
+            assert_eq!(
+                matches!(
+                    super::filter_pushdown(&filter, time_partition),
+                    TableProviderFilterPushDown::Exact
+                ),
+                exact,
+                "{filter} with time partition {time_partition:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_is_pushed_into_scan_only_for_exact_partition_bounds() {
+        // `collect_from_snapshot` truncates the file list by row counts when a
+        // limit reaches the scan, so it must not see one when a filter only
+        // partially matches the surviving files.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "p_timestamp",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]));
+        let context = SessionContext::new();
+        context
+            .register_table("logs", Arc::new(TestParquetProvider { schema }))
+            .unwrap();
+
+        for (column, limit_pushed) in [("p_timestamp", true), ("created_at", false)] {
+            let plan = context
+                .sql(&format!(
+                    "SELECT * FROM logs WHERE {column} >= '2023-01-01T00:00:00' LIMIT 5"
+                ))
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let plan = displayable(plan.as_ref()).indent(true).to_string();
+            let source_line = plan
+                .lines()
+                .find(|line| line.contains("DataSourceExec"))
+                .expect("parquet source line");
+
+            assert_eq!(source_line.contains("limit=5"), limit_pushed, "{plan}");
+            assert_eq!(
+                plan.lines()
+                    .any(|line| line.contains("FilterExec") && line.contains(column)),
+                !limit_pushed,
+                "{plan}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1783,6 +1971,42 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_millisecond_literal_yields_no_bound() {
+        let binexpr = BinaryExpr {
+            left: Box::new(Expr::Column("p_timestamp".into())),
+            op: Operator::GtEq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some(i64::MAX), None),
+                None,
+            )),
+        };
+
+        assert_eq!(extract_timestamp_bound(&binexpr, &None), None);
+        assert!(!super::expr_in_boundary(&Expr::BinaryExpr(binexpr)));
+    }
+
+    #[tokio::test]
+    async fn out_of_range_millisecond_literal_in_sql_does_not_panic() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "p_timestamp",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let context = SessionContext::new();
+        context
+            .register_table("logs", Arc::new(TestParquetProvider { schema }))
+            .unwrap();
+
+        context
+            .sql("SELECT * FROM logs WHERE p_timestamp >= to_timestamp_millis(9223372036854775807)")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+    }
+
+    #[test]
     fn timestamp_in_milliseconds() {
         let binexpr = BinaryExpr {
             left: Box::new(Expr::Column("timestamp_column".into())),
@@ -1927,7 +2151,134 @@ mod tests {
 
         assert_eq!(result, expected);
     }
+
+    fn ts_millis(time: DateTime<Utc>) -> Expr {
+        Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some(time.timestamp_millis()), None),
+            None,
+        )
+    }
+
+    fn column(name: &str) -> Expr {
+        Expr::Column(name.into())
+    }
+
+    fn pruned_manifest_paths(filters: &[Expr], time_partition: &Option<String>) -> Vec<String> {
+        let time_filters = extract_primary_filter(filters, time_partition);
+        manifest_snapshot()
+            .manifests(&time_filters)
+            .into_iter()
+            .map(|item| item.manifest_path)
+            .collect()
+    }
+
+    fn manifest_snapshot() -> Snapshot {
+        Snapshot {
+            manifest_list: manifest_items(),
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn non_timestamp_column_filter_does_not_prune_manifests() {
+        // `created_at` is unrelated to how manifests are bucketed: rows with a
+        // late `created_at` can live in any day's manifest.
+        let filters = [
+            column("created_at").gt_eq(ts_millis(datetime_min(2023, 12, 17))),
+            column("created_at").lt(ts_millis(datetime_max(2023, 12, 17))),
+        ];
+
+        assert!(extract_primary_filter(&filters, &None).is_empty());
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn non_timestamp_string_literal_filter_does_not_prune_manifests() {
+        let filters = [column("created_at").gt(Expr::Literal(
+            ScalarValue::Utf8(Some("2023-12-17T00:00:00".to_owned())),
+            None,
+        ))];
+
+        assert!(extract_primary_filter(&filters, &None).is_empty());
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn p_timestamp_filter_prunes_manifests() {
+        let filters = [
+            column(DEFAULT_TIMESTAMP_KEY).gt_eq(ts_millis(datetime_min(2023, 12, 16))),
+            column(DEFAULT_TIMESTAMP_KEY).lt(ts_millis(datetime_max(2023, 12, 16))),
+        ];
+
+        assert_eq!(extract_primary_filter(&filters, &None).len(), 2);
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["2"]);
+    }
+
+    #[test]
+    fn qualified_p_timestamp_filter_prunes_manifests() {
+        // The query handler injects table-qualified time filters.
+        let filters = [Expr::Column(datafusion::common::Column::new(
+            Some("app_logs"),
+            DEFAULT_TIMESTAMP_KEY,
+        ))
+        .gt_eq(ts_millis(datetime_min(2023, 12, 17)))];
+
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["3"]);
+    }
+
+    #[test]
+    fn literal_on_left_or_non_comparison_does_not_prune_manifests() {
+        let filters = [
+            ts_millis(datetime_min(2023, 12, 17)).lt(column(DEFAULT_TIMESTAMP_KEY)),
+            column(DEFAULT_TIMESTAMP_KEY).not_eq(ts_millis(datetime_min(2023, 12, 17))),
+        ];
+
+        assert!(extract_primary_filter(&filters, &None).is_empty());
+    }
+
+    #[test]
+    fn custom_time_partition_filter_prunes_manifests() {
+        // Manifests of time-partitioned streams are bucketed by the partition
+        // column, so bounds on it (timestamp or parseable string) prune.
+        let time_partition = Some("event_time".to_owned());
+        let filters = [
+            column("event_time").gt_eq(ts_millis(datetime_min(2023, 12, 16))),
+            column("event_time").lt(Expr::Literal(
+                ScalarValue::Utf8(Some("2023-12-16T12:00:00".to_owned())),
+                None,
+            )),
+        ];
+
+        assert_eq!(extract_primary_filter(&filters, &time_partition).len(), 2);
+        assert_eq!(pruned_manifest_paths(&filters, &time_partition), ["2"]);
+    }
+
+    #[test]
+    fn p_timestamp_filter_does_not_prune_custom_time_partition_manifests() {
+        // On a time-partitioned stream `p_timestamp` is ingestion time, while
+        // manifests are bucketed by event time: back-filled events ingested on
+        // the 17th sit in the 15th's manifest and must not be pruned away.
+        let time_partition = Some("event_time".to_owned());
+        let filters = [column(DEFAULT_TIMESTAMP_KEY).gt_eq(ts_millis(datetime_min(2023, 12, 17)))];
+
+        assert!(extract_primary_filter(&filters, &time_partition).is_empty());
+        assert_eq!(
+            pruned_manifest_paths(&filters, &time_partition),
+            ["1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn unrelated_column_does_not_prune_custom_time_partition_manifests() {
+        let time_partition = Some("event_time".to_owned());
+        let filters = [column("created_at").gt_eq(ts_millis(datetime_min(2023, 12, 17)))];
+
+        assert!(extract_primary_filter(&filters, &time_partition).is_empty());
+    }
 }
 
 #[cfg(test)]
 mod ordering_tests;
+
+#[cfg(test)]
+mod exact_filter_tests;
