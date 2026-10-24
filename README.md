@@ -80,8 +80,8 @@ For production deployments, refer to the [installation guide ↗︎](https://www
 
 ## Contributing
 
-Pull requests use the [CI workflow](.github/workflows/ci.yaml) on Blacksmith
-8-vCPU Ubuntu 24.04 runners. It selects frontend, Rust, and integration jobs from
+Pull requests use the [CI workflow](.github/workflows/ci.yaml) on GitHub-hosted
+Ubuntu 24.04 runners. It selects frontend, Rust, and integration jobs from
 the changed paths and reports one aggregate `CI passed` check. Frontend changes
 still exercise the embedded UI through the integration image; Rust-only changes
 skip the browser suite. A newer PR commit cancels its superseded CI run.
