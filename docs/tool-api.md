@@ -151,12 +151,16 @@ datasets.
 
 `resolve_dataset` accepts an optional `telemetryType` (`logs`, `metrics` or
 `traces`) and `limit` (1–20, default 5). It resolves a `selectedDataset` or
-`contextDataset` exactly, or resolves the only visible dataset. Otherwise it
-ranks visible datasets by name match against `query`. It resolves only a
-unique high-confidence name match. In every other case it returns
-`status: "ambiguous"` with up to `limit` scored `candidates`, or `"not_found"`.
-It never falls back to an arbitrary dataset. A selected dataset whose telemetry
-type does not match `telemetryType` returns `not_found`.
+`contextDataset` by exact, case-sensitive name. If there is no exact match, it
+falls back to a case-insensitive match only when that match is unique; several
+case-insensitive matches return `status: "ambiguous"` with those datasets as
+`candidates`. Without a selection, it resolves the only visible dataset.
+Otherwise it ranks visible datasets by name match against `query`. It resolves
+only a unique high-confidence name match. In every other case it returns
+`status: "ambiguous"` with up to `limit` scored `candidates`, or `"not_found"`
+when no visible dataset matches the requested telemetry type. It never falls
+back to an arbitrary dataset. A selected dataset whose telemetry type does not
+match `telemetryType` returns `not_found`.
 
 `discover_datasets` counts events in the requested range for each visible
 dataset of the requested telemetry type that the caller can query. It returns
