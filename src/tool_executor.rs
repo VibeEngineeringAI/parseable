@@ -1,7 +1,7 @@
 use std::{collections::HashMap, ops::ControlFlow};
 
 use actix_web::{HttpRequest, HttpResponse, body::to_bytes_limited, http::header::HeaderMap, web};
-use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
+use chrono::{DateTime, Duration, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -219,11 +219,23 @@ pub fn resolve_time_range_at(arguments: &Value, reference: DateTime<Utc>) -> Res
         .get("timezone")
         .and_then(Value::as_str)
         .unwrap_or("UTC");
-    let timezone = timezone_name
-        .parse::<Tz>()
-        .map_err(|_| format!("invalid IANA timezone `{timezone_name}`"))?;
+    let timezone = if timezone_name.eq_ignore_ascii_case("utc") {
+        Tz::UTC
+    } else {
+        timezone_name
+            .parse::<Tz>()
+            .map_err(|_| format!("invalid IANA timezone `{timezone_name}`"))?
+    };
     let normalized = expression.trim().to_ascii_lowercase();
-    let range = if normalized == "today" || normalized == "yesterday" {
+    // ASCII lowercasing preserves byte offsets, so the split index applies to `expression`.
+    let explicit_range = expression
+        .to_ascii_lowercase()
+        .find(" to ")
+        .map(|index| (&expression[..index], &expression[index + 4..]));
+    let range = if let Some((start, end)) = explicit_range {
+        TimeRange::parse_human_time_at(start.trim(), end.trim(), reference)
+            .map_err(|error| error.to_string())?
+    } else if normalized == "today" || normalized == "yesterday" {
         let date = reference.with_timezone(&timezone).date_naive()
             - Duration::days(i64::from(normalized == "yesterday"));
         let local_start = date
@@ -233,7 +245,7 @@ pub fn resolve_time_range_at(arguments: &Value, reference: DateTime<Utc>) -> Res
             LocalResult::Single(start) | LocalResult::Ambiguous(start, _) => {
                 start.with_timezone(&Utc)
             }
-            LocalResult::None => return Err("local day boundary does not exist".to_owned()),
+            LocalResult::None => first_instant_after_gap(&timezone, local_start),
         };
         let end = if normalized == "today" {
             reference
@@ -245,7 +257,7 @@ pub fn resolve_time_range_at(arguments: &Value, reference: DateTime<Utc>) -> Res
                 LocalResult::Single(end) | LocalResult::Ambiguous(end, _) => {
                     end.with_timezone(&Utc)
                 }
-                LocalResult::None => return Err("local day boundary does not exist".to_owned()),
+                LocalResult::None => first_instant_after_gap(&timezone, next_local_start),
             }
         };
         TimeRange::new(start, end)
@@ -272,13 +284,9 @@ pub fn resolve_time_range_at(arguments: &Value, reference: DateTime<Utc>) -> Res
             .checked_sub_signed(duration)
             .ok_or_else(|| "time duration is too large".to_owned())?;
         TimeRange::new(start, reference)
-    } else if let Some((start, end)) = expression.split_once(" to ") {
-        TimeRange::parse_human_time(start.trim(), end.trim()).map_err(|error| error.to_string())?
-    } else if DateTime::parse_from_rfc3339(expression).is_ok() {
-        TimeRange::parse_human_time(expression, &reference.to_rfc3339())
-            .map_err(|error| error.to_string())?
     } else {
-        TimeRange::parse_human_time(expression, "now").map_err(|error| error.to_string())?
+        TimeRange::parse_human_time_at(expression, "now", reference)
+            .map_err(|error| error.to_string())?
     };
     Ok(json!({
         "expression": expression,
@@ -286,6 +294,15 @@ pub fn resolve_time_range_at(arguments: &Value, reference: DateTime<Utc>) -> Res
         "startTime": range.start.to_rfc3339(),
         "endTime": range.end.to_rfc3339(),
     }))
+}
+
+/// Resolves a local time that falls in a DST gap to the first instant after the gap: the
+/// local time read with the offset in effect before the transition.
+fn first_instant_after_gap(timezone: &Tz, local: NaiveDateTime) -> DateTime<Utc> {
+    let offset_before = timezone
+        .offset_from_utc_datetime(&(local - Duration::days(1)))
+        .fix();
+    (local - offset_before).and_utc()
 }
 
 fn nested_string<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
@@ -2976,6 +2993,37 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn time_resolution_parses_now_relative_explicit_ranges_against_reference() {
+        let reference = DateTime::parse_from_rfc3339("2020-01-01T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        for expression in ["now-1h to now", "now-1h TO now"] {
+            let resolved =
+                resolve_time_range_at(&json!({ "expression": expression }), reference).unwrap();
+            assert_eq!(resolved["startTime"], "2020-01-01T11:00:00+00:00");
+            assert_eq!(resolved["endTime"], "2020-01-01T12:00:00+00:00");
+        }
+        let fallback = resolve_time_range_at(&json!({ "expression": "1h" }), reference).unwrap();
+        assert_eq!(fallback["startTime"], "2020-01-01T11:00:00+00:00");
+        assert_eq!(fallback["endTime"], "2020-01-01T12:00:00+00:00");
+    }
+
+    #[actix_web::test]
+    async fn time_resolution_accepts_utc_case_insensitively() {
+        let reference = DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        for timezone in ["utc", "Utc", "UTC"] {
+            let today = resolve_time_range_at(
+                &json!({ "expression": "today", "timezone": timezone }),
+                reference,
+            )
+            .unwrap();
+            assert_eq!(today["startTime"], "2026-10-01T00:00:00+00:00");
+        }
+    }
+
+    #[actix_web::test]
     async fn sample_events_selects_at_most_ten_columns() {
         let fields = (0..15)
             .map(|index| format!("f{index}"))
@@ -3023,6 +3071,36 @@ mod tests {
                 resolve_time_range_at(&json!({ "expression": expression }), reference).unwrap_err();
             assert!(error.contains("too large"), "{expression}: {error}");
         }
+    }
+
+    #[actix_web::test]
+    async fn time_resolution_starts_days_after_a_dst_gap_at_midnight() {
+        // America/Santiago skipped 2026-09-06T00:00 local (-04:00 -> -03:00 at 04:00Z).
+        let today = resolve_time_range_at(
+            &json!({ "expression": "today", "timezone": "America/Santiago" }),
+            DateTime::parse_from_rfc3339("2026-09-06T15:00:00Z")
+                .unwrap()
+                .to_utc(),
+        )
+        .unwrap();
+        assert_eq!(today["startTime"], "2026-09-06T04:00:00+00:00");
+        let yesterday = resolve_time_range_at(
+            &json!({ "expression": "yesterday", "timezone": "America/Santiago" }),
+            DateTime::parse_from_rfc3339("2026-09-07T15:00:00Z")
+                .unwrap()
+                .to_utc(),
+        )
+        .unwrap();
+        assert_eq!(yesterday["startTime"], "2026-09-06T04:00:00+00:00");
+        assert_eq!(yesterday["endTime"], "2026-09-07T03:00:00+00:00");
+        let day_before = resolve_time_range_at(
+            &json!({ "expression": "yesterday", "timezone": "America/Santiago" }),
+            DateTime::parse_from_rfc3339("2026-09-06T15:00:00Z")
+                .unwrap()
+                .to_utc(),
+        )
+        .unwrap();
+        assert_eq!(day_before["endTime"], "2026-09-06T04:00:00+00:00");
     }
 
     #[actix_web::test]

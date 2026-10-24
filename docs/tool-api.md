@@ -191,10 +191,14 @@ with `selectedDatasets`, `activeDatasetCount`, `truncated` and up to 20
 `unavailableDatasets`. If no dataset is active and at least one could not be
 counted, the result has `status: "error"` and no datasets.
 
-`resolve_time_range` accepts any IANA `timezone` (default `UTC`), and uses it
-for `today` and `yesterday` day boundaries. It also accepts `last <duration>`,
-`past <duration>`, `now-<duration>`, `<start> to <end>` and RFC3339 start
-times. An unknown timezone is an error.
+`resolve_time_range` accepts any IANA `timezone` (default `UTC`; `UTC` itself
+is matched case-insensitively), and uses it for `today` and `yesterday` day
+boundaries. A day whose local midnight is skipped by a DST change starts at
+the first instant after the gap. It also accepts `last <duration>`,
+`past <duration>`, `now-<duration>`, `<start> to <end>` (`to` is
+case-insensitive; each side is `now`, `now-<duration>`, `now+<duration>` or
+RFC3339, and the start may also be a bare duration such as `1h`) and RFC3339
+start times. An unknown timezone is an error.
 
 `sample_events` accepts an explicit `startTime` and `endTime`, which must be
 provided together. They take precedence over `minutes`.

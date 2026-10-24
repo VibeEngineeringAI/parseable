@@ -207,7 +207,7 @@ impl TimeRange {
         Self::parse_human_time_at(start_time, end_time, Utc::now())
     }
 
-    fn parse_human_time_at(
+    pub(crate) fn parse_human_time_at(
         start_time: &str,
         end_time: &str,
         now: DateTime<Utc>,
