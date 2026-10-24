@@ -212,8 +212,13 @@ must have traces telemetry and contain `span_span_id` and `span_trace_id`.
 Unknown fields are rejected. `span_count` is `COUNT(DISTINCT span_span_id)` and
 `trace_count` is `COUNT(DISTINCT span_trace_id)`, so duplicate span rows are
 not double counted. The result contains the exact executed SQL as `query`,
-along with `bucketInterval`, `semantics` and up to 500 `rows`. Clients can
+along with `bucketInterval`, `semantics`, up to 500 `rows` and `truncated`. Clients can
 rerun that SQL unchanged, for example in a dashboard tile.
+
+Rows are ordered by bucket time, oldest first. The SQL fetches one row past the
+limit (`LIMIT 501`) to detect overflow. When more than 500 rows match, the
+newest are dropped and `truncated` is `true`; reduce `bucketCount`, `groupBy`
+or the time range to get the full series.
 
 ## Argument schema validation
 
