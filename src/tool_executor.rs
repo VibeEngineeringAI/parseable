@@ -366,12 +366,43 @@ pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
     if let Some(requested_dataset) = requested_dataset {
-        let selected = datasets.iter().find(|dataset| {
-            dataset
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case(requested_dataset))
-        });
+        // Dataset names are case-sensitive: prefer an exact match and fall
+        // back to a case-insensitive match only when it is unique.
+        fn dataset_name(dataset: &Value) -> Option<&str> {
+            dataset.get("name").and_then(Value::as_str)
+        }
+        let exact = datasets
+            .iter()
+            .find(|dataset| dataset_name(dataset) == Some(requested_dataset));
+        let case_insensitive = datasets
+            .iter()
+            .filter(|dataset| {
+                dataset_name(dataset)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(requested_dataset))
+            })
+            .collect::<Vec<_>>();
+        let selected = match (exact, case_insensitive.as_slice()) {
+            (Some(dataset), _) => Some(dataset),
+            (None, [dataset]) => Some(*dataset),
+            (None, []) => None,
+            (None, matches) => {
+                return json!({
+                    "status": "ambiguous",
+                    "datasets": [],
+                    "candidates": matches
+                        .iter()
+                        .map(|dataset| json!({
+                            "name": dataset_name(dataset),
+                            "reasons": ["case-insensitive dataset name match"],
+                            "dataset": dataset,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "message": format!(
+                        "Dataset `{requested_dataset}` matches several caller-visible datasets that differ only in case. Call resolve_dataset again with the exact dataset name."
+                    ),
+                });
+            }
+        };
         return match selected {
             Some(dataset) if dataset_matches_telemetry_type(dataset, telemetry_type.as_deref()) => {
                 json!({
@@ -491,9 +522,16 @@ pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
         "candidates": candidates,
         "query": query,
         "message": if datasets.is_empty() {
-            "No caller-visible datasets were found."
+            "No caller-visible datasets were found.".to_owned()
+        } else if candidates.is_empty() {
+            match telemetry_type.as_deref() {
+                Some(telemetry_type) => format!(
+                    "No caller-visible datasets match requested telemetry type `{telemetry_type}`."
+                ),
+                None => "No caller-visible datasets match the request.".to_owned(),
+            }
         } else {
-            "Dataset resolution is ambiguous. Inspect candidate schemas, then call resolve_dataset again with selectedDataset."
+            "Dataset resolution is ambiguous. Inspect candidate schemas, then call resolve_dataset again with selectedDataset.".to_owned()
         }
     })
 }
@@ -1866,6 +1904,26 @@ async fn execute_oss_tool_inner(
 /// Execute a registered OSS tool in-process. Enterprise uses this only after
 /// applying its own agent policy and action-confirmation checks, so catalog
 /// validation and the underlying platform implementation remain canonical.
+///
+/// # Caller obligations
+///
+/// Unlike [`call_tool_registry`], this function applies only catalog argument
+/// validation and each tool's own per-resource `authorize()` check. Before
+/// calling it, the caller must:
+///
+/// - confirm the session is still valid (`Users.session_exists`);
+/// - reject suspended tenants with
+///   `middleware::check_suspension_for_tenant(tenant_id, Action::Query)`;
+/// - authorize the global `Action::Query` gate for the session;
+/// - restrict which tools may run. Lookup uses the full [`oss_tool_specs`],
+///   including action tools such as `create_alert`, `enable_alert`,
+///   `disable_alert`, `evaluate_alert` and `create_alert_target`, whereas the
+///   HTTP route exposes only [`oss_read_tool_specs`] (plus dashboard writes
+///   when enabled). Action tools need the caller's own confirmation policy.
+///
+/// The same obligations apply to [`execute_oss_tool_with_query_headers`].
+///
+/// [`oss_read_tool_specs`]: crate::tool_catalog::oss_read_tool_specs
 pub async fn execute_oss_tool(
     name: &str,
     arguments: &Value,
@@ -1880,6 +1938,10 @@ pub async fn execute_oss_tool(
 /// Execute a registered OSS tool with separate headers for internal query-node
 /// requests. Prism callers use this to preserve their server-authenticated
 /// routing headers without changing the external MCP execution path.
+///
+/// Callers must apply the session, tenant-suspension, global `Query` and
+/// tool-restriction gates listed on [`execute_oss_tool`]; none are enforced
+/// here.
 pub async fn execute_oss_tool_with_query_headers(
     name: &str,
     arguments: &Value,
@@ -2165,6 +2227,56 @@ mod tests {
             &json!({ "query": "data", "telemetryType": "traces" }),
         );
         assert_eq!(sole_mismatch["status"], "not_found");
+    }
+
+    #[actix_web::test]
+    async fn shared_dataset_resolution_prefers_exact_case_selection() {
+        let datasets = json!([{ "name": "Logs" }, { "name": "logs" }, { "name": "Traces" }]);
+        for (requested, expected) in [("logs", "logs"), ("Logs", "Logs")] {
+            let resolved = resolve_dataset_candidates(
+                datasets.clone(),
+                &json!({ "selectedDataset": requested }),
+            );
+            assert_eq!(resolved["status"], "resolved");
+            assert_eq!(resolved["selectedDatasets"], json!([expected]));
+            assert_eq!(resolved["datasets"][0]["name"], expected);
+        }
+
+        let unique_fallback =
+            resolve_dataset_candidates(datasets.clone(), &json!({ "contextDataset": "traces" }));
+        assert_eq!(unique_fallback["status"], "resolved");
+        assert_eq!(unique_fallback["selectedDatasets"], json!(["Traces"]));
+
+        let ambiguous_case =
+            resolve_dataset_candidates(datasets, &json!({ "selectedDataset": "LOGS" }));
+        assert_eq!(ambiguous_case["status"], "ambiguous");
+        assert_eq!(ambiguous_case["datasets"], json!([]));
+        let names = ambiguous_case["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["name"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![json!("Logs"), json!("logs")]);
+    }
+
+    #[actix_web::test]
+    async fn shared_dataset_resolution_reports_no_matching_candidates() {
+        let none_match = resolve_dataset_candidates(
+            json!([
+                { "name": "app-logs", "telemetryType": "logs" },
+                { "name": "otel-metrics", "telemetryType": "metrics" }
+            ]),
+            &json!({ "query": "checkout", "telemetryType": "traces" }),
+        );
+        assert_eq!(none_match["status"], "not_found");
+        assert_eq!(none_match["candidates"], json!([]));
+        let message = none_match["message"].as_str().unwrap();
+        assert!(!message.contains("ambiguous"), "{message}");
+        assert_eq!(
+            message,
+            "No caller-visible datasets match requested telemetry type `traces`."
+        );
     }
 
     #[actix_web::test]

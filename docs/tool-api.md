@@ -161,20 +161,22 @@ datasets.
 
 `resolve_dataset` accepts an optional `telemetryType` (`logs`, `metrics` or
 `traces`) and `limit` (1–20, default 5). Its `status` is `resolved`,
-`ambiguous`, `not_found` or `error`. Dataset names are matched
-case-insensitively.
+`ambiguous`, `not_found` or `error`.
 
 - A `selectedDataset` or `contextDataset` resolves to the visible dataset with
-  that name. If no visible dataset has that name, the result has
-  `status: "error"`. If its telemetry type does not match `telemetryType`, the
-  result is `not_found`.
+  exactly that (case-sensitive) name. If none has that exact name, it resolves
+  to the one visible dataset whose name matches case-insensitively; if several
+  do, the result is `ambiguous` with those datasets as `candidates`. If no
+  visible dataset matches, the result has `status: "error"`. If the selected
+  dataset's telemetry type does not match `telemetryType`, the result is
+  `not_found`.
 - Otherwise, if exactly one dataset is visible, it resolves to that dataset, or
   returns `not_found` if its telemetry type does not match.
 - Otherwise it scores the visible datasets that match `telemetryType` by name
-  against `query`: 1000 if the name equals the query, 750 if the query contains
-  the name, or 500 if the name contains the query, plus 25 for each query term
-  longer than two characters that the name contains, plus 15 when
-  `telemetryType` is given. It resolves only a unique top score of at least
+  against `query`, ignoring case: 1000 if the name equals the query, 750 if the
+  query contains the name, or 500 if the name contains the query, plus 25 for
+  each query term longer than two characters that the name contains, plus 15
+  when `telemetryType` is given. It resolves only a unique top score of at least
   500. In every other case it returns `ambiguous` with up to `limit` scored
   `candidates`, or `not_found` if no visible dataset matches `telemetryType`.
 
