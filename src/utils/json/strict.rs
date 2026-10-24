@@ -71,10 +71,12 @@ impl TryFrom<InterimValue> for serde_json::Value {
             InterimValue::Object(o) => {
                 let mut map = serde_json::Map::with_capacity(o.len());
                 for (k, v) in o {
-                    if map.contains_key(&k) {
-                        return Err("duplicate key in JSON");
+                    match map.entry(k) {
+                        serde_json::map::Entry::Occupied(_) => return Err("duplicate key in JSON"),
+                        serde_json::map::Entry::Vacant(entry) => {
+                            entry.insert(v.try_into()?);
+                        }
                     }
-                    map.insert(k, v.try_into()?);
                 }
                 Self::Object(map)
             }
@@ -384,5 +386,32 @@ mod tests {
 
         let deserialized = serde_result.unwrap();
         assert_eq!(deserialized, json!({"key": "value2"}));
+    }
+
+    #[test]
+    fn duplicate_detection_covers_escaped_keys_and_nested_objects() {
+        for raw in [
+            r#"{"x":1,"\u0078":2}"#,
+            r#"[{"outer":{"x":1,"x":2}}]"#,
+            r#"{"x":null,"x":{"nested":true}}"#,
+        ] {
+            let error = serde_json::from_str::<StrictValue>(raw).err().unwrap();
+            assert!(error.to_string().contains("duplicate key in JSON"));
+        }
+    }
+
+    #[test]
+    fn strict_objects_preserve_values_and_insertion_order() {
+        for width in [0, 1, 16, 64, 256] {
+            let mut object = serde_json::Map::new();
+            for i in (0..width).rev() {
+                object.insert(format!("field_{i}"), json!({"v": [i, null, true, "text"]}));
+            }
+            let raw = serde_json::to_string(&object).unwrap();
+            let result = serde_json::from_str::<StrictValue>(&raw)
+                .unwrap()
+                .into_inner();
+            assert_eq!(serde_json::to_string(&result).unwrap(), raw);
+        }
     }
 }
