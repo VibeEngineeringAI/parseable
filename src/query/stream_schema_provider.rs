@@ -1251,10 +1251,11 @@ pub fn extract_timestamp_bound(
     };
 
     match value {
-        ScalarValue::TimestampMillisecond(Some(value), _) => Some((
-            binexpr.op,
-            DateTime::from_timestamp_millis(*value).unwrap().naive_utc(),
-        )),
+        // Out-of-range literals (reachable from SQL, e.g.
+        // `to_timestamp_millis(9223372036854775807)`) yield no bound.
+        ScalarValue::TimestampMillisecond(Some(value), _) => {
+            DateTime::from_timestamp_millis(*value).map(|time| (binexpr.op, time.naive_utc()))
+        }
         ScalarValue::TimestampNanosecond(Some(value), _) => Some((
             binexpr.op,
             DateTime::from_timestamp_nanos(*value).naive_utc(),
@@ -1967,6 +1968,42 @@ mod tests {
         );
 
         assert!(!res)
+    }
+
+    #[test]
+    fn out_of_range_millisecond_literal_yields_no_bound() {
+        let binexpr = BinaryExpr {
+            left: Box::new(Expr::Column("p_timestamp".into())),
+            op: Operator::GtEq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some(i64::MAX), None),
+                None,
+            )),
+        };
+
+        assert_eq!(extract_timestamp_bound(&binexpr, &None), None);
+        assert!(!super::expr_in_boundary(&Expr::BinaryExpr(binexpr)));
+    }
+
+    #[tokio::test]
+    async fn out_of_range_millisecond_literal_in_sql_does_not_panic() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "p_timestamp",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let context = SessionContext::new();
+        context
+            .register_table("logs", Arc::new(TestParquetProvider { schema }))
+            .unwrap();
+
+        context
+            .sql("SELECT * FROM logs WHERE p_timestamp >= to_timestamp_millis(9223372036854775807)")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
     }
 
     #[test]
