@@ -344,6 +344,24 @@ fn dataset_matches_telemetry_type(dataset: &Value, expected: Option<&str>) -> bo
     })
 }
 
+/// Whether `name` occurs in `query` as a whole token. Dataset names may contain
+/// `-` and `_`, so those count as part of a name rather than as boundaries.
+fn query_mentions_dataset_name(query: &str, name: &str) -> bool {
+    let is_name_character =
+        |character: char| character.is_ascii_alphanumeric() || character == '_' || character == '-';
+    !name.is_empty()
+        && query.match_indices(name).any(|(start, matched)| {
+            !query[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_name_character)
+                && !query[start + matched.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_name_character)
+        })
+}
+
 pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
     let query = arguments
         .get("query")
@@ -366,12 +384,43 @@ pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
     if let Some(requested_dataset) = requested_dataset {
-        let selected = datasets.iter().find(|dataset| {
-            dataset
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case(requested_dataset))
-        });
+        // Dataset names are case-sensitive: prefer an exact match and fall
+        // back to a case-insensitive match only when it is unique.
+        fn dataset_name(dataset: &Value) -> Option<&str> {
+            dataset.get("name").and_then(Value::as_str)
+        }
+        let exact = datasets
+            .iter()
+            .find(|dataset| dataset_name(dataset) == Some(requested_dataset));
+        let case_insensitive = datasets
+            .iter()
+            .filter(|dataset| {
+                dataset_name(dataset)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(requested_dataset))
+            })
+            .collect::<Vec<_>>();
+        let selected = match (exact, case_insensitive.as_slice()) {
+            (Some(dataset), _) => Some(dataset),
+            (None, [dataset]) => Some(*dataset),
+            (None, []) => None,
+            (None, matches) => {
+                return json!({
+                    "status": "ambiguous",
+                    "datasets": [],
+                    "candidates": matches
+                        .iter()
+                        .map(|dataset| json!({
+                            "name": dataset_name(dataset),
+                            "reasons": ["case-insensitive dataset name match"],
+                            "dataset": dataset,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "message": format!(
+                        "Dataset `{requested_dataset}` matches several caller-visible datasets that differ only in case. Call resolve_dataset again with the exact dataset name."
+                    ),
+                });
+            }
+        };
         return match selected {
             Some(dataset) if dataset_matches_telemetry_type(dataset, telemetry_type.as_deref()) => {
                 json!({
@@ -439,7 +488,7 @@ pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
             if !query.is_empty() && name == query {
                 score += 1_000;
                 reasons.push("exact dataset name");
-            } else if !query.is_empty() && query.contains(&name) {
+            } else if !query.is_empty() && query_mentions_dataset_name(&query, &name) {
                 score += 750;
                 reasons.push("dataset name explicitly mentioned in the question");
             } else if !query.is_empty() && name.contains(&query) {
@@ -491,9 +540,16 @@ pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
         "candidates": candidates,
         "query": query,
         "message": if datasets.is_empty() {
-            "No caller-visible datasets were found."
+            "No caller-visible datasets were found.".to_owned()
+        } else if candidates.is_empty() {
+            match telemetry_type.as_deref() {
+                Some(telemetry_type) => format!(
+                    "No caller-visible datasets match requested telemetry type `{telemetry_type}`."
+                ),
+                None => "No caller-visible datasets match the request.".to_owned(),
+            }
         } else {
-            "Dataset resolution is ambiguous. Inspect candidate schemas, then call resolve_dataset again with selectedDataset."
+            "Dataset resolution is ambiguous. Inspect candidate schemas, then call resolve_dataset again with selectedDataset.".to_owned()
         }
     })
 }
@@ -1369,24 +1425,36 @@ async fn execute_trace_tool(
     Ok(json!({ "results": results, "errors": errors }))
 }
 
-fn time_bucket_interval(start: &str, end: &str, bucket_count: u64) -> String {
-    let seconds = TimeRange::parse_human_time(start, end)
-        .map(|range| (range.end - range.start).num_seconds().max(1) as u64)
-        .unwrap_or(3_600);
+fn time_bucket_interval(range: &TimeRange, bucket_count: u64) -> String {
+    let seconds = (range.end - range.start).num_seconds().max(1) as u64;
     format!("{} seconds", (seconds / bucket_count.max(1)).max(1))
+}
+
+fn trace_activity_range(arguments: &Value, now: DateTime<Utc>) -> Result<TimeRange, String> {
+    let start = parse_start_time_expression(required_string(arguments, "startTime")?, now)
+        .map_err(|error| format!("invalid trace activity start time: {error}"))?;
+    let end = parse_time_expression(required_string(arguments, "endTime")?, now)
+        .map_err(|error| format!("invalid trace activity end time: {error}"))?;
+    if start >= end {
+        return Err("trace activity start time must be before end time".to_owned());
+    }
+    Ok(TimeRange { start, end })
 }
 
 fn trace_activity_query(
     dataset: &str,
     time_field: &str,
     interval: &str,
+    range: &TimeRange,
     group_by: &[String],
     clauses: &[String],
 ) -> String {
+    let time_column = quote_identifier(time_field);
+    let start = quote_literal(&range.start.to_rfc3339());
+    // Bucket from the requested start so the first bucket is not partial.
     let bucket = format!(
-        "CAST(DATE_BIN({}, {}, TIMESTAMP '1970-01-01T00:00:00Z') AS TEXT)",
+        "CAST(DATE_BIN({}, {time_column}, TIMESTAMP {start}) AS TEXT)",
         quote_literal(interval),
-        quote_identifier(time_field),
     );
     let mut select = vec![format!("{bucket} AS \"time\"")];
     select.extend(group_by.iter().map(|field| quote_identifier(field)));
@@ -1396,17 +1464,41 @@ fn trace_activity_query(
         .map(|position| position.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let where_clause = clauses
-        .first()
-        .map(|_| format!(" WHERE {}", clauses.join(" AND ")))
-        .unwrap_or_default();
+    // The query API rounds its transport range to minutes, so keep the exact
+    // half-open requested range in the SQL.
+    let mut predicates = vec![
+        format!("{time_column} >= TIMESTAMP {start}"),
+        format!(
+            "{time_column} < TIMESTAMP {}",
+            quote_literal(&range.end.to_rfc3339())
+        ),
+    ];
+    predicates.extend(clauses.iter().cloned());
+    let where_clause = format!(" WHERE {}", predicates.join(" AND "));
+    // One row past the tool limit lets the caller detect truncation.
     format!(
-        "SELECT {} FROM {}{} GROUP BY {} ORDER BY 1 LIMIT 500",
+        "SELECT {} FROM {}{} GROUP BY {} ORDER BY 1 LIMIT {}",
         select.join(", "),
         quote_identifier(dataset),
         where_clause,
         groups,
+        MAX_TOOL_ROWS + 1,
     )
+}
+
+/// Caps trace activity rows at the tool limit and reports whether any were dropped.
+fn truncate_trace_activity_rows(rows: &mut Value) -> bool {
+    let rows = match rows {
+        Value::Array(rows) => rows,
+        Value::Object(object) => match object.get_mut("records").and_then(Value::as_array_mut) {
+            Some(rows) => rows,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let truncated = rows.len() > MAX_TOOL_ROWS as usize;
+    rows.truncate(MAX_TOOL_ROWS as usize);
+    truncated
 }
 
 async fn trace_activity_fields(
@@ -1529,35 +1621,46 @@ fn trace_activity_filter_clauses(
         .collect()
 }
 
+fn trace_activity_request(query: &str, range: &TimeRange) -> Result<query::Query, String> {
+    // Widen the minute-rounded transport envelope to cover the exact range.
+    let transport_end = truncate_to_minute(range.end)
+        .checked_add_signed(Duration::minutes(1))
+        .ok_or_else(|| "trace activity end time is outside the supported range".to_owned())?;
+    // The generated query carries its own LIMIT; wrapping it in the generic
+    // 500-row bound would hide the extra row used to detect truncation.
+    validate_tool_sql(query)?;
+    Ok(query::Query {
+        query: query.to_owned(),
+        start_time: truncate_to_minute(range.start).to_rfc3339(),
+        end_time: transport_end.to_rfc3339(),
+        send_null: true,
+        fields: false,
+        streaming: false,
+        filter_tags: None,
+    })
+}
+
 async fn execute_trace_activity_tool(
     arguments: &Value,
     context: OssToolContext<'_>,
 ) -> Result<Value, String> {
     let dataset = required_string(arguments, "dataset")?;
-    let start_time = required_string(arguments, "startTime")?;
-    let end_time = required_string(arguments, "endTime")?;
+    let range = trace_activity_range(arguments, Utc::now())?;
     let (fields, time_field) = trace_activity_fields(dataset, context).await?;
     let group_by = trace_activity_group_by(arguments, &fields)?;
     let clauses = trace_activity_filter_clauses(arguments, &fields)?;
     let bucket_count = bounded_integer(arguments, "bucketCount", 60, 1, 100);
-    let interval = time_bucket_interval(start_time, end_time, bucket_count);
-    let query = trace_activity_query(dataset, &time_field, &interval, &group_by, &clauses);
+    let interval = time_bucket_interval(&range, bucket_count);
+    let query = trace_activity_query(dataset, &time_field, &interval, &range, &group_by, &clauses);
     let response = query::query_internal(
-        query::Query {
-            query: bounded_select(&query)?,
-            start_time: start_time.to_owned(),
-            end_time: end_time.to_owned(),
-            send_null: true,
-            fields: false,
-            streaming: false,
-            filter_tags: None,
-        },
+        trace_activity_request(&query, &range)?,
         context.session_key,
         context.tenant_id,
     )
     .await
     .map_err(|error| error.to_string())?;
-    let rows = response_value(response).await?;
+    let mut rows = response_value(response).await?;
+    let truncated = truncate_trace_activity_rows(&mut rows);
     Ok(json!({
         "dataset": dataset,
         "queryType": "sql",
@@ -1568,6 +1671,7 @@ async fn execute_trace_activity_tool(
             "trace_count": "COUNT(DISTINCT span_trace_id)"
         },
         "rows": rows,
+        "truncated": truncated,
     }))
 }
 
@@ -1828,6 +1932,26 @@ async fn execute_oss_tool_inner(
 /// Execute a registered OSS tool in-process. Enterprise uses this only after
 /// applying its own agent policy and action-confirmation checks, so catalog
 /// validation and the underlying platform implementation remain canonical.
+///
+/// # Caller obligations
+///
+/// Unlike [`call_tool_registry`], this function applies only catalog argument
+/// validation and each tool's own per-resource `authorize()` check. Before
+/// calling it, the caller must:
+///
+/// - confirm the session is still valid (`Users.session_exists`);
+/// - reject suspended tenants with
+///   `middleware::check_suspension_for_tenant(tenant_id, Action::Query)`;
+/// - authorize the global `Action::Query` gate for the session;
+/// - restrict which tools may run. Lookup uses the full [`oss_tool_specs`],
+///   including action tools such as `create_alert`, `enable_alert`,
+///   `disable_alert`, `evaluate_alert` and `create_alert_target`, whereas the
+///   HTTP route exposes only [`oss_read_tool_specs`] (plus dashboard writes
+///   when enabled). Action tools need the caller's own confirmation policy.
+///
+/// The same obligations apply to [`execute_oss_tool_with_query_headers`].
+///
+/// [`oss_read_tool_specs`]: crate::tool_catalog::oss_read_tool_specs
 pub async fn execute_oss_tool(
     name: &str,
     arguments: &Value,
@@ -1842,6 +1966,10 @@ pub async fn execute_oss_tool(
 /// Execute a registered OSS tool with separate headers for internal query-node
 /// requests. Prism callers use this to preserve their server-authenticated
 /// routing headers without changing the external MCP execution path.
+///
+/// Callers must apply the session, tenant-suspension, global `Query` and
+/// tool-restriction gates listed on [`execute_oss_tool`]; none are enforced
+/// here.
 pub async fn execute_oss_tool_with_query_headers(
     name: &str,
     arguments: &Value,
@@ -2130,6 +2258,85 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn shared_dataset_resolution_requires_whole_name_mentions() {
+        let datasets = json!([{ "name": "api" }, { "name": "web" }]);
+        let embedded = resolve_dataset_candidates(
+            datasets.clone(),
+            &json!({ "query": "show rapid failures" }),
+        );
+        assert_ne!(embedded["status"], "resolved");
+
+        let mentioned =
+            resolve_dataset_candidates(datasets.clone(), &json!({ "query": "show api errors" }));
+        assert_eq!(mentioned["status"], "resolved");
+        assert_eq!(mentioned["selectedDatasets"], json!(["api"]));
+
+        let punctuated =
+            resolve_dataset_candidates(datasets, &json!({ "query": "errors in (api)?" }));
+        assert_eq!(punctuated["selectedDatasets"], json!(["api"]));
+
+        let hyphenated = json!([{ "name": "otel-metrics" }, { "name": "otel-traces" }]);
+        let longer_name = resolve_dataset_candidates(
+            hyphenated.clone(),
+            &json!({ "query": "show otel-metrics-v2 errors" }),
+        );
+        assert_ne!(longer_name["status"], "resolved");
+        let underscored =
+            resolve_dataset_candidates(hyphenated, &json!({ "query": "show my_otel-metrics" }));
+        assert_ne!(underscored["status"], "resolved");
+    }
+
+    #[actix_web::test]
+    async fn shared_dataset_resolution_prefers_exact_case_selection() {
+        let datasets = json!([{ "name": "Logs" }, { "name": "logs" }, { "name": "Traces" }]);
+        for (requested, expected) in [("logs", "logs"), ("Logs", "Logs")] {
+            let resolved = resolve_dataset_candidates(
+                datasets.clone(),
+                &json!({ "selectedDataset": requested }),
+            );
+            assert_eq!(resolved["status"], "resolved");
+            assert_eq!(resolved["selectedDatasets"], json!([expected]));
+            assert_eq!(resolved["datasets"][0]["name"], expected);
+        }
+
+        let unique_fallback =
+            resolve_dataset_candidates(datasets.clone(), &json!({ "contextDataset": "traces" }));
+        assert_eq!(unique_fallback["status"], "resolved");
+        assert_eq!(unique_fallback["selectedDatasets"], json!(["Traces"]));
+
+        let ambiguous_case =
+            resolve_dataset_candidates(datasets, &json!({ "selectedDataset": "LOGS" }));
+        assert_eq!(ambiguous_case["status"], "ambiguous");
+        assert_eq!(ambiguous_case["datasets"], json!([]));
+        let names = ambiguous_case["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["name"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![json!("Logs"), json!("logs")]);
+    }
+
+    #[actix_web::test]
+    async fn shared_dataset_resolution_reports_no_matching_candidates() {
+        let none_match = resolve_dataset_candidates(
+            json!([
+                { "name": "app-logs", "telemetryType": "logs" },
+                { "name": "otel-metrics", "telemetryType": "metrics" }
+            ]),
+            &json!({ "query": "checkout", "telemetryType": "traces" }),
+        );
+        assert_eq!(none_match["status"], "not_found");
+        assert_eq!(none_match["candidates"], json!([]));
+        let message = none_match["message"].as_str().unwrap();
+        assert!(!message.contains("ambiguous"), "{message}");
+        assert_eq!(
+            message,
+            "No caller-visible datasets match requested telemetry type `traces`."
+        );
+    }
+
+    #[actix_web::test]
     async fn shared_time_resolution_honors_timezone_and_reference() {
         let reference = DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
             .unwrap()
@@ -2276,6 +2483,7 @@ mod tests {
             "astronomy-shop-traces",
             "p_timestamp",
             "60 seconds",
+            &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z"),
             &["service.name".to_owned()],
             &[],
         );
@@ -2286,13 +2494,40 @@ mod tests {
         assert!(!query.contains("COUNT(*)"));
     }
 
-    /// Runs the trace-activity SQL over a fixture with Parseable's millisecond
-    /// timestamps, and checks that rows come back ordered by bucket.
+    fn trace_activity_test_range(start: &str, end: &str) -> crate::utils::time::TimeRange {
+        crate::utils::time::TimeRange {
+            start: start.parse().unwrap(),
+            end: end.parse().unwrap(),
+        }
+    }
+
     async fn run_trace_activity_fixture(
         group_by: &[String],
         clauses: &[String],
         status_type: &str,
     ) -> Vec<Value> {
+        let arguments = json!({
+            "startTime": "2026-10-22T00:00:00Z",
+            "endTime": "2026-10-22T00:02:00Z",
+        });
+        let (interval, rows) =
+            run_trace_activity_fixture_with(&arguments, 2, group_by, clauses, status_type).await;
+        assert_eq!(interval, "60 seconds");
+        rows
+    }
+
+    /// Runs the tool's request over a fixture with Parseable's millisecond
+    /// timestamps, applying the query API's minute-aligned transport range
+    /// before the generated SQL, and checks that rows come back ordered by bucket.
+    async fn run_trace_activity_fixture_with(
+        arguments: &Value,
+        bucket_count: u64,
+        group_by: &[String],
+        clauses: &[String],
+        status_type: &str,
+    ) -> (String, Vec<Value>) {
+        let range = super::trace_activity_range(arguments, "2026-10-22T00:05:00Z".parse().unwrap())
+            .unwrap();
         let context = datafusion::prelude::SessionContext::new();
         // Later buckets come first so that ordering depends on the query.
         let fixture = context
@@ -2309,27 +2544,38 @@ mod tests {
             ))
             .await
             .unwrap();
+        let interval = super::time_bucket_interval(&range, bucket_count);
+        let request = super::trace_activity_request(
+            &trace_activity_query(
+                "traces",
+                "p_timestamp",
+                &interval,
+                &range,
+                group_by,
+                clauses,
+            ),
+            &range,
+        )
+        .unwrap();
+        let envelope =
+            crate::utils::time::TimeRange::parse_human_time(&request.start_time, &request.end_time)
+                .unwrap();
+        assert!(envelope.start <= range.start && envelope.end >= range.end);
+        context
+            .register_table("raw_traces", fixture.into_view())
+            .unwrap();
+        let fixture = context
+            .sql(&format!(
+                "SELECT * FROM raw_traces WHERE p_timestamp >= TIMESTAMP '{}' AND p_timestamp < TIMESTAMP '{}'",
+                envelope.start.to_rfc3339(),
+                envelope.end.to_rfc3339(),
+            ))
+            .await
+            .unwrap();
         context
             .register_table("traces", fixture.into_view())
             .unwrap();
-        let interval =
-            super::time_bucket_interval("2026-10-22T00:00:00Z", "2026-10-22T00:02:00Z", 2);
-        assert_eq!(interval, "60 seconds");
-        let query = bounded_tool_sql(&trace_activity_query(
-            "traces",
-            "p_timestamp",
-            &interval,
-            group_by,
-            clauses,
-        ))
-        .unwrap();
-        let batches = context.sql(&query).await.unwrap().collect().await.unwrap();
-        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-        writer
-            .write_batches(&batches.iter().collect::<Vec<_>>())
-            .unwrap();
-        writer.finish().unwrap();
-        let rows: Vec<Value> = serde_json::from_slice(&writer.into_inner()).unwrap();
+        let rows = execute_trace_activity_sql(&context, &request.query).await;
         let times = rows
             .iter()
             .map(|row| row["time"].as_str().unwrap())
@@ -2338,7 +2584,71 @@ mod tests {
             times.is_sorted(),
             "trace activity must be ordered by time: {times:?}"
         );
-        rows
+        (interval, rows)
+    }
+
+    /// Runs trace activity SQL the way the tool does: validated, without the
+    /// generic 500-row wrapper.
+    async fn execute_trace_activity_sql(
+        context: &datafusion::prelude::SessionContext,
+        query: &str,
+    ) -> Vec<Value> {
+        super::validate_tool_sql(query).unwrap();
+        let batches = context.sql(query).await.unwrap().collect().await.unwrap();
+        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+        writer
+            .write_batches(&batches.iter().collect::<Vec<_>>())
+            .unwrap();
+        writer.finish().unwrap();
+        serde_json::from_slice(&writer.into_inner()).unwrap()
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_signals_truncation_past_the_row_limit() {
+        // 20 services x 60 one-minute buckets = 1200 groups x buckets.
+        let context = datafusion::prelude::SessionContext::new();
+        let fixture = context
+            .sql(
+                r#"SELECT CAST(TO_TIMESTAMP_SECONDS(1792627200 + (value / 20) * 60) AS TIMESTAMP)
+                        AS p_timestamp,
+                    CONCAT('t', value) AS span_trace_id, CONCAT('s', value) AS span_span_id,
+                    CONCAT('svc-', value % 20) AS "service.name"
+                   FROM range(1200)"#,
+            )
+            .await
+            .unwrap();
+        context
+            .register_table("traces", fixture.into_view())
+            .unwrap();
+        let range = trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z");
+        let interval = super::time_bucket_interval(&range, 60);
+        assert_eq!(interval, "60 seconds");
+        let query = trace_activity_query(
+            "traces",
+            "p_timestamp",
+            &interval,
+            &range,
+            &["service.name".to_owned()],
+            &[],
+        );
+        let mut rows = Value::Array(execute_trace_activity_sql(&context, &query).await);
+        assert!(super::truncate_trace_activity_rows(&mut rows));
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 500);
+        // Ascending order keeps the oldest 25 buckets; the newest are the ones dropped.
+        assert_eq!(rows[499]["time"], "2026-10-22T00:24:00");
+
+        // A result that fits is returned whole and not flagged.
+        let query = trace_activity_query("traces", "p_timestamp", &interval, &range, &[], &[]);
+        let mut rows = Value::Array(execute_trace_activity_sql(&context, &query).await);
+        assert!(!super::truncate_trace_activity_rows(&mut rows));
+        assert_eq!(rows.as_array().unwrap().len(), 60);
+
+        let mut exact = Value::Array(vec![json!({}); 500]);
+        assert!(!super::truncate_trace_activity_rows(&mut exact));
+        let mut records = json!({ "records": vec![json!({}); 501] });
+        assert!(super::truncate_trace_activity_rows(&mut records));
+        assert_eq!(records["records"].as_array().unwrap().len(), 500);
     }
 
     #[actix_web::test]
@@ -2428,7 +2738,14 @@ mod tests {
         .unwrap();
         assert!(clauses.contains(&"\"odd\"\"field\" = 'it''s'".to_owned()));
         assert!(clauses.contains(&"\"service.name\" IS NULL".to_owned()));
-        let query = trace_activity_query("traces", "p_timestamp", "1 seconds", &[], &clauses);
+        let query = trace_activity_query(
+            "traces",
+            "p_timestamp",
+            "1 seconds",
+            &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T00:01:00Z"),
+            &[],
+            &clauses,
+        );
         assert!(bounded_tool_sql(&query).is_ok());
     }
 
@@ -2548,13 +2865,120 @@ mod tests {
     #[actix_web::test]
     async fn trace_activity_bucket_interval_is_bounded() {
         assert_eq!(
-            super::time_bucket_interval("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z", 60),
+            super::time_bucket_interval(
+                &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T01:00:00Z"),
+                60
+            ),
             "60 seconds"
         );
         assert_eq!(
-            super::time_bucket_interval("2026-10-22T00:00:00Z", "2026-10-22T00:00:30Z", 100),
+            super::time_bucket_interval(
+                &trace_activity_test_range("2026-10-22T00:00:00Z", "2026-10-22T00:00:30Z"),
+                100
+            ),
             "1 seconds"
         );
+        // Subminute ranges size buckets from their exact, unrounded duration.
+        assert_eq!(
+            super::time_bucket_interval(
+                &trace_activity_test_range("2026-10-22T00:00:10Z", "2026-10-22T00:00:50Z"),
+                4
+            ),
+            "10 seconds"
+        );
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_subminute_range_returns_exact_rows() {
+        let summarize = |rows: Vec<Value>| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row["time"].as_str().unwrap().to_owned(),
+                        row["span_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // Both bounds fall inside one minute; start inclusive, end exclusive,
+        // buckets aligned to the requested start.
+        let (interval, rows) = run_trace_activity_fixture_with(
+            &json!({
+                "startTime": "2026-10-22T00:00:15Z",
+                "endTime": "2026-10-22T00:00:40Z",
+            }),
+            5,
+            &[],
+            &[],
+            "BIGINT",
+        )
+        .await;
+        assert_eq!(interval, "5 seconds");
+        assert_eq!(
+            summarize(rows),
+            [
+                ("2026-10-22T00:00:20".to_owned(), 1),
+                ("2026-10-22T00:00:30".to_owned(), 1),
+            ]
+        );
+        let (interval, rows) = run_trace_activity_fixture_with(
+            &json!({
+                "startTime": "2026-10-22T00:00:20Z",
+                "endTime": "2026-10-22T00:00:30Z",
+            }),
+            1,
+            &[],
+            &[],
+            "BIGINT",
+        )
+        .await;
+        assert_eq!(interval, "10 seconds");
+        assert_eq!(summarize(rows), [("2026-10-22T00:00:20".to_owned(), 1)]);
+        // A range crossing a minute boundary keeps its exact edges too.
+        let (interval, rows) = run_trace_activity_fixture_with(
+            &json!({
+                "startTime": "2026-10-22T00:00:35Z",
+                "endTime": "2026-10-22T00:01:15Z",
+            }),
+            1,
+            &[],
+            &[],
+            "BIGINT",
+        )
+        .await;
+        assert_eq!(interval, "40 seconds");
+        assert_eq!(summarize(rows), [("2026-10-22T00:00:35".to_owned(), 2)]);
+    }
+
+    #[actix_web::test]
+    async fn trace_activity_request_validates_exact_ranges_and_widens_transport() {
+        let now = "2026-10-22T00:00:30.123456Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let range =
+            super::trace_activity_range(&json!({"startTime": "now-15s", "endTime": "now"}), now)
+                .unwrap();
+        assert_eq!(range.start, now - Duration::seconds(15));
+        assert_eq!(range.end, now);
+        let query = trace_activity_query("traces", "p_timestamp", "1 seconds", &range, &[], &[]);
+        assert!(query.contains(
+            "\"p_timestamp\" >= TIMESTAMP '2026-10-22T00:00:15.123456+00:00' AND \"p_timestamp\" < TIMESTAMP '2026-10-22T00:00:30.123456+00:00'"
+        ));
+        assert!(query.contains("TIMESTAMP '2026-10-22T00:00:15.123456+00:00') AS TEXT)"));
+        let request = super::trace_activity_request(&query, &range).unwrap();
+        assert_eq!(request.start_time, "2026-10-22T00:00:00+00:00");
+        assert_eq!(request.end_time, "2026-10-22T00:01:00+00:00");
+        for (start, end) in [
+            ("2026-10-22T00:00:30Z", "2026-10-22T00:00:30Z"),
+            ("2026-10-22T00:00:30Z", "2026-10-22T00:00:15Z"),
+            ("invalid", "now"),
+            ("now-15s", "invalid"),
+        ] {
+            assert!(
+                super::trace_activity_range(&json!({"startTime": start, "endTime": end}), now)
+                    .is_err()
+            );
+        }
     }
 
     #[actix_web::test]
