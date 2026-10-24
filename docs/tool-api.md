@@ -135,12 +135,15 @@ and pagination are not identical to this summary tool.
 
 `query_sql`, `explain_query` and other tools that run SQL internally parse the
 statement with DataFusion's SQL parser and accept exactly one `SELECT` or `WITH`
-query. A trailing semicolon and trailing comments are allowed. Every `SELECT`
-projection, including those inside nested queries and set operations, must
-name at most 10 explicit columns. `*` and `table.*` are rejected. Casts to
-`INT64`, `UINT64` or `FLOAT64` are rejected with a hint to use `BIGINT` or
-`DOUBLE`. The statement is wrapped with an outer `LIMIT 500`. `sample_events`
-returns at most 10 columns, choosing common observability fields such as
+query. Trailing semicolons and trailing comments are allowed, including
+comments after the final semicolon (`SELECT a FROM t; -- note`). The outer
+query's `SELECT` projection, including each branch of a set operation and any
+parenthesized query, must name at most 10 explicit columns, and `*` and
+`table.*` are rejected there. Projections inside CTEs, derived tables and
+subquery expressions are not checked; the result width is bounded by the outer
+projection. Casts to `INT64`, `UINT64` or `FLOAT64` are rejected with a hint
+to use `BIGINT` or `DOUBLE`. The statement is wrapped with an outer
+`LIMIT 500`. `sample_events` returns at most 10 columns, choosing common observability fields such as
 `p_timestamp`, `service.name`, `severity_text`, `body` and `trace_id` before
 other fields.
 
