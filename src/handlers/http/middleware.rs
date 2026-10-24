@@ -1123,7 +1123,8 @@ mod api_key_auth_tests {
     use super::*;
     use crate::rbac::{
         map::{
-            ROLES, SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups, Users as UserMap, mut_users,
+            ROLES, SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups, Users as UserMap, mut_roles,
+            mut_users,
         },
         role::model::{DefaultPrivilege, Role},
     };
@@ -1154,11 +1155,13 @@ mod api_key_auth_tests {
         USERS.get_or_init(|| RwLock::new(UserMap::default()));
         SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
         USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
-        ROLES.get_or_init(|| {
-            let role = Role::create_internal_role(vec![DefaultPrivilege::Admin]);
-            let roles = HashMap::from([(ROLE.to_owned(), role)]);
-            RwLock::new(HashMap::from([(DEFAULT_TENANT.to_owned(), roles)]))
-        });
+        // Other tests may create ROLES first, so add the role either way.
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+        mut_roles()
+            .entry(DEFAULT_TENANT.to_owned())
+            .or_default()
+            .entry(ROLE.to_owned())
+            .or_insert_with(|| Role::create_internal_role(vec![DefaultPrivilege::Admin]));
         CLUSTER_SECRET.get_or_init(|| {
             let salt = SaltString::encode_b64(b"api-key-expiry-salt").unwrap();
             let hash = Argon2::default()
