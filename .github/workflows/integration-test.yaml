@@ -11,21 +11,34 @@ permissions:
 
 jobs:
   build-image:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare Linux build resources
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          if sudo fallocate -l 16G /swap.build && sudo chmod 600 /swap.build \
+            && sudo mkswap /swap.build && sudo swapon /swap.build; then
+            echo "Added 16G swap"
+          else
+            sudo rm -f /swap.build
+            echo "::warning title=Swap::Could not add swap; continuing without it"
+          fi
+          free -h
+          df -h /
       - name: Set up cached Docker builder
-        uses: useblacksmith/setup-docker-builder@v2
-        with:
-          cache-key: parseable-integration
+        uses: docker/setup-buildx-action@v3
       - name: Build integration image once
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.debug
           platforms: linux/amd64
           tags: parseable-ci:${{ github.sha }}
+          cache-from: type=gha,scope=parseable-integration
+          cache-to: type=gha,scope=parseable-integration,mode=max
           outputs: type=docker,dest=${{ runner.temp }}/parseable-ci.tar
       - uses: actions/upload-artifact@v4
         with:
@@ -38,7 +51,7 @@ jobs:
   quest:
     name: Quest ${{ matrix.deployment }} (${{ inputs.full && 'full' || 'smoke' }})
     needs: build-image
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
       fail-fast: false
