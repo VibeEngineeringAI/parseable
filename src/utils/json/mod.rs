@@ -19,7 +19,9 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
-use flatten::{convert_to_array, generic_flattening, has_more_than_max_allowed_levels};
+use flatten::{
+    convert_to_array, generic_flattening, generic_flattening_noop, has_more_than_max_allowed_levels,
+};
 use serde::de::Visitor;
 use serde_json;
 use serde_json::Value;
@@ -45,12 +47,34 @@ pub fn flatten_json_body(
     log_source: &LogSource,
 ) -> Result<Value, anyhow::Error> {
     // Flatten the json body only if new schema and has less than 4 levels of nesting
-    let mut nested_value = if schema_version == SchemaVersion::V1
-        && !has_more_than_max_allowed_levels(&body, 1)
-        && matches!(log_source, LogSource::Json | LogSource::Custom(_))
-    {
-        let flattened_json = generic_flattening(&body)?;
-        convert_to_array(flattened_json)?
+    let apply_generic_flattening =
+        should_apply_generic_flattening(&body, schema_version, log_source);
+    flatten_json_body_inner(
+        body,
+        apply_generic_flattening,
+        time_partition,
+        time_partition_limit,
+        custom_partition,
+        validation_required,
+    )
+}
+
+fn flatten_json_body_inner(
+    body: Value,
+    apply_generic_flattening: bool,
+    time_partition: Option<&String>,
+    time_partition_limit: Option<NonZeroU32>,
+    custom_partition: Option<&String>,
+    validation_required: bool,
+) -> Result<Value, anyhow::Error> {
+    let mut nested_value = if apply_generic_flattening {
+        match generic_flattening_noop(body) {
+            Ok(unchanged) => unchanged,
+            Err(body) => {
+                let flattened_json = generic_flattening(&body)?;
+                convert_to_array(flattened_json)?
+            }
+        }
     } else {
         body
     };
@@ -83,7 +107,11 @@ pub fn apply_generic_flattening_for_partition(
     time_partition_limit: Option<NonZeroU32>,
     custom_partition: Option<&String>,
 ) -> Result<Vec<Value>, anyhow::Error> {
-    let flattened_json = generic_flattening(&element)?;
+    let flattened_json = match element {
+        // Generic flattening returns an array-free object unchanged as its only row
+        Value::Object(ref map) if !flatten::map_contains_array(map) => vec![element],
+        element => generic_flattening(&element)?,
+    };
 
     if flattened_json.len() == 1 {
         // Single result - process normally
@@ -327,6 +355,126 @@ mod tests {
         )]
         value: bool,
         other_field: String,
+    }
+
+    fn legacy_flatten_json_body(
+        body: Value,
+        apply_generic_flattening: bool,
+        custom_partition: Option<&String>,
+        validation_required: bool,
+    ) -> Result<Value, anyhow::Error> {
+        let mut nested_value = if apply_generic_flattening {
+            convert_to_array(flatten::legacy::generic_flattening(&body)?)?
+        } else {
+            body
+        };
+        flatten::legacy::flatten(
+            &mut nested_value,
+            "_",
+            custom_partition,
+            validation_required,
+        )?;
+        Ok(nested_value)
+    }
+
+    fn legacy_apply_generic_flattening_for_partition(
+        element: Value,
+        custom_partition: Option<&String>,
+    ) -> Result<Vec<Value>, anyhow::Error> {
+        let mut result = Vec::new();
+        for mut item in flatten::legacy::generic_flattening(&element)? {
+            flatten::legacy::flatten(&mut item, "_", custom_partition, true)?;
+            result.push(item);
+        }
+        Ok(result)
+    }
+
+    fn ordered<T: Serialize>(result: Result<T, anyhow::Error>) -> Result<String, String> {
+        result
+            .map(|value| serde_json::to_string(&value).unwrap())
+            .map_err(|err| err.to_string())
+    }
+
+    fn corpus() -> Vec<Value> {
+        let mut values = flatten::shapes::fixtures();
+        for arrays in [0, 3, 10] {
+            let mut generator = flatten::shapes::Gen::new(arrays + 100);
+            for _ in 0..1500 {
+                values.push(generator.body(arrays));
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn flatten_json_body_matches_legacy() {
+        let partitions = [None, Some("a"), Some("a_b")].map(|p| p.map(str::to_owned));
+        for value in corpus() {
+            for apply_generic_flattening in [false, true] {
+                for partition in &partitions {
+                    for validation_required in [false, true] {
+                        assert_eq!(
+                            ordered(flatten_json_body_inner(
+                                value.clone(),
+                                apply_generic_flattening,
+                                None,
+                                None,
+                                partition.as_ref(),
+                                validation_required,
+                            )),
+                            ordered(legacy_flatten_json_body(
+                                value.clone(),
+                                apply_generic_flattening,
+                                partition.as_ref(),
+                                validation_required,
+                            )),
+                            "input: {value} generic: {apply_generic_flattening} partition: {partition:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_generic_flattening_for_partition_matches_legacy() {
+        let partitions = [None, Some("a"), Some("a_b")].map(|p| p.map(str::to_owned));
+        for value in corpus() {
+            for partition in &partitions {
+                assert_eq!(
+                    ordered(apply_generic_flattening_for_partition(
+                        value.clone(),
+                        None,
+                        None,
+                        partition.as_ref(),
+                    )),
+                    ordered(legacy_apply_generic_flattening_for_partition(
+                        value.clone(),
+                        partition.as_ref(),
+                    )),
+                    "input: {value} partition: {partition:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flatten_json_body_wraps_flat_object() {
+        let body = json!({"a": {"b": 2}, "c": {}, "d": 1});
+        assert_eq!(
+            flatten_json_body_inner(body.clone(), true, None, None, None, false).unwrap(),
+            json!([{"a_b": 2, "d": 1}])
+        );
+        assert_eq!(
+            flatten_json_body_inner(json!({"b": 1, "a": 2}), true, None, None, None, false)
+                .unwrap(),
+            json!([{"b": 1, "a": 2}])
+        );
+        // Too deeply nested bodies skip generic flattening and are not wrapped
+        assert_eq!(
+            flatten_json_body_inner(body, false, None, None, None, false).unwrap(),
+            json!({"a_b": 2, "d": 1})
+        );
     }
 
     #[test]
