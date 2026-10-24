@@ -25,8 +25,11 @@ export function savedLogViewsForDataset(views: SavedLogView[], dataset: string) 
       return decoded.dataset === dataset ? [{ view, decoded }] : [];
     } catch {
       // Classic dataset-scoped views remain visible, but canonical views need a
-      // valid explorer state to establish which dataset they belong to.
-      return view.stream_name !== 'sql' && view.stream_name === dataset
+      // valid explorer state to establish which dataset they belong to. Saved
+      // PromQL queries share the endpoint but are not log views.
+      return view.query.filter_type !== 'promql' &&
+        view.stream_name !== 'sql' &&
+        view.stream_name === dataset
         ? [{ view, decoded: undefined }]
         : [];
     }

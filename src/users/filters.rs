@@ -252,6 +252,63 @@ mod tests {
         })).unwrap()
     }
 
+    fn promql_filter(stream_name: &str) -> Filter {
+        serde_json::from_value(serde_json::json!({
+            "version":"v2", "user_id":"owner", "filter_id":format!("promql-{stream_name}"),
+            "stream_name":stream_name, "filter_name":"Request rate", "tenant_id":null,
+            "query":{"filter_type":"promql","filter_query":"sum(rate(http_requests_total[5m]))","filter_builder":null},
+            "time_filter":null
+        })).unwrap()
+    }
+
+    // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+    // A user without groups never reads `ROLES`, which other tests seed.
+    fn session_with(permissions: Vec<crate::rbac::role::Permission>) -> SessionKey {
+        use crate::rbac::map::{SESSIONS, Sessions, USER_GROUPS, USERS, UserGroups};
+        USERS.get_or_init(|| parking_lot::RwLock::new(crate::rbac::map::Users::default()));
+        SESSIONS.get_or_init(|| parking_lot::RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| parking_lot::RwLock::new(UserGroups::default()));
+        let key = SessionKey::SessionId(ulid::Ulid::new());
+        crate::rbac::map::mut_sessions().track_new(
+            format!("user-{key:?}"),
+            key.clone(),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            permissions,
+            &None,
+        );
+        key
+    }
+
+    #[test]
+    fn promql_filter_type_round_trips_as_lowercase() {
+        let filter = promql_filter("otel_metrics");
+        assert_eq!(filter.query.filter_type, FilterType::Promql);
+        assert_eq!(filter.query.filter_type.to_str(), "promql");
+        let value = serde_json::to_value(&filter).unwrap();
+        assert_eq!(value["query"]["filter_type"], "promql");
+        assert_eq!(serde_json::from_value::<Filter>(value).unwrap(), filter);
+    }
+
+    #[tokio::test]
+    async fn promql_filters_are_authorized_by_dataset_not_parsed_as_sql() {
+        use crate::rbac::role::{Action, Permission};
+        let cache = Filters::default();
+        let filter = promql_filter("otel_metrics");
+        cache.update(&filter, &None).await;
+
+        // PromQL is not SQL: routing it through SQL table extraction would
+        // fail and silently hide the filter from authorized users.
+        let reader = session_with(vec![Permission::Resource(Action::Query, None)]);
+        assert_eq!(cache.list_filters(&reader).await, vec![filter]);
+
+        let unauthorized = session_with(vec![]);
+        assert!(cache.list_filters(&unauthorized).await.is_empty());
+
+        for key in [reader, unauthorized] {
+            crate::rbac::map::mut_sessions().remove_session(&key);
+        }
+    }
+
     #[tokio::test]
     async fn saved_filter_cache_prefers_administrators_own_copy_of_shared_id() {
         let cache = Filters::default();

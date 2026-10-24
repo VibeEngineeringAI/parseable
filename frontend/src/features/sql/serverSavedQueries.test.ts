@@ -92,6 +92,17 @@ const classicSearch: SavedLogView = {
 };
 
 describe('server saved SQL queries', () => {
+  it('ignores saved PromQL filters', () => {
+    const promql: SavedLogView = {
+      ...classicSearch,
+      filter_id: '01HPROMQL',
+      stream_name: 'otel_metrics',
+      query: { filter_type: 'promql', filter_query: 'sum(rate(http_requests_total[5m]))' },
+    };
+    expect(savedLogView(promql)).toBe(true);
+    expect(serverSavedQuery(promql)).toBeUndefined();
+    expect(serverSavedQueries([promql])).toEqual([]);
+  });
   it('accepts the real classic fixtures through the client contract', () => {
     for (const view of [classicSql, classicLogsSql, nativeLogsSql, classicBuilder, classicSearch])
       expect(savedLogView(view)).toBe(true);
