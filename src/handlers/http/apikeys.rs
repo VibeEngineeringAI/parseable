@@ -15,6 +15,7 @@ use crate::{
     rbac::{
         Users,
         map::{roles, users},
+        role::model::RoleType,
         user::{User, UserType},
     },
     utils::{get_user_and_tenant_from_request, is_admin},
@@ -140,7 +141,7 @@ fn collect_tenant_api_keys(tenant_id: &Option<String>) -> Vec<User> {
         .collect()
 }
 
-/// Validate that every role in the request exists in the tenant's role map.
+/// Validate that every requested role exists and can be assigned in this tenant.
 /// Mirrors the check performed by the native-user CRUD endpoint.
 fn validate_roles(
     role_names: &HashSet<String>,
@@ -158,11 +159,19 @@ fn validate_roles(
         })
         .cloned()
         .collect();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(ApiKeyError::Rbac(RBACError::RolesDoNotExist(missing)))
+    if !missing.is_empty() {
+        return Err(ApiKeyError::Rbac(RBACError::RolesDoNotExist(missing)));
     }
+    if let Some(tenant_roles) = tenant_roles.get(tenant)
+        && role_names.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &RoleType::Internal || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(ApiKeyError::Rbac(RBACError::ProtectedRole));
+    }
+    Ok(())
 }
 
 /// POST /api/prism/v1/apikeys
@@ -176,8 +185,8 @@ pub async fn create_api_key(
 
     let guard = UPDATE_LOCK.lock().await;
 
-    // Reject any role names that don't exist in this tenant while holding the
-    // update lock so a concurrent role update cannot invalidate the check.
+    // Validate role assignments under the update lock so a concurrent role
+    // update cannot invalidate the check.
     validate_roles(&body.roles, &tenant_id)?;
 
     // Duplicate key-name detection inside the same tenant.

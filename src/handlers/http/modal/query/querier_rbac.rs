@@ -33,6 +33,7 @@ use crate::{
     rbac::{
         Users,
         map::{read_user_groups, roles, users, write_user_groups},
+        role::model::RoleType,
         user::{self, UserType},
     },
     tenants::TENANT_METADATA,
@@ -51,7 +52,7 @@ pub async fn post_user(
     let tenant_id = get_tenant_id_from_request(&req);
     let caller_userid = get_user_from_request(&req)?;
     validator::user_role_name(&username)?;
-    let mut metadata = get_metadata(&tenant_id).await?;
+    let _guard = UPDATE_LOCK.lock().await;
 
     let user_roles: HashSet<String> = if let Some(body) = body {
         serde_json::from_value(body.into_inner())?
@@ -73,7 +74,16 @@ pub async fn post_user(
     if !non_existent_roles.is_empty() {
         return Err(RBACError::RolesDoNotExist(non_existent_roles));
     }
-    let _guard = UPDATE_LOCK.lock().await;
+    if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
+        && user_roles.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &RoleType::Internal || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(RBACError::ProtectedRole);
+    }
+    let mut metadata = get_metadata(&tenant_id).await?;
     if Users.contains(&username, &tenant_id)
         || metadata
             .users
@@ -245,6 +255,16 @@ pub async fn add_roles_to_user(
 
     if !non_existent_roles.is_empty() {
         return Err(RBACError::RolesDoNotExist(non_existent_roles));
+    }
+
+    if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
+        && roles_to_add.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &RoleType::Internal || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(RBACError::ProtectedRole);
     }
 
     // update parseable.json first
