@@ -238,11 +238,15 @@ traces dataset:
 }
 ```
 
-`dataset`, `startTime` and `endTime` are required. `groupBy` takes up to 5
+`dataset`, `startTime` and `endTime` are required. `startTime` must be before
+`endTime`; both are resolved once and applied as exact, half-open bounds (start
+inclusive, end exclusive) on the dataset's time partition, so subminute ranges
+keep their full precision. `groupBy` takes up to 5
 exact field names. `filters` maps exact field names to JSON scalars: strings,
 numbers and booleans test equality, and `null` tests `IS NULL`. `bucketCount`
 is 1–100, default 60. It approximates the number of `DATE_BIN` buckets over the
-dataset's time partition, or `p_timestamp` if none is configured. The dataset
+dataset's time partition, or `p_timestamp` if none is configured. Buckets are
+whole seconds, sized from the exact range and aligned to `startTime`. The dataset
 must have traces telemetry and contain `span_span_id` and `span_trace_id`.
 Unknown fields are rejected. `span_count` is `COUNT(DISTINCT span_span_id)` and
 `trace_count` is `COUNT(DISTINCT span_trace_id)`, so duplicate span rows are
@@ -253,10 +257,11 @@ contains `query`, `bucketInterval`, `semantics`, up to 500 `rows` and
 `query` is the exact SQL the tool runs; it ends in `LIMIT 501` so the tool can
 detect overflow. When more than 500 rows match, the newest buckets are dropped
 and `truncated` is `true`; reduce `bucketCount`, `groupBy` or the time range to
-get the full series. `query` has no time predicate: the time range comes from
-the request's `startTime` and `endTime`, which the query API rounds down to the
-minute. To reproduce the result, for example in a dashboard tile, run `query`
-through the query API with the same `startTime` and `endTime`.
+get the full series. `query` embeds the exact time bounds as a half-open
+predicate on the time field. The query API rounds a request's `startTime` and
+`endTime` down to the minute, so to reproduce the result, for example in a
+dashboard tile, run `query` through the query API with a time range that covers
+those bounds.
 
 ## Argument schema validation
 
