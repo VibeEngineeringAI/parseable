@@ -101,10 +101,12 @@ pub struct ValidateApiKeyRequest {
     api_key: String,
 }
 
-/// Query params for `GET /apikeys`. `privilege` is the canonical name;
-/// `priviledge` is accepted as an alias for compatibility with upstream
-/// Parseable clients, which use that spelling. Unknown parameter names, such as
-/// `Privilege`, are ignored and leave the list unfiltered.
+/// Query params for `GET /apikeys`. `privilege` takes one of `reader`,
+/// `ingestor`, `admin`, `writer`, `editor` or `superadmin`, matched by kind.
+/// `privilege` is the canonical name; `priviledge` is accepted as an alias for
+/// compatibility with upstream Parseable clients, which use that spelling.
+/// Unknown parameter names, such as `Privilege`, are ignored and leave the list
+/// unfiltered.
 #[derive(Debug, Deserialize)]
 pub struct ListApiKeysQuery {
     #[serde(
@@ -128,9 +130,17 @@ where
             "admin" => Ok(DefaultPrivilege::Admin),
             "writer" => Ok(DefaultPrivilege::Writer { resource: None }),
             "editor" => Ok(DefaultPrivilege::Editor),
+            "superadmin" => Ok(DefaultPrivilege::SuperAdmin),
             _ => Err(de::Error::unknown_variant(
                 &privilege,
-                &["reader", "ingestor", "admin", "writer", "editor"],
+                &[
+                    "reader",
+                    "ingestor",
+                    "admin",
+                    "writer",
+                    "editor",
+                    "superadmin",
+                ],
             )),
         })
         .transpose()
@@ -385,8 +395,10 @@ pub async fn delete_api_key(
 /// GET /api/prism/v1/apikeys
 ///
 /// List all API keys (masked). Only admins can list keys. Optionally filter by
-/// role privilege with `?privilege=reader|ingestor|admin|writer|editor`
-/// (`?priviledge=` is accepted too). An unknown value is rejected with 400.
+/// role privilege with
+/// `?privilege=reader|ingestor|admin|writer|editor|superadmin` (`?priviledge=`
+/// is accepted too). Privileges match by kind, so `admin` does not match
+/// super-admin keys. An unknown value is rejected with 400.
 /// Unknown parameter names are ignored and return the unfiltered list.
 pub async fn list_api_keys(
     req: HttpRequest,
