@@ -853,6 +853,25 @@ pub fn external_tool_specs(writes_enabled: bool) -> impl Iterator<Item = &'stati
         .chain(WRITES.iter().filter(move |_| writes_enabled))
 }
 
+/// Root-level schema combinators that common LLM tool APIs reject in a tool's
+/// input schema (Anthropic `input_schema`, OpenAI strict function schemas).
+const ROOT_SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+/// The `inputSchema` advertised to external clients. Root-level combinators
+/// are omitted so that one tool cannot break a client's whole tool list; the
+/// catalog schema, including those combinators, is still enforced
+/// server-side, and affected properties state the constraint in their
+/// descriptions.
+pub fn listed_input_schema(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    if let Some(object) = schema.as_object_mut() {
+        for combinator in ROOT_SCHEMA_COMBINATORS {
+            object.remove(combinator);
+        }
+    }
+    schema
+}
+
 /// `GET /api/prism/v1/llm/tools/list`
 pub async fn list_tool_registry(request: HttpRequest) -> HttpResponse {
     let tools = external_tool_specs(crate::users::dashboard_tools::writes_enabled(&request))
@@ -861,7 +880,7 @@ pub async fn list_tool_registry(request: HttpRequest) -> HttpResponse {
                 "name": tool.name,
                 "title": tool.title,
                 "description": tool.description,
-                "inputSchema": tool.input_schema,
+                "inputSchema": listed_input_schema(&tool.input_schema),
                 "annotations": { "readOnlyHint": matches!(tool.effect(), ToolEffect::ReadOnly | ToolEffect::ExpensiveRead), "destructiveHint": tool.name == "delete_dashboard", "idempotentHint": crate::users::dashboard_tools::is_write(tool.name), "openWorldHint": false },
             });
             if let Some(schema) = crate::users::dashboard_tools::output_schema(tool.name) { value["outputSchema"] = schema; }
@@ -881,8 +900,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ToolCallRequest, ToolCallResult, ToolEffect, is_oss_read_tool, list_tool_registry,
-        oss_action_tool_specs, oss_read_tool_specs, oss_tool_specs,
+        ROOT_SCHEMA_COMBINATORS, ToolCallRequest, ToolCallResult, ToolEffect, external_tool_specs,
+        is_oss_read_tool, list_tool_registry, listed_input_schema, oss_action_tool_specs,
+        oss_read_tool_specs, oss_tool_specs,
     };
 
     #[actix_web::test]
@@ -1075,6 +1095,62 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn listed_tools_have_no_root_schema_combinators() {
+        let app =
+            test::init_service(App::new().route("/tools/list", web::get().to(list_tool_registry)))
+                .await;
+        let response: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/tools/list").to_request(),
+        )
+        .await;
+        let listed = response["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                (
+                    tool["name"].as_str().unwrap().to_owned(),
+                    tool["inputSchema"].clone(),
+                )
+            })
+            .chain(external_tool_specs(true).map(|tool| {
+                (
+                    tool.name.to_owned(),
+                    listed_input_schema(&tool.input_schema),
+                )
+            }))
+            .collect::<Vec<_>>();
+        assert!(listed.iter().any(|(name, _)| name == "get_log_context"));
+        for (name, schema) in &listed {
+            assert_eq!(schema["type"], "object", "{name}");
+            for combinator in ROOT_SCHEMA_COMBINATORS {
+                assert!(
+                    schema.get(combinator).is_none(),
+                    "{name} lists root {combinator}"
+                );
+            }
+        }
+
+        // The catalog keeps the constraint for server-side validation, and the
+        // listed property descriptions state it.
+        let context = external_tool_specs(true)
+            .find(|tool| tool.name == "get_log_context")
+            .unwrap();
+        assert!(context.input_schema.get("oneOf").is_some());
+        let listed_context = listed_input_schema(&context.input_schema);
+        for anchor in ["log", "body", "message"] {
+            assert!(
+                listed_context["properties"][anchor]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("exactly one of log, body, or message"),
+                "{anchor}"
+            );
+        }
+    }
+
+    #[actix_web::test]
     async fn changed_read_tool_schemas_reject_out_of_contract_arguments() {
         let find = |name: &str| {
             oss_read_tool_specs()
@@ -1115,6 +1191,21 @@ mod tests {
                 }))
                 .is_err()
         );
+        for invalid in [
+            serde_json::json!({ "dataset": "logs", "pTimestamp": "2026-10-22T00:00:00Z" }),
+            serde_json::json!({
+                "dataset": "logs",
+                "pTimestamp": "2026-10-22T00:00:00Z",
+                "log": "a",
+                "body": "b"
+            }),
+        ] {
+            assert_eq!(
+                context.validate_arguments(&invalid).unwrap_err(),
+                "arguments must match exactly one allowed schema",
+                "{invalid}"
+            );
+        }
 
         let sample = find("sample_events");
         assert!(
@@ -1257,10 +1348,21 @@ mod tests {
         ] {
             assert!(validate_tool_arguments(&schema, &value).is_err());
         }
-        assert!(
-            validate_tool_arguments(&serde_json::json!({"oneOf":[{},{}]}), &serde_json::json!(1))
-                .is_err()
-        );
+        for (schema, value) in [
+            // Zero matching variants.
+            (
+                serde_json::json!({"oneOf":[{"type":"string"},{"type":"boolean"}]}),
+                serde_json::json!(1),
+            ),
+            // Two matching variants.
+            (serde_json::json!({"oneOf":[{},{}]}), serde_json::json!(1)),
+        ] {
+            assert_eq!(
+                validate_tool_arguments(&schema, &value).unwrap_err(),
+                "arguments must match exactly one allowed schema",
+                "{schema}"
+            );
+        }
         assert!(
             validate_tool_arguments(
                 &serde_json::json!({"anyOf":[{"type":"string"}],"maxLength":2}),
