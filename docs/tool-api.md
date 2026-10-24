@@ -174,11 +174,13 @@ datasets.
   returns `not_found` if its telemetry type does not match.
 - Otherwise it scores the visible datasets that match `telemetryType` by name
   against `query`, ignoring case: 1000 if the name equals the query, 750 if the
-  query contains the name, or 500 if the name contains the query, plus 25 for
-  each query term longer than two characters that the name contains, plus 15
-  when `telemetryType` is given. It resolves only a unique top score of at least
-  500. In every other case it returns `ambiguous` with up to `limit` scored
-  `candidates`, or `not_found` if no visible dataset matches `telemetryType`.
+  query contains the name as a whole word (`-` and `_` count as part of a name,
+  so `api` is not in `rapid` or `api-gateway`), or 500 if the name contains the
+  query, plus 25 for each query term longer than two characters that the name
+  contains, plus 15 when `telemetryType` is given. It resolves only a unique top
+  score of at least 500. In every other case it returns `ambiguous` with up to
+  `limit` scored `candidates`, or `not_found` if no visible dataset matches
+  `telemetryType`.
 
 It never falls back to an arbitrary dataset.
 
