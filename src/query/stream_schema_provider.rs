@@ -1025,6 +1025,19 @@ impl PartialTimeFilter {
         let Expr::BinaryExpr(binexpr) = expr else {
             return None;
         };
+
+        // Manifests (and staging/listing prefixes) are bucketed by the stream's
+        // time partition column, or `p_timestamp` when none is configured. A
+        // bound on any other column, including `p_timestamp` on a stream with a
+        // custom time partition, says nothing about which manifests hold
+        // matching rows and must not be used to prune them.
+        let partition_column = time_partition.as_deref().unwrap_or(DEFAULT_TIMESTAMP_KEY);
+        let Expr::Column(column) = binexpr.left.as_ref() else {
+            return None;
+        };
+        if column.name != partition_column {
+            return None;
+        }
         let (op, time) = extract_timestamp_bound(binexpr, time_partition)?;
         let value = match op {
             Operator::Gt => PartialTimeFilter::Low(Bound::Excluded(time)),
@@ -1409,16 +1422,19 @@ mod tests {
     };
 
     use crate::catalog::{
+        Snapshot as _,
         column::{Column, Int64Type, TypedStatistics},
         manifest::{File, SortOrder},
-        snapshot::ManifestItem,
+        snapshot::{ManifestItem, Snapshot},
     };
+    use crate::event::DEFAULT_TIMESTAMP_KEY;
 
     use super::{
         HotTierStreamKey, PartialTimeFilter, StandardTableProvider, balanced_file_groups,
         build_parquet_scan_components, build_parquet_scan_components_with_full_filters,
-        exact_source_filters, extract_timestamp_bound, guarded_hot_tier_table_source,
-        hot_tier_stream_key, is_overlapping_query, standard_table_provider,
+        exact_source_filters, extract_primary_filter, extract_timestamp_bound,
+        guarded_hot_tier_table_source, hot_tier_stream_key, is_overlapping_query,
+        standard_table_provider,
     };
 
     #[test]
@@ -2097,6 +2113,130 @@ mod tests {
         let result = extract_timestamp_bound(&binexpr, &time_partition);
 
         assert_eq!(result, expected);
+    }
+
+    fn ts_millis(time: DateTime<Utc>) -> Expr {
+        Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some(time.timestamp_millis()), None),
+            None,
+        )
+    }
+
+    fn column(name: &str) -> Expr {
+        Expr::Column(name.into())
+    }
+
+    fn pruned_manifest_paths(filters: &[Expr], time_partition: &Option<String>) -> Vec<String> {
+        let time_filters = extract_primary_filter(filters, time_partition);
+        manifest_snapshot()
+            .manifests(&time_filters)
+            .into_iter()
+            .map(|item| item.manifest_path)
+            .collect()
+    }
+
+    fn manifest_snapshot() -> Snapshot {
+        Snapshot {
+            manifest_list: manifest_items(),
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn non_timestamp_column_filter_does_not_prune_manifests() {
+        // `created_at` is unrelated to how manifests are bucketed: rows with a
+        // late `created_at` can live in any day's manifest.
+        let filters = [
+            column("created_at").gt_eq(ts_millis(datetime_min(2023, 12, 17))),
+            column("created_at").lt(ts_millis(datetime_max(2023, 12, 17))),
+        ];
+
+        assert!(extract_primary_filter(&filters, &None).is_empty());
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn non_timestamp_string_literal_filter_does_not_prune_manifests() {
+        let filters = [column("created_at").gt(Expr::Literal(
+            ScalarValue::Utf8(Some("2023-12-17T00:00:00".to_owned())),
+            None,
+        ))];
+
+        assert!(extract_primary_filter(&filters, &None).is_empty());
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn p_timestamp_filter_prunes_manifests() {
+        let filters = [
+            column(DEFAULT_TIMESTAMP_KEY).gt_eq(ts_millis(datetime_min(2023, 12, 16))),
+            column(DEFAULT_TIMESTAMP_KEY).lt(ts_millis(datetime_max(2023, 12, 16))),
+        ];
+
+        assert_eq!(extract_primary_filter(&filters, &None).len(), 2);
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["2"]);
+    }
+
+    #[test]
+    fn qualified_p_timestamp_filter_prunes_manifests() {
+        // The query handler injects table-qualified time filters.
+        let filters = [Expr::Column(datafusion::common::Column::new(
+            Some("app_logs"),
+            DEFAULT_TIMESTAMP_KEY,
+        ))
+        .gt_eq(ts_millis(datetime_min(2023, 12, 17)))];
+
+        assert_eq!(pruned_manifest_paths(&filters, &None), ["3"]);
+    }
+
+    #[test]
+    fn literal_on_left_or_non_comparison_does_not_prune_manifests() {
+        let filters = [
+            ts_millis(datetime_min(2023, 12, 17)).lt(column(DEFAULT_TIMESTAMP_KEY)),
+            column(DEFAULT_TIMESTAMP_KEY).not_eq(ts_millis(datetime_min(2023, 12, 17))),
+        ];
+
+        assert!(extract_primary_filter(&filters, &None).is_empty());
+    }
+
+    #[test]
+    fn custom_time_partition_filter_prunes_manifests() {
+        // Manifests of time-partitioned streams are bucketed by the partition
+        // column, so bounds on it (timestamp or parseable string) prune.
+        let time_partition = Some("event_time".to_owned());
+        let filters = [
+            column("event_time").gt_eq(ts_millis(datetime_min(2023, 12, 16))),
+            column("event_time").lt(Expr::Literal(
+                ScalarValue::Utf8(Some("2023-12-16T12:00:00".to_owned())),
+                None,
+            )),
+        ];
+
+        assert_eq!(extract_primary_filter(&filters, &time_partition).len(), 2);
+        assert_eq!(pruned_manifest_paths(&filters, &time_partition), ["2"]);
+    }
+
+    #[test]
+    fn p_timestamp_filter_does_not_prune_custom_time_partition_manifests() {
+        // On a time-partitioned stream `p_timestamp` is ingestion time, while
+        // manifests are bucketed by event time: back-filled events ingested on
+        // the 17th sit in the 15th's manifest and must not be pruned away.
+        let time_partition = Some("event_time".to_owned());
+        let filters = [column(DEFAULT_TIMESTAMP_KEY).gt_eq(ts_millis(datetime_min(2023, 12, 17)))];
+
+        assert!(extract_primary_filter(&filters, &time_partition).is_empty());
+        assert_eq!(
+            pruned_manifest_paths(&filters, &time_partition),
+            ["1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn unrelated_column_does_not_prune_custom_time_partition_manifests() {
+        let time_partition = Some("event_time".to_owned());
+        let filters = [column("created_at").gt_eq(ts_millis(datetime_min(2023, 12, 17)))];
+
+        assert!(extract_primary_filter(&filters, &time_partition).is_empty());
     }
 }
 
