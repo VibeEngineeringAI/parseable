@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn privilege_filter_uses_the_callers_tenant_roles() {
+    fn privilege_filter_resolves_roles_in_the_given_tenant() {
         let _serial = blocking_rbac_state();
         // Same role and group names, different privileges per tenant.
         let readers = tenant(
