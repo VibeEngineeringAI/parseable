@@ -90,6 +90,9 @@ async function addField(editor: Locator, label: string, value: string) {
 test('creating every chart type through the editor saves classic-compatible keys', async ({
   page,
 }) => {
+  // Eleven editor flows and four full-page accessibility scans share this budget.
+  test.setTimeout(60_000);
+
   const server = await serve(page);
   const sql = 'SELECT time, service, requests FROM "app-logs"';
 
