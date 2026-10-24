@@ -10,7 +10,7 @@ on:
       runner:
         description: Runner label for every independent Rust job.
         type: string
-        default: blacksmith-8vcpu-ubuntu-2404
+        default: ubuntu-24.04
       cache-namespace:
         description: Isolated experiment compiler cache namespace.
         type: string

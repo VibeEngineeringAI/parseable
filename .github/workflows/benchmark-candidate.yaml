@@ -76,13 +76,13 @@ jobs:
       cache-namespace: ${{ needs.prepare.outputs.cache-namespace }}
       timeout-minutes: 8
       variant: cpu16-debug0
-      runner: blacksmith-16vcpu-ubuntu-2404
+      runner: ubuntu-24.04
       debug: '0'
 
   quest:
     needs: [prepare, image-candidate]
     name: Quest ${{ matrix.deployment }} (candidate)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 8
     strategy:
       fail-fast: false

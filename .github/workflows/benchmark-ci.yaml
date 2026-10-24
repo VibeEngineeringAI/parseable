@@ -68,7 +68,7 @@ jobs:
       source-ref: ${{ needs.prepare.outputs.source-ref }}
       cache-namespace: ${{ needs.prepare.outputs.cache-namespace }}
       variant: cpu16-debug0
-      runner: blacksmith-16vcpu-ubuntu-2404
+      runner: ubuntu-24.04
       debug: '0'
 
   image-controls:
@@ -78,9 +78,9 @@ jobs:
       matrix:
         include:
           - variant: cpu8-debug2
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - variant: cpu16-debug2
-            runner: blacksmith-16vcpu-ubuntu-2404
+            runner: ubuntu-24.04
     uses: ./.github/workflows/benchmark-image.yaml
     with:
       source-ref: ${{ needs.prepare.outputs.source-ref }}
@@ -91,7 +91,7 @@ jobs:
 
   quest-binaries:
     needs: prepare
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -131,7 +131,7 @@ jobs:
   quest:
     needs: [prepare, image-candidate, quest-binaries]
     name: Quest ${{ matrix.deployment }} (${{ matrix.variant }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 8
     strategy:
       fail-fast: false
