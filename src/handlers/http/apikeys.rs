@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
@@ -16,7 +16,7 @@ use crate::{
         Users,
         map::{read_user_groups, roles, users},
         role::model::{DefaultPrivilege, Role},
-        user::{User, UserGroup, UserType},
+        user::{User, UserType},
     },
     utils::{get_user_and_tenant_from_request, is_admin},
 };
@@ -152,28 +152,9 @@ fn role_has_privilege(role: &Role, privilege: &DefaultPrivilege) -> bool {
         .any(|candidate| std::mem::discriminant(candidate) == std::mem::discriminant(privilege))
 }
 
-/// Whether any direct or group-inherited role grants `privilege`.
-/// Groups and roles missing from the tenant maps never match.
-fn user_has_privilege(
-    user: &User,
-    tenant_roles: Option<&HashMap<String, Role>>,
-    tenant_groups: Option<&HashMap<String, UserGroup>>,
-    privilege: &DefaultPrivilege,
-) -> bool {
-    let group_roles = user
-        .user_groups
-        .iter()
-        .filter_map(|group_name| tenant_groups.and_then(|groups| groups.get(group_name)))
-        .flat_map(|group| &group.roles);
-    user.roles.iter().chain(group_roles).any(|role_name| {
-        tenant_roles
-            .and_then(|roles| roles.get(role_name))
-            .is_some_and(|role| role_has_privilege(role, privilege))
-    })
-}
-
 /// Masked list entries for the tenant's API keys whose direct or group-inherited
 /// roles grant `privilege`, or all of them when `privilege` is `None`.
+/// Groups and roles missing from the tenant maps never match.
 fn tenant_entries(
     tenant_id: &Option<String>,
     privilege: Option<&DefaultPrivilege>,
@@ -182,14 +163,34 @@ fn tenant_entries(
     let matching: Vec<&User> = match privilege {
         None => keys.iter().collect(),
         Some(privilege) => {
-            // Lock order: user groups before roles. Both guards drop at the end
-            // of this arm, before entries are built.
-            let all_groups = read_user_groups();
-            let all_roles = roles();
             let tenant = tenant_or_default(tenant_id);
-            let (tenant_roles, tenant_groups) = (all_roles.get(tenant), all_groups.get(tenant));
+            // Lock order: user groups before roles. Only the granting role and
+            // group names are computed under the guards; both drop before the
+            // per-key scan so it never blocks writers or the readers behind them.
+            let (granting_roles, granting_groups) = {
+                let all_groups = read_user_groups();
+                let all_roles = roles();
+                let granting_roles: HashSet<String> = all_roles
+                    .get(tenant)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, role)| role_has_privilege(role, privilege))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let granting_groups: HashSet<String> = all_groups
+                    .get(tenant)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, group)| !group.roles.is_disjoint(&granting_roles))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                (granting_roles, granting_groups)
+            };
             keys.iter()
-                .filter(|user| user_has_privilege(user, tenant_roles, tenant_groups, privilege))
+                .filter(|user| {
+                    !user.roles.is_disjoint(&granting_roles)
+                        || !user.user_groups.is_disjoint(&granting_groups)
+                })
                 .collect()
         }
     };
@@ -450,6 +451,8 @@ pub async fn get_api_key(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use actix_web::{App, cookie::Cookie, http::StatusCode, test as actix_test};
     use parking_lot::RwLock;
     use tokio::sync::Mutex;
@@ -462,6 +465,7 @@ mod tests {
             mut_users, write_user_groups,
         },
         role::ParseableResourceType,
+        user::UserGroup,
     };
 
     static SERIAL: Mutex<()> = Mutex::const_new(());
