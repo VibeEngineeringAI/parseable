@@ -13,15 +13,15 @@ jobs:
   build-default:
     name: Build Default ${{matrix.target}}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
           # Linux builds - both native, matching the release workflow
-          - os: blacksmith-8vcpu-ubuntu-2404
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: blacksmith-8vcpu-ubuntu-2404-arm
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
 
           # macOS build - aarch64 only (M1/M2)
@@ -34,6 +34,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare Linux build resources
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          if sudo fallocate -l 16G /swap.build && sudo chmod 600 /swap.build \
+            && sudo mkswap /swap.build && sudo swapon /swap.build; then
+            echo "Added 16G swap"
+          else
+            sudo rm -f /swap.build
+            echo "::warning title=Swap::Could not add swap; continuing without it"
+          fi
+          free -h
+          df -h /
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -79,10 +93,24 @@ jobs:
   # Kafka build for x86_64 Linux only
   build-kafka:
     name: Build Kafka x86_64-unknown-linux-gnu
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare Linux build resources
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          if sudo fallocate -l 16G /swap.build && sudo chmod 600 /swap.build \
+            && sudo mkswap /swap.build && sudo swapon /swap.build; then
+            echo "Added 16G swap"
+          else
+            sudo rm -f /swap.build
+            echo "::warning title=Swap::Could not add swap; continuing without it"
+          fi
+          free -h
+          df -h /
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
