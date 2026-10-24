@@ -341,6 +341,24 @@ fn dataset_matches_telemetry_type(dataset: &Value, expected: Option<&str>) -> bo
     })
 }
 
+/// Whether `name` occurs in `query` as a whole token. Dataset names may contain
+/// `-` and `_`, so those count as part of a name rather than as boundaries.
+fn query_mentions_dataset_name(query: &str, name: &str) -> bool {
+    let is_name_character =
+        |character: char| character.is_ascii_alphanumeric() || character == '_' || character == '-';
+    !name.is_empty()
+        && query.match_indices(name).any(|(start, matched)| {
+            !query[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_name_character)
+                && !query[start + matched.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_name_character)
+        })
+}
+
 pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
     let query = arguments
         .get("query")
@@ -436,7 +454,7 @@ pub fn resolve_dataset_candidates(payload: Value, arguments: &Value) -> Value {
             if !query.is_empty() && name == query {
                 score += 1_000;
                 reasons.push("exact dataset name");
-            } else if !query.is_empty() && query.contains(&name) {
+            } else if !query.is_empty() && query_mentions_dataset_name(&query, &name) {
                 score += 750;
                 reasons.push("dataset name explicitly mentioned in the question");
             } else if !query.is_empty() && name.contains(&query) {
@@ -2008,6 +2026,35 @@ mod tests {
             &json!({ "query": "data", "telemetryType": "traces" }),
         );
         assert_eq!(sole_mismatch["status"], "not_found");
+    }
+
+    #[actix_web::test]
+    async fn shared_dataset_resolution_requires_whole_name_mentions() {
+        let datasets = json!([{ "name": "api" }, { "name": "web" }]);
+        let embedded = resolve_dataset_candidates(
+            datasets.clone(),
+            &json!({ "query": "show rapid failures" }),
+        );
+        assert_ne!(embedded["status"], "resolved");
+
+        let mentioned =
+            resolve_dataset_candidates(datasets.clone(), &json!({ "query": "show api errors" }));
+        assert_eq!(mentioned["status"], "resolved");
+        assert_eq!(mentioned["selectedDatasets"], json!(["api"]));
+
+        let punctuated =
+            resolve_dataset_candidates(datasets, &json!({ "query": "errors in (api)?" }));
+        assert_eq!(punctuated["selectedDatasets"], json!(["api"]));
+
+        let hyphenated = json!([{ "name": "otel-metrics" }, { "name": "otel-traces" }]);
+        let longer_name = resolve_dataset_candidates(
+            hyphenated.clone(),
+            &json!({ "query": "show otel-metrics-v2 errors" }),
+        );
+        assert_ne!(longer_name["status"], "resolved");
+        let underscored =
+            resolve_dataset_candidates(hyphenated, &json!({ "query": "show my_otel-metrics" }));
+        assert_ne!(underscored["status"], "resolved");
     }
 
     #[actix_web::test]

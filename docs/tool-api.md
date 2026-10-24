@@ -153,7 +153,9 @@ datasets.
 `traces`) and `limit` (1–20, default 5). It resolves a `selectedDataset` or
 `contextDataset` exactly, or resolves the only visible dataset. Otherwise it
 ranks visible datasets by name match against `query`. It resolves only a
-unique high-confidence name match. In every other case it returns
+unique high-confidence name match. A dataset name counts as mentioned in
+`query` only as a whole word, where `-` and `_` are part of a name, so `api`
+is not mentioned in `rapid` or `api-gateway`. In every other case it returns
 `status: "ambiguous"` with up to `limit` scored `candidates`, or `"not_found"`.
 It never falls back to an arbitrary dataset. A selected dataset whose telemetry
 type does not match `telemetryType` returns `not_found`.
