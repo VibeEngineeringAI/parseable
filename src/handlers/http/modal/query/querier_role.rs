@@ -288,4 +288,26 @@ mod tests {
             "rejected update must not change the live role"
         );
     }
+
+    #[tokio::test]
+    async fn rejected_internal_update_leaves_live_role_unchanged() {
+        for privilege in [
+            DefaultPrivilege::SuperAdmin,
+            DefaultPrivilege::Reader { resource: None },
+        ] {
+            let (tenant, req) = tenant_request();
+            let body = Role::create_internal_role(vec![privilege]);
+
+            let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(body)).await else {
+                panic!("internal role update must be rejected");
+            };
+            assert!(matches!(err, RoleError::ProtectedRole), "{err:?}");
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned(),
+                Some(reader_role()),
+                "rejected update must not change the live role"
+            );
+        }
+    }
 }
