@@ -592,6 +592,45 @@ mod role_escalation {
     }
 
     #[tokio::test]
+    async fn post_gen_password_rejects_protected_user_before_storage() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, _, req) = tenant_request(ordinary_role());
+        let target = insert_protected_user(&tenant, "admin");
+        let before = Users.get_user(&target, &Some(tenant.clone())).unwrap();
+
+        let Err(err) = post_gen_password(req, web::Path::from(target.clone())).await else {
+            panic!("a protected user's password must not be reset");
+        };
+        assert!(matches!(err, RBACError::ProtectedUser), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        let after = Users.get_user(&target, &Some(tenant)).unwrap();
+        let (UserType::Native(before), UserType::Native(after)) = (before.ty, after.ty) else {
+            panic!("the protected user must remain native");
+        };
+        assert_eq!(after.password_hash, before.password_hash);
+    }
+
+    #[tokio::test]
+    async fn post_gen_password_waits_for_update_lock_before_storage() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_, userid, req) = tenant_request(ordinary_role());
+        let _guard = UPDATE_LOCK.lock().await;
+
+        // Cancel at the lock: resuming would initialize PARSEABLE and make clap
+        // parse the test arguments. Without the lock before get_metadata, this
+        // test exits with code 2 instead of timing out.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                post_gen_password(req, web::Path::from(userid)),
+            )
+            .await
+            .is_err(),
+            "password generation must wait for UPDATE_LOCK before reading metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn post_user_rejects_role_held_by_protected_user() {
         // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
         let _serial = TEST_SERIAL.lock().await;

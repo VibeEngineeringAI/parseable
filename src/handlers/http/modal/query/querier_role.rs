@@ -274,6 +274,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_waits_for_update_lock_before_checking_role() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, req) = tenant_request();
+        let internal_role = Role::create_internal_role(vec![DefaultPrivilege::Admin]);
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), internal_role.clone());
+        let guard = UPDATE_LOCK.lock().await;
+        let deletion = delete(req, web::Path::from(ROLE.to_owned()));
+        tokio::pin!(deletion);
+
+        // Poll the handler while the lock is held. An internal role lets it
+        // complete after release without initializing PARSEABLE or storage.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut deletion)
+                .await
+                .is_err(),
+            "role deletion must wait for UPDATE_LOCK"
+        );
+        drop(guard);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut deletion)
+            .await
+            .expect("role deletion must resume after UPDATE_LOCK is released");
+        let Err(err) = result else {
+            panic!("deleting an internal role must be rejected");
+        };
+        assert!(matches!(err, RoleError::ProtectedRole), "{err:?}");
+        assert_eq!(
+            roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned(),
+            Some(internal_role)
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_super_admin_update_leaves_live_role_unchanged() {
         // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
         let _serial = TEST_SERIAL.lock().await;
