@@ -788,6 +788,51 @@ impl UserGroup {
 }
 
 #[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::rbac::map::{TEST_SERIAL, USERS, mut_users};
+    use parking_lot::RwLock;
+
+    #[test]
+    fn preparing_user_patch_does_not_publish_before_persistence() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        let original = User {
+            ty: UserType::Native(Basic {
+                username: "patch-user".to_owned(),
+                password_hash: "unchanged-hash".to_owned(),
+                email: Some("before@example.com".to_owned()),
+            }),
+            roles: HashSet::from(["reader".to_owned()]),
+            user_groups: HashSet::from(["engineering".to_owned()]),
+            tenant: Some(format!("patch-test-{}", Ulid::new())),
+            protected: false,
+        };
+        mut_users().insert(original.clone());
+        let update = UpdateUser {
+            email: Some("after@example.com".to_owned()),
+        };
+
+        // This is the handler's step before get_metadata/put_metadata. If either
+        // fails, the prepared value is discarded and live state must be intact.
+        let prepared = update
+            .update(original.userid(), &original.tenant)
+            .unwrap()
+            .unwrap();
+        let mut expected = original.clone();
+        expected
+            .insert_email("after@example.com".to_owned())
+            .unwrap();
+        assert_eq!(prepared, expected);
+        assert_eq!(
+            Users.get_user(original.userid(), &original.tenant),
+            Some(original),
+            "preparing a PATCH must not publish it before metadata persists"
+        );
+    }
+}
+
+#[cfg(test)]
 mod apikey_serde_tests {
     use super::*;
 
