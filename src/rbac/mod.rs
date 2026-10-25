@@ -1433,3 +1433,82 @@ mod lock_order_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod protected_holder_tests {
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::rbac::map::{TEST_SERIAL, USERS};
+    use crate::rbac::user::Basic;
+
+    fn insert_user(tenant: Option<String>, roles: &[&str], protected: bool) {
+        mut_users().insert(User {
+            ty: UserType::Native(Basic {
+                username: format!("user-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+            user_groups: HashSet::new(),
+            tenant,
+            protected,
+        });
+    }
+
+    fn names(roles: &[&str]) -> HashSet<String> {
+        roles.iter().map(|role| role.to_string()).collect()
+    }
+
+    /// Unique role names keep these tests apart from others sharing the default tenant.
+    fn role() -> String {
+        format!("role-{}", Ulid::new())
+    }
+
+    #[test]
+    fn only_protected_holders_of_a_requested_role_count() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(map::Users::default()));
+        let tenant = Some(format!("protected-holder-{}", Ulid::new()));
+        let (held, unprotected, other) = (role(), role(), role());
+        insert_user(tenant.clone(), &[&unprotected], false);
+        insert_user(tenant.clone(), &[&held], true);
+
+        assert!(!Users.any_role_held_by_protected_user(&names(&[&unprotected]), &tenant));
+        assert!(!Users.any_role_held_by_protected_user(&names(&[&other]), &tenant));
+        assert!(Users.any_role_held_by_protected_user(&names(&[&other, &held]), &tenant));
+    }
+
+    #[test]
+    fn protected_holders_in_other_tenants_do_not_count() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(map::Users::default()));
+        let held = role();
+        insert_user(
+            Some(format!("protected-holder-{}", Ulid::new())),
+            &[&held],
+            true,
+        );
+
+        let other_tenant = Some(format!("protected-holder-{}", Ulid::new()));
+        assert!(!Users.any_role_held_by_protected_user(&names(&[&held]), &other_tenant));
+        assert!(!Users.any_role_held_by_protected_user(&names(&[&held]), &None));
+    }
+
+    #[test]
+    fn no_tenant_means_the_default_tenant() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(map::Users::default()));
+        let held = role();
+        insert_user(None, &[&held], true);
+
+        assert!(Users.any_role_held_by_protected_user(&names(&[&held]), &None));
+        assert!(
+            Users.any_role_held_by_protected_user(
+                &names(&[&held]),
+                &Some(DEFAULT_TENANT.to_owned())
+            )
+        );
+    }
+}
