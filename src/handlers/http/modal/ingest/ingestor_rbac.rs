@@ -26,7 +26,7 @@ use crate::{
         rbac::{RBACError, UPDATE_LOCK},
     },
     parseable::DEFAULT_TENANT,
-    rbac::{Users, user::User as ParseableUser},
+    rbac::{Users, map::write_user_groups, user::User as ParseableUser},
     storage::{self, StorageMetadata},
     utils::get_tenant_id_from_request,
 };
@@ -130,11 +130,20 @@ fn put_staging(metadata: &StorageMetadata, tenant_id: &Option<String>) {
 }
 
 /// Makes the live user `userid` match `stored` (the tenant's users in storage),
-/// removing it if storage no longer has it, and drops the user's sessions.
+/// removing it, and its group memberships, if storage no longer has it, and
+/// drops the user's sessions.
 fn apply_stored_user(stored: &[ParseableUser], userid: &str, tenant_id: &Option<String>) {
     match stored.iter().find(|user| user.userid() == userid) {
         Some(user) => Users.put_user(user.clone()),
-        None => Users.delete_user(userid, tenant_id),
+        None => {
+            Users.delete_user(userid, tenant_id);
+            let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+            if let Some(groups) = write_user_groups().get_mut(tenant) {
+                for group in groups.values_mut() {
+                    group.users.retain(|member| member.userid() != userid);
+                }
+            }
+        }
     }
 }
 
@@ -150,9 +159,9 @@ mod tests {
     use crate::rbac::{
         map::{
             ROLES, SESSIONS, SessionKey, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
-            mut_users,
+            mut_users, read_user_groups, write_user_groups,
         },
-        user::{Basic, UserType},
+        user::{Basic, GroupUser, UserGroup, UserType},
     };
 
     // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
@@ -282,5 +291,41 @@ mod tests {
             live_roles(&userid, &tenant),
             Some(HashSet::from(["a".to_owned()]))
         );
+    }
+
+    // Like the querier's user deletion, the live groups must forget the user.
+    #[tokio::test]
+    async fn deleted_user_is_removed_from_live_groups() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let tenant_name = tenant.clone().unwrap();
+        live_with_session(&user(&tenant, &userid, &[]));
+        let member = |id: &str| GroupUser {
+            userid: id.to_owned(),
+            username: id.to_owned(),
+            method: "native".to_owned(),
+            tenant_id: tenant.clone(),
+        };
+        write_user_groups().insert(
+            UserGroup {
+                name: "group".to_owned(),
+                roles: HashSet::new(),
+                users: HashSet::from([member(&userid), member("other")]),
+            },
+            &tenant_name,
+        );
+
+        apply_stored_user(&[], &userid, &tenant);
+
+        let groups = read_user_groups();
+        let users = &groups
+            .get(&tenant_name)
+            .unwrap()
+            .get("group")
+            .unwrap()
+            .users;
+        assert_eq!(users, &HashSet::from([member("other")]));
     }
 }
