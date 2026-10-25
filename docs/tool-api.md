@@ -36,6 +36,11 @@ Response:
 }
 ```
 
+A listed `inputSchema` never has a root-level `oneOf`, `anyOf` or `allOf`,
+because several LLM tool APIs reject tool input schemas with root combinators.
+Where the catalog schema has one, the server still enforces it when the tool is
+called, and the affected property descriptions state the constraint.
+
 The response includes an `ETag` and
 `Cache-Control: private, max-age=300, must-revalidate`. A request with a
 matching `If-None-Match` receives `304 Not Modified`.
@@ -130,3 +135,144 @@ and last-seen value, and coalesces supported aliases per row. Its `total` is the
 number of returned groups, not an unbounded count of all matching groups. The
 native Errors page additionally separates issues by message, so its grouping
 and pagination are not identical to this summary tool.
+
+## SQL tool limits
+
+`query_sql`, `explain_query` and other tools that run SQL internally parse the
+statement with DataFusion's SQL parser and accept exactly one `SELECT` or `WITH`
+query. Trailing semicolons and trailing comments are allowed, including
+comments after the final semicolon (`SELECT a FROM t; -- note`).
+The outermost projection must name at most 10 explicit columns, and `*` and
+`table.*` are rejected there. The same limit applies to each branch of a
+top-level set operation such as `UNION` and to a parenthesized outer query.
+Projections inside CTE definitions, derived tables and subqueries are not
+checked. Casts to `INT64`, `UINT64` or `FLOAT64` anywhere in the statement are
+rejected with a hint to use `BIGINT` or `DOUBLE`. The statement is wrapped with
+an outer `LIMIT 500`, except in `get_trace_activity`, whose generated SQL carries
+its own limit (see below). `sample_events`
+returns at most 10 columns, choosing common observability fields such as
+`p_timestamp`, `service.name`, `severity_text`, `body` and `trace_id` before
+other fields.
+
+## Dataset and time resolution
+
+`list_datasets`, `resolve_dataset` and `discover_datasets` omit internal
+datasets.
+
+`resolve_dataset` accepts an optional `telemetryType` (`logs`, `metrics` or
+`traces`) and `limit` (1–20, default 5). Its `status` is `resolved`,
+`ambiguous`, `not_found` or `error`.
+
+- A `selectedDataset` or `contextDataset` resolves to the visible dataset with
+  exactly that (case-sensitive) name. If none has that exact name, it resolves
+  to the one visible dataset whose name matches case-insensitively; if several
+  do, the result is `ambiguous` with those datasets as `candidates`. If no
+  visible dataset matches, the result has `status: "error"`. If the selected
+  dataset's telemetry type does not match `telemetryType`, the result is
+  `not_found`.
+- Otherwise, if exactly one dataset is visible, it resolves to that dataset, or
+  returns `not_found` if its telemetry type does not match.
+- Otherwise it scores the visible datasets that match `telemetryType` by name
+  against `query`, ignoring case: 1000 if the name equals the query, 750 if the
+  query contains the name as a whole word (`-` and `_` count as part of a name,
+  so `api` is not in `rapid` or `api-gateway`), or 500 if the name contains the
+  query, plus 25 for each query term longer than two characters that the name
+  contains, plus 15 when `telemetryType` is given. It resolves only a unique top
+  score of at least 500. In every other case it returns `ambiguous` with up to
+  `limit` scored `candidates`, or `not_found` if no visible dataset matches
+  `telemetryType`.
+
+It never falls back to an arbitrary dataset.
+
+`discover_datasets` counts events in the requested range for each visible
+dataset of the requested telemetry type that the caller can query. It returns
+active datasets ordered by event count as `{ name, eventsInRange }`, together
+with `selectedDatasets`, `activeDatasetCount`, `truncated` and up to 20
+`unavailableDatasets`. If no dataset is active and at least one could not be
+counted, the result has `status: "error"` and no datasets.
+
+`resolve_time_range` accepts any IANA `timezone` (default `UTC`), and uses it
+for `today` and `yesterday` day boundaries. It also accepts `last <duration>`,
+`past <duration>`, `now-<duration>`, `<start> to <end>` and RFC3339 start
+times. An unknown timezone is an error.
+
+`sample_events` accepts an explicit `startTime` and `endTime`, which must be
+provided together. They take precedence over `minutes`.
+
+## Log context
+
+`get_log_context` uses the same implementation as `POST /api/v1/query/context`.
+Arguments must include exactly one of `log`, `body` or `message`, holding the
+anchor row's exact value. The catalog schema enforces this with a root `oneOf`,
+so calls with none or more than one are rejected with `400`. The listed
+`inputSchema` omits that `oneOf` (see [List tools](#list-tools)) and states the
+rule in the property descriptions.
+
+Context bounds are either `contextWindow` or both `contextStartTime` and
+`contextEndTime`. Giving only one explicit bound, or a window together with an
+explicit bound, is an error. If no bounds are given, the tool uses
+`contextWindow: "5 minutes"`. A window extends that duration on each side of
+`pTimestamp`, and both ends are rounded down to the minute; if they round to the
+same minute, the end is one minute after the start. Explicit bounds are used at
+millisecond precision without rounding, and `pTimestamp` must be at or after
+the start and before the end. `pageSize` is 1–500, default 100.
+
+Returned records keep at most 10 fields per row, preferring `p_timestamp`,
+service, severity, message and trace identifiers. The response also includes
+the anchor index, scope and the executed queries.
+
+## Trace activity
+
+`get_trace_activity` returns a bucketed span and trace activity series for one
+traces dataset:
+
+```json
+{
+  "name": "get_trace_activity",
+  "arguments": {
+    "dataset": "otel-traces",
+    "startTime": "2026-10-22T00:00:00Z",
+    "endTime": "2026-10-22T01:00:00Z",
+    "groupBy": ["service.name"],
+    "filters": { "span_status_code": 2 },
+    "bucketCount": 60
+  }
+}
+```
+
+`dataset`, `startTime` and `endTime` are required. `startTime` must be before
+`endTime`; both are resolved once and applied as exact, half-open bounds (start
+inclusive, end exclusive) on the dataset's time partition, so subminute ranges
+keep their full precision. `groupBy` takes up to 5
+exact field names. Each field may appear only once, and `time`, `span_count`
+and `trace_count` are rejected because they are output column names. `filters`
+maps exact field names to JSON scalars: strings, numbers and booleans test
+equality, and `null` tests `IS NULL`. `bucketCount`
+is 1–100, default 60. It approximates the number of `DATE_BIN` buckets over the
+dataset's time partition, or `p_timestamp` if none is configured. Buckets are
+whole seconds, sized from the exact range and aligned to `startTime`. The dataset
+must have traces telemetry and contain `span_span_id` and `span_trace_id`.
+Unknown fields are rejected. `span_count` is `COUNT(DISTINCT span_span_id)` and
+`trace_count` is `COUNT(DISTINCT span_trace_id)`, so duplicate span rows are
+not double counted. Rows are ordered by bucket, oldest first. The result
+contains `query`, `bucketInterval`, `semantics`, up to 500 `rows` and
+`truncated`.
+
+`query` is the exact SQL the tool runs; it ends in `LIMIT 501` so the tool can
+detect overflow. When more than 500 rows match, the newest buckets are dropped
+and `truncated` is `true`; reduce `bucketCount`, `groupBy` or the time range to
+get the full series. `query` embeds the exact time bounds as a half-open
+predicate on the time field. The query API rounds a request's `startTime` and
+`endTime` down to the minute, so to reproduce the result, for example in a
+dashboard tile, run `query` through the query API with a time range that covers
+those bounds.
+
+## Argument schema validation
+
+`inputSchema` is enforced server-side for `type` (a single type or a list of types), `required`,
+`additionalProperties`, `enum`, `const`, `minLength`/`maxLength`,
+`minimum`/`maximum`, `minItems`/`maxItems`, `items`, `anyOf` and `oneOf`.
+`oneOf` passes only when exactly one variant matches. Combinators are checked
+in addition to sibling keywords; they do not replace them. Validation uses the
+catalog schema, including any root combinators omitted from the listed
+`inputSchema`.

@@ -53,6 +53,13 @@ pub static DEFAULT_ROLE: Lazy<RwLock<HashMap<String, Option<String>>>> =
 pub static SESSIONS: OnceCell<RwLock<Sessions>> = OnceCell::new();
 pub static USER_GROUPS: OnceCell<RwLock<UserGroups>> = OnceCell::new();
 
+/// Held by every test that writes the maps above. Some tests detect progress
+/// by observing a queued writer, so an unrelated writer can fail them or let
+/// them pass vacuously. Sync tests take it with `blocking_lock`, async tests
+/// with `lock().await`; unlike a std mutex, a panicking test doesn't poison it.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub fn read_user_groups() -> RwLockReadGuard<'static, UserGroups> {
     USER_GROUPS
         .get()
