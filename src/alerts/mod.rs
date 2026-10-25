@@ -1237,6 +1237,8 @@ pub enum AlertError {
     ValidationFailure(String),
     #[error(transparent)]
     MetastoreError(#[from] MetastoreError),
+    #[error("{0}")]
+    Header(#[from] crate::utils::header_parsing::ParseHeaderError),
 }
 
 impl actix_web::ResponseError for AlertError {
@@ -1266,6 +1268,7 @@ impl actix_web::ResponseError for AlertError {
             Self::NotPresentInOSS(_) => StatusCode::BAD_REQUEST,
             Self::MetastoreError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::OutboundPolicy(_) => StatusCode::BAD_REQUEST,
+            Self::Header(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -1845,6 +1848,22 @@ mod tests {
         assert_eq!(
             alert_tenant_from_storage_key("tenant-a"),
             Some("tenant-a".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::ResponseError;
+
+    use super::*;
+    use crate::utils::header_parsing::ParseHeaderError;
+
+    #[test]
+    fn header_error_is_bad_request() {
+        assert_eq!(
+            AlertError::from(ParseHeaderError::InvalidTenantId).status_code(),
+            StatusCode::BAD_REQUEST
         );
     }
 }

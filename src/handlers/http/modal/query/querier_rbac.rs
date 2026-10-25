@@ -49,7 +49,7 @@ pub async fn post_user(
     body: Option<web::Json<serde_json::Value>>,
 ) -> Result<impl Responder, RBACError> {
     let username = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     validator::user_role_name(&username)?;
     let _guard = UPDATE_LOCK.lock().await;
@@ -120,7 +120,7 @@ pub async fn delete_user(
     userid: web::Path<String>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     let _guard = UPDATE_LOCK.lock().await;
@@ -234,7 +234,7 @@ pub async fn add_roles_to_user(
 ) -> Result<String, RBACError> {
     let userid = userid.into_inner();
     let roles_to_add = roles_to_add.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let _guard = UPDATE_LOCK.lock().await;
     let caller_userid = get_user_from_request(&req)?;
     if !Users.contains(&userid, &tenant_id) {
@@ -330,7 +330,7 @@ pub async fn remove_roles_from_user(
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
     let roles_to_remove = roles_to_remove.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     let _guard = UPDATE_LOCK.lock().await;
@@ -445,7 +445,7 @@ pub async fn post_gen_password(
     let userid = userid.into_inner();
     let mut new_password = String::default();
     let mut new_hash = String::default();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     if Users.is_protected(&userid, &tenant_id) == Some(true) {
         return Err(RBACError::ProtectedUser);

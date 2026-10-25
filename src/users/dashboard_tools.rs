@@ -154,7 +154,9 @@ pub fn authorize(req: &HttpRequest, name: &str) -> Result<(), DashboardError> {
         )
     })?;
     let action = required_action(name);
-    let tenant = crate::utils::get_tenant_id_from_request(req);
+    let tenant = crate::utils::get_tenant_id_from_request(req).map_err(|error| {
+        DashboardError::api(400, "INVALID_HEADER", error.to_string(), json!({}))
+    })?;
     if let Response::Suspended(message) =
         middleware::check_suspension_for_tenant(tenant.as_deref(), action)
     {
@@ -384,4 +386,26 @@ pub fn output_schema(name: &str) -> Option<Value> {
     Some(
         json!({"type":"object","properties":{"result":result,"error":{"type":"object","properties":{"code":{"type":"string"},"message":{"type":"string"},"status":{"type":"integer"}},"required":["message"]}},"anyOf":[{"required":["result"]},{"required":["error"]}]}),
     )
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{ResponseError, http::header::HeaderValue, test::TestRequest};
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+
+    #[test]
+    fn authorize_rejects_malformed_tenant_with_json_400() {
+        let req = TestRequest::default()
+            .insert_header(("authorization", "Basic YWxpY2U6cGFzcw=="))
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request();
+        let err = authorize(&req, "list_dashboards").unwrap_err();
+        assert_eq!(err.status_code(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.detail()["code"], "INVALID_HEADER");
+    }
 }

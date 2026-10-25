@@ -26,6 +26,7 @@ use crate::users::{
 };
 use crate::utils::{
     actix::extract_session_key_from_req, arrow::record_batches_to_json, get_tenant_id_from_request,
+    header_parsing::ParseHeaderError,
 };
 use crate::{
     handlers::http::middleware,
@@ -63,6 +64,10 @@ struct PreviewRequest {
 
 fn bad(message: impl Into<String>) -> DashboardError {
     DashboardError::api(400, "INVALID_PREVIEW", message, json!({}))
+}
+/// A malformed request header. The message never includes the value.
+pub(crate) fn invalid_header(error: ParseHeaderError) -> DashboardError {
+    DashboardError::api(400, "INVALID_HEADER", error.to_string(), json!({}))
 }
 fn text(value: &Value) -> &str {
     value.as_str().unwrap_or("")
@@ -755,7 +760,8 @@ async fn sql_rows(
         return Err("This tile has no SQL query".into());
     }
     let creds = extract_session_key_from_req(req).map_err(|e| e.to_string())?;
-    let tenant = get_tenant_id_from_request(req);
+    // callers run authorize_runtime first, which rejects a malformed tenant with 400
+    let tenant = get_tenant_id_from_request(req).map_err(|e| e.to_string())?;
     let query = Query {
         query: bounded_sql(sql, limit),
         start_time: start.into(),
@@ -1131,7 +1137,7 @@ fn authorize_runtime(req: &HttpRequest, action: Action) -> Result<(), DashboardE
             json!({}),
         )
     })?;
-    let tenant = get_tenant_id_from_request(req);
+    let tenant = get_tenant_id_from_request(req).map_err(invalid_header)?;
     if let Response::Suspended(message) =
         middleware::check_suspension_for_tenant(tenant.as_deref(), action)
     {
@@ -1176,7 +1182,7 @@ async fn preview_inner(req: &HttpRequest, request: Value) -> Result<Value, Dashb
             authorize_runtime(req, Action::GetDashboard)?;
             dashboard_service::get_json(
                 validate_dashboard_id(id)?,
-                &get_tenant_id_from_request(req),
+                &get_tenant_id_from_request(req).map_err(invalid_header)?,
             )
             .await?
         }
@@ -1494,5 +1500,27 @@ mod tests {
         let req = actix_web::test::TestRequest::default().to_http_request();
         let error=preview_value(&req,json!({"document":{"tiles":[]},"startTime":"2026-10-10T00:00:00Z","endTime":"2026-10-10T01:00:00Z"})).await.unwrap_err();
         assert!(matches!(error, DashboardError::Api { status: 401, .. }));
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{ResponseError, http::header::HeaderValue, test::TestRequest};
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+
+    #[test]
+    fn authorize_runtime_rejects_malformed_tenant_with_json_400() {
+        let req = TestRequest::default()
+            .insert_header(("authorization", "Basic YWxpY2U6cGFzcw=="))
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request();
+        let err = authorize_runtime(&req, Action::Query).unwrap_err();
+        assert_eq!(err.status_code(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.detail()["code"], "INVALID_HEADER");
     }
 }

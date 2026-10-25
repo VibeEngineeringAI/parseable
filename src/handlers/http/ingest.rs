@@ -49,7 +49,7 @@ use crate::otel::traces::OTEL_TRACES_KNOWN_FIELD_LIST;
 use crate::parseable::{PARSEABLE, StreamNotFound};
 use crate::storage::{ObjectStorageError, StreamType};
 use crate::utils::get_tenant_id_from_request;
-use crate::utils::header_parsing::ParseHeaderError;
+use crate::utils::header_parsing::{ParseHeaderError, optional_header_str};
 use crate::utils::json::{flatten::JsonFlattenError, strict::StrictValue};
 
 use super::logstream::error::{CreateStreamError, StreamError};
@@ -70,11 +70,11 @@ pub async fn ingest(
     req: HttpRequest,
     Json(json): Json<StrictValue>,
 ) -> Result<HttpResponse, PostError> {
-    let Some(stream_name) = req.headers().get(STREAM_NAME_HEADER_KEY) else {
+    let Some(stream_name) = optional_header_str(req.headers(), STREAM_NAME_HEADER_KEY)? else {
         return Err(PostError::Header(ParseHeaderError::MissingStreamName));
     };
-    let tenant_id = get_tenant_id_from_request(&req);
-    let stream_name = stream_name.to_str().unwrap().to_owned();
+    let stream_name = stream_name.to_owned();
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let internal_stream_names = PARSEABLE.streams.list_internal_streams(&tenant_id);
     if internal_stream_names.contains(&stream_name) {
         return Err(PostError::InternalStream(stream_name));
@@ -229,18 +229,18 @@ pub async fn setup_otel_stream(
     dataset_tags: Vec<DatasetTag>,
     dataset_labels: Vec<String>,
 ) -> Result<(String, LogSource, LogSourceEntry, Option<String>), PostError> {
-    let Some(stream_name) = req.headers().get(STREAM_NAME_HEADER_KEY) else {
+    let Some(stream_name) = optional_header_str(req.headers(), STREAM_NAME_HEADER_KEY)? else {
         return Err(PostError::Header(ParseHeaderError::MissingStreamName));
     };
 
-    let stream_name = stream_name.to_str().unwrap().to_owned();
+    let stream_name = stream_name.to_owned();
 
     let log_source_entry = LogSourceEntry::new(
         log_source.clone(),
         known_fields.iter().map(|&s| s.to_string()).collect(),
     );
 
-    let tenant_id = get_tenant_id_from_request(req);
+    let tenant_id = get_tenant_id_from_request(req)?;
     PARSEABLE
         .create_stream_if_not_exists(
             &stream_name,
@@ -385,7 +385,7 @@ pub async fn post_event(
     Json(json): Json<StrictValue>,
 ) -> Result<HttpResponse, PostError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let internal_stream_names = PARSEABLE.streams.list_internal_streams(&tenant_id);
     if internal_stream_names.contains(&stream_name) {
         return Err(PostError::InternalStream(stream_name));
@@ -560,7 +560,13 @@ impl actix_web::ResponseError for PostError {
             | InvalidQueryParameter
             | MissingQueryParameter
             | CreateStream(CreateStreamError::StreamNameValidation(_))
+            | StreamError(super::logstream::error::StreamError::Header(_))
+            | DashboardError(super::users::dashboards::DashboardError::Header(_))
             | OtelNotSupported(_) => StatusCode::BAD_REQUEST,
+
+            StreamError(super::logstream::error::StreamError::HeaderBuild(e)) => {
+                actix_web::ResponseError::status_code(e)
+            }
 
             Event(_)
             | CreateStream(_)
@@ -1128,5 +1134,150 @@ mod tests {
             rb.column_by_name("c_b").unwrap().as_float64_arr().unwrap(),
             &Float64Array::from(vec![None, None, None, Some(2.0)])
         );
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{
+        ResponseError,
+        http::{StatusCode, header::HeaderValue},
+        test::TestRequest,
+        web::Json,
+    };
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+    use crate::utils::header_parsing::HeaderBuildError;
+
+    fn non_ascii() -> HeaderValue {
+        HeaderValue::from_bytes(b"name\xff").expect("obs-text is a valid header value")
+    }
+
+    fn empty_body() -> Json<StrictValue> {
+        Json(serde_json::from_str("{}").expect("empty object is strict JSON"))
+    }
+
+    #[actix_web::test]
+    async fn ingest_rejects_non_ascii_stream_header_with_400() {
+        let req = TestRequest::default()
+            .insert_header((STREAM_NAME_HEADER_KEY, non_ascii()))
+            .to_http_request();
+        let err = ingest(req, empty_body()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PostError::Header(ParseHeaderError::InvalidValue)
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn ingest_missing_stream_header_is_still_missing() {
+        let req = TestRequest::default().to_http_request();
+        let err = ingest(req, empty_body()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PostError::Header(ParseHeaderError::MissingStreamName)
+        ));
+    }
+
+    #[actix_web::test]
+    async fn ingest_rejects_malformed_tenant_with_400() {
+        let req = TestRequest::default()
+            .insert_header((STREAM_NAME_HEADER_KEY, "app"))
+            .insert_header((TENANT_ID, non_ascii()))
+            .to_http_request();
+        let err = ingest(req, empty_body()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PostError::Header(ParseHeaderError::InvalidTenantId)
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn post_event_rejects_malformed_tenant_with_400() {
+        let req = TestRequest::default()
+            .insert_header((TENANT_ID, non_ascii()))
+            .to_http_request();
+        let err = post_event(req, Path::from("app".to_owned()), empty_body())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PostError::Header(ParseHeaderError::InvalidTenantId)
+        ));
+    }
+
+    #[actix_web::test]
+    async fn setup_otel_stream_rejects_bad_stream_and_tenant_headers() {
+        let req = TestRequest::default()
+            .insert_header((STREAM_NAME_HEADER_KEY, non_ascii()))
+            .to_http_request();
+        let Err(err) = setup_otel_stream(
+            &req,
+            LogSource::OtelLogs,
+            &[],
+            TelemetryType::Logs,
+            vec![],
+            vec![],
+        )
+        .await
+        else {
+            panic!("bad header must be rejected");
+        };
+        assert!(matches!(
+            err,
+            PostError::Header(ParseHeaderError::InvalidValue)
+        ));
+
+        let req = TestRequest::default()
+            .insert_header((STREAM_NAME_HEADER_KEY, "otel"))
+            .insert_header((TENANT_ID, non_ascii()))
+            .to_http_request();
+        let Err(err) = setup_otel_stream(
+            &req,
+            LogSource::OtelLogs,
+            &[],
+            TelemetryType::Logs,
+            vec![],
+            vec![],
+        )
+        .await
+        else {
+            panic!("bad header must be rejected");
+        };
+        assert!(matches!(
+            err,
+            PostError::Header(ParseHeaderError::InvalidTenantId)
+        ));
+    }
+
+    #[test]
+    fn nested_header_errors_keep_their_status() {
+        let stream_header =
+            PostError::StreamError(StreamError::Header(ParseHeaderError::InvalidTenantId));
+        assert_eq!(stream_header.status_code(), StatusCode::BAD_REQUEST);
+
+        let stream_input = PostError::StreamError(StreamError::HeaderBuild(
+            HeaderBuildError::Input(ParseHeaderError::InvalidTenantId),
+        ));
+        assert_eq!(stream_input.status_code(), StatusCode::BAD_REQUEST);
+
+        let stream_internal = PostError::StreamError(StreamError::HeaderBuild(
+            HeaderBuildError::Internal("user id"),
+        ));
+        assert_eq!(
+            stream_internal.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let dashboard_header =
+            PostError::DashboardError(DashboardError::Header(ParseHeaderError::InvalidTenantId));
+        assert_eq!(dashboard_header.status_code(), StatusCode::BAD_REQUEST);
+
+        // unrelated nested errors keep their existing 500 mapping
+        let other = PostError::StreamError(StreamError::UninitializedLogstream);
+        assert_eq!(other.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

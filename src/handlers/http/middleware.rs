@@ -40,7 +40,10 @@ use crate::{
     handlers::{
         AUTHORIZATION_KEY, KINESIS_COMMON_ATTRIBUTES_KEY, LOG_SOURCE_KEY, LOG_SOURCE_KINESIS,
         STREAM_NAME_HEADER_KEY, TENANT_ID,
-        http::{ingest::PostError, modal::OIDC_CLIENT, rbac::RBACError},
+        http::{
+            base_path, ingest::PostError, modal::OIDC_CLIENT, prism_base_path, promql,
+            rbac::RBACError, traces::TraceError,
+        },
     },
     option::Mode,
     parseable::{DEFAULT_TENANT, PARSEABLE},
@@ -51,7 +54,12 @@ use crate::{
         user::UserType,
     },
     tenants::TENANT_METADATA,
-    utils::{get_user_and_tenant_from_request, get_user_from_request},
+    tool_executor::ToolCallHeaderError,
+    users::dashboard_runtime,
+    utils::{
+        get_user_and_tenant_from_request, get_user_from_request,
+        header_parsing::{HeaderBuildError, ParseHeaderError, optional_header_str},
+    },
 };
 use crate::{
     rbac::Users,
@@ -62,6 +70,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 pub const CLUSTER_SECRET_HEADER: &str = "x-p-cluster-secret";
+const INTRA_CLUSTER_TENANT_HEADER: &str = "intra-cluster-tenant";
+const INTRA_CLUSTER_USERID_HEADER: &str = "intra-cluster-userid";
 pub static CLUSTER_SECRET: OnceCell<(String, String)> = OnceCell::new();
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -168,18 +178,23 @@ where
 
         // Capture the incoming tenant header value before `get_user_and_tenant`
         // potentially mutates it, so the API-key branch below sees the original
-        // client-supplied value.
-        let tenant_id = req
-            .headers()
-            .get(TENANT_ID)
-            .or_else(|| req.headers().get("intra-cluster-tenant"))
-            .and_then(|v| v.to_str().ok())
-            .filter(|tenant| !tenant.eq(&DEFAULT_TENANT))
-            .map(String::from);
+        // client-supplied value. A malformed value is rejected here, before it
+        // can be replaced or any identity or session is resolved.
+        let tenant_id = match api_key_tenant_hint(req.headers()) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => {
+                let error = tenant_header_error(&req, error);
+                return Box::pin(async move { Err(error) });
+            }
+        };
 
         // an optional error to track the presence of CORRECT tenant header in case of ingestion
         let mut header_error = None;
-        let user_and_tenant_id = get_user_and_tenant(&self.action, &mut req, &mut header_error);
+        let user_and_tenant_id =
+            match get_user_and_tenant(&self.action, &mut req, &mut header_error) {
+                Ok(user_and_tenant_id) => user_and_tenant_id,
+                Err(error) => return Box::pin(async move { Err(error) }),
+            };
 
         // If an API key is present in X-API-KEY or as a Bearer token, resolve it to the backing
         // `UserType::ApiKey` user and register an ephemeral session whose
@@ -193,6 +208,13 @@ where
                     let Some(api_key) = user.as_api_key() else {
                         return Box::pin(async { Err(ErrorUnauthorized("Invalid API key")) });
                     };
+                    // Fallible header work happens before the session is
+                    // tracked so a failure cannot leave a session behind.
+                    if let Err(error) =
+                        insert_api_key_tenant_header(&mut req, &user, is_multi_tenant())
+                    {
+                        return Box::pin(async move { Err(Error::from(error)) });
+                    }
                     let tenant = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
                     let permissions = roles_to_permission(user.roles(), tenant);
                     let session_id = Ulid::new();
@@ -204,7 +226,6 @@ where
                         permissions,
                         &user.tenant,
                     );
-                    insert_api_key_tenant_header(&mut req, &user, is_multi_tenant());
                     req.extensions_mut().insert(session_key);
                     Some(session_id)
                 }
@@ -243,6 +264,9 @@ where
         } else {
             None
         };
+        // Owned from here so the session is removed even if the returned
+        // future is dropped before it is first polled.
+        let api_key_guard = EphemeralSessionGuard(api_key_session_id);
 
         let key: Result<SessionKey, Error> = extract_session_key(&mut req);
 
@@ -250,8 +274,7 @@ where
         if self.action.eq(&Action::Ingest)
             && let Ok(key) = &key
             && let SessionKey::BasicAuth { username, password } = &key
-            && let Ok((_, tenant)) = &user_and_tenant_id
-            && let Some(tenant) = tenant.as_ref()
+            && let (_, Some(tenant)) = &user_and_tenant_id
             && !Users.validate_basic_user_tenant_id(username, password, tenant)
         {
             header_error = Some(actix_web::Error::from(PostError::Header(
@@ -265,17 +288,9 @@ where
         let auth_method = self.auth_method;
         let action = self.action;
         Box::pin(async move {
-            // Guard cleans up the ephemeral session created for an API-key
-            // request when this future finishes (success OR failure).
-            struct ApiKeySessionGuard(Option<Ulid>);
-            impl Drop for ApiKeySessionGuard {
-                fn drop(&mut self) {
-                    if let Some(sid) = self.0 {
-                        mut_sessions().remove_session(&SessionKey::SessionId(sid));
-                    }
-                }
-            }
-            let _api_key_guard = ApiKeySessionGuard(api_key_session_id);
+            // Cleans up the ephemeral session created for an API-key request
+            // when this future finishes (success OR failure) or is dropped.
+            let _api_key_guard = api_key_guard;
 
             let Ok(key) = key else {
                 return Err(ErrorUnauthorized(
@@ -292,7 +307,7 @@ where
             // Basic auth retains its existing precedence when both mechanisms
             // are supplied. Only the selected non-API session may be refreshed.
             if api_key_session.as_ref() != Some(&key) && sessions().is_session_expired(&key) {
-                refresh_token(user_and_tenant_id, &key, headers).await?;
+                refresh_token(Ok(user_and_tenant_id), &key, headers).await?;
             }
             if let Some(api_key_session) = &api_key_session {
                 // This per-request session is capped by the credential's expiry.
@@ -377,19 +392,82 @@ fn extract_api_key(req: &ServiceRequest) -> Option<String> {
         .map(String::from)
 }
 
+/// Removes an ephemeral session when dropped, so the session is cleaned up
+/// whether the request future completes, fails or is cancelled.
+struct EphemeralSessionGuard(Option<Ulid>);
+
+impl Drop for EphemeralSessionGuard {
+    fn drop(&mut self) {
+        if let Some(sid) = self.0 {
+            mut_sessions().remove_session(&SessionKey::SessionId(sid));
+        }
+    }
+}
+
+/// The client-supplied tenant used to scope an API-key lookup: `x-p-tenant`,
+/// or `intra-cluster-tenant` when `x-p-tenant` is absent. A missing header is
+/// `Ok(None)`; a present but non visible-ASCII value is an error, never `None`.
+fn api_key_tenant_hint(headers: &HeaderMap) -> Result<Option<String>, ParseHeaderError> {
+    let tenant = match optional_header_str(headers, TENANT_ID) {
+        Ok(Some(tenant)) => Some(tenant),
+        Ok(None) => optional_header_str(headers, INTRA_CLUSTER_TENANT_HEADER)
+            .map_err(|_| ParseHeaderError::InvalidTenantId)?,
+        Err(_) => return Err(ParseHeaderError::InvalidTenantId),
+    };
+    Ok(tenant
+        .filter(|tenant| !tenant.eq(&DEFAULT_TENANT))
+        .map(String::from))
+}
+
+/// The rejection for a malformed tenant header. This happens before the
+/// handler runs, so endpoints that answer errors in a JSON envelope get theirs
+/// from the handler's own constructor; every other endpoint keeps the plain
+/// text error. Endpoints are recognized by the registered route pattern, found
+/// from the path as the router decoded it, so path parameters and
+/// percent-encoded spellings of a route resolve to the same endpoint.
+fn tenant_header_error(req: &ServiceRequest, error: ParseHeaderError) -> Error {
+    let Some(pattern) = req.resource_map().match_pattern(req.match_info().as_str()) else {
+        return PostError::Header(error).into();
+    };
+    // Registered by `promql::scope` and by the server's dashboards, llm and
+    // traces scopes.
+    if pattern.starts_with(&format!("{}/", promql::SCOPE)) {
+        promql::ApiError::invalid_header(error).into()
+    } else if pattern.starts_with(&format!("{}/services/traces/", prism_base_path())) {
+        TraceError::invalid_header(error).into()
+    } else if pattern == format!("{}/dashboards/preview", base_path()) {
+        dashboard_runtime::invalid_header(error).into()
+    } else if pattern == format!("{}/llm/tools/call", prism_base_path()) {
+        ToolCallHeaderError(error).into()
+    } else {
+        PostError::Header(error).into()
+    }
+}
+
+/// Encode a tenant id the server resolved from its own user records.
+/// The value must read back as text, since handlers re-read the header;
+/// anything else is corrupt stored data and a server error.
+fn stored_tenant_header_value(tenant: &str) -> Result<HeaderValue, HeaderBuildError> {
+    HeaderValue::from_str(tenant)
+        .ok()
+        .filter(|value| value.to_str().is_ok())
+        .ok_or(HeaderBuildError::Internal("stored tenant id"))
+}
+
 /// Add the tenant resolved from an API-key user to a multi-tenant request.
+/// The request is left unchanged on error.
 fn insert_api_key_tenant_header(
     req: &mut ServiceRequest,
     user: &user::User,
     is_multi_tenant: bool,
-) {
+) -> Result<(), HeaderBuildError> {
     if is_multi_tenant {
         let tenant = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
-        req.headers_mut().insert(
-            HeaderName::from_static(TENANT_ID),
-            HeaderValue::from_str(tenant).unwrap(),
-        );
+        let value = stored_tenant_header_value(tenant)?;
+        req.headers_mut()
+            .insert(HeaderName::from_static(TENANT_ID), value);
     }
+    Ok(())
 }
 
 /// Unit tests cannot initialize `PARSEABLE`, which parses the process arguments,
@@ -430,18 +508,21 @@ fn find_api_key_user(api_key_value: &str, tenant_id: &Option<String>) -> Option<
     })
 }
 
+/// Resolve the requesting user and tenant. Client header problems are
+/// recorded in `header_error`; an `Err` is a server-side failure that must
+/// fail the request immediately.
 #[inline]
 fn get_user_and_tenant(
     action: &Action,
     request: &mut ServiceRequest,
     header_error: &mut Option<Error>,
-) -> Result<(Result<String, RBACError>, Option<String>), RBACError> {
+) -> Result<(Result<String, RBACError>, Option<String>), Error> {
     if is_multi_tenant() {
         // if ingestion then tenant MUST be present and should not be DEFAULT_TENANT
         let tenant = if action.eq(&Action::Ingest) {
-            if let Some(tenant) = request.headers().get(TENANT_ID)
-                && let Ok(tenant) = tenant.to_str()
-            {
+            let tenant = optional_header_str(request.headers(), TENANT_ID)
+                .map_err(|_| PostError::Header(ParseHeaderError::InvalidTenantId))?;
+            if let Some(tenant) = tenant {
                 if tenant.eq(DEFAULT_TENANT) {
                     *header_error = Some(actix_web::Error::from(PostError::Header(
                         crate::utils::header_parsing::ParseHeaderError::InvalidTenantId,
@@ -463,10 +544,10 @@ fn get_user_and_tenant(
             if let Ok((_, tenant)) = get_user_and_tenant_from_request(request.request())
                 && let Some(tid) = tenant.as_ref()
             {
-                request.headers_mut().insert(
-                    HeaderName::from_static(TENANT_ID),
-                    HeaderValue::from_str(tid).unwrap(),
-                );
+                let value = stored_tenant_header_value(tid)?;
+                request
+                    .headers_mut()
+                    .insert(HeaderName::from_static(TENANT_ID), value);
                 t = tenant;
             } else {
                 // remove the header if already present
@@ -672,7 +753,7 @@ pub fn auth_resource_context(
     let creds = extract_session_key(req);
     let usergroup = req.match_info().get("usergroup");
     let llmid = req.match_info().get("llmid");
-    let mut stream = req.match_info().get("logstream");
+    let stream = req.match_info().get("logstream");
     if let Some(usergroup) = usergroup {
         creds.map(|key| Users.authorize(key, action, Some(usergroup), None))
     } else if let Some(llmid) = llmid {
@@ -680,9 +761,9 @@ pub fn auth_resource_context(
     } else if let Some(stream) = stream {
         creds.map(|key| Users.authorize(key, action, Some(stream), None))
     } else {
-        if let Some(stream_name) = req.headers().get(STREAM_NAME_HEADER_KEY) {
-            stream = Some(stream_name.to_str().unwrap());
-        }
+        // Path resources take precedence, so the header is only read here.
+        let stream = optional_header_str(req.headers(), STREAM_NAME_HEADER_KEY)
+            .map_err(PostError::Header)?;
         creds.map(|key| Users.authorize(key, action, stream, None))
     }
 }
@@ -793,84 +874,87 @@ where
     forward_ready!(service);
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
-        let (err, id) = if let Some((secret, _)) = CLUSTER_SECRET.get() {
-            if let Some(header) = req.headers().get(CLUSTER_SECRET_HEADER)
-                && let Some(tenant) = req.headers().get("intra-cluster-tenant")
-                && let Some(userid) = req.headers().get("intra-cluster-userid")
-                && let Ok(incoming_secret) = header.to_str()
-                && let Ok(tenant) = tenant.to_str()
-                && let Ok(userid) = userid.to_str()
-            {
-                // validate the incoming header value
-                let parsed_hash = PasswordHash::new(incoming_secret).unwrap();
-                if Argon2::default()
-                    .verify_password(secret.as_bytes(), &parsed_hash)
-                    .is_ok()
-                {
-                    // create a user session (how to remove that later?)
-                    let tenant_id = if tenant.eq(DEFAULT_TENANT) {
-                        None
-                    } else {
-                        Some(tenant.to_owned())
-                    };
-                    let user = Users.get_user(userid, &tenant_id);
-                    // Forwarded work must not outlive the API key that authorized it.
-                    if user
-                        .as_ref()
-                        .and_then(|user| user.as_api_key())
-                        .is_some_and(|api_key| api_key.is_expired_at(Utc::now()))
-                    {
-                        return Box::pin(async { Err(ErrorUnauthorized("Invalid API key")) });
-                    }
-                    let id = if let Some(user) = user {
-                        let id = Ulid::new();
-                        req.headers_mut().insert(
-                            header::COOKIE,
-                            HeaderValue::from_str(&format!("session={}", id)).unwrap(),
-                        );
-
-                        // remove basic auth header
-                        req.headers_mut().remove(header::AUTHORIZATION);
-
-                        let session = SessionKey::SessionId(id);
-                        req.extensions_mut().insert(session.clone());
-                        Users.new_session(&user, session, TimeDelta::seconds(20));
-                        Some(id)
-                    } else {
-                        None
-                    };
-                    (None, id)
-                } else {
-                    (
-                        Some("Incoming intra-cluster request validation failed"),
-                        None,
-                    )
-                }
-            } else {
-                (
-                    Some(
-                        "Incoming intra-cluster request doesn't contain the proper header or the server was started without P_CLUSTER_SECRET",
-                    ),
-                    None,
-                )
-            }
-        } else {
-            (None, None)
+        // Without a configured secret the request passes through unchanged.
+        let session_guard = match CLUSTER_SECRET.get() {
+            Some((secret, _)) => match authenticate_intra_cluster_request(&mut req, secret) {
+                Ok(guard) => guard,
+                // Rejected before the inner service sees the request.
+                Err(error) => return Box::pin(async move { Err(error) }),
+            },
+            None => EphemeralSessionGuard(None),
         };
 
         let fut = self.service.call(req);
 
         Box::pin(async move {
-            if let Some(err) = err {
-                return Err(ErrorUnauthorized(err));
-            }
-            let res = fut.await;
-            if let Some(id) = id {
-                mut_sessions().remove_session(&SessionKey::SessionId(id));
-            }
-            res
+            // The forwarded user's session ends with this request.
+            let _session_guard = session_guard;
+            fut.await
         })
     }
+}
+
+/// Verify the forwarded cluster credentials and give the forwarded user a
+/// short-lived session. Credentials present but not visible ASCII, or a
+/// secret that is not a PHC password hash, are 400; missing or wrong
+/// credentials are 401. Submitted values never appear in errors.
+fn authenticate_intra_cluster_request(
+    req: &mut ServiceRequest,
+    secret: &str,
+) -> Result<EphemeralSessionGuard, Error> {
+    let headers = req.headers();
+    let incoming_secret = optional_header_str(headers, CLUSTER_SECRET_HEADER)?;
+    let tenant = optional_header_str(headers, INTRA_CLUSTER_TENANT_HEADER)?;
+    let userid = optional_header_str(headers, INTRA_CLUSTER_USERID_HEADER)?;
+    let (Some(incoming_secret), Some(tenant), Some(userid)) = (incoming_secret, tenant, userid)
+    else {
+        return Err(ErrorUnauthorized(
+            "Incoming intra-cluster request doesn't contain the proper header or the server was started without P_CLUSTER_SECRET",
+        ));
+    };
+
+    // validate the incoming header value
+    let parsed_hash = PasswordHash::new(incoming_secret)
+        .map_err(|_| ErrorBadRequest("Incoming intra-cluster secret is malformed"))?;
+    if Argon2::default()
+        .verify_password(secret.as_bytes(), &parsed_hash)
+        .is_err()
+    {
+        return Err(ErrorUnauthorized(
+            "Incoming intra-cluster request validation failed",
+        ));
+    }
+
+    let tenant_id = if tenant.eq(DEFAULT_TENANT) {
+        None
+    } else {
+        Some(tenant.to_owned())
+    };
+    let Some(user) = Users.get_user(userid, &tenant_id) else {
+        return Ok(EphemeralSessionGuard(None));
+    };
+    // Forwarded work must not outlive the API key that authorized it.
+    if user
+        .as_api_key()
+        .is_some_and(|api_key| api_key.is_expired_at(Utc::now()))
+    {
+        return Err(ErrorUnauthorized("Invalid API key"));
+    }
+
+    // Build the cookie before registering the session so a failure here
+    // cannot leave a session behind.
+    let id = Ulid::new();
+    let cookie = HeaderValue::from_str(&format!("session={id}"))
+        .map_err(|_| HeaderBuildError::Internal("intra-cluster session cookie"))?;
+    req.headers_mut().insert(header::COOKIE, cookie);
+
+    // remove basic auth header
+    req.headers_mut().remove(header::AUTHORIZATION);
+
+    let session = SessionKey::SessionId(id);
+    req.extensions_mut().insert(session.clone());
+    Users.new_session(&user, session, TimeDelta::seconds(20));
+    Ok(EphemeralSessionGuard(Some(id)))
 }
 
 /// ModeFilterMiddleware factory
@@ -1103,21 +1187,116 @@ mod api_key_header_tests {
         );
         let mut req = actix_test::TestRequest::default().to_srv_request();
 
-        insert_api_key_tenant_header(&mut req, &user, true);
+        insert_api_key_tenant_header(&mut req, &user, true).unwrap();
 
         assert_eq!(req.headers().get(TENANT_ID).unwrap(), "acme");
+    }
+
+    #[test]
+    fn unencodable_stored_api_key_tenant_is_a_server_error() {
+        // Stored data that cannot be sent as a header, or would not read
+        // back as text, is the server's fault and must not panic.
+        for tenant in ["bad\ntenant", "tenänt"] {
+            let user = user::User::new_api_key(
+                Ulid::new(),
+                "valid-api-key".to_owned(),
+                "test-key".to_owned(),
+                HashSet::new(),
+                "admin".to_owned(),
+                Some(tenant.to_owned()),
+            );
+            let mut req = actix_test::TestRequest::default().to_srv_request();
+
+            let error = insert_api_key_tenant_header(&mut req, &user, true).unwrap_err();
+
+            assert!(matches!(error, HeaderBuildError::Internal(_)));
+            assert_eq!(
+                Error::from(error).as_response_error().status_code(),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert!(req.headers().get(TENANT_ID).is_none());
+            // Single-tenant requests never carry the header.
+            insert_api_key_tenant_header(&mut req, &user, false).unwrap();
+            assert!(req.headers().get(TENANT_ID).is_none());
+        }
+    }
+
+    fn header_map(pairs: &[(&'static str, &[u8])]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for &(name, value) in pairs {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn api_key_tenant_hint_rejects_malformed_headers() {
+        let invalid = b"\xff".as_slice();
+        for (pairs, expected) in [
+            (vec![], Ok(None)),
+            (vec![(TENANT_ID, b"acme".as_slice())], Ok(Some("acme"))),
+            (vec![(TENANT_ID, DEFAULT_TENANT.as_bytes())], Ok(None)),
+            (vec![(TENANT_ID, invalid)], Err(())),
+            (vec![(TENANT_ID, b"caf\xc3\xa9".as_slice())], Err(())),
+            // A malformed client tenant is not replaced by the fallback.
+            (
+                vec![
+                    (TENANT_ID, invalid),
+                    (INTRA_CLUSTER_TENANT_HEADER, b"acme".as_slice()),
+                ],
+                Err(()),
+            ),
+            (
+                vec![(INTRA_CLUSTER_TENANT_HEADER, b"acme".as_slice())],
+                Ok(Some("acme")),
+            ),
+            (vec![(INTRA_CLUSTER_TENANT_HEADER, invalid)], Err(())),
+            // The fallback is only read when `x-p-tenant` is absent.
+            (
+                vec![
+                    (TENANT_ID, b"acme".as_slice()),
+                    (INTRA_CLUSTER_TENANT_HEADER, invalid),
+                ],
+                Ok(Some("acme")),
+            ),
+        ] {
+            let result = api_key_tenant_hint(&header_map(&pairs));
+            match expected {
+                Ok(expected) => assert_eq!(result.unwrap().as_deref(), expected),
+                Err(()) => assert!(matches!(result, Err(ParseHeaderError::InvalidTenantId))),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod api_key_auth_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    use actix_web::{App, HttpResponse, http::StatusCode, test as actix_test, web};
+    use actix_web::{
+        App, HttpResponse,
+        body::{MessageBody, to_bytes},
+        dev::fn_service,
+        http::{Method, StatusCode},
+        test as actix_test, web,
+    };
     use argon2::{PasswordHasher, password_hash::SaltString};
     use base64::{Engine, prelude::BASE64_STANDARD};
+    use bytes::Bytes;
     use chrono::DateTime;
     use parking_lot::RwLock;
+    use proptest::{
+        collection::vec,
+        prelude::*,
+        test_runner::{Config, TestRunner},
+    };
+    use serde_json::{Value, json};
     use tokio::sync::MutexGuard;
 
     use super::*;
@@ -1218,25 +1397,117 @@ mod api_key_auth_tests {
         intra_cluster: bool,
         headers: &[(&'static str, String)],
     ) -> StatusCode {
-        let route = web::get()
-            .to(|| async { HttpResponse::Ok().finish() })
-            .wrap(Auth {
-                action: Action::Query,
-                method,
-            });
-        let app = if intra_cluster {
-            actix_test::init_service(App::new().route("/", route.wrap(IntraClusterRequest))).await
-        } else {
-            actix_test::init_service(App::new().route("/", route)).await
+        let headers: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| (*name, HeaderValue::from_str(value).unwrap()))
+            .collect();
+        call_app(method, intra_cluster, "/", &headers).await.status
+    }
+
+    /// Calls to `counting_auth`. `Auth` always runs its method synchronously
+    /// in `call` unless it rejects the request first, so an unchanged count
+    /// shows an outer middleware never called into it. Tests only compare
+    /// counts while holding `TEST_SERIAL`.
+    static AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_auth(req: &mut ServiceRequest, action: Action) -> Result<rbac::Response, Error> {
+        AUTH_CALLS.fetch_add(1, Ordering::SeqCst);
+        auth_no_context(req, action)
+    }
+
+    struct Outcome {
+        status: StatusCode,
+        error: Option<String>,
+        handled: usize,
+        auth_calls: usize,
+    }
+
+    /// Serves `/` and `/logstream/{logstream}` behind `Auth` (and optionally
+    /// `IntraClusterRequest`), accepting raw header values.
+    async fn call_app(
+        method: AuthMethod,
+        intra_cluster: bool,
+        uri: &str,
+        headers: &[(&'static str, HeaderValue)],
+    ) -> Outcome {
+        let handled = Arc::new(AtomicUsize::new(0));
+        let route = |handled: Arc<AtomicUsize>| {
+            let route = web::get()
+                .to(move || {
+                    handled.fetch_add(1, Ordering::SeqCst);
+                    async { HttpResponse::Ok().finish() }
+                })
+                .wrap(Auth {
+                    action: Action::Query,
+                    method,
+                });
+            if intra_cluster {
+                route.wrap(IntraClusterRequest)
+            } else {
+                route
+            }
         };
-        let mut req = actix_test::TestRequest::get().uri("/");
+        let app = actix_test::init_service(
+            App::new()
+                .route("/", route(Arc::clone(&handled)))
+                .route("/logstream/{logstream}", route(Arc::clone(&handled))),
+        )
+        .await;
+        let mut req = actix_test::TestRequest::get().uri(uri);
         for header in headers {
             req = req.insert_header(header.clone());
         }
-        match actix_test::try_call_service(&app, req.to_request()).await {
-            Ok(response) => response.status(),
-            Err(error) => error.as_response_error().status_code(),
+        let auth_calls = AUTH_CALLS.load(Ordering::SeqCst);
+        let (status, error) = match actix_test::try_call_service(&app, req.to_request()).await {
+            Ok(response) => (response.status(), None),
+            Err(error) => (
+                error.as_response_error().status_code(),
+                Some(error.to_string()),
+            ),
+        };
+        Outcome {
+            status,
+            error,
+            handled: handled.load(Ordering::SeqCst),
+            auth_calls: AUTH_CALLS.load(Ordering::SeqCst) - auth_calls,
         }
+    }
+
+    fn basic_admin() -> (&'static str, HeaderValue) {
+        let username = format!("header-test-{}", Ulid::new()).to_lowercase();
+        let (mut basic, password) = user::User::new_basic(username.clone(), None, false);
+        basic.roles.insert(ROLE.to_owned());
+        mut_users().insert(basic);
+        let credentials = BASE64_STANDARD.encode(format!("{username}:{password}"));
+        (
+            "authorization",
+            HeaderValue::from_str(&format!("Basic {credentials}")).unwrap(),
+        )
+    }
+
+    fn raw(value: &[u8]) -> HeaderValue {
+        HeaderValue::from_bytes(value).unwrap()
+    }
+
+    fn text(value: &str) -> HeaderValue {
+        HeaderValue::from_str(value).unwrap()
+    }
+
+    fn raw_cluster_headers(user: &user::User) -> Vec<(&'static str, HeaderValue)> {
+        cluster_headers(user)
+            .into_iter()
+            .map(|(name, value)| (name, text(&value)))
+            .collect()
+    }
+
+    fn with_header(
+        mut headers: Vec<(&'static str, HeaderValue)>,
+        name: &'static str,
+        value: Option<HeaderValue>,
+    ) -> Vec<(&'static str, HeaderValue)> {
+        headers.retain(|(header, _)| *header != name);
+        headers.extend(value.map(|value| (name, value)));
+        headers
     }
 
     /// Simulates the key's deadline passing after its session was registered.
@@ -1377,5 +1648,532 @@ mod api_key_auth_tests {
             assert_eq!(sessions().is_session_expired(&session), expired);
             mut_sessions().remove_session(&session);
         }
+    }
+
+    #[actix_web::test]
+    async fn malformed_stream_header_is_rejected_before_authorization() {
+        let _state = auth_state().await;
+        let auth = basic_admin();
+        let stream = |value: HeaderValue| vec![auth.clone(), (STREAM_NAME_HEADER_KEY, value)];
+
+        for value in [raw(b"\xff"), raw(b"caf\xc3\xa9")] {
+            let outcome = call_app(auth_resource_context, false, "/", &stream(value)).await;
+            assert_eq!(outcome.status, StatusCode::BAD_REQUEST);
+            assert!(outcome.error.unwrap().contains("visible ASCII"));
+            assert_eq!(outcome.handled, 0);
+        }
+
+        let outcome = call_app(auth_resource_context, false, "/", &stream(text("app-logs"))).await;
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert_eq!(outcome.handled, 1);
+    }
+
+    #[actix_web::test]
+    async fn path_stream_takes_precedence_over_malformed_stream_header() {
+        let _state = auth_state().await;
+        let headers = [basic_admin(), (STREAM_NAME_HEADER_KEY, raw(b"\xff"))];
+
+        let outcome = call_app(
+            auth_resource_context,
+            false,
+            "/logstream/app-logs",
+            &headers,
+        )
+        .await;
+
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert_eq!(outcome.handled, 1);
+    }
+
+    #[actix_web::test]
+    async fn malformed_tenant_header_is_rejected_before_api_key_session() {
+        let _state = auth_state().await;
+        let (user, secret) = api_key_user(None);
+        let api_key = ("x-api-key", text(&secret));
+
+        for tenant_header in [TENANT_ID, INTRA_CLUSTER_TENANT_HEADER] {
+            let headers = [api_key.clone(), (tenant_header, raw(b"\xff"))];
+            let outcome = call_app(counting_auth, false, "/", &headers).await;
+            assert_eq!(outcome.status, StatusCode::BAD_REQUEST);
+            // Rejected as malformed up front, not as an unexpected header
+            // after the API key resolved an identity.
+            assert!(outcome.error.unwrap().contains("Invalid tenant id"));
+            assert_eq!((outcome.handled, outcome.auth_calls), (0, 0));
+            assert!(!has_sessions(&user));
+        }
+
+        let outcome = call_app(counting_auth, false, "/", &[api_key]).await;
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert_eq!(outcome.handled, 1);
+        assert!(!has_sessions(&user));
+    }
+
+    /// Status, content type and body the client receives, whether the app
+    /// answered or failed with an error.
+    async fn read_reply<S, R, B>(app: &S, req: R) -> (StatusCode, Option<String>, Bytes)
+    where
+        S: Service<R, Response = ServiceResponse<B>, Error = Error>,
+        B: MessageBody + 'static,
+    {
+        let response = match actix_test::try_call_service(app, req).await {
+            Ok(response) => response.map_into_boxed_body().into_parts().1,
+            Err(error) => error.error_response(),
+        };
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let status = response.status();
+        let body = to_bytes(response.into_body()).await.expect("buffered body");
+        (status, content_type, body)
+    }
+
+    /// The tenant error for each endpoint family, in its handler's envelope.
+    fn expected_tenant_error(family: &str) -> Option<Value> {
+        let message = ParseHeaderError::InvalidTenantId.to_string();
+        match family {
+            "promql" => Some(json!({"status":"error","errorType":"bad_data","error":message})),
+            "traces" => Some(json!({"error":message})),
+            "preview" => Some(json!({
+                "error": {"code":"INVALID_HEADER","message":message,"details":{}},
+                "message": message,
+            })),
+            "tools" => Some(json!({
+                "content": [{"type":"text","text":message}],
+                "structuredContent": {"error":{"message":message}},
+                "isError": true,
+            })),
+            _ => None,
+        }
+    }
+
+    /// Asserts a malformed-tenant 400 in `family`'s format that does not echo
+    /// the submitted value.
+    fn assert_tenant_rejection(
+        family: &str,
+        context: &str,
+        (status, content_type, body): (StatusCode, Option<String>, Bytes),
+    ) {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{context}");
+        assert!(
+            !body
+                .windows(SUBMITTED_TENANT.len())
+                .any(|w| w == SUBMITTED_TENANT),
+            "{context}: the submitted tenant is echoed"
+        );
+        match expected_tenant_error(family) {
+            Some(expected) => {
+                assert_eq!(
+                    content_type.as_deref(),
+                    Some("application/json"),
+                    "{context}"
+                );
+                let body: Value = serde_json::from_slice(&body).expect("JSON error body");
+                assert_eq!(body, expected, "{context}");
+            }
+            None => {
+                assert_eq!(
+                    content_type.as_deref(),
+                    Some("text/plain; charset=utf-8"),
+                    "{context}"
+                );
+                assert_eq!(
+                    body,
+                    format!("Header Error: {}", ParseHeaderError::InvalidTenantId),
+                    "{context}"
+                );
+            }
+        }
+    }
+
+    const SUBMITTED_TENANT: &[u8] = b"acme-tenant";
+
+    /// Present but not visible ASCII, carrying a recognizable submitted value.
+    fn malformed_tenants() -> [HeaderValue; 2] {
+        [raw(b"acme-tenant\xff"), raw(b"acme-tenant\xc3\xa9")]
+    }
+
+    #[actix_web::test]
+    async fn malformed_tenant_is_rejected_in_each_endpoint_error_format() {
+        let _state = auth_state().await;
+        let (api_user, secret) = api_key_user(None);
+        let credentials = [
+            ("basic", basic_admin()),
+            ("api key", ("x-api-key", text(&secret))),
+        ];
+
+        // Counting stubs behind `Auth` at the paths the servers register,
+        // so only the middleware and the production error constructors run.
+        let handled = Arc::new(AtomicUsize::new(0));
+        let stub = |route: Route| {
+            let handled = Arc::clone(&handled);
+            route
+                .to(move || {
+                    handled.fetch_add(1, Ordering::SeqCst);
+                    async { HttpResponse::Ok().finish() }
+                })
+                .wrap(Auth {
+                    action: Action::Query,
+                    method: counting_auth,
+                })
+        };
+        let app = actix_test::init_service(
+            App::new()
+                .service(
+                    web::scope(promql::SCOPE)
+                        .route("/query", stub(web::get()))
+                        .route("/query_range", stub(web::post()))
+                        .route("/label/{name}/values", stub(web::get())),
+                )
+                .service(
+                    web::scope(&base_path())
+                        .route("/query", stub(web::post()))
+                        .service(
+                            web::scope("/dashboards")
+                                .route("/preview", stub(web::post()))
+                                .route("/{dashboard_id}", stub(web::post())),
+                        ),
+                )
+                .service(
+                    web::scope(&prism_base_path())
+                        .service(
+                            web::scope("/llm")
+                                .route("/tools/list", stub(web::post()))
+                                .route("/tools/call", stub(web::post())),
+                        )
+                        .service(
+                            web::scope("/services/traces")
+                                .route("/list", stub(web::post()))
+                                .route("/detail", stub(web::post())),
+                        ),
+                ),
+        )
+        .await;
+
+        let cases = [
+            (Method::GET, "/prometheus/api/v1/query", "promql"),
+            (Method::POST, "/prometheus/api/v1/query_range", "promql"),
+            (Method::GET, "/prometheus/api/v1/label/job/values", "promql"),
+            (Method::POST, "/api/prism/v1/services/traces/list", "traces"),
+            (
+                Method::POST,
+                "/api/prism/v1/services/traces/detail",
+                "traces",
+            ),
+            (
+                Method::POST,
+                "/api/prism/v1/services/traces/%6cist",
+                "traces",
+            ),
+            (Method::POST, "/api/v1/dashboards/preview", "preview"),
+            // Routed to `/preview`, though the raw path would match `/{dashboard_id}`.
+            (Method::POST, "/api/v1/dashboards/%70review", "preview"),
+            (Method::POST, "/api/prism/v1/llm/tools/call", "tools"),
+            (Method::POST, "/api/prism/v1/llm/tools/%63all", "tools"),
+            // Ordinary endpoints keep the plain-text error, including the
+            // SQL endpoint whose path is a suffix of a PromQL one.
+            (Method::POST, "/api/v1/query", "plain"),
+            (Method::POST, "/api/v1/dashboards/abc", "plain"),
+            (Method::POST, "/api/prism/v1/llm/tools/list", "plain"),
+        ];
+        let active_sessions = sessions().get_active_sessions().len();
+        for (method, uri, family) in &cases {
+            for (credential, auth) in &credentials {
+                for tenant_header in [TENANT_ID, INTRA_CLUSTER_TENANT_HEADER] {
+                    for tenant in malformed_tenants() {
+                        let context =
+                            format!("{method} {uri} with {credential} and {tenant_header}");
+                        let handled_before = handled.load(Ordering::SeqCst);
+                        let auth_calls = AUTH_CALLS.load(Ordering::SeqCst);
+                        let req = actix_test::TestRequest::default()
+                            .method(method.clone())
+                            .uri(uri)
+                            .insert_header(auth.clone())
+                            .insert_header((tenant_header, tenant))
+                            .to_request();
+                        assert_tenant_rejection(family, &context, read_reply(&app, req).await);
+                        assert_eq!(handled.load(Ordering::SeqCst), handled_before, "{context}");
+                        assert_eq!(AUTH_CALLS.load(Ordering::SeqCst), auth_calls, "{context}");
+                        assert_eq!(
+                            sessions().get_active_sessions().len(),
+                            active_sessions,
+                            "{context}: a session was created"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(!has_sessions(&api_user));
+
+        // The same requests without a tenant header reach the handler, so
+        // every path above is a registered route.
+        for (method, uri, _) in &cases {
+            let handled_before = handled.load(Ordering::SeqCst);
+            let req = actix_test::TestRequest::default()
+                .method(method.clone())
+                .uri(uri)
+                .insert_header(credentials[1].1.clone())
+                .to_request();
+            let (status, _, _) = read_reply(&app, req).await;
+            assert_eq!(status, StatusCode::OK, "{method} {uri}");
+            assert_eq!(
+                handled.load(Ordering::SeqCst),
+                handled_before + 1,
+                "{method} {uri}"
+            );
+        }
+        assert!(!has_sessions(&api_user));
+    }
+
+    #[actix_web::test]
+    async fn production_promql_and_traces_routes_reject_malformed_tenant_as_json() {
+        let _state = auth_state().await;
+        let (api_user, secret) = api_key_user(None);
+        // Mounted exactly as the servers' `configure_routes` mount them.
+        let app = actix_test::init_service(
+            App::new().service(promql::scope()).service(
+                web::scope(&prism_base_path())
+                    .service(crate::handlers::http::modal::server::Server::get_traces_webscope()),
+            ),
+        )
+        .await;
+
+        let cases = [
+            (Method::GET, "/prometheus/api/v1/query", "promql"),
+            (Method::POST, "/prometheus/api/v1/query", "promql"),
+            (Method::GET, "/prometheus/api/v1/query_range", "promql"),
+            (Method::GET, "/prometheus/api/v1/labels", "promql"),
+            (
+                Method::GET,
+                "/prometheus/api/v1/label/__name__/values",
+                "promql",
+            ),
+            (Method::POST, "/api/prism/v1/services/traces/list", "traces"),
+            (
+                Method::POST,
+                "/api/prism/v1/services/traces/detail",
+                "traces",
+            ),
+        ];
+        let active_sessions = sessions().get_active_sessions().len();
+        for (method, uri, family) in cases {
+            for tenant_header in [TENANT_ID, INTRA_CLUSTER_TENANT_HEADER] {
+                for tenant in malformed_tenants() {
+                    let req = actix_test::TestRequest::default()
+                        .method(method.clone())
+                        .uri(uri)
+                        .insert_header(("x-api-key", text(&secret)))
+                        .insert_header((tenant_header, tenant))
+                        .to_request();
+                    let context = format!("{method} {uri} with {tenant_header}");
+                    assert_tenant_rejection(family, &context, read_reply(&app, req).await);
+                    assert_eq!(sessions().get_active_sessions().len(), active_sessions);
+                }
+            }
+        }
+        assert!(!has_sessions(&api_user));
+    }
+
+    #[actix_web::test]
+    async fn intra_cluster_rejects_malformed_credentials_before_inner_service() {
+        let _state = auth_state().await;
+        let (user, _) = api_key_user(None);
+        let valid = raw_cluster_headers(&user);
+        let malformed_hash = "not-a-phc-hash";
+
+        // The messages show `IntraClusterRequest` rejected the request, not
+        // the inner `Auth`, which reports a malformed tenant differently.
+        for (name, value, message) in [
+            (CLUSTER_SECRET_HEADER, raw(b"\xff"), "visible ASCII"),
+            (INTRA_CLUSTER_TENANT_HEADER, raw(b"\xff"), "visible ASCII"),
+            (
+                INTRA_CLUSTER_USERID_HEADER,
+                raw(b"caf\xc3\xa9"),
+                "visible ASCII",
+            ),
+            (CLUSTER_SECRET_HEADER, text(malformed_hash), "malformed"),
+        ] {
+            let headers = with_header(valid.clone(), name, Some(value));
+            let outcome = call_app(counting_auth, true, "/", &headers).await;
+            assert_eq!(outcome.status, StatusCode::BAD_REQUEST, "{name}");
+            let error = outcome.error.unwrap();
+            assert!(error.contains(message), "{name}: {error}");
+            assert!(!error.contains(malformed_hash));
+            assert_eq!((outcome.handled, outcome.auth_calls), (0, 0), "{name}");
+            assert!(!has_sessions(&user));
+        }
+
+        let outcome = call_app(counting_auth, true, "/", &valid).await;
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert_eq!((outcome.handled, outcome.auth_calls), (1, 2));
+        assert!(!has_sessions(&user));
+    }
+
+    #[actix_web::test]
+    async fn intra_cluster_rejects_missing_or_wrong_credentials() {
+        let _state = auth_state().await;
+        let (user, _) = api_key_user(None);
+        let valid = raw_cluster_headers(&user);
+        let salt = SaltString::encode_b64(b"wrong-cluster-salt").unwrap();
+        let wrong_hash = Argon2::default()
+            .hash_password(b"wrong-cluster-secret", &salt)
+            .unwrap()
+            .to_string();
+
+        let mut cases: Vec<_> = [
+            CLUSTER_SECRET_HEADER,
+            INTRA_CLUSTER_TENANT_HEADER,
+            INTRA_CLUSTER_USERID_HEADER,
+        ]
+        .into_iter()
+        .map(|name| with_header(valid.clone(), name, None))
+        .collect();
+        cases.push(with_header(
+            valid.clone(),
+            CLUSTER_SECRET_HEADER,
+            Some(text(&wrong_hash)),
+        ));
+
+        for headers in cases {
+            let outcome = call_app(counting_auth, true, "/", &headers).await;
+            assert_eq!(outcome.status, StatusCode::UNAUTHORIZED);
+            assert_eq!((outcome.handled, outcome.auth_calls), (0, 0));
+            assert!(!has_sessions(&user));
+        }
+
+        let outcome = call_app(counting_auth, true, "/", &valid).await;
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert_eq!(outcome.handled, 1);
+        assert!(!has_sessions(&user));
+    }
+
+    #[actix_web::test]
+    async fn api_key_session_is_removed_when_unpolled_future_is_dropped() {
+        let _state = auth_state().await;
+        let (user, secret) = api_key_user(Some(Utc::now() + TimeDelta::hours(1)));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let inner = {
+            let handled = Arc::clone(&handled);
+            fn_service(move |req: ServiceRequest| {
+                handled.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<_, Error>(req.into_response(HttpResponse::Ok().finish())) }
+            })
+        };
+        let middleware = AuthMiddleware {
+            action: Action::Query,
+            auth_method: counting_auth,
+            service: Rc::new(inner),
+        };
+        let req = actix_test::TestRequest::default()
+            .insert_header(("x-api-key", secret))
+            .to_srv_request();
+
+        // `call` registers the API-key session before returning its future.
+        let future = middleware.call(req);
+        let session = sessions()
+            .get_active_sessions()
+            .into_iter()
+            .find_map(|(key, userid, _)| (userid == user.userid()).then_some(key))
+            .expect("API-key session is registered by `call`");
+        assert!(sessions().get(&session).is_some());
+        assert!(!sessions().is_session_expired(&session));
+
+        // A client disconnect can drop the future before it is ever polled.
+        drop(future);
+        assert!(!has_sessions(&user));
+        assert_eq!(handled.load(Ordering::SeqCst), 0);
+    }
+
+    /// Bytes `HeaderValue` accepts, so every case can reach the server:
+    /// printable ASCII (possibly empty), or visible ASCII mixed with at least
+    /// one obs-text byte (0x80..=0xff) that `to_str` rejects. At most 256 bytes.
+    fn accepted_header_bytes() -> impl Strategy<Value = Vec<u8>> {
+        let printable = vec(0x20u8..=0x7e, 0..=256);
+        let obs_text = (
+            vec(prop_oneof![0x20u8..=0x7e, 0x80u8..=0xff], 0..=255),
+            0x80u8..=0xff,
+            any::<prop::sample::Index>(),
+        )
+            .prop_map(|(mut bytes, obs, at)| {
+                let at = at.index(bytes.len() + 1);
+                bytes.insert(at, obs);
+                bytes
+            });
+        prop_oneof![1 => printable, 1 => obs_text]
+    }
+
+    #[test]
+    fn header_extractors_never_panic_on_accepted_bytes() {
+        let _state = blocking_auth_state();
+        let auth = basic_admin();
+        let bad_request = |error: Error| error.as_response_error().status_code();
+        let (text_cases, obs_text_cases) = (AtomicUsize::new(0), AtomicUsize::new(0));
+
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner
+            .run(&accepted_header_bytes(), |bytes| {
+                prop_assert!(bytes.len() <= 256);
+                let value = HeaderValue::from_bytes(&bytes)
+                    .expect("generator only yields bytes `HeaderValue` accepts");
+                let accepted = value.to_str().ok();
+                let printable = bytes.iter().all(|byte| (0x20..=0x7e).contains(byte));
+                prop_assert_eq!(accepted.is_some(), printable);
+                let category = if printable {
+                    &text_cases
+                } else {
+                    &obs_text_cases
+                };
+                category.fetch_add(1, Ordering::SeqCst);
+
+                let mut headers = HeaderMap::new();
+                headers.insert(HeaderName::from_static(TENANT_ID), value.clone());
+                match (api_key_tenant_hint(&headers), accepted) {
+                    (Ok(hint), Some(text)) => {
+                        prop_assert_eq!(hint.as_deref(), (text != DEFAULT_TENANT).then_some(text))
+                    }
+                    (Err(error), None) => {
+                        prop_assert_eq!(bad_request(error.into()), StatusCode::BAD_REQUEST)
+                    }
+                    (result, _) => prop_assert!(false, "unexpected tenant hint {result:?}"),
+                }
+
+                let mut req = actix_test::TestRequest::default()
+                    .insert_header(auth.clone())
+                    .insert_header((STREAM_NAME_HEADER_KEY, value.clone()))
+                    .to_srv_request();
+                match (auth_resource_context(&mut req, Action::Query), accepted) {
+                    (Ok(rbac::Response::Authorized), Some(_)) => {}
+                    (Err(error), None) => {
+                        prop_assert_eq!(bad_request(error), StatusCode::BAD_REQUEST)
+                    }
+                    (result, _) => prop_assert!(false, "unexpected auth result {result:?}"),
+                }
+
+                let mut req = actix_test::TestRequest::default()
+                    .insert_header((CLUSTER_SECRET_HEADER, value.clone()))
+                    .insert_header((INTRA_CLUSTER_TENANT_HEADER, DEFAULT_TENANT))
+                    .insert_header((INTRA_CLUSTER_USERID_HEADER, "header-proptest"))
+                    .to_srv_request();
+                let status = authenticate_intra_cluster_request(&mut req, CLUSTER_TEST_SECRET)
+                    .err()
+                    .map(bad_request);
+                match accepted {
+                    None => prop_assert_eq!(status, Some(StatusCode::BAD_REQUEST)),
+                    Some(_) => prop_assert!(matches!(
+                        status,
+                        Some(StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED)
+                    )),
+                }
+                Ok(())
+            })
+            .unwrap();
+        // Both categories ran, so neither branch above went untested.
+        assert!(text_cases.load(Ordering::SeqCst) > 0);
+        assert!(obs_text_cases.load(Ordering::SeqCst) > 0);
     }
 }

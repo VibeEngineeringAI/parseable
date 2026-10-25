@@ -56,7 +56,7 @@ pub async fn put(
         return Err(RoleError::SuperAdminPrivilege);
     }
     let name = name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     // extract caller userid early, before any session mutations
     let caller_userid =
@@ -131,7 +131,7 @@ pub async fn delete(
 ) -> Result<impl Responder, RoleError> {
     let guard = UPDATE_LOCK.lock().await;
     let name = name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     // extract caller userid early, before any session mutations
     let caller_userid =

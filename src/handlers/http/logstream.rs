@@ -57,7 +57,7 @@ pub async fn delete(
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
     // Error out if stream doesn't exist in memory, or in the case of query node, in storage as well
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     if !PARSEABLE
         .check_or_load_stream(&stream_name, &tenant_id)
         .await
@@ -99,7 +99,7 @@ pub async fn list(req: HttpRequest) -> Result<impl Responder, StreamError> {
     let key = extract_session_key_from_req(&req)
         .map_err(|err| StreamError::Anyhow(anyhow::Error::msg(err.to_string())))?;
 
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // list all streams from storage
     let res = PARSEABLE
         .metastore
@@ -292,7 +292,7 @@ pub async fn get_schema(
     query: Query<SchemaQuery>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let schema = get_schema_internal(&stream_name, &tenant_id).await?;
     Ok(schema_response(&schema, query.format))
 }
@@ -329,7 +329,7 @@ pub async fn put_stream(
     body: Bytes,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
 
     PARSEABLE
         .create_update_stream(req.headers(), &body, &stream_name, &tenant_id)
@@ -343,7 +343,7 @@ pub async fn get_retention(
     stream_name: Path<String>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = stream_name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let retention = get_retention_internal(&stream_name, &tenant_id).await?;
     Ok((web::Json(retention), StatusCode::OK))
 }
@@ -372,7 +372,7 @@ pub async fn put_retention(
     Json(retention): Json<Retention>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = stream_name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // For query mode, if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
@@ -433,7 +433,7 @@ pub async fn get_stats(
     logstream: Path<String>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // For query mode, if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
@@ -504,7 +504,7 @@ pub async fn get_stream_info(
     logstream: Path<String>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // For query mode, if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
@@ -566,7 +566,7 @@ pub async fn put_stream_hot_tier(
     Json(mut hottier): Json<StreamHotTier>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let current_span = tracing::Span::current();
     current_span
         .record("stream", tracing::field::display(&stream_name))
@@ -642,7 +642,7 @@ pub async fn get_stream_hot_tier(
     logstream: Path<String>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     tracing::Span::current()
         .record("stream", tracing::field::display(&stream_name))
         .record("tenant", tracing::field::debug(&tenant_id));
@@ -679,7 +679,7 @@ pub async fn delete_stream_hot_tier(
     logstream: Path<String>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = logstream.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let current_span = tracing::Span::current();
     current_span
         .record("stream", tracing::field::display(&stream_name))
@@ -755,6 +755,7 @@ pub mod error {
         parseable::StreamNotFound,
         storage::ObjectStorageError,
         tenants::TenantNotFound,
+        utils::header_parsing::{HeaderBuildError, ParseHeaderError},
         validator::error::{
             AlertValidationError, HotTierValidationError, StreamNameValidationError,
         },
@@ -829,6 +830,10 @@ pub mod error {
         MetastoreError(#[from] MetastoreError),
         #[error("{0}")]
         TenantNotFoundError(#[from] TenantNotFound),
+        #[error("{0}")]
+        Header(#[from] ParseHeaderError),
+        #[error("{0}")]
+        HeaderBuild(#[from] HeaderBuildError),
     }
 
     impl actix_web::ResponseError for StreamError {
@@ -868,6 +873,8 @@ pub mod error {
                 StreamError::HotTierError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 StreamError::InvalidQueryParameter(_) => StatusCode::BAD_REQUEST,
                 StreamError::MetastoreError(e) => e.status_code(),
+                StreamError::Header(_) => StatusCode::BAD_REQUEST,
+                StreamError::HeaderBuild(e) => actix_web::ResponseError::status_code(e),
             }
         }
 
@@ -1107,7 +1114,8 @@ mod tests {
     #[actix_web::test]
     async fn header_without_log_source() {
         let req = TestRequest::default().to_http_request();
-        let PutStreamHeaders { log_source, .. } = req.headers().into();
+        let PutStreamHeaders { log_source, .. } =
+            PutStreamHeaders::try_from(req.headers()).unwrap();
         assert_eq!(log_source, LogSource::Json);
     }
 
@@ -1116,19 +1124,22 @@ mod tests {
         let mut req = TestRequest::default()
             .insert_header(("X-P-Log-Source", "pmeta"))
             .to_http_request();
-        let PutStreamHeaders { log_source, .. } = req.headers().into();
+        let PutStreamHeaders { log_source, .. } =
+            PutStreamHeaders::try_from(req.headers()).unwrap();
         assert_eq!(log_source, LogSource::Pmeta);
 
         req = TestRequest::default()
             .insert_header(("X-P-Log-Source", "otel-logs"))
             .to_http_request();
-        let PutStreamHeaders { log_source, .. } = req.headers().into();
+        let PutStreamHeaders { log_source, .. } =
+            PutStreamHeaders::try_from(req.headers()).unwrap();
         assert_eq!(log_source, LogSource::OtelLogs);
 
         req = TestRequest::default()
             .insert_header(("X-P-Log-Source", "kinesis"))
             .to_http_request();
-        let PutStreamHeaders { log_source, .. } = req.headers().into();
+        let PutStreamHeaders { log_source, .. } =
+            PutStreamHeaders::try_from(req.headers()).unwrap();
         assert_eq!(log_source, LogSource::Kinesis);
     }
 
@@ -1137,10 +1148,60 @@ mod tests {
         let req = TestRequest::default()
             .insert_header(("X-P-Log-Source", "teststream"))
             .to_http_request();
-        let PutStreamHeaders { log_source, .. } = req.headers().into();
+        let PutStreamHeaders { log_source, .. } =
+            PutStreamHeaders::try_from(req.headers()).unwrap();
         matches!(
             log_source,
             LogSource::Custom(src) if src == "teststream"
         );
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{
+        ResponseError,
+        http::{StatusCode, header::HeaderValue},
+        test::TestRequest,
+        web::Path,
+    };
+
+    use super::error::StreamError;
+    use crate::handlers::TENANT_ID;
+    use crate::utils::header_parsing::{HeaderBuildError, ParseHeaderError};
+
+    #[test]
+    fn header_errors_map_to_expected_status() {
+        assert_eq!(
+            StreamError::from(ParseHeaderError::InvalidTenantId).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            StreamError::from(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))
+                .status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            StreamError::from(HeaderBuildError::Internal("user id")).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[actix_web::test]
+    async fn delete_rejects_malformed_tenant_before_touching_storage() {
+        let req = TestRequest::default()
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request();
+        let Err(err) = super::delete(req, Path::from("app".to_owned())).await else {
+            panic!("malformed tenant must be rejected");
+        };
+        assert!(matches!(
+            err,
+            StreamError::Header(ParseHeaderError::InvalidTenantId)
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
     }
 }

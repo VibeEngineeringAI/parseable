@@ -39,6 +39,9 @@ use crate::tenants::TENANT_METADATA;
 use crate::utils::create_intracluster_auth_headermap;
 use crate::utils::get_tenant_id_from_request;
 use crate::utils::get_user_from_request;
+use crate::utils::header_parsing::{
+    HeaderBuildError, ParseHeaderError, generated_text_header_value,
+};
 use crate::utils::json::apply_generic_flattening_for_partition;
 use actix_web::HttpRequest;
 use actix_web::HttpResponse;
@@ -856,7 +859,7 @@ pub async fn get_dataset_stats(
 ) -> Result<impl Responder, QueryError> {
     let offset = dataset_stats_request.offset.unwrap_or(0);
     let limit = dataset_stats_request.limit.unwrap_or(5);
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let sql = if dataset_stats_request.fields.is_empty() {
         build_stats_sql(&dataset_stats_request.dataset_name, None, offset, limit)
     } else {
@@ -893,34 +896,16 @@ pub async fn get_dataset_stats(
         }
         Mode::Prism => {
             let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+            let userid = get_user_from_request(&req).map_err(|_| QueryError::Unauthorized)?;
             let auth = if let Some((_, hash)) = CLUSTER_SECRET.get() {
-                let mut map = actix_web::http::header::HeaderMap::new();
-                if let Some(header) = TENANT_METADATA.get_global_query_auth(tenant) {
-                    map.insert(
-                        HeaderName::from_static("authorization"),
-                        HeaderValue::from_str(&header).unwrap(),
-                    );
-                }
-                let userid = get_user_from_request(&req).unwrap();
-                map.insert(
-                    HeaderName::from_static(CLUSTER_SECRET_HEADER),
-                    HeaderValue::from_str(hash).unwrap(),
-                );
-                map.insert(
-                    HeaderName::from_static("intra-cluster-tenant"),
-                    HeaderValue::from_str(tenant).unwrap(),
-                );
-                map.insert(
-                    HeaderName::from_static("intra-cluster-userid"),
-                    HeaderValue::from_str(&userid).unwrap(),
-                );
-                Some(map)
+                Some(prism_forwarding_headers(
+                    hash,
+                    tenant,
+                    &userid,
+                    TENANT_METADATA.get_global_query_auth(tenant).as_deref(),
+                )?)
             } else {
-                let auth = create_intracluster_auth_headermap(
-                    req.headers(),
-                    "",
-                    &get_user_from_request(&req).unwrap(),
-                );
+                let auth = create_intracluster_auth_headermap(req.headers(), "", &userid)?;
                 let mut map = HeaderMap::new();
 
                 for (key, value) in auth.iter() {
@@ -953,6 +938,39 @@ pub async fn get_dataset_stats(
     let response = HttpResponse::Ok().json(field_stats);
 
     Ok(response)
+}
+
+/// Headers for forwarding a Prism dataset-stats query to a querier with the
+/// cluster secret. All values are server-side (stored global query auth,
+/// cluster secret hash, the authenticated user id) apart from the tenant,
+/// which was already validated from the request header.
+fn prism_forwarding_headers(
+    hash: &str,
+    tenant: &str,
+    userid: &str,
+    global_query_auth: Option<&str>,
+) -> Result<HeaderMap, HeaderBuildError> {
+    let mut map = HeaderMap::new();
+    if let Some(header) = global_query_auth {
+        map.insert(
+            HeaderName::from_static("authorization"),
+            generated_text_header_value(header, "global query auth")?,
+        );
+    }
+    map.insert(
+        HeaderName::from_static(CLUSTER_SECRET_HEADER),
+        generated_text_header_value(hash, "cluster secret hash")?,
+    );
+    map.insert(
+        HeaderName::from_static("intra-cluster-tenant"),
+        HeaderValue::from_str(tenant)
+            .map_err(|_| HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))?,
+    );
+    map.insert(
+        HeaderName::from_static("intra-cluster-userid"),
+        generated_text_header_value(userid, "user id")?,
+    );
+    Ok(map)
 }
 
 pub fn transform_query_results(
@@ -1493,5 +1511,70 @@ mod tests {
             per_run,
             ROWS as f64 / per_run.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod forwarding_header_tests {
+    use super::*;
+
+    #[test]
+    fn prism_forwarding_headers_include_auth_secret_tenant_and_user() {
+        let map = prism_forwarding_headers("hash", "acme", "alice", Some("Basic abc"))
+            .expect("valid values build headers");
+        assert_eq!(map.get("authorization").unwrap(), "Basic abc");
+        assert_eq!(map.get(CLUSTER_SECRET_HEADER).unwrap(), "hash");
+        assert_eq!(map.get("intra-cluster-tenant").unwrap(), "acme");
+        assert_eq!(map.get("intra-cluster-userid").unwrap(), "alice");
+    }
+
+    #[test]
+    fn prism_forwarding_headers_skip_missing_global_auth() {
+        let map = prism_forwarding_headers("hash", "acme", "alice", None).unwrap();
+        assert!(map.get("authorization").is_none());
+    }
+
+    #[test]
+    fn prism_forwarding_headers_reject_invalid_stored_values_as_internal() {
+        for (hash, user, auth, field) in [
+            ("ha\nsh", "alice", None, "cluster secret hash"),
+            ("hash", "al\nice", None, "user id"),
+            ("hash", "alice", Some("Basic\r\nx"), "global query auth"),
+        ] {
+            let err = prism_forwarding_headers(hash, "acme", user, auth).unwrap_err();
+            assert!(matches!(err, HeaderBuildError::Internal(f) if f == field));
+            let status = actix_web::ResponseError::status_code(&QueryError::from(err));
+            assert_eq!(status, actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn prism_forwarding_headers_reject_unreadable_stored_text_as_internal() {
+        // `HeaderValue::from_str` accepts the non-ASCII values but the querier's `to_str` doesn't
+        for value in ["josé", "用户", "ctl\u{1}"] {
+            let auth = format!("Basic {value}");
+            for (hash, user, auth, field) in [
+                (value, "alice", None, "cluster secret hash"),
+                ("hash", value, None, "user id"),
+                ("hash", "alice", Some(auth.as_str()), "global query auth"),
+            ] {
+                let err = prism_forwarding_headers(hash, "acme", user, auth).unwrap_err();
+                assert!(matches!(err, HeaderBuildError::Internal(f) if f == field));
+                assert!(!err.to_string().contains(value));
+                let status = actix_web::ResponseError::status_code(&QueryError::from(err));
+                assert_eq!(status, actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    #[test]
+    fn prism_forwarding_headers_reject_invalid_tenant_as_input() {
+        let err = prism_forwarding_headers("hash", "ac\nme", "alice", None).unwrap_err();
+        assert!(matches!(
+            err,
+            HeaderBuildError::Input(ParseHeaderError::InvalidTenantId)
+        ));
+        let status = actix_web::ResponseError::status_code(&QueryError::from(err));
+        assert_eq!(status, actix_web::http::StatusCode::BAD_REQUEST);
     }
 }

@@ -96,7 +96,7 @@ pub async fn process_otel_content(
         .get("Content-Type")
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned);
-    let tenant_id = get_tenant_id_from_request(req);
+    let tenant_id = get_tenant_id_from_request(req)?;
     let (s, r) = oneshot::channel();
     let stream_name = stream_name.to_string();
     let log_source = log_source.clone();

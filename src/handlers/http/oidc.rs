@@ -206,7 +206,8 @@ pub async fn reply_login(
     login_query: web::Query<Login>,
 ) -> Result<HttpResponse, OIDCError> {
     let oidc_client = OIDC_CLIENT.get().ok_or(OIDCError::Unauthorized)?;
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)
+        .map_err(|error| OIDCError::BadRequest(error.to_string()))?;
     // An XHR caller forwards the code itself and receives the session as JSON;
     // a browser arrives from the IdP and is redirected on. Check either caller
     // before the code is redeemed: a forged callback must not create a session.

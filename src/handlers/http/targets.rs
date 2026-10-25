@@ -38,7 +38,7 @@ pub async fn post(
     req: HttpRequest,
     Json(target): Json<Target>,
 ) -> Result<impl Responder, AlertError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(post_internal(target, &tenant_id).await?))
 }
 
@@ -58,7 +58,7 @@ pub async fn post_internal(
 
 // GET /targets
 pub async fn list(req: HttpRequest) -> Result<impl Responder, AlertError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(list_internal(&tenant_id).await?))
 }
 
@@ -103,7 +103,7 @@ pub async fn list_internal(
 // GET /targets/{target_id}
 pub async fn get(req: HttpRequest, target_id: Path<Ulid>) -> Result<impl Responder, AlertError> {
     let target_id = target_id.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(get_internal(target_id, &tenant_id).await?))
 }
 
@@ -139,7 +139,7 @@ pub async fn update(
     Json(mut target): Json<Target>,
 ) -> Result<impl Responder, AlertError> {
     let target_id = target_id.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // if target_id does not exist, error
     let old_target = TARGETS.get_target_by_id(&target_id, &tenant_id).await?;
 
@@ -164,7 +164,7 @@ pub async fn update(
 // DELETE /targets/{target_id}
 pub async fn delete(req: HttpRequest, target_id: Path<Ulid>) -> Result<impl Responder, AlertError> {
     let target_id = target_id.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let target = TARGETS.delete(&target_id, &tenant_id).await?;
 
     Ok(web::Json(target.mask()))
