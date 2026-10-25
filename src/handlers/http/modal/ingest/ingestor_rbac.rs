@@ -234,3 +234,154 @@ pub async fn post_gen_password(
     Users.change_password_hash(&username, &new_hash, &tenant_id);
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
+
+/// Makes the live user `userid` match `stored` (the tenant's users in storage),
+/// removing it if storage no longer has it, and drops the user's sessions.
+fn apply_stored_user(_stored: &[ParseableUser], _userid: &str, _tenant_id: &Option<String>) {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::TimeDelta;
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::rbac::{
+        map::{
+            ROLES, SESSIONS, SessionKey, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
+            mut_users,
+        },
+        user::{Basic, UserType},
+    };
+
+    // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+    fn init_auth_maps() {
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+    }
+
+    fn user(tenant: &Option<String>, userid: &str, roles: &[&str]) -> ParseableUser {
+        ParseableUser {
+            ty: UserType::Native(Basic {
+                username: userid.to_owned(),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+            user_groups: HashSet::new(),
+            tenant: tenant.clone(),
+            protected: false,
+        }
+    }
+
+    /// A tenant and user id no other test uses.
+    fn fresh() -> (Option<String>, String) {
+        (
+            Some(format!("ingestor-user-{}", Ulid::new())),
+            format!("user-{}", Ulid::new()),
+        )
+    }
+
+    /// Stores `user` in the live map and tracks a session for it.
+    fn live_with_session(user: &ParseableUser) -> SessionKey {
+        mut_users().insert(user.clone());
+        let key = SessionKey::SessionId(Ulid::new());
+        Users.new_session(user, key.clone(), TimeDelta::minutes(5));
+        key
+    }
+
+    fn live_roles(userid: &str, tenant: &Option<String>) -> Option<HashSet<String>> {
+        Users.get_user(userid, tenant).map(|user| user.roles)
+    }
+
+    // The querier commits the removal before syncing, so storage no longer
+    // holds the revoked role when the sync arrives; it must still be revoked.
+    #[tokio::test]
+    async fn revoked_role_is_removed_from_live_user_and_sessions_dropped() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let session = live_with_session(&user(&tenant, &userid, &["a", "b"]));
+
+        apply_stored_user(&[user(&tenant, &userid, &["a"])], &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned()])),
+            "live user must hold only the committed roles"
+        );
+        assert!(
+            !Users.session_exists(&session),
+            "sessions with revoked permissions must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn granted_role_is_added_to_live_user_and_sessions_dropped() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let session = live_with_session(&user(&tenant, &userid, &["a"]));
+
+        apply_stored_user(&[user(&tenant, &userid, &["a", "b"])], &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned(), "b".to_owned()]))
+        );
+        assert!(!Users.session_exists(&session));
+    }
+
+    // A repeated or late sync applies the same committed state again.
+    #[tokio::test]
+    async fn applying_stored_user_twice_is_idempotent() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        live_with_session(&user(&tenant, &userid, &["a", "b"]));
+        let stored = [user(&tenant, &userid, &["a"])];
+
+        apply_stored_user(&stored, &userid, &tenant);
+        apply_stored_user(&stored, &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned()]))
+        );
+    }
+
+    // Create then delete: the create's sync arriving after the delete was
+    // committed must not resurrect the user.
+    #[tokio::test]
+    async fn user_deleted_in_storage_is_removed_from_live_map() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let session = live_with_session(&user(&tenant, &userid, &["a"]));
+
+        apply_stored_user(&[], &userid, &tenant);
+
+        assert!(!Users.contains(&userid, &tenant), "user must not be live");
+        assert!(!Users.session_exists(&session));
+    }
+
+    // An ingestor that missed the create sync picks the user up on the next one.
+    #[tokio::test]
+    async fn user_missing_from_live_map_is_installed() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+
+        apply_stored_user(&[user(&tenant, &userid, &["a"])], &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned()]))
+        );
+    }
+}
