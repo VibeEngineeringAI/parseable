@@ -2,8 +2,10 @@
 use crate::{
     alerts::{
         AlertConfig, AlertError, AlertQueryType, AlertState, NotificationState,
-        alert_structs::DeploymentInfo, alert_types::ThresholdAlert,
-        alerts_utils::evaluate_condition, target::TARGETS,
+        alert_structs::DeploymentInfo,
+        alert_types::ThresholdAlert,
+        alerts_utils::evaluate_condition,
+        target::{TARGETS, safe_runtime_error},
     },
     handlers::http::promql::AlertQueryError,
     parseable::{DEFAULT_TENANT, PARSEABLE},
@@ -177,6 +179,16 @@ pub(super) fn authorize_execution(config: &AlertConfig) -> Result<(), String> {
 }
 
 impl Runtime {
+    /// Scrub diagnostics restored from storage, which may predate URL redaction.
+    pub fn sanitize_errors(&mut self) {
+        let errors = self
+            .deliveries
+            .iter_mut()
+            .map(|delivery| &mut delivery.error);
+        for error in std::iter::once(&mut self.error).chain(errors).flatten() {
+            *error = safe_runtime_error(error);
+        }
+    }
     pub fn discontinuity(&mut self, health: &str, error: Option<String>, now: DateTime<Utc>) {
         self.health = health.into();
         self.error = error;
@@ -469,6 +481,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
         .map(|v| serde_json::from_value(v.clone()))
         .transpose()?
         .unwrap_or_default();
+    runtime.sanitize_errors();
     let authorized = authorize_execution(&config);
     let may_deliver = authorized.is_ok();
     let result = match authorized {
@@ -485,7 +498,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
     let result = match result {
         Ok(samples) => runtime.observe_transactionally(samples, &config, now),
         Err(AlertQueryError::Busy(error)) => {
-            runtime.interrupted(error, &config, now);
+            runtime.interrupted(safe_runtime_error(&error), &config, now);
             Ok(vec![])
         }
         Err(AlertQueryError::Failed(error)) => Err(error),
@@ -493,7 +506,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
     let transitions = match result {
         Ok(transitions) => transitions,
         Err(error) => {
-            runtime.discontinuity("error", Some(error), now);
+            runtime.discontinuity("error", Some(safe_runtime_error(&error)), now);
             vec![]
         }
     };
@@ -575,7 +588,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
             let target_result = TARGETS
                 .get_target_by_id(&delivery.target, &updated.tenant_id)
                 .await
-                .map_err(|error| error.to_string());
+                .map_err(|error| safe_runtime_error(&error.to_string()));
             let result = match target_result {
                 Ok(target) => match tokio::time::timeout_at(
                     deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
@@ -593,7 +606,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
                     delivery.attempts = u32::MAX;
                     delivery.error = None;
                 }
-                Err(error) => delivery.error = Some(error),
+                Err(error) => delivery.error = Some(safe_runtime_error(&error)),
             }
         }
         // Alertmanager expects active alerts to be re-sent, so every
@@ -636,8 +649,9 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
                 .unwrap_or_else(|_| Err("Notification delivery timed out".into()));
                 if let Err(error) = result {
                     tracing::warn!(
-                        "PromQL alert {} could not re-send firing alerts to Alertmanager target {target_id}: {error}",
-                        updated.id
+                        "PromQL alert {} could not re-send firing alerts to Alertmanager target {target_id}: {}",
+                        updated.id,
+                        safe_runtime_error(&error)
                     );
                 }
             }
@@ -1182,5 +1196,119 @@ mod tests {
             resolved["endsAt"],
             now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         );
+    }
+
+    #[test]
+    fn restored_runtime_preserves_error_labels_and_prunes_stale_firing_delivery() {
+        let mut config = config();
+        config.other_fields.as_mut().unwrap().insert(
+            "promqlConfig".into(),
+            serde_json::json!({"holdDuration":"0s"}),
+        );
+        config.targets = vec![Ulid::new()];
+        let labels = BTreeMap::from([
+            ("host".into(), "a".into()),
+            (
+                "error".into(),
+                format!("https://metric.example/failure/{}", "é".repeat(1500)),
+            ),
+        ]);
+        let key = serde_json::to_string(&labels).unwrap();
+        let now = Utc::now();
+        let mut runtime = Runtime::default();
+        let firing = runtime
+            .observe_transactionally(vec![(labels.clone(), 9.0)], &config, now)
+            .unwrap();
+        assert_eq!(firing, vec![(labels.clone(), 9.0, true)]);
+        runtime.enqueue(&firing, &config.targets);
+        runtime.deliveries[0].error =
+            Some("request failed for https://hook.example/TARGET-SECRET".into());
+
+        // Exercise the JSON boundary used at startup and for API responses,
+        // then restore the typed outbox as the next evaluation would.
+        config.other_fields.as_mut().unwrap().insert(
+            "promqlRuntime".into(),
+            serde_json::to_value(runtime).unwrap(),
+        );
+        config.sanitize_runtime_diagnostics();
+        let mut restored: Runtime =
+            serde_json::from_value(config.other_fields.as_ref().unwrap()["promqlRuntime"].clone())
+                .unwrap();
+        restored.sanitize_errors();
+        assert_eq!(restored.instances[&key].labels, labels);
+        assert_eq!(restored.deliveries[0].labels, labels);
+        assert_eq!(
+            serde_json::to_string(&restored.instances[&key].labels).unwrap(),
+            key
+        );
+        assert!(
+            !restored.deliveries[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("TARGET-SECRET")
+        );
+
+        let recovery = restored
+            .observe_transactionally(
+                vec![(labels.clone(), 0.0)],
+                &config,
+                now + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        assert_eq!(recovery, vec![(labels.clone(), 0.0, false)]);
+        assert!(restored.deliveries.is_empty());
+        restored.enqueue(&recovery, &config.targets);
+        assert_eq!(restored.deliveries.len(), 1);
+        assert_eq!(restored.deliveries[0].labels, labels);
+        assert!(!restored.deliveries[0].firing);
+    }
+
+    #[test]
+    fn restored_runtime_errors_are_sanitized_without_changing_state() {
+        let target = ulid::Ulid::new();
+        let delivery = |error: Option<&str>| Delivery {
+            labels: BTreeMap::from([("host".into(), "a".into())]),
+            value: 9.0,
+            firing: true,
+            target,
+            attempts: 2,
+            error: error.map(Into::into),
+        };
+        let stored = serde_json::json!({
+            "health":"error",
+            "error":"error sending request for url (https://am.example/api?token=SECRET)",
+            "lastEvaluatedAt":Utc::now(),
+            "instances":{"a":{"labels":{"host":"a"},"state":"firing","pendingSince":null,
+                "lastSeen":Utc::now(),"value":9.0}},
+            "deliveries":[
+                delivery(Some("HTTP status server error (500) for url (HTTP://u:p@hook.example/SECRET)")),
+                delivery(Some("Notification delivery timed out")),
+                delivery(None),
+            ]
+        });
+        let mut runtime: Runtime = serde_json::from_value(stored).unwrap();
+        runtime.sanitize_errors();
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("Request failed (URL details redacted)")
+        );
+        let errors: Vec<_> = runtime
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.error.as_deref())
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                Some("Request failed (URL details redacted)"),
+                Some("Notification delivery timed out"),
+                None
+            ]
+        );
+        assert_eq!(runtime.health, "error");
+        assert_eq!(runtime.instances["a"].state, "firing");
+        assert!(runtime.deliveries.iter().all(|d| d.attempts == 2));
+        assert!(!serde_json::to_string(&runtime).unwrap().contains("SECRET"));
     }
 }
