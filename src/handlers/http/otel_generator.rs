@@ -7,7 +7,7 @@
  * License, or (at your option) any later version.
  */
 
-use actix_web::{HttpRequest, HttpResponse, web};
+use actix_web::{HttpRequest, HttpResponse, ResponseError, http::StatusCode, web};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use crate::{
     option::Mode,
     otel_generator::OTEL_GENERATOR,
     parseable::{DEFAULT_TENANT, PARSEABLE},
-    utils::{get_tenant_id_from_request, get_user_from_request},
+    utils::{get_tenant_id_from_request, get_user_from_request, header_parsing::ParseHeaderError},
 };
 
 use super::{
@@ -45,6 +45,24 @@ fn default_duration() -> u64 {
 #[derive(Serialize)]
 struct OtelGeneratorErrorResponse {
     error: String,
+}
+
+/// A malformed request header on a generator request, answered in the same
+/// envelope as the endpoint's other errors. The message never includes the
+/// value.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct OtelGeneratorHeaderError(pub(crate) ParseHeaderError);
+
+impl ResponseError for OtelGeneratorHeaderError {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
+    }
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::build(self.status_code()).json(OtelGeneratorErrorResponse {
+            error: self.0.to_string(),
+        })
+    }
 }
 
 pub async fn start_otel_generator(
@@ -136,11 +154,8 @@ pub async fn get_otel_generator_status(req: HttpRequest) -> HttpResponse {
 }
 
 fn request_tenant(req: &HttpRequest) -> Result<Option<String>, HttpResponse> {
-    let tenant_id = get_tenant_id_from_request(req).map_err(|error| {
-        HttpResponse::BadRequest().json(OtelGeneratorErrorResponse {
-            error: error.to_string(),
-        })
-    })?;
+    let tenant_id = get_tenant_id_from_request(req)
+        .map_err(|error| OtelGeneratorHeaderError(error).error_response())?;
     if PARSEABLE.options.is_multi_tenant() && tenant_id.is_none() {
         return Err(HttpResponse::BadRequest().json(OtelGeneratorErrorResponse {
             error: "X-P-Tenant header is required when multi-tenancy is enabled".to_string(),

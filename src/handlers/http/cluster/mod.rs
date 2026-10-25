@@ -342,7 +342,7 @@ pub async fn for_each_live_node<F, Fut, E>(tenant_id: &Option<String>, api_fn: F
 where
     F: Fn(NodeMetadata) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<(), E>> + Send,
-    E: From<anyhow::Error> + Send + Sync + 'static,
+    E: From<anyhow::Error> + std::error::Error + Send + Sync + 'static,
 {
     let mut nodes = Vec::new();
 
@@ -380,12 +380,34 @@ where
     }))
     .await;
 
-    // collect results
-    for result in results {
-        result?;
-    }
+    collect_node_results(results)
+}
 
-    Ok(())
+/// A best-effort caller may ignore ordinary node failures, but must still see
+/// a header validation failure from any node. Preserve first-error ordering
+/// when none of the nodes failed header validation.
+fn collect_node_results<E: std::error::Error + 'static>(
+    results: impl IntoIterator<Item = Result<(), E>>,
+) -> Result<(), E> {
+    let mut first_error = None;
+    for result in results {
+        if let Err(error) = result {
+            let mut cause: &(dyn std::error::Error + 'static) = &error;
+            loop {
+                if cause.is::<HeaderBuildError>() {
+                    return Err(error);
+                }
+                match cause.source() {
+                    Some(source) => cause = source,
+                    None => break,
+                }
+            }
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 pub const INTRA_CLUSTER_USERID: &str = "intra-cluster-userid";
@@ -2070,6 +2092,62 @@ pub async fn send_query_request(
 #[cfg(test)]
 mod header_build_tests {
     use super::*;
+
+    #[test]
+    fn node_header_failure_wins_over_earlier_network_failure() {
+        for header_first in [false, true] {
+            let network = RBACError::Network(
+                reqwest::Client::new()
+                    .get("invalid url")
+                    .build()
+                    .unwrap_err(),
+            );
+            let header = RBACError::HeaderBuild(HeaderBuildError::Internal("node token"));
+            let results = if header_first {
+                vec![Err(header), Err(network)]
+            } else {
+                vec![Err(network), Err(header)]
+            };
+            let error = collect_node_results(results).unwrap_err();
+            assert!(matches!(error, RBACError::HeaderBuild(_)));
+            assert_eq!(
+                actix_web::ResponseError::status_code(&error),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert_eq!(
+                error.to_string(),
+                "Failed to build internal request headers"
+            );
+        }
+    }
+
+    #[test]
+    fn node_header_input_failure_preserves_400_through_role_wrapper() {
+        let error = collect_node_results(vec![
+            Err(RoleError::Anyhow(anyhow::anyhow!("node unavailable"))),
+            Err(RoleError::HeaderBuild(HeaderBuildError::Input(
+                crate::utils::header_parsing::ParseHeaderError::InvalidTenantId,
+            ))),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            actix_web::ResponseError::status_code(&error),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(matches!(error, RoleError::HeaderBuild(_)));
+    }
+
+    #[test]
+    fn node_results_preserve_first_ordinary_error_and_success() {
+        let error = collect_node_results(vec![
+            Err(RBACError::Anyhow(anyhow::anyhow!("first node failed"))),
+            Err(RBACError::UserDoesNotExist),
+        ])
+        .unwrap_err();
+        assert!(matches!(error, RBACError::Anyhow(_)));
+        assert_eq!(error.to_string(), "Error: first node failed");
+        assert!(collect_node_results::<ObjectStorageError>([Ok(()), Ok(())]).is_ok());
+    }
 
     #[test]
     fn basic_token_userid_header_extracts_user() {

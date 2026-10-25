@@ -41,8 +41,9 @@ use crate::{
         AUTHORIZATION_KEY, KINESIS_COMMON_ATTRIBUTES_KEY, LOG_SOURCE_KEY, LOG_SOURCE_KINESIS,
         STREAM_NAME_HEADER_KEY, TENANT_ID,
         http::{
-            base_path, ingest::PostError, modal::OIDC_CLIENT, prism_base_path, promql,
-            rbac::RBACError, traces::TraceError,
+            base_path, ingest::PostError, modal::OIDC_CLIENT,
+            otel_generator::OtelGeneratorHeaderError, prism_base_path, promql, rbac::RBACError,
+            traces::TraceError,
         },
     },
     option::Mode,
@@ -429,8 +430,8 @@ fn tenant_header_error(req: &ServiceRequest, error: ParseHeaderError) -> Error {
     let Some(pattern) = req.resource_map().match_pattern(req.match_info().as_str()) else {
         return PostError::Header(error).into();
     };
-    // Registered by `promql::scope` and by the server's dashboards, llm and
-    // traces scopes.
+    // Registered by `promql::scope` and by the server's dashboards, llm,
+    // traces and OTel generator scopes (the generator under both prefixes).
     if pattern.starts_with(&format!("{}/", promql::SCOPE)) {
         promql::ApiError::invalid_header(error).into()
     } else if pattern.starts_with(&format!("{}/services/traces/", prism_base_path())) {
@@ -439,6 +440,10 @@ fn tenant_header_error(req: &ServiceRequest, error: ParseHeaderError) -> Error {
         dashboard_runtime::invalid_header(error).into()
     } else if pattern == format!("{}/llm/tools/call", prism_base_path()) {
         ToolCallHeaderError(error).into()
+    } else if pattern == format!("{}/otel_generator", prism_base_path())
+        || pattern == format!("{}/otel_generator", base_path())
+    {
+        OtelGeneratorHeaderError(error).into()
     } else {
         PostError::Header(error).into()
     }
@@ -1719,6 +1724,11 @@ mod api_key_auth_tests {
             Ok(response) => response.map_into_boxed_body().into_parts().1,
             Err(error) => error.error_response(),
         };
+        reply_parts(response).await
+    }
+
+    /// Status, content type and body of `response`.
+    async fn reply_parts(response: HttpResponse) -> (StatusCode, Option<String>, Bytes) {
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -1734,7 +1744,7 @@ mod api_key_auth_tests {
         let message = ParseHeaderError::InvalidTenantId.to_string();
         match family {
             "promql" => Some(json!({"status":"error","errorType":"bad_data","error":message})),
-            "traces" => Some(json!({"error":message})),
+            "traces" | "otel" => Some(json!({"error":message})),
             "preview" => Some(json!({
                 "error": {"code":"INVALID_HEADER","message":message,"details":{}},
                 "message": message,
@@ -1818,6 +1828,12 @@ mod api_key_auth_tests {
                     method: counting_auth,
                 })
         };
+        let otel_stub = || {
+            web::resource("")
+                .route(stub(web::get()))
+                .route(stub(web::post()))
+                .route(stub(web::delete()))
+        };
         let app = actix_test::init_service(
             App::new()
                 .service(
@@ -1833,6 +1849,11 @@ mod api_key_auth_tests {
                             web::scope("/dashboards")
                                 .route("/preview", stub(web::post()))
                                 .route("/{dashboard_id}", stub(web::post())),
+                        )
+                        .service(
+                            web::scope("/otel_generator")
+                                .service(otel_stub())
+                                .route("/status", stub(web::get())),
                         ),
                 )
                 .service(
@@ -1846,7 +1867,8 @@ mod api_key_auth_tests {
                             web::scope("/services/traces")
                                 .route("/list", stub(web::post()))
                                 .route("/detail", stub(web::post())),
-                        ),
+                        )
+                        .service(web::scope("/otel_generator").service(otel_stub())),
                 ),
         )
         .await;
@@ -1871,11 +1893,23 @@ mod api_key_auth_tests {
             (Method::POST, "/api/v1/dashboards/%70review", "preview"),
             (Method::POST, "/api/prism/v1/llm/tools/call", "tools"),
             (Method::POST, "/api/prism/v1/llm/tools/%63all", "tools"),
+            // The generator is served under the prism prefix by query
+            // servers and under the base prefix by ingestors.
+            (Method::GET, "/api/prism/v1/otel_generator", "otel"),
+            (Method::POST, "/api/prism/v1/otel_generator", "otel"),
+            (Method::DELETE, "/api/prism/v1/otel_generator", "otel"),
+            (Method::GET, "/api/prism/v1/%6ftel_generator", "otel"),
+            (Method::GET, "/api/v1/otel_generator", "otel"),
+            (Method::POST, "/api/v1/otel_generator", "otel"),
+            (Method::DELETE, "/api/v1/otel_generator", "otel"),
+            (Method::DELETE, "/api/v1/otel_%67enerator", "otel"),
             // Ordinary endpoints keep the plain-text error, including the
-            // SQL endpoint whose path is a suffix of a PromQL one.
+            // SQL endpoint whose path is a suffix of a PromQL one, and a
+            // route nested under the generator's.
             (Method::POST, "/api/v1/query", "plain"),
             (Method::POST, "/api/v1/dashboards/abc", "plain"),
             (Method::POST, "/api/prism/v1/llm/tools/list", "plain"),
+            (Method::GET, "/api/v1/otel_generator/status", "plain"),
         ];
         let active_sessions = sessions().get_active_sessions().len();
         for (method, uri, family) in &cases {
@@ -1969,6 +2003,79 @@ mod api_key_auth_tests {
                     let context = format!("{method} {uri} with {tenant_header}");
                     assert_tenant_rejection(family, &context, read_reply(&app, req).await);
                     assert_eq!(sessions().get_active_sessions().len(), active_sessions);
+                }
+            }
+        }
+        assert!(!has_sessions(&api_user));
+    }
+
+    #[actix_web::test]
+    async fn production_otel_generator_routes_reject_malformed_tenant_as_json() {
+        use crate::handlers::http::modal::server::Server;
+
+        let _state = auth_state().await;
+        let (api_user, secret) = api_key_user(None);
+        let credentials = [
+            ("basic", basic_admin()),
+            ("api key", ("x-api-key", text(&secret))),
+        ];
+        // Mounted exactly as the query and ingest servers mount them. The
+        // handlers need `PARSEABLE`, so every request must stop in `Auth`.
+        let app = actix_test::init_service(
+            App::new()
+                .service(
+                    web::scope(&prism_base_path()).service(Server::get_otel_generator_webscope()),
+                )
+                .service(
+                    web::scope(&base_path()).service(Server::get_otel_generator_ingest_webscope()),
+                ),
+        )
+        .await;
+
+        let cluster = raw_cluster_headers(&api_user);
+        let mut cases = Vec::new();
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for uri in [
+                "/api/prism/v1/otel_generator",
+                "/api/prism/v1/%6ftel_generator",
+            ] {
+                for tenant_header in [TENANT_ID, INTRA_CLUSTER_TENANT_HEADER] {
+                    cases.push((method.clone(), uri, tenant_header, Vec::new()));
+                }
+            }
+            // The ingest scope first verifies the forwarded cluster
+            // credentials, which carry a well-formed `intra-cluster-tenant`.
+            for uri in ["/api/v1/otel_generator", "/api/v1/otel_%67enerator"] {
+                cases.push((method.clone(), uri, TENANT_ID, cluster.clone()));
+            }
+        }
+        let active_sessions = sessions().get_active_sessions().len();
+        for (method, uri, tenant_header, forwarded) in &cases {
+            for (credential, auth) in &credentials {
+                for tenant in malformed_tenants() {
+                    let context = format!("{method} {uri} with {credential} and {tenant_header}");
+                    let mut req = actix_test::TestRequest::default()
+                        .method(method.clone())
+                        .uri(uri)
+                        .insert_header(auth.clone());
+                    for header in forwarded {
+                        req = req.insert_header(header.clone());
+                    }
+                    let req = req.insert_header((*tenant_header, tenant)).to_request();
+                    let error = actix_test::try_call_service(&app, req)
+                        .await
+                        .err()
+                        .unwrap_or_else(|| panic!("{context}: reached the handler"));
+                    assert_tenant_rejection(
+                        "otel",
+                        &context,
+                        reply_parts(error.error_response()).await,
+                    );
+                    assert_eq!(
+                        sessions().get_active_sessions().len(),
+                        active_sessions,
+                        "{context}: a session was left behind"
+                    );
                 }
             }
         }

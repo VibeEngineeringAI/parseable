@@ -116,9 +116,10 @@ pub async fn put(
 
     drop(guard);
 
-    if let Err(e) = sync_role_update(&req, name.clone(), role, &tenant_id, &caller_userid).await {
-        tracing::error!("Failed to sync role update to cluster nodes: {e}");
-    }
+    best_effort_sync(
+        sync_role_update(&req, name.clone(), role, &tenant_id, &caller_userid).await,
+        "Failed to sync role update to cluster nodes",
+    )?;
 
     Ok(HttpResponse::Ok().finish())
 }
@@ -202,11 +203,28 @@ pub async fn delete(
 
     drop(guard);
 
-    if let Err(e) = sync_role_delete(&req, name.clone(), &tenant_id, &caller_userid).await {
-        tracing::error!("Failed to sync role deletion to cluster nodes: {e}");
-    }
+    best_effort_sync(
+        sync_role_delete(&req, name.clone(), &tenant_id, &caller_userid).await,
+        "Failed to sync role deletion to cluster nodes",
+    )?;
 
     Ok(HttpResponse::Ok().finish())
+}
+
+/// Forwarding a change to the other nodes is best effort: a node or network
+/// failure is logged and the local change still succeeds. A `HeaderBuild`
+/// error means a node's forwarding headers could not be built; it retains its
+/// status: 400 for a malformed client header, a generic 500 for a stored or
+/// generated value.
+fn best_effort_sync(result: Result<(), RoleError>, context: &str) -> Result<(), RoleError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e @ RoleError::HeaderBuild(_)) => Err(e),
+        Err(e) => {
+            tracing::error!("{context}: {e}");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -381,5 +399,55 @@ mod tests {
                 "rejected update must not change the live role"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_policy {
+    use actix_web::{ResponseError, body::to_bytes, http::StatusCode};
+
+    use super::*;
+    use crate::utils::header_parsing::{HeaderBuildError, ParseHeaderError};
+
+    // a request builder error, so no network is touched
+    fn network_error() -> reqwest::Error {
+        reqwest::Client::new().get("not a url").build().unwrap_err()
+    }
+
+    #[actix_web::test]
+    async fn header_build_input_fails_the_request_with_400() {
+        let err = best_effort_sync(
+            Err(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId).into()),
+            "sync",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RoleError::HeaderBuild(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn header_build_internal_fails_the_request_with_generic_500() {
+        let err = best_effort_sync(
+            Err(HeaderBuildError::Internal("configured username").into()),
+            "sync",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RoleError::HeaderBuild(HeaderBuildError::Internal("configured username"))
+        ));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(err.error_response().into_body()).await.unwrap();
+        assert_eq!(body, "Failed to build internal request headers");
+    }
+
+    #[actix_web::test]
+    async fn node_and_network_failures_stay_best_effort() {
+        assert!(best_effort_sync(Ok(()), "sync").is_ok());
+        assert!(best_effort_sync(Err(RoleError::Network(network_error())), "sync").is_ok());
+        assert!(best_effort_sync(Err(anyhow::anyhow!("node info").into()), "sync").is_ok());
     }
 }
