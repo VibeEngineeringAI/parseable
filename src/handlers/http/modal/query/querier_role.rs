@@ -129,6 +129,7 @@ pub async fn delete(
     req: HttpRequest,
     name: web::Path<String>,
 ) -> Result<impl Responder, RoleError> {
+    let guard = UPDATE_LOCK.lock().await;
     let name = name.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
@@ -144,6 +145,9 @@ pub async fn delete(
 
     // check if the role is being used by any user or group
     let mut metadata = get_metadata(&tenant_id).await?;
+    if metadata.default_role.as_deref() == Some(name.as_str()) {
+        return Err(RoleError::DefaultRoleInUse);
+    }
     if metadata.users.iter().any(|user| user.roles.contains(&name)) {
         return Err(RoleError::RoleInUse);
     }
@@ -195,6 +199,8 @@ pub async fn delete(
             }
         }
     }
+
+    drop(guard);
 
     if let Err(e) = sync_role_delete(&req, name.clone(), &tenant_id, &caller_userid).await {
         tracing::error!("Failed to sync role deletion to cluster nodes: {e}");
@@ -271,6 +277,42 @@ mod tests {
             .to_http_request();
         req.extensions_mut().insert(session);
         (tenant, req)
+    }
+
+    #[tokio::test]
+    async fn delete_waits_for_update_lock_before_checking_role() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, req) = tenant_request();
+        let internal_role = Role::create_internal_role(vec![DefaultPrivilege::Admin]);
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), internal_role.clone());
+        let guard = UPDATE_LOCK.lock().await;
+        let deletion = delete(req, web::Path::from(ROLE.to_owned()));
+        tokio::pin!(deletion);
+
+        // Poll the handler while the lock is held. An internal role lets it
+        // complete after release without initializing PARSEABLE or storage.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut deletion)
+                .await
+                .is_err(),
+            "role deletion must wait for UPDATE_LOCK"
+        );
+        drop(guard);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut deletion)
+            .await
+            .expect("role deletion must resume after UPDATE_LOCK is released");
+        let Err(err) = result else {
+            panic!("deleting an internal role must be rejected");
+        };
+        assert!(matches!(err, RoleError::ProtectedRole), "{err:?}");
+        assert_eq!(
+            roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned(),
+            Some(internal_role)
+        );
     }
 
     #[tokio::test]

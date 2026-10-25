@@ -442,14 +442,17 @@ pub async fn post_gen_password(
     req: HttpRequest,
     userid: web::Path<String>,
 ) -> Result<impl Responder, RBACError> {
-    let username = userid.into_inner();
+    let userid = userid.into_inner();
     let mut new_password = String::default();
     let mut new_hash = String::default();
     let tenant_id = get_tenant_id_from_request(&req);
     let caller_userid = get_user_from_request(&req)?;
+    if Users.is_protected(&userid, &tenant_id) == Some(true) {
+        return Err(RBACError::ProtectedUser);
+    }
+    let _guard = UPDATE_LOCK.lock().await;
     let mut metadata = get_metadata(&tenant_id).await?;
 
-    let _guard = UPDATE_LOCK.lock().await;
     let user::PassCode { password, hash } = user::Basic::gen_new_password();
     new_password.clone_from(&password);
     new_hash.clone_from(&hash);
@@ -460,16 +463,16 @@ pub async fn post_gen_password(
             user::UserType::Native(ref mut user) => Some(user),
             _ => None,
         })
-        .find(|user| user.username == username)
+        .find(|user| user.username == userid)
     {
         user.password_hash.clone_from(&hash);
     } else {
         return Err(RBACError::UserDoesNotExist);
     }
     put_metadata(&metadata, &tenant_id).await?;
-    Users.change_password_hash(&username, &new_hash, &tenant_id);
+    Users.change_password_hash(&userid, &new_hash, &tenant_id);
 
-    if let Err(e) = sync_password_reset_with_ingestors(req, &username, &caller_userid).await {
+    if let Err(e) = sync_password_reset_with_ingestors(req, &userid, &caller_userid).await {
         tracing::error!("{e}");
     };
 
@@ -589,6 +592,45 @@ mod role_escalation {
 
     fn ordinary_role() -> Role {
         Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }])
+    }
+
+    #[tokio::test]
+    async fn post_gen_password_rejects_protected_user_before_storage() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, _, req) = tenant_request(ordinary_role());
+        let target = insert_protected_user(&tenant, "admin");
+        let before = Users.get_user(&target, &Some(tenant.clone())).unwrap();
+
+        let Err(err) = post_gen_password(req, web::Path::from(target.clone())).await else {
+            panic!("a protected user's password must not be reset");
+        };
+        assert!(matches!(err, RBACError::ProtectedUser), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        let after = Users.get_user(&target, &Some(tenant)).unwrap();
+        let (UserType::Native(before), UserType::Native(after)) = (before.ty, after.ty) else {
+            panic!("the protected user must remain native");
+        };
+        assert_eq!(after.password_hash, before.password_hash);
+    }
+
+    #[tokio::test]
+    async fn post_gen_password_waits_for_update_lock_before_storage() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_, userid, req) = tenant_request(ordinary_role());
+        let _guard = UPDATE_LOCK.lock().await;
+
+        // Cancel at the lock: resuming would initialize PARSEABLE and make clap
+        // parse the test arguments. Without the lock before get_metadata, this
+        // test exits with code 2 instead of timing out.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                post_gen_password(req, web::Path::from(userid)),
+            )
+            .await
+            .is_err(),
+            "password generation must wait for UPDATE_LOCK before reading metadata"
+        );
     }
 
     #[tokio::test]
