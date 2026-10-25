@@ -543,6 +543,143 @@ mod role_escalation {
         );
     }
 
+    /// Adds a protected user holding `role` to `tenant`.
+    fn insert_protected_user(tenant: &str, role: &str) -> String {
+        let protected = User {
+            ty: UserType::Native(Basic {
+                username: format!("protected-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: HashSet::from([role.to_owned()]),
+            user_groups: HashSet::new(),
+            tenant: Some(tenant.to_owned()),
+            protected: true,
+        };
+        mut_users().insert(protected.clone());
+        protected.userid().to_owned()
+    }
+
+    fn ordinary_role() -> Role {
+        Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }])
+    }
+
+    #[tokio::test]
+    async fn post_user_rejects_role_held_by_protected_user() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, _, req) = tenant_request(ordinary_role());
+        insert_protected_user(&tenant, "elevated");
+        let body = web::Json(serde_json::json!(["elevated"]));
+        let Err(err) = post_user(req, web::Path::from("new-user".to_owned()), Some(body)).await
+        else {
+            panic!("a protected user's role must be rejected before storage");
+        };
+        assert!(matches!(err, RBACError::ProtectedRole), "{err:?}");
+        assert!(!Users.contains("new-user", &Some(tenant)));
+    }
+
+    #[tokio::test]
+    async fn add_roles_rejects_role_held_by_protected_user() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, userid, req) = tenant_request(ordinary_role());
+        insert_protected_user(&tenant, "elevated");
+        let Err(err) = add_roles_to_user(
+            req,
+            web::Path::from(userid.clone()),
+            web::Json(HashSet::from(["elevated".to_owned()])),
+        )
+        .await
+        else {
+            panic!("a protected user's role must be rejected before storage");
+        };
+        assert!(matches!(err, RBACError::ProtectedRole), "{err:?}");
+        assert_eq!(
+            Users.get_user(&userid, &Some(tenant)).unwrap().roles,
+            HashSet::from(["admin".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn add_roles_rejects_protected_target_user() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, _, req) = tenant_request(ordinary_role());
+        let target = insert_protected_user(&tenant, "admin");
+        let Err(err) = add_roles_to_user(
+            req,
+            web::Path::from(target.clone()),
+            web::Json(HashSet::from(["elevated".to_owned()])),
+        )
+        .await
+        else {
+            panic!("a protected user must be rejected before storage");
+        };
+        assert!(matches!(err, RBACError::ProtectedUser), "{err:?}");
+        assert_eq!(
+            Users.get_user(&target, &Some(tenant)).unwrap().roles,
+            HashSet::from(["admin".to_owned()])
+        );
+    }
+
+    // Like the standalone handler, protected checks run before the existence
+    // check, so a request mixing a protected and a missing role is a 400 for
+    // the protected one rather than a list of missing roles.
+    #[tokio::test]
+    async fn add_roles_checks_protected_target_before_missing_roles() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, _, req) = tenant_request(ordinary_role());
+        let target = insert_protected_user(&tenant, "admin");
+        let Err(err) = add_roles_to_user(
+            req,
+            web::Path::from(target),
+            web::Json(HashSet::from(["missing".to_owned()])),
+        )
+        .await
+        else {
+            panic!("a protected user must be rejected");
+        };
+        assert!(matches!(err, RBACError::ProtectedUser), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn add_roles_checks_protected_role_before_missing_roles() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (_, userid, req) =
+            tenant_request(Role::create_internal_role(vec![DefaultPrivilege::Admin]));
+        let Err(err) = add_roles_to_user(
+            req,
+            web::Path::from(userid),
+            web::Json(HashSet::from(["elevated".to_owned(), "missing".to_owned()])),
+        )
+        .await
+        else {
+            panic!("an internal role must be rejected");
+        };
+        assert!(matches!(err, RBACError::ProtectedRole), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn add_roles_checks_protected_user_role_before_missing_roles() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, userid, req) = tenant_request(ordinary_role());
+        insert_protected_user(&tenant, "elevated");
+        let Err(err) = add_roles_to_user(
+            req,
+            web::Path::from(userid),
+            web::Json(HashSet::from(["elevated".to_owned(), "missing".to_owned()])),
+        )
+        .await
+        else {
+            panic!("a protected user's role must be rejected");
+        };
+        assert!(matches!(err, RBACError::ProtectedRole), "{err:?}");
+    }
+
     #[tokio::test]
     async fn post_user_rejects_internal_role() {
         // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.

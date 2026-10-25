@@ -970,6 +970,28 @@ mod tests {
             );
         }
 
+        #[test]
+        fn validate_roles_rejects_role_held_by_protected_user() {
+            let _serial = blocking_rbac_state();
+            let tenant = tenant();
+            mut_users().insert(User {
+                ty: UserType::Native(Basic {
+                    username: format!("protected-{}", Ulid::new()),
+                    password_hash: String::new(),
+                    email: None,
+                }),
+                roles: role_set(READER_ROLE),
+                user_groups: HashSet::new(),
+                tenant: Some(tenant.clone()),
+                protected: true,
+            });
+            let result = validate_roles(&role_set(READER_ROLE), &Some(tenant));
+            assert!(
+                matches!(result, Err(ApiKeyError::Rbac(RBACError::ProtectedRole))),
+                "a protected user's role must be rejected like the native-user path, got {result:?}"
+            );
+        }
+
         #[tokio::test]
         async fn tenant_admin_cannot_create_super_admin_api_key() {
             let _serial = rbac_state().await;
