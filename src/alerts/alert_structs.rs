@@ -321,6 +321,7 @@ impl AlertRequest {
                     tracing::warn!("Removed reserved field '{}' from other_fields", reserved);
                 }
             }
+            sanitize_runtime_fields(&mut other_fields);
 
             if other_fields.is_empty() {
                 None
@@ -469,7 +470,49 @@ pub struct AlertConfigResponse {
     pub other_fields: Option<serde_json::Map<String, Value>>,
 }
 
+/// Extension fields holding runtime state whose diagnostics may carry target URLs.
+const RUNTIME_FIELDS: [&str; 2] = ["promqlRuntime", "sqlRuntime"];
+
+/// Sanitize runtime diagnostics in extension fields, leaving every other field untouched.
+pub(super) fn sanitize_runtime_fields(fields: &mut serde_json::Map<String, Value>) {
+    for name in RUNTIME_FIELDS {
+        if let Some(runtime) = fields.get_mut(name) {
+            sanitize_runtime_errors(runtime);
+        }
+    }
+}
+
+/// Recursively sanitize string `error` fields, preserving the surrounding shape.
+/// Containers are always descended into, including ones stored under `error`.
+pub(super) fn sanitize_runtime_errors(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                match value {
+                    Value::String(error)
+                        if key == "error"
+                            && super::target::runtime_error_needs_redaction(error.as_str()) =>
+                    {
+                        *error = super::target::safe_runtime_error(error.as_str());
+                    }
+                    _ => sanitize_runtime_errors(value),
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(sanitize_runtime_errors),
+        _ => {}
+    }
+}
+
 impl AlertConfig {
+    /// Sanitize stored runtime diagnostics in place. Used when configs enter memory;
+    /// the stored object keeps its contents until the next normal save.
+    pub fn sanitize_runtime_diagnostics(&mut self) {
+        if let Some(fields) = self.other_fields.as_mut() {
+            sanitize_runtime_fields(fields);
+        }
+    }
+
     /// Filters out reserved field names from other_fields
     /// This prevents conflicts when flattening other_fields during serialization
     pub fn sanitize_other_fields(&mut self) {
@@ -489,7 +532,8 @@ impl AlertConfig {
         }
     }
 
-    pub fn to_response(self) -> AlertConfigResponse {
+    pub fn to_response(mut self) -> AlertConfigResponse {
+        self.sanitize_runtime_diagnostics();
         AlertConfigResponse {
             version: self.version,
             id: self.id,
@@ -942,9 +986,142 @@ impl MetastoreObject for MTTRHistory {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::AlertRequest;
+pub(crate) mod tests {
+    use serde_json::{Map, Value, json};
+
+    use super::{AlertConfig, AlertRequest, sanitize_runtime_fields};
     use crate::alerts::AlertError;
+
+    pub(crate) const REDACTED: &str = "Request failed (URL details redacted)";
+
+    /// Extension fields as stored by older builds, with raw delivery URLs in errors.
+    pub(crate) fn legacy_runtime_fields() -> Map<String, Value> {
+        let delivery = |error: &str| {
+            json!({"labels":{"host":"a"},"value":2.0,"firing":true,
+                "target":"01ARZ3NDEKTSV4RRFFQ69G5FAV","attempts":3,"error":error})
+        };
+        let Value::Object(fields) = json!({
+            "promqlConfig":{"holdDuration":"5m"},
+            "executionIdentity":{"userId":"owner","tenantId":"DEFAULT_TENANT"},
+            "promqlRuntime":{
+                "health":"error",
+                "error":"error sending request for url (https://user:SECRET-PASS@am.example/api?token=SECRET-TOKEN#frag)",
+                "lastEvaluatedAt":"2026-01-01T00:00:00Z",
+                "instances":{"a":{"labels":{"host":"a","runbook":"https://runbook.example/keep"},
+                    "state":"firing","pendingSince":null,"lastSeen":"2026-01-01T00:00:00Z","value":2.0}},
+                "deliveries":[
+                    delivery("HTTP status server error (500) for url (HTTP://hook.example/SECRET-PATH)"),
+                    delivery("Notification delivery timed out"),
+                ]
+            },
+            "sqlRuntime":{
+                "runs":[
+                    {"error":"hTtPs://hook.example/SECRET-SQL"},
+                    {"nested":{"error":"é".repeat(3000)}},
+                    {"error":42}
+                ],
+                // Containers stored directly under `error` are still descended into.
+                "error":{"error":"https://user:SECRET-NESTED@host.example/token","code":7},
+                "history":{"error":[
+                    {"error":"https://hook.example/SECRET-ARRAY"},
+                    [{"error":{"error":"http://hook.example/SECRET-DEEP"}}],
+                    "plain array entry",
+                    null
+                ]}
+            },
+            "customNote":{"error":"https://docs.example/keep-this"}
+        }) else {
+            unreachable!()
+        };
+        fields
+    }
+
+    /// `legacy_runtime_fields` with only the runtime `error` strings sanitized.
+    pub(crate) fn sanitized_runtime_fields() -> Map<String, Value> {
+        let mut fields = legacy_runtime_fields();
+        fields["promqlRuntime"]["error"] = REDACTED.into();
+        fields["promqlRuntime"]["deliveries"][0]["error"] = REDACTED.into();
+        fields["sqlRuntime"]["runs"][0]["error"] = REDACTED.into();
+        fields["sqlRuntime"]["runs"][1]["nested"]["error"] = "é".repeat(1024).into();
+        fields["sqlRuntime"]["error"]["error"] = REDACTED.into();
+        fields["sqlRuntime"]["history"]["error"][0]["error"] = REDACTED.into();
+        fields["sqlRuntime"]["history"]["error"][1][0]["error"]["error"] = REDACTED.into();
+        fields
+    }
+
+    pub(crate) fn legacy_alert_json(state: &str) -> Value {
+        let mut alert = json!({
+            "version":"v2","id":ulid::Ulid::new(),"severity":"high","title":"Legacy",
+            "queryType":"promql","query":"up","datasets":["metrics"],"alertType":"threshold",
+            "thresholdConfig":{"operator":">","value":1.0},
+            "evalConfig":{"rollingWindow":{"evalStart":"5m","evalEnd":"now","evalFrequency":1}},
+            "targets":[],"state":state,"notificationState":"notify","notificationConfig":{"interval":1},
+            "created":"2026-01-01T00:00:00Z","tags":["prod"]
+        });
+        alert
+            .as_object_mut()
+            .unwrap()
+            .extend(legacy_runtime_fields());
+        alert
+    }
+
+    #[test]
+    fn runtime_sanitization_only_touches_runtime_error_strings() {
+        let mut fields = legacy_runtime_fields();
+        sanitize_runtime_fields(&mut fields);
+        assert_eq!(fields, sanitized_runtime_fields());
+        // Idempotent: a second pass leaves the result unchanged.
+        sanitize_runtime_fields(&mut fields);
+        assert_eq!(fields, sanitized_runtime_fields());
+    }
+
+    #[test]
+    fn detail_response_sanitizes_legacy_runtime_and_keeps_shape() {
+        let raw = legacy_alert_json("triggered");
+        let config: AlertConfig = serde_json::from_value(raw.clone()).unwrap();
+        let response = serde_json::to_value(config.to_response()).unwrap();
+
+        let text = response.to_string();
+        for secret in [
+            "SECRET-PASS",
+            "SECRET-TOKEN",
+            "SECRET-PATH",
+            "SECRET-SQL",
+            "SECRET-NESTED",
+            "SECRET-ARRAY",
+            "SECRET-DEEP",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked in: {text}");
+        }
+        for (key, value) in sanitized_runtime_fields() {
+            assert_eq!(response[&key], value, "{key}");
+        }
+        for key in [
+            "id",
+            "title",
+            "query",
+            "queryType",
+            "datasets",
+            "state",
+            "tags",
+        ] {
+            assert_eq!(response[key], raw[key], "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_request_sanitizes_client_runtime_extras() {
+        let mut request = alert_request("code", "SELECT COUNT(*) FROM \"logs-a\"", &[]);
+        let mut extras = legacy_runtime_fields();
+        extras.remove("executionIdentity");
+        request.other_fields = Some(extras);
+
+        let config = request.into(None).await.unwrap();
+
+        let mut expected = sanitized_runtime_fields();
+        expected.remove("executionIdentity");
+        assert_eq!(config.other_fields, Some(expected));
+    }
 
     fn alert_request(query_type: &str, query: &str, datasets: &[&str]) -> AlertRequest {
         serde_json::from_value(serde_json::json!({
@@ -1005,5 +1182,141 @@ mod tests {
             AlertError::ValidationFailure(message)
                 if message == "Alert should include only one dataset. Found: [\"metrics-a\", \"metrics-b\"]"
         ));
+    }
+
+    /// Ignored microbenchmark for the response path: the existing clone + serialize
+    /// of runtime extension fields versus clone + sanitize + serialize. It measures
+    /// per-response/runtime overhead only, not whole-server throughput. Run with
+    /// `cargo test --release --lib bench_runtime_sanitization -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_runtime_sanitization_overhead() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const WARMUP: usize = 500;
+        const ITERATIONS: usize = 2_000;
+        const ROUNDS: usize = 6;
+
+        fn fixture(errors: &[String]) -> Map<String, Value> {
+            let instances: Map<String, Value> = (0..50)
+                .map(|i| {
+                    let state = if i % 3 == 0 { "firing" } else { "resolved" };
+                    (
+                        format!("host={i}"),
+                        json!({"labels":{"host":format!("host-{i}"),"region":"us-east-1"},
+                            "state":state,"pendingSince":null,
+                            "lastSeen":"2026-01-01T00:00:00Z","value":i as f64}),
+                    )
+                })
+                .collect();
+            let deliveries: Vec<Value> = (0..20)
+                .map(|i| {
+                    json!({"labels":{"host":format!("host-{i}")},"value":i as f64,"firing":true,
+                        "target":"01ARZ3NDEKTSV4RRFFQ69G5FAV","attempts":1,
+                        "error":errors[i % errors.len()]})
+                })
+                .collect();
+            let Value::Object(fields) = json!({
+                "promqlConfig":{"holdDuration":"5m"},
+                "executionIdentity":{"userId":"owner","tenantId":"DEFAULT_TENANT"},
+                "promqlRuntime":{"health":"error","error":errors[0],
+                    "lastEvaluatedAt":"2026-01-01T00:00:00Z",
+                    "instances":instances,"deliveries":deliveries}
+            }) else {
+                unreachable!()
+            };
+            fields
+        }
+
+        fn serialize(fields: &Map<String, Value>, sanitize: bool) -> Vec<u8> {
+            let mut fields = black_box(fields).clone();
+            if sanitize {
+                sanitize_runtime_fields(&mut fields);
+            }
+            black_box(serde_json::to_vec(black_box(&fields)).unwrap())
+        }
+
+        /// Nanoseconds per operation for one round of `iterations` calls.
+        fn run(fields: &Map<String, Value>, sanitize: bool, iterations: usize) -> f64 {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(serialize(fields, sanitize));
+            }
+            start.elapsed().as_nanos() as f64 / iterations as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            let mid = samples.len() / 2;
+            if samples.len().is_multiple_of(2) {
+                (samples[mid - 1] + samples[mid]) / 2.0
+            } else {
+                samples[mid]
+            }
+        }
+
+        let clean = fixture(&[
+            "Notification delivery timed out".into(),
+            "HTTP status server error (503 Service Unavailable)".into(),
+            "error sending request".into(),
+        ]);
+        let legacy = fixture(&[
+            "error sending request for url (https://user:secret@am.example/api/v2/alerts?token=abc)"
+                .into(),
+            format!(
+                "HTTP status client error (401 Unauthorized) for url (http://hook.example/{}?key=secret)",
+                "p".repeat(4000)
+            ),
+            "x".repeat(5000),
+        ]);
+
+        // Correctness checks run outside the timed section.
+        assert_eq!(serialize(&clean, false), serialize(&clean, true));
+        let sanitized_legacy = String::from_utf8(serialize(&legacy, true)).unwrap();
+        for needle in ["://", "secret", "token="] {
+            assert!(
+                !sanitized_legacy.contains(needle),
+                "{needle} survived sanitization"
+            );
+        }
+
+        println!(
+            "Response-path microbenchmark: clone+serialize vs clone+sanitize+serialize; \
+             not whole-server throughput. Medians of {ROUNDS} rounds x {ITERATIONS} iterations."
+        );
+        for (name, fields) in [
+            ("clean typical", &clean),
+            ("legacy credential URL", &legacy),
+        ] {
+            run(fields, false, WARMUP);
+            run(fields, true, WARMUP);
+            let (mut baseline, mut sanitized) = (Vec::new(), Vec::new());
+            for round in 0..ROUNDS {
+                // Alternate order so warm caches and frequency scaling favour neither side.
+                let order = if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
+                for sanitize in order {
+                    let ns = run(fields, sanitize, ITERATIONS);
+                    if sanitize {
+                        sanitized.push(ns);
+                    } else {
+                        baseline.push(ns);
+                    }
+                }
+            }
+            let baseline_ns = median(baseline);
+            let sanitized_ns = median(sanitized);
+            let baseline_bytes = serialize(fields, false).len();
+            let sanitized_bytes = serialize(fields, true).len();
+            println!(
+                "{name}: baseline {baseline_ns:.0} ns/op, sanitized {sanitized_ns:.0} ns/op, \
+                 ratio {:.3}, payload {baseline_bytes} -> {sanitized_bytes} bytes",
+                sanitized_ns / baseline_ns
+            );
+        }
     }
 }

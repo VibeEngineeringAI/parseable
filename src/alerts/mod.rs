@@ -102,7 +102,18 @@ fn ensure_schedulable_in_oss(alert: &dyn AlertTrait) -> Result<(), AlertError> {
     Ok(())
 }
 
+/// Parse or migrate a stored alert, scrubbing historic runtime diagnostics in memory
+/// before the alert is scheduled or inserted. Storage is not rewritten here.
 async fn parse_alert_config(alert_bytes: &[u8], tenant: &Option<String>) -> Option<AlertConfig> {
+    let mut alert = parse_stored_alert_config(alert_bytes, tenant).await?;
+    alert.sanitize_runtime_diagnostics();
+    Some(alert)
+}
+
+async fn parse_stored_alert_config(
+    alert_bytes: &[u8],
+    tenant: &Option<String>,
+) -> Option<AlertConfig> {
     let json_value: JsonValue = match serde_json::from_slice(alert_bytes) {
         Ok(val) => val,
         Err(e) => {
@@ -829,9 +840,9 @@ impl AlertConfig {
         );
 
         if let Some(other_fields) = &self.other_fields {
-            for (key, value) in other_fields {
-                map.insert(key.clone(), value.clone());
-            }
+            let mut other_fields = other_fields.clone();
+            alert_structs::sanitize_runtime_fields(&mut other_fields);
+            map.extend(other_fields);
         }
 
         map
@@ -1197,8 +1208,13 @@ pub enum AlertError {
     Metadata(&'static str),
     #[error("User is not authorized to run this query")]
     Unauthorized,
-    #[error("Alert target outbound policy rejected request:{0}")]
-    OutboundPolicy(#[from] outbound_http_policy::OutboundPolicyError),
+    // Policy errors can name the target host, address or scheme; only the sanitized
+    // message is displayed, and the raw error is not exposed as an error source.
+    #[error(
+        "Alert target outbound policy rejected request: {}",
+        .0.sanitized_message()
+    )]
+    OutboundPolicy(outbound_http_policy::OutboundPolicyError),
     #[error("ActixError: {0}")]
     Error(#[from] actix_web::Error),
     #[error("DataFusion Error: {0}")]
@@ -1237,6 +1253,12 @@ pub enum AlertError {
     ValidationFailure(String),
     #[error(transparent)]
     MetastoreError(#[from] MetastoreError),
+}
+
+impl From<outbound_http_policy::OutboundPolicyError> for AlertError {
+    fn from(error: outbound_http_policy::OutboundPolicyError) -> Self {
+        Self::OutboundPolicy(error)
+    }
 }
 
 impl actix_web::ResponseError for AlertError {
@@ -1846,5 +1868,82 @@ mod tests {
             alert_tenant_from_storage_key("tenant-a"),
             Some("tenant-a".to_owned())
         );
+    }
+
+    #[test]
+    fn summary_sanitizes_legacy_runtime_and_keeps_extension_fields() {
+        use crate::alerts::alert_structs::tests::{legacy_alert_json, sanitized_runtime_fields};
+        let raw = legacy_alert_json("triggered");
+        let config: super::AlertConfig = serde_json::from_value(raw.clone()).unwrap();
+        let summary = config.to_summary();
+        for (key, value) in sanitized_runtime_fields() {
+            assert_eq!(summary[&key], value, "{key}");
+        }
+        for key in ["title", "id", "state", "queryType", "datasets", "tags"] {
+            assert_eq!(summary[key], raw[key], "{key}");
+        }
+        // The config itself is not modified by building a summary.
+        assert_eq!(
+            config.other_fields.unwrap()["promqlRuntime"],
+            raw["promqlRuntime"]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_parse_sanitizes_historic_runtime_errors_including_disabled() {
+        use crate::alerts::alert_structs::tests::{legacy_alert_json, sanitized_runtime_fields};
+        for state in ["disabled", "triggered", "not-triggered"] {
+            let raw = legacy_alert_json(state);
+            let bytes = serde_json::to_vec(&raw).unwrap();
+            let config = super::parse_alert_config(&bytes, &None).await.unwrap();
+            assert_eq!(serde_json::to_value(config.state).unwrap(), state);
+            assert_eq!(
+                config.other_fields,
+                Some(sanitized_runtime_fields()),
+                "{state}"
+            );
+            assert_eq!(config.title, "Legacy");
+            assert_eq!(config.tags, Some(vec!["prod".to_string()]));
+        }
+    }
+
+    #[test]
+    fn outbound_policy_errors_display_only_sanitized_messages() {
+        use super::outbound_http_policy::OutboundPolicyError;
+        use actix_web::ResponseError;
+        use std::error::Error;
+
+        let errors = [
+            OutboundPolicyError::DeniedDomain("secret-host.internal".into()),
+            OutboundPolicyError::PrivateAddressNotAllowed("10.1.2.3".parse().unwrap()),
+            OutboundPolicyError::UnsupportedScheme("secret-scheme".into()),
+            OutboundPolicyError::ResolveFailed {
+                host: "secret-host.internal".into(),
+                source: std::io::Error::other("lookup failed for secret-host.internal"),
+            },
+        ];
+        for error in errors {
+            let expected = error.sanitized_message();
+            let error = super::AlertError::from(error);
+            assert_eq!(
+                error.to_string(),
+                format!("Alert target outbound policy rejected request: {expected}")
+            );
+            assert!(error.source().is_none());
+
+            let response = error.error_response();
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+            let body = actix_web::body::to_bytes(response.into_body());
+            let body = futures::executor::block_on(body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["error"],
+                "Alert target blocked by outbound security policy"
+            );
+            assert_eq!(body["message"], error.to_string());
+            for secret in ["secret-host", "10.1.2.3", "secret-scheme"] {
+                assert!(!body.to_string().contains(secret), "{secret} leaked");
+            }
+        }
     }
 }

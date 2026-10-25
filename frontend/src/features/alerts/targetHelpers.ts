@@ -1,6 +1,9 @@
 import type { AlertTarget, AlertTargetRequest, AlertTargetType } from '../../lib/types';
 import { createId } from '../../lib/ids';
 
+/** The placeholder the server returns in place of stored target secrets. */
+export const MASKED = '********';
+
 export function targetType(target: AlertTarget): AlertTargetType {
   return target.type === 'webhook' &&
     !target.headers &&
@@ -25,7 +28,8 @@ export function targetDraft(target?: AlertTarget): TargetDraft {
     type: target ? targetType(target) : 'webhook',
     endpoint: '',
     skipTls: target?.skipTlsCheck ?? false,
-    username: target?.username ?? '',
+    // Credentials come back masked, so both start empty and must be re-entered together.
+    username: '',
     password: '',
     headers: Object.keys(target?.headers ?? {}).map((key) => ({ id: createId(), key, value: '' })),
   };
@@ -57,6 +61,8 @@ export function invalidHeader(
         fields,
         message: 'Each header needs a valid name and a non-empty value without line breaks.',
       };
+    if (header.value === MASKED)
+      return { index, fields: ['value'], message: 'Enter the real header value, not the mask.' };
     if (deniedHeaders.includes(name))
       return {
         index,
@@ -75,7 +81,7 @@ export function validateTarget(draft: TargetDraft): Partial<Record<keyof TargetD
     if (
       !['https:', 'http:'].includes(url.protocol) ||
       !url.hostname ||
-      draft.endpoint.includes('********') ||
+      draft.endpoint.includes(MASKED) ||
       url.username ||
       url.password
     )
@@ -89,8 +95,12 @@ export function validateTarget(draft: TargetDraft): Partial<Record<keyof TargetD
   } catch {
     errors.endpoint = 'Enter a complete HTTP or HTTPS endpoint URL.';
   }
-  if (draft.type === 'alertManager' && Boolean(draft.username) !== Boolean(draft.password))
-    errors.password = 'Enter both username and password, or leave both empty.';
+  if (draft.type === 'alertManager') {
+    if (draft.username === MASKED) errors.username = 'Enter the real username, not the mask.';
+    if (draft.password === MASKED) errors.password = 'Enter the real password, not the mask.';
+    else if (Boolean(draft.username) !== Boolean(draft.password))
+      errors.password = 'Enter both username and password, or leave both empty.';
+  }
   if (draft.type === 'webhook') {
     const header = invalidHeader(draft.headers);
     if (header) errors.headers = header.message;

@@ -45,6 +45,41 @@ use crate::{
     storage::object_storage::target_json_path,
 };
 
+const MAX_RUNTIME_ERROR_CHARS: usize = 1024;
+const REDACTED_URL_ERROR: &str = "Request failed (URL details redacted)";
+const INVALID_TARGET_CONFIGURATION: &str = "invalid alert target configuration";
+
+/// Bound diagnostics and remove URL-bearing details before storage or API output.
+/// Historic reqwest messages can include credentials in paths, query strings or userinfo.
+pub fn safe_runtime_error(error: &str) -> String {
+    if contains_http_url(error) {
+        return REDACTED_URL_ERROR.into();
+    }
+    error.chars().take(MAX_RUNTIME_ERROR_CHARS).collect()
+}
+
+/// Whether `safe_runtime_error` would change `error`, so clean diagnostics are not reallocated.
+pub(super) fn runtime_error_needs_redaction(error: &str) -> bool {
+    contains_http_url(error)
+        || (error.len() > MAX_RUNTIME_ERROR_CHARS
+            && error.chars().nth(MAX_RUNTIME_ERROR_CHARS).is_some())
+}
+
+// Case-insensitive `http://` or `https://` marker, without allocating a lowercase copy.
+fn contains_http_url(error: &str) -> bool {
+    let bytes = error.as_bytes();
+    error.match_indices("://").any(|(index, _)| {
+        let ends_with = |scheme: &[u8]| {
+            index >= scheme.len() && bytes[index - scheme.len()..index].eq_ignore_ascii_case(scheme)
+        };
+        ends_with(b"http") || ends_with(b"https")
+    })
+}
+
+fn safe_delivery_error(error: reqwest::Error) -> String {
+    safe_runtime_error(&error.without_url().to_string())
+}
+
 pub static TARGETS: Lazy<TargetConfigs> = Lazy::new(|| TargetConfigs {
     target_configs: RwLock::new(HashMap::new()),
 });
@@ -163,9 +198,10 @@ impl Default for Retry {
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+/// Serialized in full so stored targets keep their credentials. Deserialization goes
+/// through `TargetVerifier`, see the `Deserialize` impl below.
+#[derive(Debug, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-#[serde(try_from = "TargetVerifier")]
 pub struct Target {
     pub name: String,
     #[serde(flatten)]
@@ -246,14 +282,13 @@ impl Target {
             }
             TargetType::AlertManager(alert_manager) => {
                 let endpoint = format!("{}://********", alert_manager.endpoint.scheme());
-                if let Some(auth) = alert_manager.auth {
-                    let password = "********";
+                if alert_manager.auth.is_some() {
                     json!({
                         "name":self.name,
                         "type":"webhook",
                         "endpoint":endpoint,
-                        "username":auth.username,
-                        "password":password,
+                        "username":"********",
+                        "password":"********",
                         "skipTlsCheck":alert_manager.skip_tls_check,
                         "id":self.id
                     })
@@ -298,7 +333,7 @@ impl Target {
                     None,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.sanitized_message().to_string())?;
                 prepared
                     .client
                     .post(target.endpoint.clone())
@@ -313,7 +348,7 @@ impl Target {
                     Some(&target.headers),
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.sanitized_message().to_string())?;
                 prepared
                     .client
                     .post(target.endpoint.clone())
@@ -325,9 +360,9 @@ impl Target {
         request
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(safe_delivery_error)?
             .error_for_status()
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_delivery_error)?;
         Ok(())
     }
 
@@ -523,6 +558,20 @@ impl TryFrom<TargetVerifier> for Target {
     }
 }
 
+// Serde errors echo rejected values (for example an endpoint string or a header value),
+// which may be secrets. Report one generic error to HTTP, tool and stored-target callers.
+impl<'de> serde::Deserialize<'de> for Target {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let verifier = <TargetVerifier as serde::Deserialize>::deserialize(deserializer)
+            .map_err(|_| <D::Error as serde::de::Error>::custom(INVALID_TARGET_CONFIGURATION))?;
+        Target::try_from(verifier)
+            .map_err(|_| <D::Error as serde::de::Error>::custom(INVALID_TARGET_CONFIGURATION))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "type")]
@@ -577,7 +626,10 @@ impl CallableTarget for SlackWebHook {
         {
             Ok(prepared) => prepared,
             Err(err) => {
-                error!("Slack alert target rejected by outbound policy:{err}");
+                error!(
+                    "Slack alert target rejected by outbound policy:{}",
+                    err.sanitized_message()
+                );
                 return;
             }
         };
@@ -588,7 +640,10 @@ impl CallableTarget for SlackWebHook {
             .send()
             .await
         {
-            error!("Couldn't make call to webhook, error:{}", e)
+            error!(
+                "Couldn't make call to webhook, error:{}",
+                safe_delivery_error(e)
+            )
         }
     }
 }
@@ -621,7 +676,10 @@ impl CallableTarget for OtherWebHook {
         {
             Ok(prepared) => prepared,
             Err(err) => {
-                error!("Webhook alert target rejected by outbound policy:{err}");
+                error!(
+                    "Webhook alert target rejected by outbound policy:{}",
+                    err.sanitized_message()
+                );
                 return;
             }
         };
@@ -630,7 +688,10 @@ impl CallableTarget for OtherWebHook {
             .post(self.endpoint.clone())
             .headers(prepared.headers);
         if let Err(e) = request.body(alert).send().await {
-            error!("Couldn't make call to webhook, error:{}", e)
+            error!(
+                "Couldn't make call to webhook, error:{}",
+                safe_delivery_error(e)
+            )
         }
     }
 }
@@ -660,7 +721,7 @@ impl AlertManager {
             None,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.sanitized_message().to_string())?;
         let mut request = prepared.client.post(self.endpoint.clone()).json(alerts);
         if let Some(auth) = &self.auth {
             if !prepared.authorization_allowed {
@@ -671,9 +732,9 @@ impl AlertManager {
         request
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(safe_delivery_error)?
             .error_for_status()
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_delivery_error)?;
         Ok(())
     }
 }
@@ -722,7 +783,10 @@ impl CallableTarget for AlertManager {
         {
             Ok(prepared) => prepared,
             Err(err) => {
-                error!("Alertmanager target rejected by outbound policy:{err}");
+                error!(
+                    "Alertmanager target rejected by outbound policy:{}",
+                    err.sanitized_message()
+                );
                 return;
             }
         };
@@ -732,8 +796,7 @@ impl CallableTarget for AlertManager {
             // Credentials are only safe when the destination itself is explicitly allowlisted.
             if !prepared.authorization_allowed {
                 error!(
-                    "Alertmanager credentials blocked by outbound policy for destination:{}",
-                    self.endpoint
+                    "Alertmanager credentials blocked by outbound policy: destination is not explicitly allowlisted"
                 );
                 return;
             }
@@ -742,7 +805,10 @@ impl CallableTarget for AlertManager {
             request = request.header(AUTHORIZATION, basic_auth_value);
         }
         if let Err(e) = request.send().await {
-            error!("Couldn't make call to alertmanager, error:{}", e)
+            error!(
+                "Couldn't make call to alertmanager, error:{}",
+                safe_delivery_error(e)
+            )
         }
     }
 }
@@ -781,7 +847,556 @@ pub struct Auth {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread::JoinHandle,
+    };
+
     use super::*;
+    use crate::alerts::{
+        AlertInfo, DeploymentInfo, NotificationState,
+        outbound_http_policy::{ALERT_TARGET_POLICY, AlertTargetPolicyConfig},
+    };
+
+    const SECRETS: [&str; 7] = [
+        "SECRET-USERINFO",
+        "SECRET-PATH-TOKEN",
+        "SECRET-QUERY-TOKEN",
+        "SECRET-FRAGMENT",
+        "SECRET-HEADER-VALUE",
+        "SECRET-AM-USER",
+        "SECRET-AM-PASSWORD",
+    ];
+
+    fn secret_url(host: &str) -> Url {
+        format!(
+            "http://url-user:SECRET-USERINFO@{host}/hooks/SECRET-PATH-TOKEN?token=SECRET-QUERY-TOKEN#SECRET-FRAGMENT"
+        )
+        .parse()
+        .unwrap()
+    }
+
+    fn named(target: TargetType, tenant: &str) -> Target {
+        Target {
+            name: "redaction-target".into(),
+            target,
+            id: Ulid::new(),
+            tenant: Some(tenant.to_owned()),
+        }
+    }
+
+    fn webhook(endpoint: Url) -> TargetType {
+        TargetType::Other(OtherWebHook {
+            endpoint,
+            headers: HashMap::from([("X-Api-Key".into(), "SECRET-HEADER-VALUE".into())]),
+            skip_tls_check: false,
+        })
+    }
+
+    fn alertmanager(endpoint: Url, with_auth: bool) -> TargetType {
+        TargetType::AlertManager(AlertManager {
+            endpoint,
+            skip_tls_check: false,
+            auth: with_auth.then(|| Auth {
+                username: "SECRET-AM-USER".into(),
+                password: "SECRET-AM-PASSWORD".into(),
+            }),
+        })
+    }
+
+    fn context() -> Context {
+        Context::new(
+            AlertInfo::new(
+                Ulid::new(),
+                "Redaction alert".into(),
+                AlertState::Triggered,
+                NotificationState::Notify,
+                "high".into(),
+            ),
+            DeploymentInfo::new("instance".into(), Ulid::new(), "standalone".into()),
+            NotificationConfig::default(),
+            "alert message".into(),
+        )
+    }
+
+    fn unique_tenant() -> String {
+        format!("target-redaction-{}", Ulid::new())
+    }
+
+    /// Allow loopback delivery for one tenant only, as an operator allowlist would.
+    async fn allow_loopback(tenant: &str) {
+        ALERT_TARGET_POLICY.write().await.insert(
+            tenant.to_owned(),
+            AlertTargetPolicyConfig {
+                allow_private: true,
+                allowed_cidrs: vec!["127.0.0.1/32".into()],
+                ..Default::default()
+            },
+        );
+    }
+
+    async fn remove_policy(tenant: &str) {
+        ALERT_TARGET_POLICY.write().await.remove(tenant);
+    }
+
+    fn assert_redacted(text: &str, port: Option<u16>) {
+        for secret in SECRETS {
+            assert!(!text.contains(secret), "{secret} leaked in: {text}");
+        }
+        assert!(!text.contains("127.0.0.1"), "host leaked in: {text}");
+        assert!(!text.contains("203.0.113.10"), "host leaked in: {text}");
+        assert!(!text.contains("url-user"), "userinfo leaked in: {text}");
+        if let Some(port) = port {
+            assert!(
+                !text.contains(&format!(":{port}")),
+                "port leaked in: {text}"
+            );
+        }
+    }
+
+    /// Serve one request with `status` from a local loopback listener and
+    /// return the raw request so callers can check what was delivered.
+    fn serve_once(status: &'static str) -> (u16, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request
+        });
+        (port, handle)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut buf).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..read]);
+            let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|len| len.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= end + 4 + body_len {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
+    /// A loopback port with nothing listening, so connecting fails locally.
+    fn refused_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `future` with a thread-local subscriber that records this crate's
+    /// alert logs, so the actual formatted log lines can be checked.
+    async fn capture_alert_logs(future: impl std::future::Future<Output = ()>) -> String {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "parseable::alerts=trace",
+            ))
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        future.await;
+        String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn diagnostics_redact_url_secrets_and_bound_non_url_errors() {
+        for error in [
+            "request failed for https://user:secret@host/path",
+            "HTTP://host/private-token",
+            "hTtPs://host/path?token=secret#fragment",
+            "error sending request for url (http://10.0.0.1:9093/api/v2/alerts)",
+            "échec: https://hôte.example/路径?jeton=秘密",
+            "first http://a.example/one then HTTPS://b.example/two",
+            "prefixhttps://glued.example/token",
+        ] {
+            assert_eq!(safe_runtime_error(error), REDACTED_URL_ERROR, "{error}");
+        }
+        // A URL beyond the length cap is still redacted rather than truncated away.
+        let late_url = format!("{}https://host/late-token", "x".repeat(3000));
+        assert_eq!(safe_runtime_error(&late_url), REDACTED_URL_ERROR);
+
+        for clean in [
+            "Notification delivery timed out",
+            "HTTP status server error (500 Internal Server Error)",
+            "error sending request",
+            "ftp://not-an-http-target",
+            "Alert owner's dataset permission has been revoked",
+        ] {
+            assert_eq!(safe_runtime_error(clean), clean);
+        }
+
+        assert_eq!(safe_runtime_error(&"x".repeat(5000)).len(), 1024);
+        let unicode = safe_runtime_error(&"é".repeat(5000));
+        assert_eq!(unicode.chars().count(), 1024);
+        assert_eq!(unicode.len(), 2048);
+        assert_eq!(safe_runtime_error(&"x".repeat(1024)).len(), 1024);
+    }
+
+    #[test]
+    fn diagnostics_redaction_is_idempotent_and_detects_needed_changes() {
+        let long = "é".repeat(1500);
+        let at_cap = "x".repeat(1024);
+        let multibyte_at_cap = "é".repeat(1024);
+        for error in [
+            "https://user:secret@host/path",
+            "Notification delivery timed out",
+            long.as_str(),
+            at_cap.as_str(),
+            multibyte_at_cap.as_str(),
+            "",
+        ] {
+            let once = safe_runtime_error(error);
+            assert_eq!(safe_runtime_error(&once), once);
+            assert!(!runtime_error_needs_redaction(&once));
+            assert_eq!(
+                runtime_error_needs_redaction(error),
+                once != error,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn masked_targets_hide_urls_headers_and_credentials() {
+        let tenant = unique_tenant();
+        let slack = named(
+            TargetType::Slack(SlackWebHook {
+                endpoint: "https://hooks.slack.com/services/SECRET-PATH-TOKEN"
+                    .parse()
+                    .unwrap(),
+            }),
+            &tenant,
+        );
+        let id = slack.id;
+        assert_eq!(
+            slack.mask(),
+            json!({"name":"redaction-target","type":"slack","endpoint":"https://********","id":id})
+        );
+
+        let other = named(webhook(secret_url("127.0.0.1:8080")), &tenant);
+        let id = other.id;
+        assert_eq!(
+            other.mask(),
+            json!({
+                "name":"redaction-target","type":"webhook","endpoint":"http://********",
+                "headers":{"X-Api-Key":"********"},"skipTlsCheck":false,"id":id
+            })
+        );
+
+        let with_auth = named(alertmanager(secret_url("127.0.0.1:9093"), true), &tenant);
+        let id = with_auth.id;
+        assert_eq!(
+            with_auth.mask(),
+            json!({
+                "name":"redaction-target","type":"webhook","endpoint":"http://********",
+                "username":"********","password":"********","skipTlsCheck":false,"id":id
+            })
+        );
+
+        let without_auth = named(alertmanager(secret_url("127.0.0.1:9093"), false), &tenant);
+        let id = without_auth.id;
+        assert_eq!(
+            without_auth.mask(),
+            json!({
+                "name":"redaction-target","type":"webhook","endpoint":"http://********",
+                "username":null,"password":null,"skipTlsCheck":false,"id":id
+            })
+        );
+    }
+
+    #[test]
+    fn storage_serialization_keeps_credentials_and_round_trips() {
+        let tenant = unique_tenant();
+        for target in [
+            named(
+                TargetType::Slack(SlackWebHook {
+                    endpoint: "https://hooks.slack.com/services/SECRET-PATH-TOKEN"
+                        .parse()
+                        .unwrap(),
+                }),
+                &tenant,
+            ),
+            named(webhook(secret_url("127.0.0.1:8080")), &tenant),
+            named(alertmanager(secret_url("127.0.0.1:9093"), true), &tenant),
+            named(alertmanager(secret_url("127.0.0.1:9093"), false), &tenant),
+        ] {
+            let stored = serde_json::to_string(&target).unwrap();
+            assert!(stored.contains("SECRET-PATH-TOKEN"));
+            if matches!(target.target, TargetType::Other(_)) {
+                assert!(stored.contains("SECRET-HEADER-VALUE"));
+            }
+            if target.alertmanager().is_some_and(|am| am.auth.is_some()) {
+                assert!(stored.contains("SECRET-AM-USER"));
+                assert!(stored.contains("SECRET-AM-PASSWORD"));
+            }
+            let restored: Target = serde_json::from_str(&stored).unwrap();
+            assert_eq!(restored.name, target.name);
+            assert_eq!(restored.id, target.id);
+            assert_eq!(restored.target, target.target);
+        }
+    }
+
+    #[test]
+    fn valid_target_requests_still_deserialize_through_the_verifier() {
+        let id = Ulid::new();
+        let target: Target = serde_json::from_value(json!({
+            "name":"am","type":"alertManager","endpoint":"https://am.example/api/v2/alerts",
+            "username":"user","password":"pass","skipTlsCheck":true,
+            "notificationConfig":{"interval":5,"times":2},"id":id,"tenantId":"tenant-a"
+        }))
+        .unwrap();
+        assert_eq!(target.id, id);
+        assert_eq!(target.tenant.as_deref(), Some("tenant-a"));
+        let am = target.alertmanager().unwrap();
+        assert!(am.skip_tls_check);
+        assert_eq!(
+            am.auth,
+            Some(Auth {
+                username: "user".into(),
+                password: "pass".into()
+            })
+        );
+
+        let generated: Target = serde_json::from_value(json!({
+            "name":"hook","type":"webhook","endpoint":"https://hook.example/x"
+        }))
+        .unwrap();
+        assert!(matches!(generated.target, TargetType::Other(ref hook) if hook.headers.is_empty()));
+    }
+
+    #[test]
+    fn invalid_secret_bearing_targets_report_generic_errors() {
+        let cases = [
+            json!({"name":"t","type":"webhook","endpoint":"not a url SECRET-ENDPOINT-VALUE"}),
+            json!({"name":"t","type":"webhook","endpoint":"https://h.example","headers":{"X-Api-Key":424242}}),
+            json!({"name":"t","type":"webhook","endpoint":"https://h.example","skipTlsCheck":"SECRET-BOOL-VALUE"}),
+            json!({"name":"t","type":"alertManager","endpoint":"https://h.example","username":"SECRET-AUTH-USER","password":"SECRET-AUTH-PASSWORD","notificationConfig":{"interval":"SECRET-AUTH-INTERVAL"}}),
+            json!({"name":"t","type":"SECRET-TYPE-VALUE","endpoint":"https://h.example"}),
+            json!({"name":"t","type":"slack","endpoint":"https://hooks.slack.com/x","id":"SECRET-ID-VALUE"}),
+        ];
+        for case in cases {
+            for error in [
+                serde_json::from_value::<Target>(case.clone())
+                    .unwrap_err()
+                    .to_string(),
+                serde_json::from_str::<Target>(&case.to_string())
+                    .unwrap_err()
+                    .to_string(),
+            ] {
+                assert!(error.starts_with(INVALID_TARGET_CONFIGURATION), "{error}");
+                for secret in [
+                    "SECRET-ENDPOINT-VALUE",
+                    "424242",
+                    "SECRET-BOOL-VALUE",
+                    "SECRET-AUTH-USER",
+                    "SECRET-AUTH-PASSWORD",
+                    "SECRET-AUTH-INTERVAL",
+                    "SECRET-TYPE-VALUE",
+                    "SECRET-ID-VALUE",
+                ] {
+                    assert!(!error.contains(secret), "{secret} leaked in: {error}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_status_and_transport_errors_hide_urls() {
+        let tenant = unique_tenant();
+        allow_loopback(&tenant).await;
+
+        let (port, server) = serve_once("500 Internal Server Error");
+        let target = named(webhook(secret_url(&format!("127.0.0.1:{port}"))), &tenant);
+        let status = target
+            .deliver_promql(&target.tenant, "message", &[])
+            .await
+            .unwrap_err();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains("x-api-key: secret-header-value"));
+        assert!(status.contains("500"), "{status}");
+        assert_redacted(&status, Some(port));
+
+        let port = refused_port();
+        let target = named(webhook(secret_url(&format!("127.0.0.1:{port}"))), &tenant);
+        let transport = target
+            .deliver_promql(&target.tenant, "message", &[])
+            .await
+            .unwrap_err();
+        assert!(transport.contains("error sending request"), "{transport}");
+        assert_redacted(&transport, Some(port));
+
+        remove_policy(&tenant).await;
+    }
+
+    #[tokio::test]
+    async fn alertmanager_delivery_status_and_transport_errors_hide_urls() {
+        let tenant = unique_tenant();
+        allow_loopback(&tenant).await;
+        let alerts = [json!({"labels":{"alertname":"x"}})];
+
+        let (port, server) = serve_once("503 Service Unavailable");
+        let target = named(
+            alertmanager(secret_url(&format!("127.0.0.1:{port}")), true),
+            &tenant,
+        );
+        let status = target
+            .deliver_promql(&target.tenant, "message", &alerts)
+            .await
+            .unwrap_err();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        let credentials =
+            base64::prelude::BASE64_STANDARD.encode("SECRET-AM-USER:SECRET-AM-PASSWORD");
+        assert!(
+            request.contains(&format!("authorization: basic {credentials}").to_ascii_lowercase())
+        );
+        assert!(status.contains("503"), "{status}");
+        assert_redacted(&status, Some(port));
+
+        let port = refused_port();
+        let target = named(
+            alertmanager(secret_url(&format!("127.0.0.1:{port}")), true),
+            &tenant,
+        );
+        let transport = target
+            .alertmanager()
+            .unwrap()
+            .post_promql(&target.tenant, &alerts)
+            .await
+            .unwrap_err();
+        assert!(transport.contains("error sending request"), "{transport}");
+        assert_redacted(&transport, Some(port));
+
+        remove_policy(&tenant).await;
+    }
+
+    #[tokio::test]
+    async fn delivery_policy_errors_use_sanitized_messages() {
+        let tenant = unique_tenant();
+        ALERT_TARGET_POLICY.write().await.insert(
+            tenant.clone(),
+            AlertTargetPolicyConfig {
+                denied_domains: vec!["secret-denied.example".into()],
+                ..Default::default()
+            },
+        );
+        let denied = named(webhook(secret_url("secret-denied.example")), &tenant);
+        let error = denied
+            .deliver_promql(&denied.tenant, "message", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Target domain is denied by outbound policy");
+
+        // Slack hosts are pinned before any DNS lookup, so this makes no request.
+        let slack = named(
+            TargetType::Slack(SlackWebHook {
+                endpoint: "https://secret-slack-host.example/services/SECRET-PATH-TOKEN"
+                    .parse()
+                    .unwrap(),
+            }),
+            &tenant,
+        );
+        let error = slack
+            .deliver_promql(&slack.tenant, "message", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Slack target host is invalid");
+
+        // A public, non-allowlisted address may receive alerts but not credentials.
+        let blocked = named(alertmanager(secret_url("203.0.113.10"), true), &tenant);
+        let error = blocked
+            .deliver_promql(&blocked.tenant, "message", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Target credentials blocked by outbound policy");
+
+        remove_policy(&tenant).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_delivery_logs_hide_urls_and_credentials() {
+        let tenant = unique_tenant();
+        allow_loopback(&tenant).await;
+        let tenant_id = Some(tenant.clone());
+        let webhook_port = refused_port();
+        let alertmanager_port = refused_port();
+
+        let logs = capture_alert_logs(async {
+            webhook(secret_url(&format!("127.0.0.1:{webhook_port}")))
+                .call(&tenant_id, &context())
+                .await;
+            alertmanager(secret_url(&format!("127.0.0.1:{alertmanager_port}")), true)
+                .call(&tenant_id, &context())
+                .await;
+            // No request is sent: credentials are blocked before delivery.
+            alertmanager(secret_url("203.0.113.10"), true)
+                .call(&tenant_id, &context())
+                .await;
+            TargetType::Slack(SlackWebHook {
+                endpoint: "https://secret-slack-host.example/services/SECRET-PATH-TOKEN"
+                    .parse()
+                    .unwrap(),
+            })
+            .call(&tenant_id, &context())
+            .await;
+        })
+        .await;
+
+        assert!(logs.contains("Couldn't make call to webhook"), "{logs}");
+        assert!(
+            logs.contains("Couldn't make call to alertmanager"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("Alertmanager credentials blocked by outbound policy"),
+            "{logs}"
+        );
+        assert!(logs.contains("Slack target host is invalid"), "{logs}");
+        assert!(!logs.contains("secret-slack-host"), "{logs}");
+        assert_redacted(&logs, Some(webhook_port));
+        assert_redacted(&logs, Some(alertmanager_port));
+
+        remove_policy(&tenant).await;
+    }
 
     #[test]
     fn test_masked_target_hides_secrets() {
