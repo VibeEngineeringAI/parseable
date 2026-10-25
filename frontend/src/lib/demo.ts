@@ -464,6 +464,16 @@ export function createDemoClient(): ParseableClient {
     const missing = names.filter((name) => !Object.hasOwn(roles, name));
     if (missing.length) fail(`Roles do not exist: ${missing.join(', ')}`);
   }
+  function assignableRoles(names: string[]) {
+    if (
+      Object.entries(privileges(names)).some(
+        ([name, actions]) =>
+          name === 'super-admin' || actions.some((action) => action.privilege === 'superadmin'),
+      )
+    )
+      fail('Role is protected');
+    knownRoles(names);
+  }
   function named(name: string, kind: 'user' | 'role') {
     const error = validateName(name, kind);
     if (error) fail(error);
@@ -613,7 +623,7 @@ export function createDemoClient(): ParseableClient {
       await ready();
       if (username === 'admin') fail('Cannot call this API for root admin user');
       named(username, 'user');
-      knownRoles(assigned);
+      assignableRoles(assigned);
       if (!assigned.length) fail('User cannot be created without a role');
       if (
         users.some(
@@ -641,7 +651,7 @@ export function createDemoClient(): ParseableClient {
     async addUserRoles(id, assigned) {
       await ready();
       const user = findUser(id, true);
-      knownRoles(assigned);
+      assignableRoles(assigned);
       if (user.oidc && !user.oidc.legacy)
         user.oidc.manualRoles = [...new Set([...(user.oidc.manualRoles ?? []), ...assigned])];
       else user.assigned = [...new Set([...user.assigned, ...assigned])];
@@ -678,7 +688,7 @@ export function createDemoClient(): ParseableClient {
     },
     async createApiKey(keyName, assigned, ttlSeconds) {
       await ready();
-      knownRoles(assigned);
+      assignableRoles(assigned);
       if (
         ttlSeconds != null &&
         (!Number.isInteger(ttlSeconds) || ttlSeconds < 1800 || ttlSeconds > 7776000)

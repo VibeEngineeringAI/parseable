@@ -95,6 +95,56 @@ describe('per-client Team demo', () => {
     }
     expect(await client.listUsers()).toEqual(users);
   });
+  describe.each([
+    { assigned: ['super-admin'] },
+    { assigned: ['analysts', 'super-admin'] },
+    { assigned: ['super-admin', 'analysts'] },
+  ])('protected role grants: $assigned', ({ assigned }) => {
+    it('rejects API-key creation without changing the key inventory', async () => {
+      const client = createDemoClient();
+      const keys = await client.listApiKeys();
+      await expect(client.createApiKey('protected-key', assigned)).rejects.toMatchObject({
+        status: 400,
+        message: 'Role is protected',
+      });
+      expect(await client.listApiKeys()).toEqual(keys);
+    });
+    it('rejects user creation without changing users', async () => {
+      const client = createDemoClient();
+      const users = await client.listUsers();
+      await expect(client.createUser('protected-user', assigned)).rejects.toMatchObject({
+        status: 400,
+        message: 'Role is protected',
+      });
+      expect(await client.listUsers()).toEqual(users);
+    });
+    it.each(['analyst', 'https://issuer.example/sso-user'])(
+      'rejects role additions to %s without changing role sources',
+      async (id) => {
+        const client = createDemoClient();
+        const sources = await client.userRoleSources(id);
+        await expect(client.addUserRoles(id, assigned)).rejects.toMatchObject({
+          status: 400,
+          message: 'Role is protected',
+        });
+        expect(await client.userRoleSources(id)).toEqual(sources);
+      },
+    );
+  });
+  it('allows ordinary admin roles for API keys and user grants', async () => {
+    const client = createDemoClient();
+    expect((await client.createApiKey('admin-key', ['administrators'])).roles).toEqual([
+      'administrators',
+    ]);
+    await client.createUser('admin-user', ['administrators']);
+    await client.addUserRoles('analyst', ['administrators']);
+    for (const id of ['admin-user', 'analyst']) {
+      expect((await client.userRoleSources(id)).roles.administrators).toEqual({
+        actions: [{ privilege: 'admin' }],
+        roleType: 'user',
+      });
+    }
+  });
   it('preserves provider overlap, removes manual grants and reconciles the fallback', async () => {
     const client = createDemoClient();
     const oauth = (await client.listUsers()).find((user) => user.method === 'oauth')!;
