@@ -131,6 +131,29 @@ describe('per-client Team demo', () => {
       },
     );
   });
+  it.each(['constructor', 'toString', '__proto__'])(
+    'rejects the inherited property name %s as an unknown role',
+    async (name) => {
+      const client = createDemoClient();
+      const unknown = { status: 400, message: `Roles do not exist: ${name}` };
+      await expect(client.createApiKey('inherited-key', [name])).rejects.toMatchObject(unknown);
+      await expect(client.createUser('inherited-user', [name])).rejects.toMatchObject(unknown);
+      await expect(client.addUserRoles('analyst', [name])).rejects.toMatchObject(unknown);
+    },
+  );
+  // Like the backend: API keys and user creation report unknown roles first,
+  // while role additions report protected roles first.
+  it('orders unknown and protected role errors like the backend', async () => {
+    const client = createDemoClient();
+    const assigned = ['nope', 'super-admin'];
+    const unknown = { status: 400, message: 'Roles do not exist: nope' };
+    await expect(client.createApiKey('mixed-key', assigned)).rejects.toMatchObject(unknown);
+    await expect(client.createUser('mixed-user', assigned)).rejects.toMatchObject(unknown);
+    await expect(client.addUserRoles('analyst', assigned)).rejects.toMatchObject({
+      status: 400,
+      message: 'Role is protected',
+    });
+  });
   it('allows ordinary admin roles for API keys and user grants', async () => {
     const client = createDemoClient();
     expect((await client.createApiKey('admin-key', ['administrators'])).roles).toEqual([

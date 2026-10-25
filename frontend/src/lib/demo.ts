@@ -464,15 +464,18 @@ export function createDemoClient(): ParseableClient {
     const missing = names.filter((name) => !Object.hasOwn(roles, name));
     if (missing.length) fail(`Roles do not exist: ${missing.join(', ')}`);
   }
-  function assignableRoles(names: string[]) {
-    if (
-      Object.entries(privileges(names)).some(
-        ([name, actions]) =>
-          name === 'super-admin' || actions.some((action) => action.privilege === 'superadmin'),
-      )
-    )
-      fail('Role is protected');
-    knownRoles(names);
+  // Demo roles can only hold admin, editor, reader, writer or ingestor, so
+  // the built-in `super-admin` is the only protected role.
+  function rejectProtectedRoles(names: string[]) {
+    if (names.includes('super-admin')) fail('Role is protected');
+  }
+  // Like the backend, role additions report protected roles before unknown
+  // ones, and API keys and user creation the other way round. `super-admin`
+  // exists on the backend but not in the demo's role map.
+  function assignableRoles(names: string[], { protectedFirst = false } = {}) {
+    if (protectedFirst) rejectProtectedRoles(names);
+    knownRoles(names.filter((name) => name !== 'super-admin'));
+    rejectProtectedRoles(names);
   }
   function named(name: string, kind: 'user' | 'role') {
     const error = validateName(name, kind);
@@ -651,7 +654,7 @@ export function createDemoClient(): ParseableClient {
     async addUserRoles(id, assigned) {
       await ready();
       const user = findUser(id, true);
-      assignableRoles(assigned);
+      assignableRoles(assigned, { protectedFirst: true });
       if (user.oidc && !user.oidc.legacy)
         user.oidc.manualRoles = [...new Set([...(user.oidc.manualRoles ?? []), ...assigned])];
       else user.assigned = [...new Set([...user.assigned, ...assigned])];
