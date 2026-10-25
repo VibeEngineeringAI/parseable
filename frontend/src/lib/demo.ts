@@ -464,6 +464,19 @@ export function createDemoClient(): ParseableClient {
     const missing = names.filter((name) => !Object.hasOwn(roles, name));
     if (missing.length) fail(`Roles do not exist: ${missing.join(', ')}`);
   }
+  // Demo roles can only hold admin, editor, reader, writer or ingestor, so
+  // the built-in `super-admin` is the only protected role.
+  function rejectProtectedRoles(names: string[]) {
+    if (names.includes('super-admin')) fail('Role is protected');
+  }
+  // Like the backend, role additions report protected roles before unknown
+  // ones, and API keys and user creation the other way round. `super-admin`
+  // exists on the backend but not in the demo's role map.
+  function assignableRoles(names: string[], { protectedFirst = false } = {}) {
+    if (protectedFirst) rejectProtectedRoles(names);
+    knownRoles(names.filter((name) => name !== 'super-admin'));
+    rejectProtectedRoles(names);
+  }
   function named(name: string, kind: 'user' | 'role') {
     const error = validateName(name, kind);
     if (error) fail(error);
@@ -613,7 +626,7 @@ export function createDemoClient(): ParseableClient {
       await ready();
       if (username === 'admin') fail('Cannot call this API for root admin user');
       named(username, 'user');
-      knownRoles(assigned);
+      assignableRoles(assigned);
       if (!assigned.length) fail('User cannot be created without a role');
       if (
         users.some(
@@ -641,7 +654,7 @@ export function createDemoClient(): ParseableClient {
     async addUserRoles(id, assigned) {
       await ready();
       const user = findUser(id, true);
-      knownRoles(assigned);
+      assignableRoles(assigned, { protectedFirst: true });
       if (user.oidc && !user.oidc.legacy)
         user.oidc.manualRoles = [...new Set([...(user.oidc.manualRoles ?? []), ...assigned])];
       else user.assigned = [...new Set([...user.assigned, ...assigned])];
@@ -678,7 +691,7 @@ export function createDemoClient(): ParseableClient {
     },
     async createApiKey(keyName, assigned, ttlSeconds) {
       await ready();
-      knownRoles(assigned);
+      assignableRoles(assigned);
       if (
         ttlSeconds != null &&
         (!Number.isInteger(ttlSeconds) || ttlSeconds < 1800 || ttlSeconds > 7776000)
