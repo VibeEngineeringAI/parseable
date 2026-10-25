@@ -31,15 +31,15 @@ use crate::{
     utils::get_tenant_id_from_request,
 };
 
-// The querier commits each user change to storage before syncing it, and sends
-// syncs after releasing its lock, so a sync can arrive after later changes were
-// committed and its body may be stale. Every receiver therefore installs the
+// Every sender commits the user change to storage before syncing it, but syncs
+// fan out in parallel and can arrive after later changes were committed, so the
+// body may be stale. Every receiver therefore installs the
 // user as storage holds it rather than replaying the request. Holding the lock
 // across read and install means a later sync always reads state at least as new
 // as an earlier one, and repeated syncs are harmless.
 
-// Handler for POST /api/v1/user/{userid}
-// Creates a new user by username if it does not exists
+// Handler for POST /api/v1/user/{userid}/sync
+// Installs the user as storage holds it, or removes it if storage has none
 pub async fn post_user(
     req: HttpRequest,
     userid: web::Path<String>,
@@ -75,7 +75,7 @@ pub async fn delete_user(
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
-// Handler PATCH /user/{userid}/role/sync/add => Add roles to a user
+// Handler PATCH /user/{userid}/role/sync/add => install the user's stored roles
 // The body is still parsed so the route accepts what older queriers send.
 pub async fn add_roles_to_user(
     req: HttpRequest,
@@ -88,7 +88,7 @@ pub async fn add_roles_to_user(
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
-// Handler PATCH /user/{userid}/role/sync/remove => Remove roles to a user
+// Handler PATCH /user/{userid}/role/sync/remove => install the user's stored roles
 // The body is still parsed so the route accepts what older queriers send.
 pub async fn remove_roles_from_user(
     req: HttpRequest,
@@ -101,8 +101,8 @@ pub async fn remove_roles_from_user(
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
-// Handler for POST /api/v1/user/{userid}/generate-new-password
-// Resets password for the user to a newly generated one and returns it
+// Handler for POST /api/v1/user/{userid}/generate-new-password/sync
+// Installs the user, and so its new password hash, as storage holds it
 pub async fn post_gen_password(
     req: HttpRequest,
     userid: web::Path<String>,
@@ -327,5 +327,47 @@ mod tests {
             .unwrap()
             .users;
         assert_eq!(users, &HashSet::from([member("other")]));
+    }
+
+    // API-key revocation goes through the same delete sync. The sender removes
+    // the key from storage first, so the sync must drop the live key.
+    #[tokio::test]
+    async fn deleted_api_key_is_removed_and_stored_key_installed() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let tenant = Some(format!("ingestor-user-{}", Ulid::new()));
+        let key = ParseableUser::new_api_key(
+            Ulid::new(),
+            "secret".to_owned(),
+            "key".to_owned(),
+            HashSet::from(["a".to_owned()]),
+            "admin".to_owned(),
+            tenant.clone(),
+        );
+        let keyid = key.userid().to_owned();
+
+        apply_stored_user(std::slice::from_ref(&key), &keyid, &tenant);
+        assert_eq!(Users.get_user(&keyid, &tenant), Some(key));
+
+        apply_stored_user(&[], &keyid, &tenant);
+        assert_eq!(Users.get_user(&keyid, &tenant), None);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_leaves_the_same_userid_in_other_tenants() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let (other_tenant, _) = fresh();
+        let other = user(&other_tenant, &userid, &["a"]);
+        live_with_session(&user(&tenant, &userid, &["a"]));
+        live_with_session(&other);
+
+        apply_stored_user(&[], &userid, &tenant);
+
+        assert_eq!(Users.get_user(&userid, &tenant), None);
+        assert_eq!(Users.get_user(&userid, &other_tenant), Some(other));
     }
 }
