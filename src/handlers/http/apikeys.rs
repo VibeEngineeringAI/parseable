@@ -376,8 +376,15 @@ pub async fn delete_api_key(
         })
         .ok_or_else(|| ApiKeyError::KeyNotFound(key_id.to_string()))?;
 
+    // Remove from parseable.json first: ingestors install what storage holds,
+    // so a sync sent before this would reinstall the key.
+    let mut metadata = get_metadata(&tenant_id).await?;
+    metadata.users.retain(|u| u.userid() != userid.as_str());
+    put_metadata(&metadata, &tenant_id).await?;
+
     // Make cluster revocation part of the success contract. If this fails, we
-    // leave the local key intact so the caller can retry the same revocation.
+    // leave the local key intact so the caller can retry the same revocation;
+    // storage no longer has it, so a restart drops it too.
     if let Err(e) = crate::handlers::http::cluster::sync_user_deletion_with_ingestors(
         &req,
         &userid,
@@ -389,11 +396,6 @@ pub async fn delete_api_key(
         tracing::error!("Failed to sync API-key user deletion: {e}");
         return Err(ApiKeyError::RevocationSyncFailed(e.to_string()));
     }
-
-    // Remove from parseable.json.
-    let mut metadata = get_metadata(&tenant_id).await?;
-    metadata.users.retain(|u| u.userid() != userid.as_str());
-    put_metadata(&metadata, &tenant_id).await?;
 
     // Remove from in-memory map on this node.
     Users.delete_user(&userid, &tenant_id);
