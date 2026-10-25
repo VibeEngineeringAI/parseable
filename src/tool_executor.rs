@@ -14,6 +14,10 @@ use crate::{
             DataType as SqlDataType, Expr as SqlExpr, SelectItem, SetExpr,
             Statement as SqlStatement, visit_expressions,
         },
+        sqlparser::{
+            dialect::GenericDialect,
+            tokenizer::{Token, Tokenizer},
+        },
     },
     handlers::http::{
         alerts, cluster, health_check, logstream,
@@ -125,11 +129,44 @@ pub fn validate_tool_sql(query: &str) -> Result<(), String> {
     validate_projection(query.body.as_ref())
 }
 
+/// Drops trailing statement terminators, along with any comments after them,
+/// so that `SELECT a FROM t; -- note` can be wrapped in a subquery. Comments
+/// and semicolons inside the statement (for example in string literals) are
+/// kept because the cut is made at a tokenizer `;`, not a textual one.
+fn strip_trailing_semicolons(query: &str) -> &str {
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, query).tokenize_with_location() else {
+        return query;
+    };
+    let Some(semicolon) = tokens
+        .iter()
+        .rev()
+        .take_while(|token| matches!(token.token, Token::Whitespace(_) | Token::SemiColon))
+        .filter(|token| token.token == Token::SemiColon)
+        .last()
+    else {
+        return query;
+    };
+    let target = semicolon.span.start;
+    let (mut line, mut column) = (1, 1);
+    for (offset, character) in query.char_indices() {
+        if line == target.line && column == target.column {
+            return query[..offset].trim_end();
+        }
+        if character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    query
+}
+
 pub fn bounded_tool_sql(query: &str) -> Result<String, String> {
     validate_tool_sql(query)?;
     Ok(format!(
         "SELECT * FROM ({}\n) AS \"__parseable_tool_result\" LIMIT {MAX_TOOL_ROWS}",
-        query.trim().trim_end_matches(';')
+        strip_trailing_semicolons(query.trim())
     ))
 }
 
@@ -2152,6 +2189,38 @@ mod tests {
         assert!(bounded_tool_sql("SELECT a,b,c,d,e,f,g,h,i,j,k FROM logs").is_err());
         let bounded = bounded_tool_sql("SELECT a FROM logs -- recent events").unwrap();
         assert!(bounded.contains("-- recent events\n) AS"));
+        // Only the outer projection is limited; nested queries may use `*`.
+        assert!(bounded_tool_sql("WITH x AS (SELECT * FROM logs) SELECT a FROM x").is_ok());
+        assert!(bounded_tool_sql("SELECT a FROM (SELECT * FROM logs) AS t").is_ok());
+        assert!(bounded_tool_sql("SELECT a FROM logs WHERE EXISTS (SELECT * FROM logs)").is_ok());
+        assert!(bounded_tool_sql("WITH x AS (SELECT a FROM logs) SELECT * FROM x").is_err());
+    }
+
+    #[actix_web::test]
+    async fn bounded_tool_sql_runs_with_comments_after_the_trailing_semicolon() {
+        let context = datafusion::prelude::SessionContext::new();
+        for (source, expected) in [
+            ("SELECT 'x' AS a; -- note", "x"),
+            ("SELECT 'x' AS a; /* note */", "x"),
+            ("SELECT 'x' AS a ; ; -- note\n-- another note\n", "x"),
+            ("SELECT 'x' AS a -- note\n; -- another note", "x"),
+            ("SELECT 'x;' AS a; -- note", "x;"),
+            ("SELECT 'x' AS a -- note;", "x"),
+            ("SELECT 'x' AS a /* ; */ ;", "x"),
+            ("SELECT 'é' AS a; -- note", "é"),
+        ] {
+            let bounded = bounded_tool_sql(source).unwrap();
+            let batches = context
+                .sql(&bounded)
+                .await
+                .unwrap_or_else(|error| panic!("{source:?} -> {bounded:?}: {error}"))
+                .collect()
+                .await
+                .unwrap();
+            let column = batches[0].column(0);
+            let value = datafusion::arrow::util::display::array_value_to_string(column, 0).unwrap();
+            assert_eq!(value, expected, "{source:?} -> {bounded:?}");
+        }
     }
 
     #[actix_web::test]

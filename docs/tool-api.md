@@ -140,8 +140,8 @@ and pagination are not identical to this summary tool.
 
 `query_sql`, `explain_query` and other tools that run SQL internally parse the
 statement with DataFusion's SQL parser and accept exactly one `SELECT` or `WITH`
-query. A trailing semicolon or trailing comments are allowed, but a semicolon
-followed by a comment passes validation and then fails when the query runs.
+query. Trailing semicolons and trailing comments are allowed, including
+comments after the final semicolon (`SELECT a FROM t; -- note`).
 The outermost projection must name at most 10 explicit columns, and `*` and
 `table.*` are rejected there. The same limit applies to each branch of a
 top-level set operation such as `UNION` and to a parenthesized outer query.
