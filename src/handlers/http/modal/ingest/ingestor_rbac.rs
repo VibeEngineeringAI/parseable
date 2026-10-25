@@ -26,14 +26,17 @@ use crate::{
         rbac::{RBACError, UPDATE_LOCK},
     },
     parseable::DEFAULT_TENANT,
-    rbac::{
-        Users,
-        map::roles,
-        user::{self, User as ParseableUser},
-    },
-    storage,
+    rbac::{Users, user::User as ParseableUser},
+    storage::{self, StorageMetadata},
     utils::get_tenant_id_from_request,
 };
+
+// The querier commits each user change to storage before syncing it, and sends
+// syncs after releasing its lock, so a sync can arrive after later changes were
+// committed and its body may be stale. Every receiver therefore installs the
+// user as storage holds it rather than replaying the request. Holding the lock
+// across read and install means a later sync always reads state at least as new
+// as an earlier one, and repeated syncs are harmless.
 
 // Handler for POST /api/v1/user/{userid}
 // Creates a new user by username if it does not exists
@@ -55,12 +58,7 @@ pub async fn post_user(
                 "non super-admin user trying to create user for another tenant",
             )));
         }
-        let req_tenant_id = &user.tenant;
-        let metadata = get_metadata(req_tenant_id).await?;
-        let _ = storage::put_staging_metadata(&metadata, req_tenant_id);
-        let created_role = user.roles.clone();
-        Users.put_user(user.clone());
-        Users.add_roles(&username, created_role.clone(), req_tenant_id);
+        sync_stored_user(&username, &user.tenant).await?;
     }
 
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
@@ -73,136 +71,33 @@ pub async fn delete_user(
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let _guard = UPDATE_LOCK.lock().await;
-    // fail this request if the user does not exists
-    if !Users.contains(&userid, &tenant_id) {
-        return Err(RBACError::UserDoesNotExist);
-    };
-
-    // delete from parseable.json first
-    let mut metadata = get_metadata(&tenant_id).await?;
-    metadata.users.retain(|user| user.userid() != userid);
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-
-    // update in mem table
-    Users.delete_user(&userid, &tenant_id);
+    sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
 // Handler PATCH /user/{userid}/role/sync/add => Add roles to a user
+// The body is still parsed so the route accepts what older queriers send.
 pub async fn add_roles_to_user(
     req: HttpRequest,
     userid: web::Path<String>,
-    roles_to_add: web::Json<HashSet<String>>,
+    _roles_to_add: web::Json<HashSet<String>>,
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
-    let roles_to_add = roles_to_add.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let _guard = UPDATE_LOCK.lock().await;
-    if !Users.contains(&userid, &tenant_id) {
-        return Err(RBACError::UserDoesNotExist);
-    };
-
-    // check if all roles exist
-    let mut non_existent_roles = Vec::new();
-    roles_to_add.iter().for_each(|r| {
-        let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let role_exists = roles()
-            .get(tenant)
-            .is_some_and(|tenant_roles| tenant_roles.contains_key(r));
-        if !role_exists {
-            non_existent_roles.push(r.clone());
-        }
-    });
-
-    if !non_existent_roles.is_empty() {
-        return Err(RBACError::RolesDoNotExist(non_existent_roles));
-    }
-
-    // update parseable.json first
-    let mut metadata = get_metadata(&tenant_id).await?;
-    if let Some(user) = metadata
-        .users
-        .iter_mut()
-        .find(|user| user.userid() == userid)
-    {
-        let mut manual = user.manual_roles();
-        manual.extend(roles_to_add.clone());
-        user.set_manual_roles(manual);
-    } else {
-        // should be unreachable given state is always consistent
-        return Err(RBACError::UserDoesNotExist);
-    }
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-    // update in mem table
-    Users.add_roles(&userid.clone(), roles_to_add.clone(), &tenant_id);
+    sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
 // Handler PATCH /user/{userid}/role/sync/remove => Remove roles to a user
+// The body is still parsed so the route accepts what older queriers send.
 pub async fn remove_roles_from_user(
     req: HttpRequest,
     userid: web::Path<String>,
-    roles_to_remove: web::Json<HashSet<String>>,
+    _roles_to_remove: web::Json<HashSet<String>>,
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
-    let roles_to_remove = roles_to_remove.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let _guard = UPDATE_LOCK.lock().await;
-    if !Users.contains(&userid, &tenant_id) {
-        return Err(RBACError::UserDoesNotExist);
-    };
-
-    // check if all roles exist
-    let mut non_existent_roles = Vec::new();
-    roles_to_remove.iter().for_each(|r| {
-        if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-            && tenant_roles.get(r).is_none()
-        {
-            non_existent_roles.push(r.clone());
-        }
-    });
-
-    if !non_existent_roles.is_empty() {
-        return Err(RBACError::RolesDoNotExist(non_existent_roles));
-    }
-
-    // check that user actually has these roles
-    let user_roles: HashSet<String> = HashSet::from_iter(Users.get_role(&userid, &tenant_id));
-    let roles_not_with_user: HashSet<String> =
-        HashSet::from_iter(roles_to_remove.difference(&user_roles).cloned());
-
-    if !roles_not_with_user.is_empty() {
-        return Err(RBACError::RolesNotAssigned(Vec::from_iter(
-            roles_not_with_user,
-        )));
-    }
-
-    // update parseable.json in staging first
-    let mut metadata = get_metadata(&tenant_id).await?;
-    if let Some(user) = metadata
-        .users
-        .iter_mut()
-        .find(|user| user.userid() == userid)
-    {
-        let manual = user.manual_roles();
-        if !roles_to_remove.is_subset(&manual) {
-            return Err(RBACError::RolesManagedByOidc);
-        }
-        user.set_manual_roles(HashSet::from_iter(
-            manual.difference(&roles_to_remove).cloned(),
-        ));
-    } else {
-        // should be unreachable given state is always consistent
-        return Err(RBACError::UserDoesNotExist);
-    }
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-    // update in mem table
-    Users.remove_roles(&userid.clone(), roles_to_remove.clone(), &tenant_id);
-
+    sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
@@ -214,30 +109,34 @@ pub async fn post_gen_password(
 ) -> Result<HttpResponse, RBACError> {
     let username = userid.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let mut new_hash = String::default();
-    let mut metadata = get_metadata(&tenant_id).await?;
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-    if let Some(user) = metadata
-        .users
-        .iter_mut()
-        .filter_map(|user| match user.ty {
-            user::UserType::Native(ref mut user) => Some(user),
-            _ => None,
-        })
-        .find(|user| user.username == username)
-    {
-        new_hash.clone_from(&user.password_hash);
-    } else {
-        return Err(RBACError::UserDoesNotExist);
-    }
-    Users.change_password_hash(&username, &new_hash, &tenant_id);
+    sync_stored_user(&username, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
+}
+
+/// Reads the tenant's metadata from storage, installs `userid` as stored there
+/// and writes the metadata to staging.
+async fn sync_stored_user(userid: &str, tenant_id: &Option<String>) -> Result<(), RBACError> {
+    let _guard = UPDATE_LOCK.lock().await;
+    let metadata = get_metadata(tenant_id).await?;
+    apply_stored_user(&metadata.users, userid, tenant_id);
+    put_staging(&metadata, tenant_id);
+    Ok(())
+}
+
+fn put_staging(metadata: &StorageMetadata, tenant_id: &Option<String>) {
+    if let Err(e) = storage::put_staging_metadata(metadata, tenant_id) {
+        tracing::warn!("Failed to write staging metadata after user sync: {e}");
+    }
 }
 
 /// Makes the live user `userid` match `stored` (the tenant's users in storage),
 /// removing it if storage no longer has it, and drops the user's sessions.
-fn apply_stored_user(_stored: &[ParseableUser], _userid: &str, _tenant_id: &Option<String>) {}
+fn apply_stored_user(stored: &[ParseableUser], userid: &str, tenant_id: &Option<String>) {
+    match stored.iter().find(|user| user.userid() == userid) {
+        Some(user) => Users.put_user(user.clone()),
+        None => Users.delete_user(userid, tenant_id),
+    }
+}
 
 #[cfg(test)]
 mod tests {
