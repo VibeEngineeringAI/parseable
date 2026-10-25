@@ -405,7 +405,11 @@ mod put_tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::{handlers::TENANT_ID, rbac::map::ROLES, rbac::role::model::DefaultPrivilege};
+    use crate::{
+        handlers::TENANT_ID,
+        rbac::map::{ROLES, TEST_SERIAL},
+        rbac::role::model::DefaultPrivilege,
+    };
 
     const ROLE: &str = "readers";
 
@@ -415,6 +419,8 @@ mod put_tests {
 
     #[tokio::test]
     async fn rejected_super_admin_update_leaves_live_role_unchanged() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
         ROLES.get_or_init(|| RwLock::new(HashMap::new()));
         let tenant = format!("role-put-{}", Ulid::new());
         mut_roles()

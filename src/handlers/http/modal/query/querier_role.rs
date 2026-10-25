@@ -218,7 +218,7 @@ mod tests {
         rbac::{
             Users,
             map::{
-                ROLES, SESSIONS, SessionKey, Sessions, USER_GROUPS, USERS, UserGroups,
+                ROLES, SESSIONS, SessionKey, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
                 Users as UserMap, mut_users,
             },
             role::model::DefaultPrivilege,
@@ -272,6 +272,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_super_admin_update_leaves_live_role_unchanged() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
         let (tenant, req) = tenant_request();
         let body = Role::create_user_role(vec![DefaultPrivilege::SuperAdmin]);
 
@@ -291,6 +293,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_internal_update_leaves_live_role_unchanged() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
         for privilege in [
             DefaultPrivilege::SuperAdmin,
             DefaultPrivilege::Reader { resource: None },

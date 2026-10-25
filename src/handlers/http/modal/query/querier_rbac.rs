@@ -467,7 +467,7 @@ mod role_escalation {
         handlers::TENANT_ID,
         rbac::{
             map::{
-                ROLES, SESSIONS, SessionKey, Sessions, USER_GROUPS, USERS, UserGroups,
+                ROLES, SESSIONS, SessionKey, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
                 Users as UserMap, mut_roles, mut_users,
             },
             role::model::{DefaultPrivilege, Role},
@@ -545,21 +545,29 @@ mod role_escalation {
 
     #[tokio::test]
     async fn post_user_rejects_internal_role() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
         rejects_creation(Role::create_internal_role(vec![DefaultPrivilege::Admin])).await;
     }
 
     #[tokio::test]
     async fn post_user_rejects_super_admin_role() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
         rejects_creation(Role::create_user_role(vec![DefaultPrivilege::SuperAdmin])).await;
     }
 
     #[tokio::test]
     async fn add_roles_rejects_internal_role() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
         rejects_addition(Role::create_internal_role(vec![DefaultPrivilege::Admin])).await;
     }
 
     #[tokio::test]
     async fn add_roles_rejects_super_admin_role() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
         rejects_addition(Role::create_user_role(vec![DefaultPrivilege::SuperAdmin])).await;
     }
 }
