@@ -55,15 +55,21 @@ pub struct UpdateUser {
 }
 
 impl UpdateUser {
+    /// Prepare a changed user value without publishing it to the live map.
+    /// The caller must persist this value before making it visible.
     pub fn update(
         &self,
         userid: &str,
         tenant_id: &Option<String>,
     ) -> Result<Option<User>, RBACError> {
         let mut user = None;
-        if let Some(email) = &self.email {
+        if self.email.is_some() {
             if self.is_valid_email() {
-                user = Some(Users.put_email(email.clone(), tenant_id, userid)?);
+                let mut updated_user = Users
+                    .get_user(userid, tenant_id)
+                    .ok_or(RBACError::UserDoesNotExist)?;
+                self.apply(&mut updated_user)?;
+                user = Some(updated_user);
             } else {
                 return Err(RBACError::Anyhow(anyhow::Error::msg("Invalid Email")));
             }
@@ -71,6 +77,14 @@ impl UpdateUser {
 
         Ok(user)
     }
+    /// Apply only the patched fields to `user`, leaving everything else as is.
+    pub fn apply(&self, user: &mut User) -> Result<(), RBACError> {
+        if let Some(email) = &self.email {
+            user.insert_email(email.clone())?;
+        }
+        Ok(())
+    }
+
     fn is_valid_email(&self) -> bool {
         if let Some(email) = &self.email {
             EMAIL_VALIDATOR_RE.is_match(email)
@@ -788,6 +802,127 @@ impl UserGroup {
 }
 
 #[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::rbac::map::{TEST_SERIAL, USERS, mut_users};
+    use actix_web::{ResponseError, http::StatusCode};
+    use parking_lot::RwLock;
+
+    #[test]
+    fn preparing_user_patch_does_not_publish_before_persistence() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        let original = User {
+            ty: UserType::Native(Basic {
+                username: "patch-user".to_owned(),
+                password_hash: "unchanged-hash".to_owned(),
+                email: Some("before@example.com".to_owned()),
+            }),
+            roles: HashSet::from(["reader".to_owned()]),
+            user_groups: HashSet::from(["engineering".to_owned()]),
+            tenant: Some(format!("patch-test-{}", Ulid::new())),
+            protected: false,
+        };
+        mut_users().insert(original.clone());
+        let update = UpdateUser {
+            email: Some("after@example.com".to_owned()),
+        };
+
+        // This is the handler's step before get_metadata/put_metadata. If either
+        // fails, the prepared value is discarded and live state must be intact.
+        let prepared = update
+            .update(original.userid(), &original.tenant)
+            .unwrap()
+            .unwrap();
+        let mut expected = original.clone();
+        expected
+            .insert_email("after@example.com".to_owned())
+            .unwrap();
+        assert_eq!(prepared, expected);
+        assert_eq!(
+            Users.get_user(original.userid(), &original.tenant),
+            Some(original),
+            "preparing a PATCH must not publish it before metadata persists"
+        );
+    }
+
+    #[test]
+    fn preparing_oauth_patch_keeps_live_profile_unchanged() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        let original = User::new_oauth(
+            "oauth-user".to_owned(),
+            HashSet::from(["reader".to_owned()]),
+            UserInfo {
+                email: Some("before@example.com".to_owned()),
+                name: Some("Unchanged Name".to_owned()),
+                ..Default::default()
+            },
+            None,
+            Some(format!("patch-test-{}", Ulid::new())),
+            false,
+        );
+        mut_users().insert(original.clone());
+        let prepared = UpdateUser {
+            email: Some("after@example.com".to_owned()),
+        }
+        .update(original.userid(), &original.tenant)
+        .unwrap()
+        .unwrap();
+        let mut expected = original.clone();
+        expected
+            .insert_email("after@example.com".to_owned())
+            .unwrap();
+        assert_eq!(prepared, expected);
+        assert_eq!(
+            Users.get_user(original.userid(), &original.tenant),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn user_patch_preserves_noop_and_validation_order() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        let tenant = Some(format!("patch-test-{}", Ulid::new()));
+        assert!(
+            UpdateUser { email: None }
+                .update("missing", &tenant)
+                .unwrap()
+                .is_none()
+        );
+        let invalid = UpdateUser {
+            email: Some("invalid".to_owned()),
+        }
+        .update("missing", &tenant)
+        .unwrap_err();
+        assert_eq!(invalid.to_string(), "Error: Invalid Email");
+        assert_eq!(invalid.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let valid = UpdateUser {
+            email: Some("after@example.com".to_owned()),
+        };
+        let missing = valid.update("missing", &tenant).unwrap_err();
+        assert!(matches!(missing, RBACError::UserDoesNotExist));
+        assert_eq!(missing.status_code(), StatusCode::NOT_FOUND);
+
+        let api_key = User::new_api_key(
+            Ulid::new(),
+            "test-key".to_owned(),
+            "test".to_owned(),
+            HashSet::new(),
+            "creator".to_owned(),
+            tenant.clone(),
+        );
+        mut_users().insert(api_key.clone());
+        let unsupported = valid.update(api_key.userid(), &tenant).unwrap_err();
+        assert_eq!(unsupported.to_string(), "Error: Can't add email to API key");
+        assert_eq!(unsupported.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(Users.get_user(api_key.userid(), &tenant), Some(api_key));
+    }
+}
+
+#[cfg(test)]
 mod apikey_serde_tests {
     use super::*;
 
@@ -936,5 +1071,61 @@ mod apikey_serde_tests {
         println!(
             "\n=== user json (persisted shape) ===\n{pretty}\n====================================\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use crate::rbac::map::{TEST_SERIAL, USERS, mut_users};
+    use parking_lot::RwLock;
+
+    fn native(tenant: &Option<String>, email: &str) -> User {
+        User {
+            ty: UserType::Native(Basic {
+                username: format!("publish-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: Some(email.to_owned()),
+            }),
+            roles: HashSet::new(),
+            user_groups: HashSet::new(),
+            tenant: tenant.clone(),
+            protected: false,
+        }
+    }
+
+    #[test]
+    fn apply_changes_only_the_patched_email() {
+        let mut user = native(&None, "before@example.com");
+        let mut expected = user.clone();
+        expected
+            .insert_email("after@example.com".to_owned())
+            .unwrap();
+        UpdateUser {
+            email: Some("after@example.com".to_owned()),
+        }
+        .apply(&mut user)
+        .unwrap();
+        assert_eq!(user, expected);
+    }
+
+    #[test]
+    fn replace_user_updates_a_live_user_but_never_recreates_one() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        let tenant = Some(format!("publish-test-{}", Ulid::new()));
+        let live = native(&tenant, "before@example.com");
+        mut_users().insert(live.clone());
+        let mut patched = live.clone();
+        patched
+            .insert_email("after@example.com".to_owned())
+            .unwrap();
+
+        Users.replace_user(patched.clone());
+        assert_eq!(Users.get_user(live.userid(), &tenant), Some(patched));
+
+        let removed = native(&tenant, "gone@example.com");
+        Users.replace_user(removed.clone());
+        assert_eq!(Users.get_user(removed.userid(), &tenant), None);
     }
 }
