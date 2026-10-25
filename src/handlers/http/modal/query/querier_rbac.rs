@@ -442,14 +442,17 @@ pub async fn post_gen_password(
     req: HttpRequest,
     userid: web::Path<String>,
 ) -> Result<impl Responder, RBACError> {
-    let username = userid.into_inner();
+    let userid = userid.into_inner();
     let mut new_password = String::default();
     let mut new_hash = String::default();
     let tenant_id = get_tenant_id_from_request(&req);
     let caller_userid = get_user_from_request(&req)?;
+    if Users.is_protected(&userid, &tenant_id) == Some(true) {
+        return Err(RBACError::ProtectedUser);
+    }
+    let _guard = UPDATE_LOCK.lock().await;
     let mut metadata = get_metadata(&tenant_id).await?;
 
-    let _guard = UPDATE_LOCK.lock().await;
     let user::PassCode { password, hash } = user::Basic::gen_new_password();
     new_password.clone_from(&password);
     new_hash.clone_from(&hash);
@@ -460,16 +463,16 @@ pub async fn post_gen_password(
             user::UserType::Native(ref mut user) => Some(user),
             _ => None,
         })
-        .find(|user| user.username == username)
+        .find(|user| user.username == userid)
     {
         user.password_hash.clone_from(&hash);
     } else {
         return Err(RBACError::UserDoesNotExist);
     }
     put_metadata(&metadata, &tenant_id).await?;
-    Users.change_password_hash(&username, &new_hash, &tenant_id);
+    Users.change_password_hash(&userid, &new_hash, &tenant_id);
 
-    if let Err(e) = sync_password_reset_with_ingestors(req, &username, &caller_userid).await {
+    if let Err(e) = sync_password_reset_with_ingestors(req, &userid, &caller_userid).await {
         tracing::error!("{e}");
     };
 

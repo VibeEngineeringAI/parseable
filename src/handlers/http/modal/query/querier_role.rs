@@ -129,6 +129,7 @@ pub async fn delete(
     req: HttpRequest,
     name: web::Path<String>,
 ) -> Result<impl Responder, RoleError> {
+    let guard = UPDATE_LOCK.lock().await;
     let name = name.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
@@ -195,6 +196,8 @@ pub async fn delete(
             }
         }
     }
+
+    drop(guard);
 
     if let Err(e) = sync_role_delete(&req, name.clone(), &tenant_id, &caller_userid).await {
         tracing::error!("Failed to sync role deletion to cluster nodes: {e}");
