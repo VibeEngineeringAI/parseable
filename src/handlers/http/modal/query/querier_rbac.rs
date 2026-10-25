@@ -74,6 +74,11 @@ pub async fn post_user(
     if !non_existent_roles.is_empty() {
         return Err(RBACError::RolesDoNotExist(non_existent_roles));
     }
+    // Standalone reads protected users from metadata; the in-memory map is
+    // loaded from it and kept in step, and is checked before any storage call.
+    if Users.any_role_held_by_protected_user(&user_roles, &tenant_id) {
+        return Err(RBACError::ProtectedRole);
+    }
     if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
         && user_roles.iter().any(|name| {
             tenant_roles.get(name).is_some_and(|role| {
@@ -232,6 +237,15 @@ pub async fn add_roles_to_user(
         return Err(RBACError::UserDoesNotExist);
     };
 
+    // Protected checks come before the existence check, as in the standalone handler.
+    if Users.is_protected(&userid, &tenant_id) == Some(true) {
+        return Err(RBACError::ProtectedUser);
+    }
+
+    if Users.any_role_held_by_protected_user(&roles_to_add, &tenant_id) {
+        return Err(RBACError::ProtectedRole);
+    }
+
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     // find username by userid, for native users, username is userid, for oauth users, we need to look up
     let username = if let Some(users) = users().get(tenant)
@@ -242,11 +256,21 @@ pub async fn add_roles_to_user(
         return Err(RBACError::UserDoesNotExist);
     };
 
+    if let Some(tenant_roles) = roles().get(tenant)
+        && roles_to_add.iter().any(|name| {
+            tenant_roles.get(name).is_some_and(|role| {
+                role.role_type() == &RoleType::Internal || role.deny_super_admin()
+            })
+        })
+    {
+        return Err(RBACError::ProtectedRole);
+    }
+
     let mut non_existent_roles = Vec::new();
 
     // check if the role exists
     roles_to_add.iter().for_each(|r| {
-        if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
+        if let Some(tenant_roles) = roles().get(tenant)
             && tenant_roles.get(r).is_none()
         {
             non_existent_roles.push(r.clone());
@@ -255,16 +279,6 @@ pub async fn add_roles_to_user(
 
     if !non_existent_roles.is_empty() {
         return Err(RBACError::RolesDoNotExist(non_existent_roles));
-    }
-
-    if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-        && roles_to_add.iter().any(|name| {
-            tenant_roles.get(name).is_some_and(|role| {
-                role.role_type() == &RoleType::Internal || role.deny_super_admin()
-            })
-        })
-    {
-        return Err(RBACError::ProtectedRole);
     }
 
     // update parseable.json first
@@ -455,6 +469,10 @@ pub async fn post_gen_password(
 
 #[cfg(test)]
 mod role_escalation {
+    // Removing a protected check lets the handler reach `get_metadata`, which
+    // initialises PARSEABLE and parses the test binary's args. Clap then exits
+    // the process with code 2 (`unrecognized subcommand`); that symptom means a
+    // check was removed.
     use std::collections::HashMap;
 
     use actix_web::{HttpMessage, ResponseError, http::StatusCode, test::TestRequest};

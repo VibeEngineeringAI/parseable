@@ -127,6 +127,21 @@ impl Users {
             .map(|users| users.get(userid).unwrap().protected)
     }
 
+    /// Whether a protected user in the tenant holds any of `role_names`.
+    /// Takes the USERS lock, so callers must not hold ROLES or USER_GROUPS.
+    pub fn any_role_held_by_protected_user(
+        &self,
+        role_names: &HashSet<String>,
+        tenant_id: &Option<String>,
+    ) -> bool {
+        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+        users().get(tenant_id).is_some_and(|users| {
+            users
+                .values()
+                .any(|user| user.protected && !user.roles.is_disjoint(role_names))
+        })
+    }
+
     pub fn collect_user<T: for<'a> From<&'a User> + 'static>(
         &self,
         tenant_id: &Option<String>,

@@ -247,21 +247,27 @@ fn validate_roles(
     tenant_id: &Option<String>,
 ) -> Result<(), ApiKeyError> {
     let tenant = tenant_or_default(tenant_id);
-    let tenant_roles = roles();
-    let missing: Vec<String> = role_names
-        .iter()
-        .filter(|r| {
-            tenant_roles
-                .get(tenant)
-                .map(|m| !m.contains_key(*r))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
+    let missing: Vec<String> = {
+        let tenant_roles = roles();
+        role_names
+            .iter()
+            .filter(|r| {
+                tenant_roles
+                    .get(tenant)
+                    .map(|m| !m.contains_key(*r))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    };
     if !missing.is_empty() {
         return Err(ApiKeyError::Rbac(RBACError::RolesDoNotExist(missing)));
     }
-    if let Some(tenant_roles) = tenant_roles.get(tenant)
+    // Takes USERS, so no ROLES guard may be held here.
+    if Users.any_role_held_by_protected_user(role_names, tenant_id) {
+        return Err(ApiKeyError::Rbac(RBACError::ProtectedRole));
+    }
+    if let Some(tenant_roles) = roles().get(tenant)
         && role_names.iter().any(|name| {
             tenant_roles.get(name).is_some_and(|role| {
                 role.role_type() == &RoleType::Internal || role.deny_super_admin()
