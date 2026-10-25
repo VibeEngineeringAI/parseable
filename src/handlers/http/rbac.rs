@@ -220,13 +220,15 @@ pub async fn patch_user(
             .iter_mut()
             .find(|user| user.userid() == userid)
         {
-            *user = updated_user;
+            *user = updated_user.clone();
         } else {
             // should be unreachable given state is always consistent
             return Err(RBACError::UserDoesNotExist);
         }
 
         put_metadata(&metadata, &tenant_id).await?;
+        // Email changes do not affect permissions, so preserve active sessions.
+        rbac::map::mut_users().insert(updated_user);
     };
 
     Ok(HttpResponse::Ok())
