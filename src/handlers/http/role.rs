@@ -25,6 +25,7 @@ use actix_web::{
     web::{self, Json},
 };
 
+use super::modal::utils::rbac_utils::put_metadata;
 use crate::rbac::map::roles;
 use crate::rbac::role::model::{Role, RoleType, RoleUI};
 use crate::{
@@ -34,7 +35,7 @@ use crate::{
         map::{DEFAULT_ROLE, mut_roles, mut_sessions, mut_users, read_user_groups, users},
         user::UserType,
     },
-    storage::{self, ObjectStorageError, StorageMetadata},
+    storage::{ObjectStorageError, StorageMetadata},
     utils::get_tenant_id_from_request,
     validator::{self, error::UsernameValidationError},
 };
@@ -300,15 +301,6 @@ async fn get_metadata(
         .map_err(|e| ObjectStorageError::MetastoreError(Box::new(e.to_detail())))?
         .ok_or_else(|| ObjectStorageError::Custom("parseable metadata not initialized".into()))?;
     Ok(serde_json::from_slice::<StorageMetadata>(&metadata)?)
-}
-
-async fn put_metadata(
-    metadata: &StorageMetadata,
-    tenant_id: &Option<String>,
-) -> Result<(), ObjectStorageError> {
-    storage::put_remote_metadata(metadata, tenant_id).await?;
-    storage::put_staging_metadata(metadata, tenant_id)?;
-    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
