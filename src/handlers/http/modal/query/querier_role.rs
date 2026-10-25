@@ -292,6 +292,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_existing_internal_role_update_leaves_live_role_unchanged() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, req) = tenant_request();
+        let internal_role = Role::create_internal_role(vec![DefaultPrivilege::Admin]);
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), internal_role.clone());
+
+        let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(reader_role())).await
+        else {
+            panic!("updating an existing internal role must be rejected");
+        };
+        assert!(matches!(err, RoleError::ProtectedRole), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned(),
+            Some(internal_role),
+            "rejected update must not change the live internal role"
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_internal_update_leaves_live_role_unchanged() {
         // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
         let _serial = TEST_SERIAL.lock().await;
