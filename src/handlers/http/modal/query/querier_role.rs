@@ -145,6 +145,9 @@ pub async fn delete(
 
     // check if the role is being used by any user or group
     let mut metadata = get_metadata(&tenant_id).await?;
+    if metadata.default_role.as_deref() == Some(name.as_str()) {
+        return Err(RoleError::DefaultRoleInUse);
+    }
     if metadata.users.iter().any(|user| user.roles.contains(&name)) {
         return Err(RoleError::RoleInUse);
     }
