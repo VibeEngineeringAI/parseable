@@ -165,10 +165,16 @@ mod tests {
     use parking_lot::RwLock;
     use ulid::Ulid;
 
+    use chrono::{TimeDelta, Utc};
+
     use super::*;
     use crate::rbac::{
-        map::{ROLES, SESSIONS, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups, roles},
+        map::{
+            ROLES, SESSIONS, SessionKey, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
+            mut_users, roles, sessions, write_user_groups,
+        },
         role::model::DefaultPrivilege,
+        user::{Basic, GroupUser, User, UserGroup, UserType},
     };
 
     const ROLE: &str = "writers";
@@ -194,14 +200,19 @@ mod tests {
     }
 
     // The querier sends syncs after releasing its lock, so PUT A's sync can
-    // arrive after PUT B was committed. Storage then holds B; the stale body
-    // must not overwrite it.
+    // arrive after PUT B was committed. Storage then holds B and the live map
+    // may still hold A. `apply_stored_role` takes no body, so the stale A in
+    // the request cannot be installed.
     #[tokio::test]
-    async fn stale_sync_body_does_not_override_stored_role() {
+    async fn installs_stored_role_over_live_role() {
         // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
         let _serial = TEST_SERIAL.lock().await;
         init_auth_maps();
         let tenant = format!("ingestor-role-{}", Ulid::new());
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), role_a());
         let stored = HashMap::from([(ROLE.to_owned(), role_b())]);
 
         apply_stored_role(&stored, &tenant, ROLE);
@@ -224,5 +235,112 @@ mod tests {
         apply_stored_role(&HashMap::new(), &tenant, ROLE);
 
         assert_eq!(live_role(&tenant), None, "deleted role must not be live");
+    }
+
+    fn insert_user(tenant: &str, roles: &[&str]) -> String {
+        let user = User {
+            ty: UserType::Native(Basic {
+                username: format!("user-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+            user_groups: HashSet::new(),
+            tenant: Some(tenant.to_owned()),
+            protected: false,
+        };
+        let userid = user.userid().to_owned();
+        mut_users().insert(user);
+        userid
+    }
+
+    fn track_session(tenant: &str, userid: &str) {
+        mut_sessions().track_new(
+            userid.to_owned(),
+            SessionKey::SessionId(Ulid::new()),
+            Utc::now() + TimeDelta::hours(1),
+            Vec::new(),
+            &Some(tenant.to_owned()),
+        );
+    }
+
+    fn has_session(tenant: &str, userid: &str) -> bool {
+        sessions()
+            .get_active_sessions()
+            .iter()
+            .any(|(_, user, t)| user == userid && t == tenant)
+    }
+
+    #[tokio::test]
+    async fn drops_sessions_of_direct_and_group_holders_only() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let tenant = format!("ingestor-role-{}", Ulid::new());
+        let other_tenant = format!("ingestor-role-{}", Ulid::new());
+        let direct = insert_user(&tenant, &[ROLE]);
+        let member = insert_user(&tenant, &[]);
+        let unrelated = insert_user(&tenant, &["other"]);
+        let elsewhere = insert_user(&other_tenant, &[ROLE]);
+        write_user_groups().insert(
+            UserGroup {
+                name: "group".to_owned(),
+                roles: HashSet::from([ROLE.to_owned()]),
+                users: HashSet::from([GroupUser {
+                    userid: member.clone(),
+                    username: member.clone(),
+                    method: "native".to_owned(),
+                    tenant_id: Some(tenant.clone()),
+                }]),
+            },
+            &tenant,
+        );
+        for (t, user) in [
+            (&tenant, &direct),
+            (&tenant, &member),
+            (&tenant, &unrelated),
+            (&other_tenant, &elsewhere),
+        ] {
+            track_session(t, user);
+        }
+
+        apply_stored_role(&HashMap::from([(ROLE.to_owned(), role_b())]), &tenant, ROLE);
+
+        assert!(
+            !has_session(&tenant, &direct),
+            "direct holder keeps a session"
+        );
+        assert!(
+            !has_session(&tenant, &member),
+            "group member keeps a session"
+        );
+        assert!(
+            has_session(&tenant, &unrelated),
+            "unrelated user lost a session"
+        );
+        assert!(
+            has_session(&other_tenant, &elsewhere),
+            "another tenant's user lost a session"
+        );
+    }
+
+    // Internal roles such as `super-admin` exist only in memory, never in
+    // storage, so a sync naming one must not remove or replace it.
+    #[tokio::test]
+    async fn sync_leaves_internal_role_alone() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let tenant = format!("ingestor-role-{}", Ulid::new());
+        let internal = Role::create_internal_role(vec![DefaultPrivilege::Admin]);
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), internal.clone());
+
+        apply_stored_role(&HashMap::new(), &tenant, ROLE);
+        assert_eq!(live_role(&tenant), Some(internal.clone()));
+        apply_stored_role(&HashMap::from([(ROLE.to_owned(), role_a())]), &tenant, ROLE);
+        assert_eq!(live_role(&tenant), Some(internal));
     }
 }
