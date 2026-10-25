@@ -248,9 +248,9 @@ pub async fn post_gen_password(
     }
     let mut new_password = String::default();
     let mut new_hash = String::default();
+    let _guard = UPDATE_LOCK.lock().await;
     let mut metadata = get_metadata(&tenant_id).await?;
 
-    let _guard = UPDATE_LOCK.lock().await;
     let user::PassCode { password, hash } = user::Basic::gen_new_password();
     new_password.clone_from(&password);
     new_hash.clone_from(&hash);
@@ -687,4 +687,36 @@ pub struct RolesResponse {
     pub group_roles: HashMap<String, HashMap<String, Role>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oidc: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::test::TestRequest;
+    use parking_lot::RwLock;
+
+    use super::*;
+    use crate::rbac::map::{TEST_SERIAL, USERS};
+
+    #[tokio::test]
+    async fn post_gen_password_waits_for_update_lock_before_storage() {
+        let _serial = TEST_SERIAL.lock().await;
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        let _guard = UPDATE_LOCK.lock().await;
+
+        // Cancel at the lock: resuming would initialize PARSEABLE and make clap
+        // parse the test arguments. Without the lock before get_metadata, this
+        // test exits with code 2 instead of timing out.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                post_gen_password(
+                    TestRequest::default().to_http_request(),
+                    web::Path::from("nobody".to_owned()),
+                ),
+            )
+            .await
+            .is_err(),
+            "password generation must wait for UPDATE_LOCK before reading metadata"
+        );
+    }
 }
