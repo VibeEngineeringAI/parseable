@@ -33,7 +33,6 @@ use serde::Serialize;
 use url::Url;
 
 use crate::handlers::TENANT_ID;
-use crate::handlers::http::rbac::RBACError;
 use crate::parseable::DEFAULT_TENANT;
 use crate::rbac::map::{mut_sessions, mut_users, read_user_groups, roles, sessions, users};
 use crate::rbac::role::Action;
@@ -64,21 +63,14 @@ pub enum Response {
 pub struct Users;
 
 impl Users {
-    pub fn put_email(
-        &self,
-        email: String,
-        tenant_id: &Option<String>,
-        userid: &str,
-    ) -> Result<User, RBACError> {
-        // won't change permissions so don't refresh session
-        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+    /// Replaces the live user with `user` if it is still present, without
+    /// touching sessions. Callers hold `UPDATE_LOCK`.
+    pub fn replace_user(&self, user: User) {
+        let tenant_id = user.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
         if let Some(tenant_users) = mut_users().get_mut(tenant_id)
-            && let Some(user) = tenant_users.get_mut(userid)
+            && let Some(live) = tenant_users.get_mut(user.userid())
         {
-            user.insert_email(email)?;
-            Ok(user.clone())
-        } else {
-            Err(RBACError::UserDoesNotExist)
+            *live = user;
         }
     }
 

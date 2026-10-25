@@ -63,12 +63,12 @@ impl UpdateUser {
         tenant_id: &Option<String>,
     ) -> Result<Option<User>, RBACError> {
         let mut user = None;
-        if let Some(email) = &self.email {
+        if self.email.is_some() {
             if self.is_valid_email() {
                 let mut updated_user = Users
                     .get_user(userid, tenant_id)
                     .ok_or(RBACError::UserDoesNotExist)?;
-                updated_user.insert_email(email.clone())?;
+                self.apply(&mut updated_user)?;
                 user = Some(updated_user);
             } else {
                 return Err(RBACError::Anyhow(anyhow::Error::msg("Invalid Email")));
@@ -77,6 +77,14 @@ impl UpdateUser {
 
         Ok(user)
     }
+    /// Apply only the patched fields to `user`, leaving everything else as is.
+    pub fn apply(&self, user: &mut User) -> Result<(), RBACError> {
+        if let Some(email) = &self.email {
+            user.insert_email(email.clone())?;
+        }
+        Ok(())
+    }
+
     fn is_valid_email(&self) -> bool {
         if let Some(email) = &self.email {
             EMAIL_VALIDATOR_RE.is_match(email)
@@ -1063,5 +1071,61 @@ mod apikey_serde_tests {
         println!(
             "\n=== user json (persisted shape) ===\n{pretty}\n====================================\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use crate::rbac::map::{TEST_SERIAL, USERS, mut_users};
+    use parking_lot::RwLock;
+
+    fn native(tenant: &Option<String>, email: &str) -> User {
+        User {
+            ty: UserType::Native(Basic {
+                username: format!("publish-{}", Ulid::new()),
+                password_hash: String::new(),
+                email: Some(email.to_owned()),
+            }),
+            roles: HashSet::new(),
+            user_groups: HashSet::new(),
+            tenant: tenant.clone(),
+            protected: false,
+        }
+    }
+
+    #[test]
+    fn apply_changes_only_the_patched_email() {
+        let mut user = native(&None, "before@example.com");
+        let mut expected = user.clone();
+        expected
+            .insert_email("after@example.com".to_owned())
+            .unwrap();
+        UpdateUser {
+            email: Some("after@example.com".to_owned()),
+        }
+        .apply(&mut user)
+        .unwrap();
+        assert_eq!(user, expected);
+    }
+
+    #[test]
+    fn replace_user_updates_a_live_user_but_never_recreates_one() {
+        let _serial = TEST_SERIAL.blocking_lock();
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        let tenant = Some(format!("publish-test-{}", Ulid::new()));
+        let live = native(&tenant, "before@example.com");
+        mut_users().insert(live.clone());
+        let mut patched = live.clone();
+        patched
+            .insert_email("after@example.com".to_owned())
+            .unwrap();
+
+        Users.replace_user(patched.clone());
+        assert_eq!(Users.get_user(live.userid(), &tenant), Some(patched));
+
+        let removed = native(&tenant, "gone@example.com");
+        Users.replace_user(removed.clone());
+        assert_eq!(Users.get_user(removed.userid(), &tenant), None);
     }
 }

@@ -220,7 +220,9 @@ pub async fn patch_user(
             .iter_mut()
             .find(|user| user.userid() == userid)
         {
-            *user = updated_user.clone();
+            // Patch the stored user rather than copying the live one, which
+            // carries live-only state such as OAuth tokens.
+            update.apply(user)?;
         } else {
             // should be unreachable given state is always consistent
             return Err(RBACError::UserDoesNotExist);
@@ -228,7 +230,7 @@ pub async fn patch_user(
 
         put_metadata(&metadata, &tenant_id).await?;
         // Email changes do not affect permissions, so preserve active sessions.
-        rbac::map::mut_users().insert(updated_user);
+        Users.replace_user(updated_user);
     };
 
     Ok(HttpResponse::Ok())
