@@ -35,22 +35,35 @@ pub async fn get_metadata(
     Ok(serde_json::from_slice::<StorageMetadata>(&metadata)?)
 }
 
+/// Persist authoritative metadata and refresh its best-effort local staging copy.
+/// Success lets callers publish the committed change to live RBAC state.
 pub async fn put_metadata(
     metadata: &StorageMetadata,
     tenant_id: &Option<String>,
 ) -> Result<(), ObjectStorageError> {
-    put_metadata_with_writers(storage::put_remote_metadata(metadata, tenant_id), || {
-        storage::put_staging_metadata(metadata, tenant_id)
-    })
+    put_metadata_with_writers(
+        storage::put_remote_metadata(metadata, tenant_id),
+        || storage::put_staging_metadata(metadata, tenant_id),
+        tenant_id,
+    )
     .await
 }
 
 async fn put_metadata_with_writers(
     remote_write: impl Future<Output = Result<(), ObjectStorageError>>,
     staging_write: impl FnOnce() -> io::Result<()>,
+    tenant_id: &Option<String>,
 ) -> Result<(), ObjectStorageError> {
     remote_write.await?;
-    staging_write()?;
+    // A staging failure cannot undo the durable commit. Returning an error here
+    // would leave callers' live authorization state behind the source of truth.
+    if let Err(error) = staging_write() {
+        tracing::error!(
+            error = %error,
+            tenant_id = ?tenant_id,
+            "Failed to refresh staging metadata after durable metadata write"
+        );
+    }
     Ok(())
 }
 
@@ -80,6 +93,7 @@ mod tests {
                     "staging is read-only",
                 ))
             },
+            &None,
         )
         .await;
 
@@ -95,6 +109,7 @@ mod tests {
         let result = put_metadata_with_writers(
             async { Err(ObjectStorageError::Custom("durable write failed".into())) },
             || panic!("staging must not be changed after a failed durable write"),
+            &None,
         )
         .await;
 
@@ -117,6 +132,7 @@ mod tests {
                 staging_written.set(true);
                 Ok(())
             },
+            &None,
         )
         .await;
 

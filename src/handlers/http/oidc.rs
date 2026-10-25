@@ -47,7 +47,9 @@ use crate::{
     handlers::{
         COOKIE_AGE_DAYS, SESSION_COOKIE_NAME, USER_COOKIE_NAME, USER_ID_COOKIE_NAME,
         http::{
-            API_BASE_PATH, API_VERSION, cluster::sync_user_creation, modal::OIDC_CLIENT,
+            API_BASE_PATH, API_VERSION,
+            cluster::sync_user_creation,
+            modal::{OIDC_CLIENT, utils::rbac_utils::put_metadata},
             rbac::UPDATE_LOCK,
         },
     },
@@ -58,7 +60,7 @@ use crate::{
         map::{DEFAULT_ROLE, SessionKey, mut_sessions, mut_users, roles, write_user_groups},
         user::{self, GroupUser, User, UserType},
     },
-    storage::{self, ObjectStorageError, StorageMetadata},
+    storage::{ObjectStorageError, StorageMetadata},
     utils::{
         actix::extract_session_key_from_req, get_tenant_id_from_key, get_tenant_id_from_request,
     },
@@ -823,15 +825,6 @@ async fn get_metadata(
         .map_err(|e| ObjectStorageError::MetastoreError(Box::new(e.to_detail())))?
         .ok_or_else(|| ObjectStorageError::Custom("parseable metadata not initialized".into()))?;
     Ok(serde_json::from_slice::<StorageMetadata>(&metadata)?)
-}
-
-async fn put_metadata(
-    metadata: &StorageMetadata,
-    tenant_id: &Option<String>,
-) -> Result<(), ObjectStorageError> {
-    storage::put_remote_metadata(metadata, tenant_id).await?;
-    storage::put_staging_metadata(metadata, tenant_id)?;
-    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
