@@ -397,3 +397,52 @@ mod oidc_default_tests {
         assert!(validate_default_role("", &roles).is_err());
     }
 }
+
+#[cfg(test)]
+mod put_tests {
+    use actix_web::{ResponseError, test::TestRequest};
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::{
+        handlers::TENANT_ID,
+        rbac::map::{ROLES, TEST_SERIAL},
+        rbac::role::model::DefaultPrivilege,
+    };
+
+    const ROLE: &str = "readers";
+
+    fn reader_role() -> Role {
+        Role::create_user_role(vec![DefaultPrivilege::Reader { resource: None }])
+    }
+
+    #[tokio::test]
+    async fn rejected_super_admin_update_leaves_live_role_unchanged() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+        let tenant = format!("role-put-{}", Ulid::new());
+        mut_roles()
+            .entry(tenant.clone())
+            .or_default()
+            .insert(ROLE.to_owned(), reader_role());
+        let req = TestRequest::default()
+            .insert_header((TENANT_ID, tenant.as_str()))
+            .to_http_request();
+        let body = Role::create_user_role(vec![DefaultPrivilege::SuperAdmin]);
+
+        let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(body)).await else {
+            panic!("SuperAdmin role update must be rejected");
+        };
+        assert!(matches!(err, RoleError::SuperAdminPrivilege), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+
+        let live = roles().get(&tenant).and_then(|r| r.get(ROLE)).cloned();
+        assert_eq!(
+            live,
+            Some(reader_role()),
+            "rejected update must not change the live role"
+        );
+    }
+}
