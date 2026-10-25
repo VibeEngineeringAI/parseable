@@ -124,6 +124,10 @@ pub async fn delete_user(
     let caller_userid = get_user_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     let _guard = UPDATE_LOCK.lock().await;
+    // fail this request if the user is protected
+    if Users.is_protected(&userid, &tenant_id) == Some(true) {
+        return Err(RBACError::ProtectedUser);
+    }
     // fail this request if the user does not exist
     if !Users.contains(&userid, &tenant_id) {
         return Err(RBACError::UserDoesNotExist);
@@ -334,6 +338,11 @@ pub async fn remove_roles_from_user(
     if !Users.contains(&userid, &tenant_id) {
         return Err(RBACError::UserDoesNotExist);
     };
+
+    // fail this request if the user is protected
+    if Users.is_protected(&userid, &tenant_id) == Some(true) {
+        return Err(RBACError::ProtectedUser);
+    }
 
     // find username by userid, for native users, username is userid, for oauth users, we need to look up
     let username = if let Some(users) = users().get(tenant)
@@ -660,6 +669,41 @@ mod role_escalation {
             panic!("a protected user must be rejected");
         };
         assert!(matches!(err, RBACError::ProtectedUser), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_user_rejects_protected_user() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, _, req) = tenant_request(ordinary_role());
+        let target = insert_protected_user(&tenant, "admin");
+        let Err(err) = delete_user(req, web::Path::from(target.clone())).await else {
+            panic!("a protected user must be rejected before storage");
+        };
+        assert!(matches!(err, RBACError::ProtectedUser), "{err:?}");
+        assert!(Users.contains(&target, &Some(tenant)));
+    }
+
+    #[tokio::test]
+    async fn remove_roles_rejects_protected_user() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        let (tenant, _, req) = tenant_request(ordinary_role());
+        let target = insert_protected_user(&tenant, "admin");
+        let Err(err) = remove_roles_from_user(
+            req,
+            web::Path::from(target.clone()),
+            web::Json(HashSet::from(["admin".to_owned()])),
+        )
+        .await
+        else {
+            panic!("a protected user must be rejected before storage");
+        };
+        assert!(matches!(err, RBACError::ProtectedUser), "{err:?}");
+        assert_eq!(
+            Users.get_user(&target, &Some(tenant)).unwrap().roles,
+            HashSet::from(["admin".to_owned()])
+        );
     }
 
     #[tokio::test]
