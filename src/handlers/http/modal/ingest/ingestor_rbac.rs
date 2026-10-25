@@ -26,17 +26,20 @@ use crate::{
         rbac::{RBACError, UPDATE_LOCK},
     },
     parseable::DEFAULT_TENANT,
-    rbac::{
-        Users,
-        map::roles,
-        user::{self, User as ParseableUser},
-    },
-    storage,
+    rbac::{Users, map::write_user_groups, user::User as ParseableUser},
+    storage::{self, StorageMetadata},
     utils::get_tenant_id_from_request,
 };
 
-// Handler for POST /api/v1/user/{userid}
-// Creates a new user by username if it does not exists
+// Every sender commits the user change to storage before syncing it, but syncs
+// fan out in parallel and can arrive after later changes were committed, so the
+// body may be stale. Every receiver therefore installs the
+// user as storage holds it rather than replaying the request. Holding the lock
+// across read and install means a later sync always reads state at least as new
+// as an earlier one, and repeated syncs are harmless.
+
+// Handler for POST /api/v1/user/{userid}/sync
+// Installs the user as storage holds it, or removes it if storage has none
 pub async fn post_user(
     req: HttpRequest,
     userid: web::Path<String>,
@@ -55,12 +58,7 @@ pub async fn post_user(
                 "non super-admin user trying to create user for another tenant",
             )));
         }
-        let req_tenant_id = &user.tenant;
-        let metadata = get_metadata(req_tenant_id).await?;
-        let _ = storage::put_staging_metadata(&metadata, req_tenant_id);
-        let created_role = user.roles.clone();
-        Users.put_user(user.clone());
-        Users.add_roles(&username, created_role.clone(), req_tenant_id);
+        sync_stored_user(&username, &user.tenant).await?;
     }
 
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
@@ -73,164 +71,303 @@ pub async fn delete_user(
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let _guard = UPDATE_LOCK.lock().await;
-    // fail this request if the user does not exists
-    if !Users.contains(&userid, &tenant_id) {
-        return Err(RBACError::UserDoesNotExist);
-    };
-
-    // delete from parseable.json first
-    let mut metadata = get_metadata(&tenant_id).await?;
-    metadata.users.retain(|user| user.userid() != userid);
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-
-    // update in mem table
-    Users.delete_user(&userid, &tenant_id);
+    sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
-// Handler PATCH /user/{userid}/role/sync/add => Add roles to a user
+// Handler PATCH /user/{userid}/role/sync/add => install the user's stored roles
+// The body is still parsed so the route accepts what older queriers send.
 pub async fn add_roles_to_user(
     req: HttpRequest,
     userid: web::Path<String>,
-    roles_to_add: web::Json<HashSet<String>>,
+    _roles_to_add: web::Json<HashSet<String>>,
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
-    let roles_to_add = roles_to_add.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let _guard = UPDATE_LOCK.lock().await;
-    if !Users.contains(&userid, &tenant_id) {
-        return Err(RBACError::UserDoesNotExist);
-    };
-
-    // check if all roles exist
-    let mut non_existent_roles = Vec::new();
-    roles_to_add.iter().for_each(|r| {
-        let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let role_exists = roles()
-            .get(tenant)
-            .is_some_and(|tenant_roles| tenant_roles.contains_key(r));
-        if !role_exists {
-            non_existent_roles.push(r.clone());
-        }
-    });
-
-    if !non_existent_roles.is_empty() {
-        return Err(RBACError::RolesDoNotExist(non_existent_roles));
-    }
-
-    // update parseable.json first
-    let mut metadata = get_metadata(&tenant_id).await?;
-    if let Some(user) = metadata
-        .users
-        .iter_mut()
-        .find(|user| user.userid() == userid)
-    {
-        let mut manual = user.manual_roles();
-        manual.extend(roles_to_add.clone());
-        user.set_manual_roles(manual);
-    } else {
-        // should be unreachable given state is always consistent
-        return Err(RBACError::UserDoesNotExist);
-    }
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-    // update in mem table
-    Users.add_roles(&userid.clone(), roles_to_add.clone(), &tenant_id);
+    sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
-// Handler PATCH /user/{userid}/role/sync/remove => Remove roles to a user
+// Handler PATCH /user/{userid}/role/sync/remove => install the user's stored roles
+// The body is still parsed so the route accepts what older queriers send.
 pub async fn remove_roles_from_user(
     req: HttpRequest,
     userid: web::Path<String>,
-    roles_to_remove: web::Json<HashSet<String>>,
+    _roles_to_remove: web::Json<HashSet<String>>,
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
-    let roles_to_remove = roles_to_remove.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let _guard = UPDATE_LOCK.lock().await;
-    if !Users.contains(&userid, &tenant_id) {
-        return Err(RBACError::UserDoesNotExist);
-    };
-
-    // check if all roles exist
-    let mut non_existent_roles = Vec::new();
-    roles_to_remove.iter().for_each(|r| {
-        if let Some(tenant_roles) = roles().get(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-            && tenant_roles.get(r).is_none()
-        {
-            non_existent_roles.push(r.clone());
-        }
-    });
-
-    if !non_existent_roles.is_empty() {
-        return Err(RBACError::RolesDoNotExist(non_existent_roles));
-    }
-
-    // check that user actually has these roles
-    let user_roles: HashSet<String> = HashSet::from_iter(Users.get_role(&userid, &tenant_id));
-    let roles_not_with_user: HashSet<String> =
-        HashSet::from_iter(roles_to_remove.difference(&user_roles).cloned());
-
-    if !roles_not_with_user.is_empty() {
-        return Err(RBACError::RolesNotAssigned(Vec::from_iter(
-            roles_not_with_user,
-        )));
-    }
-
-    // update parseable.json in staging first
-    let mut metadata = get_metadata(&tenant_id).await?;
-    if let Some(user) = metadata
-        .users
-        .iter_mut()
-        .find(|user| user.userid() == userid)
-    {
-        let manual = user.manual_roles();
-        if !roles_to_remove.is_subset(&manual) {
-            return Err(RBACError::RolesManagedByOidc);
-        }
-        user.set_manual_roles(HashSet::from_iter(
-            manual.difference(&roles_to_remove).cloned(),
-        ));
-    } else {
-        // should be unreachable given state is always consistent
-        return Err(RBACError::UserDoesNotExist);
-    }
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-    // update in mem table
-    Users.remove_roles(&userid.clone(), roles_to_remove.clone(), &tenant_id);
-
+    sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
 
-// Handler for POST /api/v1/user/{userid}/generate-new-password
-// Resets password for the user to a newly generated one and returns it
+// Handler for POST /api/v1/user/{userid}/generate-new-password/sync
+// Installs the user, and so its new password hash, as storage holds it
 pub async fn post_gen_password(
     req: HttpRequest,
     userid: web::Path<String>,
 ) -> Result<HttpResponse, RBACError> {
     let username = userid.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    let mut new_hash = String::default();
-    let mut metadata = get_metadata(&tenant_id).await?;
-
-    let _ = storage::put_staging_metadata(&metadata, &tenant_id);
-    if let Some(user) = metadata
-        .users
-        .iter_mut()
-        .filter_map(|user| match user.ty {
-            user::UserType::Native(ref mut user) => Some(user),
-            _ => None,
-        })
-        .find(|user| user.username == username)
-    {
-        new_hash.clone_from(&user.password_hash);
-    } else {
-        return Err(RBACError::UserDoesNotExist);
-    }
-    Users.change_password_hash(&username, &new_hash, &tenant_id);
+    sync_stored_user(&username, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
+}
+
+/// Reads the tenant's metadata from storage, installs `userid` as stored there
+/// and writes the metadata to staging.
+async fn sync_stored_user(userid: &str, tenant_id: &Option<String>) -> Result<(), RBACError> {
+    let _guard = UPDATE_LOCK.lock().await;
+    let metadata = get_metadata(tenant_id).await?;
+    apply_stored_user(&metadata.users, userid, tenant_id);
+    put_staging(&metadata, tenant_id);
+    Ok(())
+}
+
+fn put_staging(metadata: &StorageMetadata, tenant_id: &Option<String>) {
+    if let Err(e) = storage::put_staging_metadata(metadata, tenant_id) {
+        tracing::warn!("Failed to write staging metadata after user sync: {e}");
+    }
+}
+
+/// Makes the live user `userid` match `stored` (the tenant's users in storage),
+/// removing it, and its group memberships, if storage no longer has it, and
+/// drops the user's sessions.
+fn apply_stored_user(stored: &[ParseableUser], userid: &str, tenant_id: &Option<String>) {
+    match stored.iter().find(|user| user.userid() == userid) {
+        Some(user) => Users.put_user(user.clone()),
+        None => {
+            Users.delete_user(userid, tenant_id);
+            let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+            if let Some(groups) = write_user_groups().get_mut(tenant) {
+                for group in groups.values_mut() {
+                    group.users.retain(|member| member.userid() != userid);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::TimeDelta;
+    use parking_lot::RwLock;
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::rbac::{
+        map::{
+            ROLES, SESSIONS, SessionKey, Sessions, TEST_SERIAL, USER_GROUPS, USERS, UserGroups,
+            mut_users, read_user_groups, write_user_groups,
+        },
+        user::{Basic, GroupUser, UserGroup, UserType},
+    };
+
+    // `rbac::map::init` needs `PARSEABLE`, so tests create the maps directly.
+    fn init_auth_maps() {
+        USERS.get_or_init(|| RwLock::new(crate::rbac::map::Users::default()));
+        SESSIONS.get_or_init(|| RwLock::new(Sessions::default()));
+        USER_GROUPS.get_or_init(|| RwLock::new(UserGroups::default()));
+        ROLES.get_or_init(|| RwLock::new(HashMap::new()));
+    }
+
+    fn user(tenant: &Option<String>, userid: &str, roles: &[&str]) -> ParseableUser {
+        ParseableUser {
+            ty: UserType::Native(Basic {
+                username: userid.to_owned(),
+                password_hash: String::new(),
+                email: None,
+            }),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+            user_groups: HashSet::new(),
+            tenant: tenant.clone(),
+            protected: false,
+        }
+    }
+
+    /// A tenant and user id no other test uses.
+    fn fresh() -> (Option<String>, String) {
+        (
+            Some(format!("ingestor-user-{}", Ulid::new())),
+            format!("user-{}", Ulid::new()),
+        )
+    }
+
+    /// Stores `user` in the live map and tracks a session for it.
+    fn live_with_session(user: &ParseableUser) -> SessionKey {
+        mut_users().insert(user.clone());
+        let key = SessionKey::SessionId(Ulid::new());
+        Users.new_session(user, key.clone(), TimeDelta::minutes(5));
+        key
+    }
+
+    fn live_roles(userid: &str, tenant: &Option<String>) -> Option<HashSet<String>> {
+        Users.get_user(userid, tenant).map(|user| user.roles)
+    }
+
+    // The querier commits the removal before syncing, so storage no longer
+    // holds the revoked role when the sync arrives; it must still be revoked.
+    #[tokio::test]
+    async fn revoked_role_is_removed_from_live_user_and_sessions_dropped() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let session = live_with_session(&user(&tenant, &userid, &["a", "b"]));
+
+        apply_stored_user(&[user(&tenant, &userid, &["a"])], &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned()])),
+            "live user must hold only the committed roles"
+        );
+        assert!(
+            !Users.session_exists(&session),
+            "sessions with revoked permissions must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn granted_role_is_added_to_live_user_and_sessions_dropped() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let session = live_with_session(&user(&tenant, &userid, &["a"]));
+
+        apply_stored_user(&[user(&tenant, &userid, &["a", "b"])], &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned(), "b".to_owned()]))
+        );
+        assert!(!Users.session_exists(&session));
+    }
+
+    // A repeated or late sync applies the same committed state again.
+    #[tokio::test]
+    async fn applying_stored_user_twice_is_idempotent() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        live_with_session(&user(&tenant, &userid, &["a", "b"]));
+        let stored = [user(&tenant, &userid, &["a"])];
+
+        apply_stored_user(&stored, &userid, &tenant);
+        apply_stored_user(&stored, &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned()]))
+        );
+    }
+
+    // Create then delete: the create's sync arriving after the delete was
+    // committed must not resurrect the user.
+    #[tokio::test]
+    async fn user_deleted_in_storage_is_removed_from_live_map() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let session = live_with_session(&user(&tenant, &userid, &["a"]));
+
+        apply_stored_user(&[], &userid, &tenant);
+
+        assert!(!Users.contains(&userid, &tenant), "user must not be live");
+        assert!(!Users.session_exists(&session));
+    }
+
+    // An ingestor that missed the create sync picks the user up on the next one.
+    #[tokio::test]
+    async fn user_missing_from_live_map_is_installed() {
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+
+        apply_stored_user(&[user(&tenant, &userid, &["a"])], &userid, &tenant);
+
+        assert_eq!(
+            live_roles(&userid, &tenant),
+            Some(HashSet::from(["a".to_owned()]))
+        );
+    }
+
+    // Like the querier's user deletion, the live groups must forget the user.
+    #[tokio::test]
+    async fn deleted_user_is_removed_from_live_groups() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let tenant_name = tenant.clone().unwrap();
+        live_with_session(&user(&tenant, &userid, &[]));
+        let member = |id: &str| GroupUser {
+            userid: id.to_owned(),
+            username: id.to_owned(),
+            method: "native".to_owned(),
+            tenant_id: tenant.clone(),
+        };
+        write_user_groups().insert(
+            UserGroup {
+                name: "group".to_owned(),
+                roles: HashSet::new(),
+                users: HashSet::from([member(&userid), member("other")]),
+            },
+            &tenant_name,
+        );
+
+        apply_stored_user(&[], &userid, &tenant);
+
+        let groups = read_user_groups();
+        let users = &groups
+            .get(&tenant_name)
+            .unwrap()
+            .get("group")
+            .unwrap()
+            .users;
+        assert_eq!(users, &HashSet::from([member("other")]));
+    }
+
+    // API-key revocation goes through the same delete sync. The sender removes
+    // the key from storage first, so the sync must drop the live key.
+    #[tokio::test]
+    async fn deleted_api_key_is_removed_and_stored_key_installed() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let tenant = Some(format!("ingestor-user-{}", Ulid::new()));
+        let key = ParseableUser::new_api_key(
+            Ulid::new(),
+            "secret".to_owned(),
+            "key".to_owned(),
+            HashSet::from(["a".to_owned()]),
+            "admin".to_owned(),
+            tenant.clone(),
+        );
+        let keyid = key.userid().to_owned();
+
+        apply_stored_user(std::slice::from_ref(&key), &keyid, &tenant);
+        assert_eq!(Users.get_user(&keyid, &tenant), Some(key));
+
+        apply_stored_user(&[], &keyid, &tenant);
+        assert_eq!(Users.get_user(&keyid, &tenant), None);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_leaves_the_same_userid_in_other_tenants() {
+        // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock().await;
+        init_auth_maps();
+        let (tenant, userid) = fresh();
+        let (other_tenant, _) = fresh();
+        let other = user(&other_tenant, &userid, &["a"]);
+        live_with_session(&user(&tenant, &userid, &["a"]));
+        live_with_session(&other);
+
+        apply_stored_user(&[], &userid, &tenant);
+
+        assert_eq!(Users.get_user(&userid, &tenant), None);
+        assert_eq!(Users.get_user(&userid, &other_tenant), Some(other));
+    }
 }
