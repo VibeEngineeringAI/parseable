@@ -32,7 +32,7 @@ use crate::{
     parseable::DEFAULT_TENANT,
     rbac::{
         map::{mut_roles, mut_sessions, read_user_groups, users},
-        role::model::Role,
+        role::model::{Role, RoleType},
     },
     storage,
     utils::get_tenant_id_from_request,
@@ -76,10 +76,17 @@ pub async fn put(
 /// Makes the live role `name` match `stored` (the tenant's roles in storage),
 /// removing it if storage no longer has it, and drops the sessions of every
 /// user holding the role.
+/// Internal roles exist only in memory and are left untouched.
 fn apply_stored_role(stored: &HashMap<String, Role>, tenant_id: &str, name: &str) {
     {
         let mut roles = mut_roles();
         let tenant_roles = roles.entry(tenant_id.to_owned()).or_default();
+        if tenant_roles
+            .get(name)
+            .is_some_and(|role| role.role_type() == &RoleType::Internal)
+        {
+            return;
+        }
         match stored.get(name) {
             Some(role) => tenant_roles.insert(name.to_owned(), role.clone()),
             None => tenant_roles.remove(name),
