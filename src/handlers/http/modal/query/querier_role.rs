@@ -205,6 +205,9 @@ pub async fn delete(
 
 #[cfg(test)]
 mod tests {
+    // Removing a protected-role check lets the handler reach storage and initialize
+    // PARSEABLE, which parses the test binary's args. Clap then exits the process
+    // with code 2 (`unrecognized subcommand`); this symptom means a check was removed.
     use std::collections::HashMap;
 
     use actix_web::{HttpMessage, ResponseError, http::StatusCode, test::TestRequest};
@@ -302,8 +305,7 @@ mod tests {
             .or_default()
             .insert(ROLE.to_owned(), internal_role.clone());
 
-        let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(reader_role())).await
-        else {
+        let Err(err) = put(req, web::Path::from(ROLE.to_owned()), Json(reader_role())).await else {
             panic!("updating an existing internal role must be rejected");
         };
         assert!(matches!(err, RoleError::ProtectedRole), "{err:?}");
