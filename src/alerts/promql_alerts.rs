@@ -1199,6 +1199,72 @@ mod tests {
     }
 
     #[test]
+    fn restored_runtime_preserves_error_labels_and_prunes_stale_firing_delivery() {
+        let mut config = config();
+        config.other_fields.as_mut().unwrap().insert(
+            "promqlConfig".into(),
+            serde_json::json!({"holdDuration":"0s"}),
+        );
+        config.targets = vec![Ulid::new()];
+        let labels = BTreeMap::from([
+            ("host".into(), "a".into()),
+            (
+                "error".into(),
+                format!("https://metric.example/failure/{}", "é".repeat(1500)),
+            ),
+        ]);
+        let key = serde_json::to_string(&labels).unwrap();
+        let now = Utc::now();
+        let mut runtime = Runtime::default();
+        let firing = runtime
+            .observe_transactionally(vec![(labels.clone(), 9.0)], &config, now)
+            .unwrap();
+        assert_eq!(firing, vec![(labels.clone(), 9.0, true)]);
+        runtime.enqueue(&firing, &config.targets);
+        runtime.deliveries[0].error =
+            Some("request failed for https://hook.example/TARGET-SECRET".into());
+
+        // Exercise the JSON boundary used at startup and for API responses,
+        // then restore the typed outbox as the next evaluation would.
+        config.other_fields.as_mut().unwrap().insert(
+            "promqlRuntime".into(),
+            serde_json::to_value(runtime).unwrap(),
+        );
+        config.sanitize_runtime_diagnostics();
+        let mut restored: Runtime =
+            serde_json::from_value(config.other_fields.as_ref().unwrap()["promqlRuntime"].clone())
+                .unwrap();
+        restored.sanitize_errors();
+        assert_eq!(restored.instances[&key].labels, labels);
+        assert_eq!(restored.deliveries[0].labels, labels);
+        assert_eq!(
+            serde_json::to_string(&restored.instances[&key].labels).unwrap(),
+            key
+        );
+        assert!(
+            !restored.deliveries[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("TARGET-SECRET")
+        );
+
+        let recovery = restored
+            .observe_transactionally(
+                vec![(labels.clone(), 0.0)],
+                &config,
+                now + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        assert_eq!(recovery, vec![(labels.clone(), 0.0, false)]);
+        assert!(restored.deliveries.is_empty());
+        restored.enqueue(&recovery, &config.targets);
+        assert_eq!(restored.deliveries.len(), 1);
+        assert_eq!(restored.deliveries[0].labels, labels);
+        assert!(!restored.deliveries[0].firing);
+    }
+
+    #[test]
     fn restored_runtime_errors_are_sanitized_without_changing_state() {
         let target = ulid::Ulid::new();
         let delivery = |error: Option<&str>| Delivery {

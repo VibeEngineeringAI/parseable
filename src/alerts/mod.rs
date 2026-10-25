@@ -1198,6 +1198,17 @@ pub fn get_number_of_agg_exprs_from_plan(plan: &LogicalPlan) -> Result<usize, Al
     }
 }
 
+/// The outward-facing policy error retains no raw destination or credential
+/// details, so Actix's response-error Debug logging is safe as well as Display.
+#[derive(Debug)]
+pub struct SanitizedOutboundPolicyError(&'static str);
+
+impl SanitizedOutboundPolicyError {
+    pub const fn sanitized_message(&self) -> &'static str {
+        self.0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AlertError {
     #[error("Storage Error: {0}")]
@@ -1208,13 +1219,12 @@ pub enum AlertError {
     Metadata(&'static str),
     #[error("User is not authorized to run this query")]
     Unauthorized,
-    // Policy errors can name the target host, address or scheme; only the sanitized
-    // message is displayed, and the raw error is not exposed as an error source.
+    // Only the sanitized category is retained, including in Debug/error chains.
     #[error(
         "Alert target outbound policy rejected request: {}",
         .0.sanitized_message()
     )]
-    OutboundPolicy(outbound_http_policy::OutboundPolicyError),
+    OutboundPolicy(SanitizedOutboundPolicyError),
     #[error("ActixError: {0}")]
     Error(#[from] actix_web::Error),
     #[error("DataFusion Error: {0}")]
@@ -1257,7 +1267,7 @@ pub enum AlertError {
 
 impl From<outbound_http_policy::OutboundPolicyError> for AlertError {
     fn from(error: outbound_http_policy::OutboundPolicyError) -> Self {
-        Self::OutboundPolicy(error)
+        Self::OutboundPolicy(SanitizedOutboundPolicyError(error.sanitized_message()))
     }
 }
 
@@ -1908,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_policy_errors_display_only_sanitized_messages() {
+    fn outbound_policy_errors_stay_sanitized_in_actix_logs_and_responses() {
         use super::outbound_http_policy::OutboundPolicyError;
         use actix_web::ResponseError;
         use std::error::Error;
@@ -1943,6 +1953,21 @@ mod tests {
             assert_eq!(body["message"], error.to_string());
             for secret in ["secret-host", "10.1.2.3", "secret-scheme"] {
                 assert!(!body.to_string().contains(secret), "{secret} leaked");
+            }
+
+            // Actix stores this error on the response and its Logger formats
+            // it with Debug, rather than the sanitized Display implementation.
+            let response = actix_web::HttpResponse::from_error(error);
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+            let stored_error = response.error().unwrap();
+            for formatted in [
+                format!("Error in response: {stored_error:?}"),
+                format!("{stored_error:#?}"),
+            ] {
+                assert!(formatted.contains(expected), "{formatted}");
+                for secret in ["secret-host", "10.1.2.3", "secret-scheme"] {
+                    assert!(!formatted.contains(secret), "{secret} leaked: {formatted}");
+                }
             }
         }
     }

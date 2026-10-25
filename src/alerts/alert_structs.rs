@@ -477,8 +477,58 @@ const RUNTIME_FIELDS: [&str; 2] = ["promqlRuntime", "sqlRuntime"];
 pub(super) fn sanitize_runtime_fields(fields: &mut serde_json::Map<String, Value>) {
     for name in RUNTIME_FIELDS {
         if let Some(runtime) = fields.get_mut(name) {
-            sanitize_runtime_errors(runtime);
+            if name == "promqlRuntime" {
+                sanitize_promql_runtime_errors(runtime);
+            } else {
+                sanitize_runtime_errors(runtime);
+            }
         }
+    }
+}
+
+// PromQL labels are series identity, not diagnostics. Preserve only the label
+// payloads at the known instance/delivery positions; a diagnostic container
+// named `labels` elsewhere must still be scrubbed.
+fn sanitize_promql_runtime_errors(value: &mut Value) {
+    let Value::Object(fields) = value else {
+        sanitize_runtime_errors(value);
+        return;
+    };
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("instances", Value::Object(instances)) => {
+                instances
+                    .values_mut()
+                    .for_each(sanitize_promql_entry_errors);
+            }
+            ("deliveries", Value::Array(deliveries)) => {
+                deliveries.iter_mut().for_each(sanitize_promql_entry_errors);
+            }
+            (_, value) => sanitize_runtime_error_field(key, value),
+        }
+    }
+}
+
+fn sanitize_promql_entry_errors(value: &mut Value) {
+    if let Value::Object(fields) = value {
+        for (key, value) in fields {
+            if key != "labels" {
+                sanitize_runtime_error_field(key, value);
+            }
+        }
+    } else {
+        sanitize_runtime_errors(value);
+    }
+}
+
+fn sanitize_runtime_error_field(key: &str, value: &mut Value) {
+    match value {
+        Value::String(error)
+            if key == "error" && super::target::runtime_error_needs_redaction(error.as_str()) =>
+        {
+            *error = super::target::safe_runtime_error(error.as_str());
+        }
+        _ => sanitize_runtime_errors(value),
     }
 }
 
@@ -488,15 +538,7 @@ pub(super) fn sanitize_runtime_errors(value: &mut Value) {
     match value {
         Value::Object(fields) => {
             for (key, value) in fields {
-                match value {
-                    Value::String(error)
-                        if key == "error"
-                            && super::target::runtime_error_needs_redaction(error.as_str()) =>
-                    {
-                        *error = super::target::safe_runtime_error(error.as_str());
-                    }
-                    _ => sanitize_runtime_errors(value),
-                }
+                sanitize_runtime_error_field(key, value);
             }
         }
         Value::Array(values) => values.iter_mut().for_each(sanitize_runtime_errors),
@@ -996,8 +1038,13 @@ pub(crate) mod tests {
 
     /// Extension fields as stored by older builds, with raw delivery URLs in errors.
     pub(crate) fn legacy_runtime_fields() -> Map<String, Value> {
+        let labels = json!({
+            "host":"a",
+            "error":format!("https://metric.example/failure/{}", "é".repeat(1500)),
+            "runbook":"https://runbook.example/keep"
+        });
         let delivery = |error: &str| {
-            json!({"labels":{"host":"a"},"value":2.0,"firing":true,
+            json!({"labels":labels.clone(),"value":2.0,"firing":true,
                 "target":"01ARZ3NDEKTSV4RRFFQ69G5FAV","attempts":3,"error":error})
         };
         let Value::Object(fields) = json!({
@@ -1007,8 +1054,13 @@ pub(crate) mod tests {
                 "health":"error",
                 "error":"error sending request for url (https://user:SECRET-PASS@am.example/api?token=SECRET-TOKEN#frag)",
                 "lastEvaluatedAt":"2026-01-01T00:00:00Z",
-                "instances":{"a":{"labels":{"host":"a","runbook":"https://runbook.example/keep"},
-                    "state":"firing","pendingSince":null,"lastSeen":"2026-01-01T00:00:00Z","value":2.0}},
+                "instances":{
+                    "a":{"labels":labels,"state":"firing","pendingSince":null,
+                        "lastSeen":"2026-01-01T00:00:00Z","value":2.0},
+                    "b":{"labels":{"host":"b","error":"é".repeat(3000)},"state":"resolved",
+                        "pendingSince":null,"lastSeen":"2026-01-01T00:00:00Z","value":0.0}
+                },
+                "diagnostics":{"error":{"labels":{"error":"https://hook.example/SECRET-DIAGNOSTIC-LABEL"}}},
                 "deliveries":[
                     delivery("HTTP status server error (500) for url (HTTP://hook.example/SECRET-PATH)"),
                     delivery("Notification delivery timed out"),
@@ -1041,6 +1093,7 @@ pub(crate) mod tests {
         let mut fields = legacy_runtime_fields();
         fields["promqlRuntime"]["error"] = REDACTED.into();
         fields["promqlRuntime"]["deliveries"][0]["error"] = REDACTED.into();
+        fields["promqlRuntime"]["diagnostics"]["error"]["labels"]["error"] = REDACTED.into();
         fields["sqlRuntime"]["runs"][0]["error"] = REDACTED.into();
         fields["sqlRuntime"]["runs"][1]["nested"]["error"] = "é".repeat(1024).into();
         fields["sqlRuntime"]["error"]["error"] = REDACTED.into();
@@ -1090,6 +1143,7 @@ pub(crate) mod tests {
             "SECRET-NESTED",
             "SECRET-ARRAY",
             "SECRET-DEEP",
+            "SECRET-DIAGNOSTIC-LABEL",
         ] {
             assert!(!text.contains(secret), "{secret} leaked in: {text}");
         }
