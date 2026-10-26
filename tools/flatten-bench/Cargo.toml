@@ -1,0 +1,32 @@
+# Standalone harness that compiles the production `src/utils/json` sources (and a
+# git-extracted baseline copy of them) without building the Parseable server.
+# It has its own empty workspace so it never joins the root crate's build graph.
+[package]
+name = "flatten-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+# The production files carry `#[cfg(test)]` modules that reference server-only
+# paths, so the library itself is never compiled in test mode.
+test = false
+doctest = false
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+serde = { version = "1.0.228", features = ["derive"] }
+# The server binary gets `preserve_order` through feature unification (serde_json
+# depends on indexmap in the root Cargo.lock), so Map behaves the same here.
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+thiserror = "2.0"
+tracing = "0.1.44"
+
+[profile.release]
+debug = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("hotpath"))'] }

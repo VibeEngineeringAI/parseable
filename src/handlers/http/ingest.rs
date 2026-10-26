@@ -562,6 +562,8 @@ impl actix_web::ResponseError for PostError {
             | CreateStream(CreateStreamError::StreamNameValidation(_))
             | OtelNotSupported(_) => StatusCode::BAD_REQUEST,
 
+            JsonFlattenError(e) if e.is_limit_exceeded() => StatusCode::BAD_REQUEST,
+
             Event(_)
             | CreateStream(_)
             | CustomError(_)
@@ -1127,6 +1129,33 @@ mod tests {
         assert_eq!(
             rb.column_by_name("c_b").unwrap().as_float64_arr().unwrap(),
             &Float64Array::from(vec![None, None, None, Some(2.0)])
+        );
+    }
+
+    #[test]
+    fn flatten_limit_errors_are_bad_requests() {
+        use actix_web::{ResponseError, http::StatusCode};
+
+        use super::PostError;
+        use crate::utils::json::flatten::JsonFlattenError;
+
+        for limit in [
+            JsonFlattenError::RowsPerEventLimitExceeded(1000),
+            JsonFlattenError::RowsPerRequestLimitExceeded(10_000),
+            JsonFlattenError::BytesPerRequestLimitExceeded(64),
+        ] {
+            let message = limit.to_string();
+            let error = PostError::JsonFlattenError(limit);
+            assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+            assert!(error.to_string().contains(&message));
+        }
+        // Limit errors from the JSON and Kinesis paths arrive wrapped in anyhow
+        let error = PostError::Invalid(JsonFlattenError::RowsPerEventLimitExceeded(1).into());
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        // Other flatten errors keep their status
+        assert_eq!(
+            PostError::JsonFlattenError(JsonFlattenError::ExpectedObjectInArray).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

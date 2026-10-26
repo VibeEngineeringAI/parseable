@@ -40,6 +40,8 @@ use crate::utils::create_intracluster_auth_headermap;
 use crate::utils::get_tenant_id_from_request;
 use crate::utils::get_user_from_request;
 use crate::utils::json::apply_generic_flattening_for_partition;
+use crate::utils::json::flatten::FlattenBudget;
+use crate::utils::json::flatten::FlattenLimits;
 use actix_web::HttpRequest;
 use actix_web::HttpResponse;
 use actix_web::Responder;
@@ -174,11 +176,17 @@ async fn calculate_field_stats_inner(
     let stats_value =
         serde_json::to_value(&stats).map_err(|e| ObjectStorageError::Invalid(e.into()))?;
     ensure_dataset_stats_stream(tenant_id).await?;
+    let limits = field_stats_flatten_limits(
+        stats.field_stats.len(),
+        max_field_statistics,
+        FlattenLimits::from_config().max_bytes_per_request,
+    );
     let vec_json = apply_generic_flattening_for_partition(
         stats_value,
         None,
         None,
         Some(&DATASET_STATS_CUSTOM_PARTITION.to_string()),
+        &mut FlattenBudget::new(limits),
     )?;
     let mut p_custom_fields = HashMap::new();
     p_custom_fields.insert(USER_AGENT_KEY.to_string(), "parseable".to_string());
@@ -208,6 +216,25 @@ async fn calculate_field_stats_inner(
         .process()?;
     }
     Ok(stats_calculated)
+}
+
+/// Generic flattening limits for one stats payload. It expands into a row per distinct value
+/// of each field, and there are at most `max_field_statistics` of those per field, so the
+/// row limits follow from its shape instead of the limits for ingested events, which a wide
+/// dataset would exceed
+fn field_stats_flatten_limits(
+    field_count: usize,
+    max_field_statistics: usize,
+    max_bytes: usize,
+) -> FlattenLimits {
+    let max_rows = field_count
+        .max(1)
+        .saturating_mul(max_field_statistics.max(1));
+    FlattenLimits {
+        max_rows_per_event: max_rows,
+        max_rows_per_request: max_rows,
+        max_bytes_per_request: max_bytes,
+    }
 }
 
 fn log_stats_calculation_time(
@@ -1111,9 +1138,12 @@ mod tests {
     use temp_dir::TempDir;
 
     use crate::storage::field_stats::{
-        FieldCountState, NULL_VALUE, build_stats_sql,
-        collect_all_field_stats_from_parquet_blocking, collect_field_counts,
+        DATASET_STATS_CUSTOM_PARTITION, DatasetStats, DistinctStat, FieldCountState, FieldStat,
+        NULL_VALUE, build_stats_sql, collect_all_field_stats_from_parquet_blocking,
+        collect_field_counts, field_stats_flatten_limits,
     };
+    use crate::utils::json::apply_generic_flattening_for_partition;
+    use crate::utils::json::flatten::FlattenBudget;
 
     async fn create_test_parquet_with_data() -> (TempDir, std::path::PathBuf) {
         let temp_dir = TempDir::new().unwrap();
@@ -1493,5 +1523,85 @@ mod tests {
             per_run,
             ROWS as f64 / per_run.as_secs_f64()
         );
+    }
+
+    fn dataset_stats(distinct_per_field: &[usize]) -> serde_json::Value {
+        let field_stats = distinct_per_field
+            .iter()
+            .enumerate()
+            .map(|(field, &distinct)| FieldStat {
+                field_name: format!("field{field}"),
+                count: 10,
+                distinct_count: distinct as i64,
+                distinct_stats: (0..distinct)
+                    .map(|value| DistinctStat {
+                        distinct_value: format!("value{value}"),
+                        count: 1,
+                    })
+                    .collect(),
+            })
+            .collect();
+        serde_json::to_value(DatasetStats {
+            dataset_name: "dataset".to_owned(),
+            stats_id: "stats".to_owned(),
+            field_stats,
+        })
+        .unwrap()
+    }
+
+    fn flatten_stats(
+        stats: serde_json::Value,
+        field_count: usize,
+        max_field_statistics: usize,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        apply_generic_flattening_for_partition(
+            stats,
+            None,
+            None,
+            Some(&DATASET_STATS_CUSTOM_PARTITION.to_string()),
+            &mut FlattenBudget::new(field_stats_flatten_limits(
+                field_count,
+                max_field_statistics,
+                1 << 30,
+            )),
+        )
+    }
+
+    #[test]
+    fn widest_stats_payload_fits_its_flatten_limits() {
+        // Far more rows than the limits for ingested events allow
+        let fields = 300;
+        let max_field_statistics = 50;
+        let rows = flatten_stats(
+            dataset_stats(&[max_field_statistics; 300]),
+            fields,
+            max_field_statistics,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), fields * max_field_statistics);
+        assert_eq!(
+            rows[0]["field_stats_distinct_stats_distinct_value"],
+            "value0"
+        );
+
+        // A field without distinct values still takes a row
+        let rows = flatten_stats(dataset_stats(&[0, 2]), 2, 2).unwrap();
+        assert_eq!(rows.len(), 3);
+        let rows = flatten_stats(dataset_stats(&[0]), 1, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn stats_payload_flatten_limits_are_bounded() {
+        assert_eq!(field_stats_flatten_limits(3, 4, 7).max_rows_per_event, 12);
+        assert_eq!(field_stats_flatten_limits(3, 4, 7).max_rows_per_request, 12);
+        assert_eq!(field_stats_flatten_limits(3, 4, 7).max_bytes_per_request, 7);
+        assert_eq!(field_stats_flatten_limits(0, 0, 7).max_rows_per_event, 1);
+        assert_eq!(
+            field_stats_flatten_limits(usize::MAX, 2, 7).max_rows_per_event,
+            usize::MAX
+        );
+        // More distinct values than the payload can hold are rejected
+        assert!(flatten_stats(dataset_stats(&[3, 2]), 2, 2).is_err());
     }
 }
