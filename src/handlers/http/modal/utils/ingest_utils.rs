@@ -50,7 +50,10 @@ use crate::{
     storage::StreamType,
     utils::{
         get_tenant_id_from_request,
-        json::{convert_array_to_object, flatten::convert_to_array},
+        json::{
+            convert_array_to_object,
+            flatten::{FlattenBudget, FlattenLimits, convert_to_array},
+        },
     },
 };
 
@@ -238,12 +241,14 @@ pub fn flatten_and_push_logs(
     let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     // Verify the dataset fields count
     verify_dataset_fields_count(stream_name, tenant_id)?;
+    // Shared by every event of this request
+    let mut budget = FlattenBudget::new(FlattenLimits::from_config());
 
     match log_source {
         LogSource::Kinesis => {
             //custom flattening required for Amazon Kinesis
             let message: Message = serde_json::from_value(json)?;
-            let flattened_kinesis_data = flatten_kinesis_logs(message)?;
+            let flattened_kinesis_data = flatten_kinesis_logs(message, &mut budget)?;
             let record = convert_to_array(flattened_kinesis_data)?;
             push_logs(
                 stream_name,
@@ -253,12 +258,13 @@ pub fn flatten_and_push_logs(
                 time_partition,
                 telemetry_type,
                 tenant_id,
+                &mut budget,
             )?;
         }
         LogSource::OtelLogs => {
             let logs: LogsData =
                 deserialize_otel_json(json, PARSEABLE.options.normalise_otel_payload)?;
-            let records = flatten_otel_logs(&logs, tenant_str);
+            let records = flatten_otel_logs(&logs, tenant_str, &mut budget)?;
             if !records.is_empty() {
                 push_logs(
                     stream_name,
@@ -268,6 +274,7 @@ pub fn flatten_and_push_logs(
                     None,
                     telemetry_type,
                     tenant_id,
+                    &mut budget,
                 )?;
             }
         }
@@ -284,6 +291,7 @@ pub fn flatten_and_push_logs(
                     None,
                     telemetry_type,
                     tenant_id,
+                    &mut budget,
                 )?;
             }
         }
@@ -300,6 +308,7 @@ pub fn flatten_and_push_logs(
                     None,
                     telemetry_type,
                     tenant_id,
+                    &mut budget,
                 )?;
             }
         }
@@ -311,6 +320,7 @@ pub fn flatten_and_push_logs(
             time_partition,
             telemetry_type,
             tenant_id,
+            &mut budget,
         )?,
     }
 
@@ -320,9 +330,19 @@ pub fn flatten_and_push_logs(
 #[instrument(
     name = "push_logs",
     level = "info",
-    skip(json, log_source, p_custom_fields, time_partition, telemetry_type, tenant_id),
+    skip(
+        json,
+        log_source,
+        p_custom_fields,
+        time_partition,
+        telemetry_type,
+        tenant_id,
+        budget
+    ),
     fields(stream_name, record_count = tracing::field::Empty)
 )]
+// `budget` is shared with the other parts of the request, so it can not be folded into them
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn push_logs(
     stream_name: &str,
@@ -332,6 +352,7 @@ pub fn push_logs(
     time_partition: Option<String>,
     telemetry_type: TelemetryType,
     tenant_id: &Option<String>,
+    budget: &mut FlattenBudget,
 ) -> Result<(), PostError> {
     let stream = PARSEABLE.get_stream(stream_name, tenant_id)?;
     let time_partition_limit = stream.get_time_partition_limit();
@@ -349,6 +370,7 @@ pub fn push_logs(
         custom_partition.as_ref(),
         schema_version,
         log_source,
+        budget,
     )?;
 
     if data.is_empty() {
@@ -424,7 +446,9 @@ pub fn push_logs(
 
 /// Zero-allocation JSON byte size counter.
 /// Uses serde_json::to_writer with a writer that only counts bytes.
-pub fn json_byte_size(value: &Value) -> u64 {
+/// Exact for values that always serialize, such as a `Value` or a struct of strings and
+/// numbers, which is what it is used for.
+pub fn json_byte_size(value: &(impl serde::Serialize + ?Sized)) -> u64 {
     struct CountingWriter(u64);
     impl std::io::Write for CountingWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -436,7 +460,7 @@ pub fn json_byte_size(value: &Value) -> u64 {
         }
     }
     let mut counter = CountingWriter(0);
-    // serde_json::to_writer won't fail on Value types
+    // serde_json::to_writer won't fail on those
     let _ = serde_json::to_writer(&mut counter, value);
     counter.0
 }

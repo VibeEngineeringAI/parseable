@@ -19,7 +19,10 @@ use super::otel_utils::collect_json_from_values;
 use super::otel_utils::convert_epoch_nano_to_timestamp;
 use super::otel_utils::insert_attributes;
 use crate::metrics::increment_logs_collected_by_date;
-use crate::utils::json::flatten::generic_flattening;
+use crate::utils::json::flatten::{
+    FlattenBudget, FlattenCost, JsonFlattenError, expand_generic_flattening, flatten_pipeline_cost,
+    string_json_len,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use opentelemetry_proto::tonic::logs::v1::LogsData;
@@ -170,7 +173,11 @@ fn category_from_body(body_str: &str) -> &'static str {
 /// this function flattens the `LogRecord` object
 /// and returns a `Map` of the flattened json
 /// this function is called recursively for each log record object in the otel logs
-pub fn flatten_log_record(log_record: &LogRecord) -> Map<String, Value> {
+/// The generic flattening of all JSON object bodies of the record is one event for `budget`
+pub fn flatten_log_record(
+    log_record: &LogRecord,
+    budget: &mut FlattenBudget,
+) -> Result<Map<String, Value>, JsonFlattenError> {
     let mut log_record_json: Map<String, Value> = Map::new();
     log_record_json.insert(
         "time_unix_nano".to_string(),
@@ -195,17 +202,59 @@ pub fn flatten_log_record(log_record: &LogRecord) -> Map<String, Value> {
     if log_record.body.is_some() {
         let body = &log_record.body;
         let body_json = collect_json_from_values(body, "body");
-        for (key, value) in &body_json {
+        // Values that are strings which can be parsed as JSON objects get their fields extracted
+        let parsed_bodies: Vec<Option<Value>> = body_json
+            .values()
+            .map(|value| match value {
+                Value::String(s) => serde_json::from_str::<Value>(s)
+                    .ok()
+                    .filter(Value::is_object),
+                _ => None,
+            })
+            .collect();
+        // The rows of every parsed body are merged into this record, but they are all built
+        // first, so charge all of them before building any
+        let limits = budget.limits();
+        let mut body_cost = FlattenCost::default();
+        for (key, parsed) in body_json.keys().zip(&parsed_bodies) {
+            let Some(parsed @ Value::Object(fields)) = parsed else {
+                continue;
+            };
+            let cost = flatten_pipeline_cost(parsed, limits)?;
+            // Every row holds each root field of the body once, and each of them gets a
+            // copy of the body key, as `{key}_{field}`. Structurally flattening the record
+            // later (in `push_logs`) copies the key into the name of every field below a
+            // root field too, as `{key}_{field}_{name}`. Charge the larger of the two.
+            let prefix = string_json_len(key).map(|quoted| quoted - 2 + "_".len());
+            let generic = prefix
+                .and_then(|prefix| prefix.checked_mul(fields.len()))
+                .and_then(|bytes| bytes.checked_mul(cost.rows))
+                .and_then(|bytes| bytes.checked_add(cost.generic_bytes));
+            let structural = prefix
+                .and_then(|prefix| prefix.checked_mul(cost.structural_fields))
+                .and_then(|bytes| bytes.checked_add(cost.structural_bytes));
+            let bytes = generic
+                .zip(structural)
+                .map(|(generic, structural)| generic.max(structural))
+                .ok_or(JsonFlattenError::BytesPerRequestLimitExceeded(
+                    limits.max_bytes_per_request,
+                ))?;
+            body_cost = body_cost.add(
+                FlattenCost {
+                    rows: cost.rows,
+                    bytes,
+                },
+                limits,
+            )?;
+        }
+        budget.charge_event(body_cost)?;
+
+        for ((key, value), parsed) in body_json.iter().zip(&parsed_bodies) {
             // Always insert the original body field as is
             log_record_json.insert(key.clone(), value.clone());
 
-            // If value is a string that can be parsed as JSON object, extract its fields
-            if let Value::String(s) = value
-                && let Ok(parsed) = serde_json::from_str::<Value>(s)
-                && parsed.is_object()
-                && let Ok(flattened_values) = generic_flattening(&parsed)
-            {
-                for flattened_value in flattened_values {
+            if let Some(parsed) = parsed {
+                for flattened_value in expand_generic_flattening(parsed)? {
                     if let Value::Object(flattened_obj) = flattened_value {
                         for (inner_key, inner_value) in flattened_obj {
                             let prefixed_key = format!("{key}_{inner_key}");
@@ -255,12 +304,15 @@ pub fn flatten_log_record(log_record: &LogRecord) -> Map<String, Value> {
         Value::String(hex::encode(&log_record.trace_id)),
     );
 
-    log_record_json
+    Ok(log_record_json)
 }
 
 /// this function flattens the `ScopeLogs` object
 /// and returns a `Vec` of `Map` of the flattened json
-fn flatten_scope_log(scope_log: &ScopeLogs, tenant_id: &str) -> Vec<Map<String, Value>> {
+fn flatten_scope_log(
+    scope_log: &ScopeLogs,
+    budget: &mut FlattenBudget,
+) -> Result<Vec<Map<String, Value>>, JsonFlattenError> {
     let mut vec_scope_log_json = Vec::new();
     let mut scope_log_json = Map::new();
     if let Some(scope) = &scope_log.scope {
@@ -281,16 +333,13 @@ fn flatten_scope_log(scope_log: &ScopeLogs, tenant_id: &str) -> Vec<Map<String, 
     );
 
     for log_record in &scope_log.log_records {
-        let log_record_json = flatten_log_record(log_record);
+        let log_record_json = flatten_log_record(log_record, budget)?;
         let mut combined_json = scope_log_json.clone();
         combined_json.extend(log_record_json);
         vec_scope_log_json.push(combined_json);
     }
 
-    let date = chrono::Utc::now().date_naive().to_string();
-    increment_logs_collected_by_date(scope_log.log_records.len() as u64, &date, tenant_id);
-
-    vec_scope_log_json
+    Ok(vec_scope_log_json)
 }
 
 /// Common function to process resource logs and merge resource-level fields
@@ -300,11 +349,13 @@ fn process_resource_logs<T>(
     get_scope_logs: fn(&T) -> &[ScopeLogs],
     get_schema_url: fn(&T) -> &str,
     tenant_id: &str,
-) -> Vec<Value>
+    budget: &mut FlattenBudget,
+) -> Result<Vec<Value>, JsonFlattenError>
 where
     T: std::fmt::Debug,
 {
     let mut vec_otel_json = Vec::new();
+    let mut logs_collected: u64 = 0;
 
     for resource_log in resource_logs {
         let mut resource_log_json = Map::new();
@@ -322,7 +373,8 @@ where
         let scope_logs = get_scope_logs(resource_log);
 
         for scope_log in scope_logs {
-            vec_resource_logs_json.extend(flatten_scope_log(scope_log, tenant_id));
+            vec_resource_logs_json.extend(flatten_scope_log(scope_log, budget)?);
+            logs_collected += scope_log.log_records.len() as u64;
         }
 
         resource_log_json.insert(
@@ -336,36 +388,57 @@ where
         }
     }
 
-    vec_otel_json
+    // Only count the logs of a request that was converted in full
+    let date = chrono::Utc::now().date_naive().to_string();
+    increment_logs_collected_by_date(logs_collected, &date, tenant_id);
+
+    Ok(vec_otel_json)
 }
 
-pub fn flatten_otel_protobuf(message: &ExportLogsServiceRequest, tenant_id: &str) -> Vec<Value> {
+/// Same as `flatten_otel_logs`, for the protobuf request
+pub fn flatten_otel_protobuf(
+    message: &ExportLogsServiceRequest,
+    tenant_id: &str,
+    budget: &mut FlattenBudget,
+) -> Result<Vec<Value>, JsonFlattenError> {
     process_resource_logs(
         &message.resource_logs,
         |record| record.resource.as_ref(),
         |record| &record.scope_logs,
         |record| &record.schema_url,
         tenant_id,
+        budget,
     )
 }
 
 /// this function performs the custom flattening of the otel logs
 /// and returns a `Vec` of `Value::Object` of the flattened json
-pub fn flatten_otel_logs(message: &LogsData, tenant_id: &str) -> Vec<Value> {
+/// Every record is charged to `budget`, which all records of the request share, before the
+/// rows of its bodies are built. Fails once a record would go over its limits, dropping the
+/// records converted before it
+pub fn flatten_otel_logs(
+    message: &LogsData,
+    tenant_id: &str,
+    budget: &mut FlattenBudget,
+) -> Result<Vec<Value>, JsonFlattenError> {
     process_resource_logs(
         &message.resource_logs,
         |record| record.resource.as_ref(),
         |record| &record.scope_logs,
         |record| &record.schema_url,
         tenant_id,
+        budget,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{flatten_log_record, normalize_severity};
-    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
-    use opentelemetry_proto::tonic::logs::v1::LogRecord;
+    use super::{flatten_log_record, flatten_otel_logs, normalize_severity};
+    use crate::utils::json::flatten::{
+        FlattenBudget, FlattenCost, FlattenLimits, JsonFlattenError, generic_flattening_with_limits,
+    };
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, KeyValueList, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
     use serde_json::json;
 
     fn flatten_record(
@@ -373,14 +446,18 @@ mod tests {
         text: &str,
         body: &str,
     ) -> serde_json::Map<String, serde_json::Value> {
-        flatten_log_record(&LogRecord {
-            severity_number: number,
-            severity_text: text.to_string(),
-            body: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(body.to_string())),
-            }),
-            ..Default::default()
-        })
+        flatten_log_record(
+            &LogRecord {
+                severity_number: number,
+                severity_text: text.to_string(),
+                body: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(body.to_string())),
+                }),
+                ..Default::default()
+            },
+            &mut FlattenBudget::new(FlattenLimits::DEFAULT),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -460,5 +537,380 @@ mod tests {
     #[test]
     fn preserves_provided_severity_fields() {
         assert_eq!(normalize_severity(18, "error"), (18, "error".to_string()));
+    }
+
+    fn limits(rows_per_event: usize, rows_per_request: usize) -> FlattenBudget {
+        FlattenBudget::new(FlattenLimits {
+            max_rows_per_event: rows_per_event,
+            max_rows_per_request: rows_per_request,
+            max_bytes_per_request: 1 << 20,
+        })
+    }
+
+    fn string_body(body: &str) -> Option<AnyValue> {
+        Some(AnyValue {
+            value: Some(any_value::Value::StringValue(body.to_string())),
+        })
+    }
+
+    fn record(body: Option<AnyValue>) -> LogRecord {
+        LogRecord {
+            severity_number: 9,
+            body,
+            ..Default::default()
+        }
+    }
+
+    // Two resources, the first with two scopes, holding one record each
+    fn logs(body: &str) -> LogsData {
+        let scope = || ScopeLogs {
+            log_records: vec![record(string_body(body))],
+            ..Default::default()
+        };
+        LogsData {
+            resource_logs: vec![
+                ResourceLogs {
+                    scope_logs: vec![scope(), scope()],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    scope_logs: vec![scope()],
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    const SIX_ROW_BODY: &str = r#"{"a": [1, 2, 3], "b": [true, false]}"#;
+
+    #[test]
+    fn json_body_rows_are_merged_into_the_record_and_charged() {
+        let mut budget = limits(6, 6);
+        let flattened =
+            flatten_log_record(&record(string_body(SIX_ROW_BODY)), &mut budget).unwrap();
+        // The last row wins, as before
+        assert_eq!(flattened["body"], json!(SIX_ROW_BODY));
+        assert_eq!(flattened["body_a"], json!(3));
+        assert_eq!(flattened["body_b"], json!(false));
+        assert_eq!(budget.used().rows, 6);
+
+        assert!(matches!(
+            flatten_log_record(&record(string_body(SIX_ROW_BODY)), &mut limits(5, 6)),
+            Err(JsonFlattenError::RowsPerEventLimitExceeded(5))
+        ));
+    }
+
+    #[test]
+    fn all_json_bodies_of_a_record_are_one_event() {
+        let kv = |key: &str, body: &str| KeyValue {
+            key: key.to_string(),
+            value: string_body(body),
+            ..Default::default()
+        };
+        let body = Some(AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![
+                    kv("x", r#"{"a": [1, 2, 3]}"#),
+                    kv("plain", "not json"),
+                    kv("y", r#"{"b": [1, 2, 3]}"#),
+                ],
+            })),
+        });
+        let mut budget = limits(6, 6);
+        let flattened = flatten_log_record(&record(body.clone()), &mut budget).unwrap();
+        assert_eq!(flattened["x_a"], json!(3));
+        assert_eq!(flattened["y_b"], json!(3));
+        assert_eq!(flattened["plain"], json!("not json"));
+        assert_eq!(budget.used().rows, 6);
+        // Each body fits on its own, but not both together
+        assert!(matches!(
+            flatten_log_record(&record(body), &mut limits(5, 6)),
+            Err(JsonFlattenError::RowsPerEventLimitExceeded(5))
+        ));
+    }
+
+    #[test]
+    fn bodies_that_are_not_json_objects_are_kept_and_not_charged() {
+        for body in ["not json", "[1, 2, 3]", "12", r#"{"a": [1, 2"#] {
+            let mut budget = limits(1, 1);
+            let flattened = flatten_log_record(&record(string_body(body)), &mut budget).unwrap();
+            assert_eq!(flattened["body"], json!(body));
+            assert_eq!(budget.used().rows, 0, "body: {body}");
+        }
+        let mut budget = limits(1, 1);
+        flatten_log_record(&record(None), &mut budget).unwrap();
+        assert_eq!(budget.used().rows, 0);
+    }
+
+    #[test]
+    fn records_of_all_scopes_and_resources_share_the_request_budget() {
+        let mut budget = limits(6, 18);
+        assert_eq!(
+            flatten_otel_logs(&logs(SIX_ROW_BODY), "tenant", &mut budget)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(budget.used().rows, 18);
+        // The third record, in the second resource, goes over the request limit
+        assert!(matches!(
+            flatten_otel_logs(&logs(SIX_ROW_BODY), "tenant", &mut limits(6, 17)),
+            Err(JsonFlattenError::RowsPerRequestLimitExceeded(17))
+        ));
+        // The second record, in the second scope of the first resource, goes over it too
+        assert!(matches!(
+            flatten_otel_logs(&logs(SIX_ROW_BODY), "tenant", &mut limits(6, 11)),
+            Err(JsonFlattenError::RowsPerRequestLimitExceeded(11))
+        ));
+    }
+
+    // Logs collected for `tenant` over all dates, so that a test running across midnight (UTC)
+    // still counts what it collected. Each test uses a tenant of its own, as the counter is
+    // global.
+    fn logs_collected(tenant: &str) -> u64 {
+        use prometheus::core::Collector;
+
+        crate::metrics::TOTAL_LOGS_COLLECTED_BY_DATE
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.get_name() == "tenant_id" && label.get_value() == tenant)
+            })
+            .map(|metric| metric.get_counter().get_value() as u64)
+            .sum()
+    }
+
+    #[test]
+    fn logs_collected_metric_counts_only_converted_requests() {
+        let tenant = "flatten-limit-metric-tenant";
+        let before = logs_collected(tenant);
+        // Fails on the third record, after the scopes of the first resource were converted
+        assert!(flatten_otel_logs(&logs(SIX_ROW_BODY), tenant, &mut limits(6, 17)).is_err());
+        assert_eq!(logs_collected(tenant), before);
+
+        flatten_otel_logs(&logs(SIX_ROW_BODY), tenant, &mut limits(6, 18)).unwrap();
+        assert_eq!(logs_collected(tenant), before + 3);
+    }
+
+    fn byte_limit(bytes: usize) -> FlattenBudget {
+        FlattenBudget::new(FlattenLimits {
+            max_rows_per_event: 1000,
+            max_rows_per_request: 10_000,
+            max_bytes_per_request: bytes,
+        })
+    }
+
+    fn kv_body(entries: &[(&str, &str)]) -> Option<AnyValue> {
+        Some(AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: entries
+                    .iter()
+                    .map(|(key, body)| KeyValue {
+                        key: key.to_string(),
+                        value: string_body(body),
+                        ..Default::default()
+                    })
+                    .collect(),
+            })),
+        })
+    }
+
+    // Compact JSON bytes of the rows of `body`, with their fields renamed as they are merged
+    // into the record
+    fn prefixed_rows_len(key: &str, body: &str) -> usize {
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        generic_flattening_with_limits(&parsed, FlattenLimits::DEFAULT)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let prefixed: serde_json::Map<String, serde_json::Value> = row
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(field, value)| (format!("{key}_{field}"), value.clone()))
+                    .collect();
+                serde_json::to_vec(&prefixed).unwrap().len()
+            })
+            .sum()
+    }
+
+    // One row of 32 short scalar fields, about 300 bytes before the key is copied into them
+    fn wide_body() -> String {
+        let fields: serde_json::Map<String, serde_json::Value> =
+            (0..32).map(|i| (format!("f{i}"), json!(i))).collect();
+        serde_json::Value::Object(fields).to_string()
+    }
+
+    #[test]
+    fn long_body_key_copied_into_every_field_is_charged() {
+        let body = wide_body();
+        let long_key = "k".repeat(128);
+        // 32 copies of the key alone are over the limit, the parsed body is not
+        let mut budget = byte_limit(4096);
+        assert!(matches!(
+            flatten_log_record(
+                &record(kv_body(&[(long_key.as_str(), body.as_str())])),
+                &mut budget
+            ),
+            Err(JsonFlattenError::BytesPerRequestLimitExceeded(4096))
+        ));
+        assert_eq!(budget.used(), FlattenCost::default());
+
+        let flattened =
+            flatten_log_record(&record(kv_body(&[("k", body.as_str())])), &mut budget).unwrap();
+        assert_eq!(flattened["k_f31"], json!(31));
+        assert_eq!(budget.used().rows, 1);
+        assert_eq!(budget.used().bytes, prefixed_rows_len("k", &body));
+    }
+
+    #[test]
+    fn body_key_prefixes_are_charged_exactly() {
+        // Two rows of two fields each, under a key with escapes
+        let key = "k\"\t\u{1}";
+        let body = r#"{"a": [1, 2], "b": "x"}"#;
+        let other = r#"{"c": {"d": [true, null]}}"#;
+        let body_record = || record(kv_body(&[(key, body), ("plain", "text"), ("o", other)]));
+        let expected = prefixed_rows_len(key, body) + prefixed_rows_len("o", other);
+
+        let mut budget = byte_limit(expected);
+        let flattened = flatten_log_record(&body_record(), &mut budget).unwrap();
+        assert_eq!(flattened[&format!("{key}_a")], json!(2));
+        assert_eq!(flattened["o_c"], json!({"d": null}));
+        assert_eq!(
+            budget.used(),
+            FlattenCost {
+                rows: 4,
+                bytes: expected
+            }
+        );
+
+        let mut budget = byte_limit(expected - 1);
+        assert!(matches!(
+            flatten_log_record(&body_record(), &mut budget),
+            Err(JsonFlattenError::BytesPerRequestLimitExceeded(limit)) if limit == expected - 1
+        ));
+        assert_eq!(budget.used(), FlattenCost::default());
+    }
+
+    #[test]
+    fn body_key_prefixes_add_up_over_records() {
+        let body = wide_body();
+        let key = "k".repeat(16);
+        let per_record = prefixed_rows_len(&key, &body);
+        let mut budget = byte_limit(2 * per_record - 1);
+        flatten_log_record(
+            &record(kv_body(&[(key.as_str(), body.as_str())])),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(matches!(
+            flatten_log_record(
+                &record(kv_body(&[(key.as_str(), body.as_str())])),
+                &mut budget
+            ),
+            Err(JsonFlattenError::BytesPerRequestLimitExceeded(_))
+        ));
+        assert_eq!(budget.used().bytes, per_record);
+    }
+
+    #[test]
+    fn logs_collected_metric_is_unchanged_when_a_body_key_is_over_the_budget() {
+        let tenant = "flatten-limit-prefix-metric-tenant";
+        let body = wide_body();
+        let long_key = "k".repeat(128);
+        let scope = |key: &str| ScopeLogs {
+            log_records: vec![record(kv_body(&[(key, body.as_str())]))],
+            ..Default::default()
+        };
+        // The first resource fits, the long key in the second one does not
+        let logs = LogsData {
+            resource_logs: vec![
+                ResourceLogs {
+                    scope_logs: vec![scope("k")],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    scope_logs: vec![scope(&long_key)],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let before = logs_collected(tenant);
+        assert!(matches!(
+            flatten_otel_logs(&logs, tenant, &mut byte_limit(4096)),
+            Err(JsonFlattenError::BytesPerRequestLimitExceeded(4096))
+        ));
+        assert_eq!(logs_collected(tenant), before);
+
+        // Without the second resource, the request is converted and counted
+        let fitting = LogsData {
+            resource_logs: logs.resource_logs[..1].to_vec(),
+        };
+        flatten_otel_logs(&fitting, tenant, &mut byte_limit(4096)).unwrap();
+        assert_eq!(logs_collected(tenant), before + 1);
+    }
+
+    // Compact JSON bytes of the rows of `body` merged into the record under `key`, once
+    // `push_logs` structurally flattens them
+    fn structural_prefixed_rows_len(key: &str, body: &str) -> usize {
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        generic_flattening_with_limits(&parsed, FlattenLimits::DEFAULT)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let mut prefixed = serde_json::Value::Object(
+                    row.as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(field, value)| (format!("{key}_{field}"), value.clone()))
+                        .collect(),
+                );
+                crate::utils::json::flatten::flatten(&mut prefixed, "_", None, None, None, false)
+                    .unwrap();
+                serde_json::to_vec(&prefixed).unwrap().len()
+            })
+            .sum()
+    }
+
+    // 4 rows of the 32 fields of `wide_body` below a parent
+    fn nested_body() -> String {
+        format!(r#"{{"p": {}, "r": [0, 1, 2, 3]}}"#, wide_body())
+    }
+
+    #[test]
+    fn body_key_copied_into_nested_field_names_is_charged() {
+        let body = nested_body();
+        let long_key = "k".repeat(128);
+        // The generic rows and their root field prefixes fit, but structurally flattening
+        // the record names all 32 fields below `p` after the long key
+        assert!(prefixed_rows_len(&long_key, &body) <= 4096);
+        let mut budget = byte_limit(4096);
+        assert!(matches!(
+            flatten_log_record(
+                &record(kv_body(&[(long_key.as_str(), body.as_str())])),
+                &mut budget
+            ),
+            Err(JsonFlattenError::BytesPerRequestLimitExceeded(4096))
+        ));
+        assert_eq!(budget.used(), FlattenCost::default());
+
+        // With a short key, the structurally flattened rows are the larger, and charged
+        let expected = structural_prefixed_rows_len("k", &body);
+        assert!(expected > prefixed_rows_len("k", &body));
+        let flattened =
+            flatten_log_record(&record(kv_body(&[("k", body.as_str())])), &mut budget).unwrap();
+        assert_eq!(flattened["k_p"]["f31"], json!(31));
+        assert_eq!(
+            budget.used(),
+            FlattenCost {
+                rows: 4,
+                bytes: expected
+            }
+        );
     }
 }
