@@ -413,8 +413,9 @@ pub fn flatten_otel_protobuf(
 
 /// this function performs the custom flattening of the otel logs
 /// and returns a `Vec` of `Value::Object` of the flattened json
-/// Fails, with nothing returned, once a log body is over the limits of `budget`, which is
-/// shared by all records of the request
+/// Every record is charged to `budget`, which all records of the request share, before the
+/// rows of its bodies are built. Fails once a record would go over its limits, dropping the
+/// records converted before it
 pub fn flatten_otel_logs(
     message: &LogsData,
     tenant_id: &str,
@@ -663,26 +664,36 @@ mod tests {
         ));
     }
 
+    // Logs collected for `tenant` over all dates, so that a test running across midnight (UTC)
+    // still counts what it collected. Each test uses a tenant of its own, as the counter is
+    // global.
+    fn logs_collected(tenant: &str) -> u64 {
+        use prometheus::core::Collector;
+
+        crate::metrics::TOTAL_LOGS_COLLECTED_BY_DATE
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.get_name() == "tenant_id" && label.get_value() == tenant)
+            })
+            .map(|metric| metric.get_counter().get_value() as u64)
+            .sum()
+    }
+
     #[test]
     fn logs_collected_metric_counts_only_converted_requests() {
-        use crate::metrics::TOTAL_LOGS_COLLECTED_BY_DATE;
-
-        // A tenant of its own, as the counter is global
         let tenant = "flatten-limit-metric-tenant";
-        let collected = || {
-            let date = chrono::Utc::now().date_naive().to_string();
-            TOTAL_LOGS_COLLECTED_BY_DATE
-                .with_label_values(&["all", &date, tenant])
-                .get()
-        };
-
-        let before = collected();
+        let before = logs_collected(tenant);
         // Fails on the third record, after the scopes of the first resource were converted
         assert!(flatten_otel_logs(&logs(SIX_ROW_BODY), tenant, &mut limits(6, 17)).is_err());
-        assert_eq!(collected(), before);
+        assert_eq!(logs_collected(tenant), before);
 
         flatten_otel_logs(&logs(SIX_ROW_BODY), tenant, &mut limits(6, 18)).unwrap();
-        assert_eq!(collected(), before + 3);
+        assert_eq!(logs_collected(tenant), before + 3);
     }
 
     fn byte_limit(bytes: usize) -> FlattenBudget {
@@ -808,15 +819,7 @@ mod tests {
 
     #[test]
     fn logs_collected_metric_is_unchanged_when_a_body_key_is_over_the_budget() {
-        use crate::metrics::TOTAL_LOGS_COLLECTED_BY_DATE;
-
         let tenant = "flatten-limit-prefix-metric-tenant";
-        let collected = || {
-            let date = chrono::Utc::now().date_naive().to_string();
-            TOTAL_LOGS_COLLECTED_BY_DATE
-                .with_label_values(&["all", &date, tenant])
-                .get()
-        };
         let body = wide_body();
         let long_key = "k".repeat(128);
         let scope = |key: &str| ScopeLogs {
@@ -837,12 +840,19 @@ mod tests {
             ],
         };
 
-        let before = collected();
+        let before = logs_collected(tenant);
         assert!(matches!(
             flatten_otel_logs(&logs, tenant, &mut byte_limit(4096)),
             Err(JsonFlattenError::BytesPerRequestLimitExceeded(4096))
         ));
-        assert_eq!(collected(), before);
+        assert_eq!(logs_collected(tenant), before);
+
+        // Without the second resource, the request is converted and counted
+        let fitting = LogsData {
+            resource_logs: logs.resource_logs[..1].to_vec(),
+        };
+        flatten_otel_logs(&fitting, tenant, &mut byte_limit(4096)).unwrap();
+        assert_eq!(logs_collected(tenant), before + 1);
     }
 
     // Compact JSON bytes of the rows of `body` merged into the record under `key`, once

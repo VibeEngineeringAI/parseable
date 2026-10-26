@@ -265,10 +265,10 @@ async fn calculate_stats_if_enabled(
         if let Err(err) =
             calculate_field_stats(stream_name, path, schema, max_field_statistics, &tenant_id).await
         {
-            tracing::trace!(
-                "Error calculating field stats for stream {}: {}",
-                stream_name,
-                err
+            warn!(
+                "Error calculating field stats for stream {stream_name} (tenant {}) from parquet file {}: {err}",
+                tenant_id.as_deref().unwrap_or(DEFAULT_TENANT),
+                path.display()
             );
         }
     }

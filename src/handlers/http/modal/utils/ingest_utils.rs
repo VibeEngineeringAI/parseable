@@ -446,7 +446,9 @@ pub fn push_logs(
 
 /// Zero-allocation JSON byte size counter.
 /// Uses serde_json::to_writer with a writer that only counts bytes.
-pub fn json_byte_size(value: &Value) -> u64 {
+/// Exact for values that always serialize, such as a `Value` or a struct of strings and
+/// numbers, which is what it is used for.
+pub fn json_byte_size(value: &(impl serde::Serialize + ?Sized)) -> u64 {
     struct CountingWriter(u64);
     impl std::io::Write for CountingWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -458,7 +460,7 @@ pub fn json_byte_size(value: &Value) -> u64 {
         }
     }
     let mut counter = CountingWriter(0);
-    // serde_json::to_writer won't fail on Value types
+    // serde_json::to_writer won't fail on those
     let _ = serde_json::to_writer(&mut counter, value);
     counter.0
 }

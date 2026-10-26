@@ -73,18 +73,20 @@ detect the no-op.
 | escaped_repeated_string (500 rows, over 64 MiB after escaping) | 62.8 / 58.7 / 62.5 µs |
 | just_over_event_limit (1001 rows) | 9.6 / 10.0 / 7.5 µs |
 
-- **Memory:** every rejection at the entry point allocates exactly once, 112 bytes (the
-  `anyhow` error), with `peak_delta=0`. In `/tmp/flatten-row-cap-harness-tests-r5.log` the
-  core paths (preflight, per-event `charge`, `pipeline charge`, and bounded
-  `generic_flattening`) report 0 allocations, 0 bytes and `peak_delta=0` for every hostile
-  input, and `core charge, remaining rows/bytes insufficient` reports the same for a request
-  budget whose remainder is too small. For an event whose generic rows fit but whose
-  structurally flattened field names do not (a 128-character parent copied into 32 field
-  names over 4 rows), `structural preflight, long parent` and `structural charge, long
-  parent` report 0 allocations, and the entry point rejects it with 1 allocation of 112
-  bytes and `peak_delta=0` (2 allocations, 184 bytes, `peak_delta=72` with a partition
-  field). `tests/alloc_limits.rs` asserts these. They are measured by the counting
-  allocator, not as full-process RSS.
+- **Memory:** the entry point rejects each of these single-event inputs with exactly one
+  allocation, 112 bytes (the `anyhow` error), with `peak_delta=0`. A request of several
+  events may have built the rows of earlier events before a later one is rejected (see the
+  partitioned case in `tests/alloc_limits.rs`), so this is not a bound for every request.
+  In `/tmp/flatten-row-cap-harness-tests-r5.log` the core paths (preflight, per-event
+  `charge`, `pipeline charge`, and bounded `generic_flattening`) report 0 allocations, 0
+  bytes and `peak_delta=0` for every hostile input, and `core charge, remaining rows/bytes
+  insufficient` reports the same for a request budget whose remainder is too small. For an
+  event whose generic rows fit but whose structurally flattened field names do not (a
+  128-character parent copied into 32 field names over 4 rows), `structural preflight,
+  long parent` and `structural charge, long parent` report 0 allocations, and the entry
+  point rejects it with 1 allocation of 112 bytes and `peak_delta=0` (2 allocations, 184
+  bytes, `peak_delta=72` with a partition field). `tests/alloc_limits.rs` asserts these.
+  They are measured by the counting allocator, not as full-process RSS.
 - **Time:** these times include freeing the consumed input. They grow with the input's size
   and with how much of it is walked before the limit trips, not with the rows the input would
   expand to. They are not constant across inputs.
@@ -93,7 +95,12 @@ detect the no-op.
 
 ## Verification
 
-Results for the sources identified by the hashes above:
+These are the results of the first validation of the sources identified by the hashes
+above, before the branch was rebased onto `04b73b57`. The rebase did not change those two
+files (the rebased commit has the same sha256 for both). The later validation of the
+rebased commit, with its own test selection and counts, is reported in the pull request
+description, not here, and this file records no validation of later changes either. The
+counts below belong to the first validation only:
 
 | check | result |
 |---|---|
@@ -120,18 +127,25 @@ cargo build --bin parseable --offline
 python3 tools/flatten-bench/http_smoke.py target/debug/parseable
 ```
 
+These are the commands of the first validation. The two `storage::field_stats` tests named in
+them have since been replaced by the `storage::field_stats::tests::stats_rows` tests, as the
+stats rows are no longer flattened as one payload, and the harness and HTTP smoke test have
+more cases than the counts above.
+
 ## Interpretation
 
 - **Remaining cost:** flat and nested inputs without arrays are 8–45% slower (about 0.13 µs
   per flat event in a batch, 0.17–0.20 µs for a single event). This is the price of the
   added safety: the event has to be walked to count its generic and structural rows and
-  bytes before anything is built. The fast paths still return the input
+  bytes before any of its rows is built. The fast paths still return the input
   unchanged without copying it, and allocation counts are unchanged.
 - **Inputs with arrays:** these break even or improve slightly, with fewer and smaller
   allocations. Only moderate_array_100 is measurably faster; product_10x10x10 and
   partitioned_batch_50x4 are within noise.
-- **Limits:** none of the optimizations relax them. A limit that would be exceeded is
-  rejected before any row is built.
+- **Limits:** none of the optimizations relax them. An event that would exceed a limit is
+  rejected before any of its rows is built. Earlier events of the same request may have
+  been built by then (one at a time with a custom or time partition, for Kinesis records
+  and OTEL log records), within the request's budget; the rejected request stores none of them.
 - **Scope:** these are microbenchmarks of the flattening code only, not end-to-end ingestion
   throughput. Parsing, Arrow conversion, and I/O are not included.
 

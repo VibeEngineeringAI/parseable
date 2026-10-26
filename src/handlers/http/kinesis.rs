@@ -53,6 +53,8 @@ struct Data {
 // The data field is base64 encoded JSON (there can be multiple data fields), and there is a requestId and timestamp field.
 // Each decoded data field is one event for `budget`, even when it holds an array, charged
 // for its generic rows or, when larger, those rows structurally flattened, plus the metadata.
+// It is charged before its rows are built; when that fails, the rows built for the records
+// before it are dropped with the error.
 // Kinesis logs are flattened to the following format:
 // {
 //     "CHANGE": 3.16,

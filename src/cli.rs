@@ -659,7 +659,7 @@ pub struct Options {
         env = "P_MAX_FLATTEN_ROWS_PER_REQUEST",
         default_value_t = DEFAULT_MAX_FLATTEN_ROWS_PER_REQUEST,
         value_parser = validation::validate_flatten_limit,
-        help = "Maximum number of rows all events of an ingest request may expand into when their nested arrays are flattened"
+        help = "Maximum number of rows all events of an ingest request may expand into when their nested arrays are flattened. Every event takes at least one row, including an event without arrays"
     )]
     pub max_flatten_rows_per_request: usize,
 

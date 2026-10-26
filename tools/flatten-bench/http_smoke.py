@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """HTTP smoke test of the generic flattening limits against a real Parseable binary.
 
-Starts `<binary> local-store` on 127.0.0.1 (ephemeral port, temporary data and staging
-directories, small flatten caps), then for plain JSON (on `/api/v1/ingest` and
-`/api/v1/logstream/{name}`), a known log format, a custom partitioned stream, Kinesis, OTEL
-JSON logs and schema detection checks that:
+Starts `<binary> local-store` on 127.0.0.1 (ephemeral ports for HTTP, gRPC, Arrow Flight
+and query gRPC, temporary data and staging directories, small flatten caps), then for plain
+JSON (on `/api/v1/ingest` and `/api/v1/logstream/{name}`), a known log format, a custom
+partitioned stream, Kinesis, OTEL JSON logs and schema detection checks that:
   - a request at the limits is accepted (200) and its rows are counted in the stream stats
   - a request over a limit, including one that only fails on a late event, gets a 400
     naming the limit, the stream's event count does not change, and a sentinel field of an
     earlier, valid event of that request does not show up in the stream schema.
+Events without arrays are a row each, so a batch of more flat events than the rows per
+request is rejected too (OTEL counts the records with a JSON object body).
 Over-limit bytes include those of the structurally flattened rows, whose field names repeat
 the names of their parents (`{"<long parent>": {"f0": 0, ...}}` becomes
 `{"<long parent>_f0": 0, ...}`), even when the generic rows are small.
@@ -83,20 +85,31 @@ class Server:
         return json.loads(text)["ingestion"]["count"]
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def free_ports(count):
+    """`count` distinct ports that were free on 127.0.0.1 a moment ago"""
+    sockets = [socket.socket() for _ in range(count)]
+    try:
+        for s in sockets:
+            s.bind(("127.0.0.1", 0))
+        return [s.getsockname()[1] for s in sockets]
+    finally:
+        for s in sockets:
+            s.close()
 
 
 def start(binary, workdir, startup_timeout):
-    port = free_port()
+    # The gRPC, Arrow Flight and query gRPC servers default to fixed ports (8001-8003),
+    # which another local server may hold
+    port, grpc_port, flight_port, query_grpc_port = free_ports(4)
     for name in ("data", "staging"):
         os.makedirs(os.path.join(workdir, name))
     # Nothing from the caller's P_* settings, so the caps below are the ones in effect
     env = {k: v for k, v in os.environ.items() if not k.startswith("P_")}
     env.update(
         P_ADDR=f"127.0.0.1:{port}",
+        P_GRPC_PORT=str(grpc_port),
+        P_FLIGHT_PORT=str(flight_port),
+        P_QUERY_GRPC_PORT=str(query_grpc_port),
         P_USERNAME="admin",
         P_PASSWORD="admin",
         P_FS_DIR=os.path.join(workdir, "data"),
@@ -197,6 +210,14 @@ def arr(n):
 
 def compact_len(value):
     return len(json.dumps(value, separators=(",", ":")))
+
+
+def flat(n, sentinel=None):
+    """`n` events without arrays, a row each. The first one holds `sentinel` when given"""
+    events = [{"f": i} for i in range(n)]
+    if sentinel is not None:
+        events[0][sentinel] = 1
+    return events
 
 
 # Three 1-row events of ~1.5 KiB each: two fit in BYTES_PER_REQUEST, three do not
@@ -347,6 +368,17 @@ def run_json(c):
     control, sentinel = unique("control"), unique("sentinel")
     c.accepted("json event at row limit", s, 4, *post, {"a": arr(4), control: 1}, h, control)
     c.accepted("json request at row limit", s, 6, *post, [{"a": arr(2)}, {"b": arr(4)}], h)
+    flat_sentinel = unique("sentinel")
+    c.accepted("json flat batch at request row limit", s, 6, *post, flat(6), h)
+    c.rejected(
+        "json flat batch over request row limit",
+        s,
+        REQUEST_MSG,
+        *post,
+        flat(7, flat_sentinel),
+        h,
+        flat_sentinel,
+    )
     c.rejected("json event over row limit", s, EVENT_MSG, *post, {"a": arr(5)}, h)
     c.rejected(
         "json sibling array product", s, EVENT_MSG, *post, {"a": arr(2), "b": arr(3)}, h
@@ -391,6 +423,20 @@ def run_partitioned(c):
     sentinel = unique("sentinel")
     ev = lambda t: {"tenant": t, "x": arr(3)}
     c.accepted("partitioned request at row limit", s, 6, *post, [ev("a"), ev("b")], h)
+    # Every partitioned event is flattened on its own, the earlier ones before the last one
+    # goes over the limit, and still none of them is written
+    flat_part = lambda events: [{"tenant": f"t{i}", **e} for i, e in enumerate(events)]
+    flat_sentinel = unique("sentinel")
+    c.accepted("partitioned flat batch at request row limit", s, 6, *post, flat_part(flat(6)), h)
+    c.rejected(
+        "partitioned flat batch over request row limit",
+        s,
+        REQUEST_MSG,
+        *post,
+        flat_part(flat(7, flat_sentinel)),
+        h,
+        flat_sentinel,
+    )
     c.rejected(
         "partitioned request rows, late partition",
         s,
@@ -462,6 +508,17 @@ def run_kinesis(c):
     h = {"X-P-Stream": s, "X-P-Log-Source": "kinesis"}
     post = ("POST", "/api/v1/ingest")
     c.accepted("kinesis request at row limit", s, 6, *post, kinesis([{"a": arr(3)}] * 2), h)
+    flat_sentinel = unique("sentinel")
+    c.accepted("kinesis flat records at request row limit", s, 6, *post, kinesis(flat(6)), h)
+    c.rejected(
+        "kinesis flat records over request row limit",
+        s,
+        REQUEST_MSG,
+        *post,
+        kinesis(flat(7, flat_sentinel)),
+        h,
+        flat_sentinel,
+    )
     # A decoded array is one event
     c.rejected(
         "kinesis decoded array over event limit",
@@ -560,6 +617,30 @@ def run_otel(c):
         sentinel,
     )
     c.accepted("otel body that is not JSON", s, 1, *post, otel([[["plain text"]]]), h)
+    # A record whose body is a JSON object without arrays is a row; one whose body is not
+    # JSON is none
+    flat_sentinel = unique("sentinel")
+    flat_bodies = lambda events: [json.dumps(event) for event in events]
+    c.accepted(
+        "otel flat JSON bodies at request row limit", s, 6, *post, otel([[flat_bodies(flat(6))]]), h
+    )
+    c.rejected(
+        "otel flat JSON bodies over request row limit",
+        s,
+        REQUEST_MSG,
+        *post,
+        otel([[flat_bodies(flat(7, flat_sentinel))]]),
+        h,
+        flat_sentinel,
+    )
+    c.accepted(
+        "otel bodies that are not JSON over request row limit",
+        s,
+        7,
+        *post,
+        otel([[["plain text"] * 7]]),
+        h,
+    )
 
     # A single row of 32 small fields. Every field is renamed to `{key}_{field}` when it is
     # merged into the record, so a long key costs 32 times its length

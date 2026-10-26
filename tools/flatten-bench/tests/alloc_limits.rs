@@ -5,7 +5,9 @@
 //! thread while a guard is armed are counted. Run with RUST_LIB_BACKTRACE=0 so anyhow
 //! does not capture (and allocate) a backtrace for the rejected requests.
 
-use flatten_bench::alloc_counter::{AllocStats, CountingAlloc, measure};
+use flatten_bench::alloc_counter::{
+    AllocStats, CAP_EXCEEDED_EXIT_CODE, CountingAlloc, measure, measure_bounded,
+};
 use flatten_bench::api::{
     FlattenBudget, FlattenCost, FlattenLimits, JsonFlattenError, UNLIMITED, baseline_generic,
     current_charge, current_convert, current_convert_with, current_cost, current_generic,
@@ -17,6 +19,9 @@ use serde_json::{Value, json};
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
 
+/// What a rejection may allocate. Rejections are asserted to stay under it, and measured
+/// with it as a hard cap (`measure_bounded`): a rejection that started to expand its input
+/// exits the test process with `CAP_EXCEEDED_EXIT_CODE` before it allocates more.
 const MAX_REJECT_BYTES: u64 = 64 * 1024;
 const DEFAULT: FlattenLimits = FlattenLimits::DEFAULT;
 
@@ -77,7 +82,7 @@ fn hostile_inputs() -> Vec<(&'static str, Value)> {
 #[test]
 fn preflight_rejects_without_allocating() {
     for (name, input) in hostile_inputs() {
-        let (result, stats) = measure(|| current_cost(&input, &DEFAULT));
+        let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || current_cost(&input, &DEFAULT));
         assert!(
             matches!(&result, Err(err) if err.is_limit_exceeded()),
             "{name}: {result:?}"
@@ -85,14 +90,16 @@ fn preflight_rejects_without_allocating() {
         assert_zero(&format!("preflight {name}"), stats);
 
         // Per-event charging on a fresh request budget, as the entry point does it
-        let (result, stats) = measure(|| current_charge(&input, DEFAULT));
+        let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || current_charge(&input, DEFAULT));
         assert!(
             matches!(&result, Err(err) if err.is_limit_exceeded()),
             "{name}: {result:?}"
         );
         assert_zero(&format!("charge {name}"), stats);
 
-        let (result, stats) = measure(|| current_pipeline_charge(&input, DEFAULT));
+        let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
+            current_pipeline_charge(&input, DEFAULT)
+        });
         assert!(
             matches!(&result, Err(err) if err.is_limit_exceeded()),
             "{name}: {result:?}"
@@ -105,7 +112,7 @@ fn preflight_rejects_without_allocating() {
 fn bounded_generic_flattening_rejects_cheaply() {
     for (name, input) in hostile_inputs() {
         let mut budget = FlattenBudget::new(DEFAULT);
-        let (result, stats) = measure(|| {
+        let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
             let result =
                 flatten_bench::current_json::flatten::generic_flattening(&input, &mut budget);
             result.map(|rows| rows.len())
@@ -123,8 +130,9 @@ fn bounded_generic_flattening_rejects_cheaply() {
 fn ingestion_entry_point_rejects_cheaply() {
     for (name, input) in hostile_inputs() {
         // The consumed input is freed inside the guard, which only lowers `net`
-        let (result, stats) =
-            measure(|| current_convert(input, None, DEFAULT).map(|rows| rows.len()));
+        let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
+            current_convert(input, None, DEFAULT).map(|rows| rows.len())
+        });
         let err = result.expect_err(name);
         limit_error(&err);
         // `err` (an anyhow box, 112 bytes today) is allocated inside the guard, so
@@ -173,7 +181,7 @@ fn insufficient_remaining_request_budget() {
             bytes: 0,
         })
         .unwrap();
-    let (result, stats) = measure(|| {
+    let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
         flatten_bench::current_json::flatten::charge_generic_flattening(&product, &mut budget)
     });
     assert!(
@@ -184,8 +192,9 @@ fn insufficient_remaining_request_budget() {
         "{result:?}"
     );
     assert_zero("core charge, remaining rows insufficient", stats);
-    let (result, stats) =
-        measure(|| current_convert_with(product, None, &mut budget).map(|r| r.len()));
+    let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
+        current_convert_with(product, None, &mut budget).map(|r| r.len())
+    });
     let err = result.expect_err("1000 rows cannot fit in the remaining 5");
     assert!(
         matches!(
@@ -207,7 +216,7 @@ fn insufficient_remaining_request_budget() {
         })
         .unwrap();
     let small = json!({"message": "this row is longer than sixteen bytes"});
-    let (result, stats) = measure(|| {
+    let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
         flatten_bench::current_json::flatten::charge_generic_flattening(&small, &mut budget)
     });
     assert!(
@@ -218,8 +227,9 @@ fn insufficient_remaining_request_budget() {
         "{result:?}"
     );
     assert_zero("core charge, remaining bytes insufficient", stats);
-    let (result, stats) =
-        measure(|| current_convert_with(small, None, &mut budget).map(|r| r.len()));
+    let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
+        current_convert_with(small, None, &mut budget).map(|r| r.len())
+    });
     let err = result.expect_err("row does not fit in the remaining 16 bytes");
     assert!(
         matches!(
@@ -253,6 +263,49 @@ fn request_budget_is_shared_across_partitions() {
     );
     // Not asserted: earlier partitions may be materialized before the 11th is charged
     report("partitioned request over limit", stats);
+}
+
+/// Events without arrays count toward the request limit too, a row each, though generic
+/// flattening leaves them as they are: 10 000 of them are accepted and 10 001 rejected, in
+/// under 100 KiB of JSON
+#[test]
+fn flat_batch_counts_a_row_per_event() {
+    let limit = DEFAULT.max_rows_per_request;
+    let batch = |events: usize| Value::Array((0..events).map(|i| json!({"t": i % 4})).collect());
+    let over = batch(limit + 1);
+    assert!(serde_json::to_vec(&over).unwrap().len() < 100 * 1024);
+
+    // Without a partition the batch comes back as a single array, unchanged
+    let rows = current_convert(batch(limit), None, DEFAULT).unwrap();
+    assert_eq!(rows[0], batch(limit));
+    let input = over.clone();
+    let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
+        current_convert(input, None, DEFAULT).map(|rows| rows.len())
+    });
+    let err = result.expect_err("10 001 events are over the 10 000 rows of a request");
+    assert!(
+        matches!(
+            limit_error(&err),
+            JsonFlattenError::RowsPerRequestLimitExceeded(10_000)
+        ),
+        "{err:#}"
+    );
+    // Charged in the walk that finds them free of arrays, nothing built
+    assert_small("flat batch over request rows", stats);
+
+    // With a partition every event is flattened on its own, so the events before the
+    // 10 001st are built before it is charged; the request is rejected all the same
+    let partition = "t".to_owned();
+    let rows = current_convert(batch(limit), Some(&partition), DEFAULT).unwrap();
+    assert_eq!(rows.len(), limit);
+    let err = current_convert(over, Some(&partition), DEFAULT).expect_err("over the limit");
+    assert!(
+        matches!(
+            limit_error(&err),
+            JsonFlattenError::RowsPerRequestLimitExceeded(10_000)
+        ),
+        "{err:#}"
+    );
 }
 
 /// Small deterministic generator of mixed shapes, bounded far below 1000 rows.
@@ -372,6 +425,43 @@ fn counter_sees_allocations() {
         stats.total_bytes >= 100_000 && stats.peak_bytes >= 100_000,
         "{stats:?}"
     );
+    // Under the cap, a bounded measurement counts the same
+    let (len, bounded) = measure_bounded(MAX_REJECT_BYTES * 2, || vec![0u8; 100_000].len());
+    assert_eq!(len, 100_000);
+    assert_eq!(bounded, stats);
+}
+
+const CAP_CHILD_ENV: &str = "FLATTEN_BENCH_ALLOCATION_CAP_CHILD";
+
+/// An allocation over the cap of a bounded measurement exits the process instead of being
+/// made, so this runs `allocation_cap_child` in a process of its own
+#[test]
+fn allocation_over_the_cap_exits() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "allocation_cap_child", "--ignored"])
+        .env(CAP_CHILD_ENV, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(CAP_EXCEEDED_EXIT_CODE),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("alloc_counter: an allocation of 1048576 bytes"),
+        "{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "exits the process; allocation_over_the_cap_exits runs it"]
+fn allocation_cap_child() {
+    if std::env::var_os(CAP_CHILD_ENV).is_none() {
+        return;
+    }
+    let (len, stats) = measure_bounded(MAX_REJECT_BYTES, || vec![0u8; 1 << 20].len());
+    panic!("{len} bytes allocated over the cap: {stats:?}");
 }
 
 /// The harness stubs `crate::cli`; make sure its defaults are the server's, and the
@@ -427,7 +517,8 @@ fn structural_field_names_are_rejected_without_expanding() {
     // The generic rows alone fit
     assert!(current_cost(&input, &small).is_ok());
 
-    let (result, stats) = measure(|| current_pipeline_cost(&input, &small));
+    let (result, stats) =
+        measure_bounded(MAX_REJECT_BYTES, || current_pipeline_cost(&input, &small));
     assert!(
         matches!(
             result,
@@ -436,7 +527,8 @@ fn structural_field_names_are_rejected_without_expanding() {
         "{result:?}"
     );
     assert_zero("structural preflight, long parent", stats);
-    let (result, stats) = measure(|| current_pipeline_charge(&input, small));
+    let (result, stats) =
+        measure_bounded(MAX_REJECT_BYTES, || current_pipeline_charge(&input, small));
     assert!(
         matches!(
             result,
@@ -449,7 +541,7 @@ fn structural_field_names_are_rejected_without_expanding() {
     for partition in [None, Some("r".to_owned())] {
         let input = input.clone();
         let mut budget = FlattenBudget::new(small);
-        let (result, stats) = measure(|| {
+        let (result, stats) = measure_bounded(MAX_REJECT_BYTES, || {
             current_convert_with(input, partition.as_ref(), &mut budget).map(|rows| rows.len())
         });
         let err = result.expect_err("long parent names exceed 4096 bytes");

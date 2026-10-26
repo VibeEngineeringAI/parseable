@@ -3,8 +3,10 @@
 //! them. Nothing in the extracted files is edited; the crate root provides the same
 //! `crate::parseable`, `crate::event` and `crate::metadata` stubs to both copies.
 //!
-//! Override the revision with FLATTEN_BENCH_BASELINE_REV (default 547c5118, the
-//! merge-base of fix/flatten-row-cap with main).
+//! Override the revision with FLATTEN_BENCH_BASELINE_REV (default 547c5118, the fixed
+//! comparison baseline: the revision fix/flatten-row-cap was first based on. Its
+//! `src/utils/json` files are the same blobs as at 04b73b57, which the branch was rebased
+//! onto).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

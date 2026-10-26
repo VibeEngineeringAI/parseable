@@ -7,9 +7,11 @@ production sources unmodified, so it measures the real code without building the
 (own `[workspace]`, depends only on serde/serde_json/chrono/thiserror/anyhow/tracing):
 
 - `current_json`: the working tree's `src/utils/json/{mod,flatten,strict}.rs`, included by path.
-- `baseline_json`: the same files at `547c5118` (the merge-base, including its no-op fast
-  paths), extracted byte for byte with `git show` by `build.rs` into `OUT_DIR`. Override
-  with `FLATTEN_BENCH_BASELINE_REV=<rev>`. This is NOT the `#[cfg(test)] legacy` module in
+- `baseline_json`: the same files at `547c5118`, the fixed comparison baseline (including
+  its no-op fast paths), extracted byte for byte with `git show` by `build.rs` into
+  `OUT_DIR`. The branch was first based on that revision and later rebased onto `04b73b57`,
+  where these three files are the same blobs. Override with
+  `FLATTEN_BENCH_BASELINE_REV=<rev>`. This is NOT the `#[cfg(test)] legacy` module in
   flatten.rs, which predates those fast paths; `[lib] test = false` keeps production
   `#[cfg(test)]` code out entirely. The bench prints the revision and flatten.rs blob id.
 
@@ -59,19 +61,30 @@ thread only, in requested bytes (not RSS): `allocs` alloc/realloc calls, `alloc_
 cumulative bytes requested, `peak_delta` highest live bytes above the level at call start,
 `net_delta` live bytes at the end minus the start. `peak_delta` is a delta, not an absolute
 peak: for consuming calls, freeing the input during the call lowers it. The borrowed
-`generic_flattening` section shows the extra memory without that offset.
+`generic_flattening` section shows the extra memory without that offset. These counted
+calls use `measure`, which has no cap.
+
+`tests/alloc_limits.rs` measures rejections with `measure_bounded` instead, which also caps
+the bytes requested at 64 KiB, the allowance those tests assert. An allocation that would go
+over the cap is never handed to the system allocator: the test process prints a line
+starting with `alloc_counter:` to stderr and exits with status 88
+(`CAP_EXCEEDED_EXIT_CODE`), so a regression that started expanding a hostile input stops
+there instead of using more memory. `allocation_over_the_cap_exits` checks this in a child
+process.
 
 ## HTTP smoke test
 
 `http_smoke.py` (Python 3 standard library only) starts a built server binary with
-`local-store` on an ephemeral 127.0.0.1 port, in a temporary directory, with small flatten
-caps (rows per event and bytes from the environment, rows per request from the CLI flag,
-overriding a different environment value). It checks accepted requests at the limits and
-`400` rejections over them, with unchanged event counts and schemas, for JSON (on
+`local-store` in a temporary directory, on ephemeral 127.0.0.1 ports for HTTP and for the
+gRPC, Arrow Flight and query gRPC servers (which otherwise take 8001 to 8003), with small
+flatten caps (rows per event and bytes from the environment, rows per request from the CLI
+flag, overriding a different environment value). It checks accepted requests at the limits
+and `400` rejections over them, with unchanged event counts and schemas, for JSON (on
 `/api/v1/ingest` and `/api/v1/logstream/{name}`), a known log format, custom partitions,
 Kinesis, OTEL JSON logs and schema detection, including events whose long or quote-escaped
 parent names only exceed the byte limit once structural flattening repeats them in every
-field name.
+field name, and batches of events without arrays (a row each) at and just over the rows per
+request.
 
 ```
 P_BUILD_NO_UI=1 cargo build --bin parseable
