@@ -35,6 +35,9 @@ use crate::query::resolve_stream_names;
 use crate::rbac::Users;
 use crate::rbac::map::{SessionKey, sessions};
 use crate::rbac::role::{Action, ParseableResourceType, Permission};
+use crate::utils::header_parsing::{
+    HeaderBuildError, ParseHeaderError, generated_text_reqwest_header_value, optional_header_str,
+};
 use actix::extract_session_key_from_req;
 use actix_web::dev::ServiceRequest;
 use actix_web::http::header::HeaderMap;
@@ -76,7 +79,7 @@ pub fn mutate_request_with_tenant(req: &mut ServiceRequest) {
     let creds = BasicAuth::extract(req.request()).into_inner();
 
     if let Ok(basic) = &creds {
-        Users.mutate_request_with_basic_user(basic.user_id(), basic.password().unwrap(), req);
+        Users.mutate_request_with_basic_user(basic.user_id(), basic.password().unwrap_or(""), req);
     } else if let Some(cookie) = req.cookie("session")
         && let Ok(ulid) = ulid::Ulid::from_string(cookie.value())
     {
@@ -87,11 +90,9 @@ pub fn mutate_request_with_tenant(req: &mut ServiceRequest) {
 
 pub fn get_user_from_request(req: &HttpRequest) -> Result<String, RBACError> {
     let session_key = extract_session_key_from_req(req).map_err(|_| RBACError::UserDoesNotExist)?;
-    let user_id = Users.get_userid_from_session(&session_key);
-    if user_id.is_none() {
-        return Err(RBACError::UserDoesNotExist);
-    }
-    let (user_id, _) = user_id.unwrap();
+    let (user_id, _) = Users
+        .get_userid_from_session(&session_key)
+        .ok_or(RBACError::UserDoesNotExist)?;
     Ok(user_id)
 }
 
@@ -121,10 +122,19 @@ pub fn get_user_and_tenant_from_request(
     }
 }
 
-pub fn get_tenant_id_from_request(req: &HttpRequest) -> Option<String> {
-    req.headers()
-        .get(TENANT_ID)
-        .map(|tenant_value| tenant_value.to_str().unwrap().to_owned())
+/// Returns the tenant id from the `x-p-tenant` request header.
+///
+/// A missing header is `Ok(None)`. A header that is present but not visible
+/// ASCII is rejected with `ParseHeaderError::InvalidTenantId` (400) instead of
+/// silently falling back to the default tenant.
+pub fn get_tenant_id_from_request(req: &HttpRequest) -> Result<Option<String>, ParseHeaderError> {
+    tenant_id_from_headers(req.headers())
+}
+
+fn tenant_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ParseHeaderError> {
+    optional_header_str(headers, TENANT_ID)
+        .map(|tenant| tenant.map(str::to_owned))
+        .map_err(|_| ParseHeaderError::InvalidTenantId)
 }
 
 pub fn get_tenant_id_from_key(key: &SessionKey) -> Option<String> {
@@ -253,48 +263,280 @@ pub fn is_admin_for_session(session_key: &SessionKey) -> bool {
     false
 }
 
+/// Builds the auth headers used to forward a request to another node.
+///
+/// A malformed tenant header on the incoming request is a client error
+/// (`HeaderBuildError::Input`, 400). Values the server stored or generated
+/// itself (cluster secret hash, user id, node token) failing to encode is a
+/// server error (`HeaderBuildError::Internal`, 500). Header values are never
+/// included in the error.
 pub fn create_intracluster_auth_headermap(
     req: &HeaderMap,
     node_token: &str,
     userid: &str,
-) -> reqwest::header::HeaderMap {
+) -> Result<reqwest::header::HeaderMap, HeaderBuildError> {
+    build_intracluster_auth_headermap(
+        req,
+        node_token,
+        userid,
+        CLUSTER_SECRET.get().map(|(_, hash)| hash.as_str()),
+    )
+}
+
+fn copied_header_value(
+    value: &actix_web::http::header::HeaderValue,
+) -> Result<reqwest::header::HeaderValue, HeaderBuildError> {
+    reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+        .map_err(|_| HeaderBuildError::Input(ParseHeaderError::InvalidValue))
+}
+
+fn build_intracluster_auth_headermap(
+    req: &HeaderMap,
+    node_token: &str,
+    userid: &str,
+    cluster_secret_hash: Option<&str>,
+) -> Result<reqwest::header::HeaderMap, HeaderBuildError> {
     let mut map = reqwest::header::HeaderMap::new();
-    let tenant_id = req
-        .get(TENANT_ID)
-        .map(|tenant_value| tenant_value.to_str().unwrap().to_owned());
-    if let Some((_, hash)) = CLUSTER_SECRET.get() {
+    // reject a malformed client-supplied tenant regardless of the auth branch
+    let tenant_id = tenant_id_from_headers(req)?;
+    if let Some(hash) = cluster_secret_hash {
+        let tenant_value =
+            reqwest::header::HeaderValue::from_str(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
+                .map_err(|_| HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))?;
         // also insert server secret along with other required headers for query forwarding
         map.insert(
             reqwest::header::HeaderName::from_static(CLUSTER_SECRET_HEADER),
-            reqwest::header::HeaderValue::from_str(hash).unwrap(),
+            generated_text_reqwest_header_value(hash, "cluster secret hash")?,
         );
         map.insert(
             reqwest::header::HeaderName::from_static("intra-cluster-tenant"),
-            reqwest::header::HeaderValue::from_str(tenant_id.as_deref().unwrap_or(DEFAULT_TENANT))
-                .unwrap(),
+            tenant_value,
         );
         map.insert(
             reqwest::header::HeaderName::from_static("intra-cluster-userid"),
-            reqwest::header::HeaderValue::from_str(userid).unwrap(),
+            generated_text_reqwest_header_value(userid, "user id")?,
         );
     } else if let Some(auth) = req.get(actix_web::http::header::AUTHORIZATION) {
-        map.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_bytes(auth.as_bytes()).unwrap(),
-        );
+        map.insert(reqwest::header::AUTHORIZATION, copied_header_value(auth)?);
     } else if req.contains_key(actix_web::http::header::COOKIE) {
         // multiple cookies
         for cookie in req.get_all(actix_web::http::header::COOKIE) {
-            map.insert(
-                reqwest::header::COOKIE,
-                reqwest::header::HeaderValue::from_bytes(cookie.as_bytes()).unwrap(),
-            );
+            map.insert(reqwest::header::COOKIE, copied_header_value(cookie)?);
         }
     } else {
         map.insert(
             reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(node_token).unwrap(),
+            generated_text_reqwest_header_value(node_token, "node token")?,
         );
     }
-    map
+    Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::http::header::{HeaderName, HeaderValue};
+    use actix_web::test::TestRequest;
+
+    fn invalid_tenant_value() -> HeaderValue {
+        HeaderValue::from_bytes(b"tenant\xff").expect("obs-text is a valid header value")
+    }
+
+    fn headers(pairs: &[(&'static str, HeaderValue)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(HeaderName::from_static(name), value.clone());
+        }
+        map
+    }
+
+    #[test]
+    fn tenant_id_missing_is_none() {
+        let req = TestRequest::default().to_http_request();
+        assert!(matches!(get_tenant_id_from_request(&req), Ok(None)));
+    }
+
+    #[test]
+    fn tenant_id_valid_is_some() {
+        let req = TestRequest::default()
+            .insert_header((TENANT_ID, "acme"))
+            .to_http_request();
+        assert_eq!(
+            get_tenant_id_from_request(&req).unwrap().as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn tenant_id_invalid_bytes_is_rejected() {
+        let req = TestRequest::default()
+            .insert_header((TENANT_ID, invalid_tenant_value()))
+            .to_http_request();
+        assert!(matches!(
+            get_tenant_id_from_request(&req),
+            Err(ParseHeaderError::InvalidTenantId)
+        ));
+    }
+
+    #[test]
+    fn forwarding_with_cluster_secret_sets_intracluster_headers() {
+        let req = headers(&[(TENANT_ID, HeaderValue::from_static("acme"))]);
+        let map = build_intracluster_auth_headermap(&req, "Basic token", "alice", Some("hash"))
+            .expect("valid inputs build headers");
+        assert_eq!(map.get(CLUSTER_SECRET_HEADER).unwrap(), "hash");
+        assert_eq!(map.get("intra-cluster-tenant").unwrap(), "acme");
+        assert_eq!(map.get("intra-cluster-userid").unwrap(), "alice");
+        assert!(map.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn forwarding_with_cluster_secret_defaults_missing_tenant() {
+        let map = build_intracluster_auth_headermap(&HeaderMap::new(), "t", "alice", Some("hash"))
+            .expect("valid inputs build headers");
+        assert_eq!(map.get("intra-cluster-tenant").unwrap(), DEFAULT_TENANT);
+    }
+
+    #[test]
+    fn forwarding_rejects_malformed_tenant_as_input_error() {
+        let req = headers(&[(TENANT_ID, invalid_tenant_value())]);
+        for secret in [Some("hash"), None] {
+            let err = build_intracluster_auth_headermap(&req, "t", "alice", secret).unwrap_err();
+            assert!(matches!(
+                err,
+                HeaderBuildError::Input(ParseHeaderError::InvalidTenantId)
+            ));
+            assert_eq!(
+                actix_web::ResponseError::status_code(&err),
+                actix_web::http::StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn forwarding_rejects_invalid_secret_hash_as_internal_without_leaking() {
+        let err = build_intracluster_auth_headermap(
+            &HeaderMap::new(),
+            "t",
+            "alice",
+            Some("secret\nvalue"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            HeaderBuildError::Internal("cluster secret hash")
+        ));
+        assert_eq!(
+            actix_web::ResponseError::status_code(&err),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!err.to_string().contains("secret\nvalue"));
+        assert!(!format!("{err:?}").contains("secret\nvalue"));
+    }
+
+    #[test]
+    fn forwarding_rejects_invalid_userid_as_internal() {
+        let err =
+            build_intracluster_auth_headermap(&HeaderMap::new(), "t", "al\u{7f}ice", Some("hash"))
+                .unwrap_err();
+        assert!(matches!(err, HeaderBuildError::Internal("user id")));
+    }
+
+    #[test]
+    fn forwarding_copies_authorization_header() {
+        let req = headers(&[(
+            "authorization",
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        )]);
+        let map = build_intracluster_auth_headermap(&req, "node", "alice", None).unwrap();
+        assert_eq!(
+            map.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Basic dXNlcjpwYXNz"
+        );
+        assert!(map.get(reqwest::header::COOKIE).is_none());
+    }
+
+    #[test]
+    fn forwarding_copies_cookie_header() {
+        let req = headers(&[("cookie", HeaderValue::from_static("session=abc"))]);
+        let map = build_intracluster_auth_headermap(&req, "node", "alice", None).unwrap();
+        assert_eq!(map.get(reqwest::header::COOKIE).unwrap(), "session=abc");
+        assert!(map.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn forwarding_copies_non_ascii_authorization_bytes() {
+        // obs-text is valid in both http versions and must not be rejected
+        let req = headers(&[(
+            "authorization",
+            HeaderValue::from_bytes(b"Basic \xe9").unwrap(),
+        )]);
+        let map = build_intracluster_auth_headermap(&req, "node", "alice", None).unwrap();
+        assert_eq!(
+            map.get(reqwest::header::AUTHORIZATION).unwrap().as_bytes(),
+            b"Basic \xe9"
+        );
+    }
+
+    #[test]
+    fn forwarding_falls_back_to_node_token() {
+        let map = build_intracluster_auth_headermap(&HeaderMap::new(), "Basic node", "alice", None)
+            .unwrap();
+        assert_eq!(
+            map.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Basic node"
+        );
+    }
+
+    #[test]
+    fn forwarding_rejects_invalid_node_token_as_internal_without_leaking() {
+        let err = build_intracluster_auth_headermap(&HeaderMap::new(), "tok\r\nen", "alice", None)
+            .unwrap_err();
+        assert!(matches!(err, HeaderBuildError::Internal("node token")));
+        assert!(!err.to_string().contains("tok"));
+    }
+
+    // text the receiving node can't read with `to_str`; `from_str` accepts the non-ASCII ones
+    const UNREADABLE_TEXT: [&str; 3] = ["josé", "用户", "ctl\u{1}"];
+
+    fn assert_internal_without_leaking(err: HeaderBuildError, field: &str, value: &str) {
+        assert!(matches!(err, HeaderBuildError::Internal(f) if f == field));
+        assert_eq!(
+            actix_web::ResponseError::status_code(&err),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!err.to_string().contains(value));
+        assert!(!format!("{err:?}").contains(value));
+    }
+
+    #[test]
+    fn forwarding_rejects_unreadable_generated_text_as_internal() {
+        for value in UNREADABLE_TEXT {
+            let err =
+                build_intracluster_auth_headermap(&HeaderMap::new(), "t", "alice", Some(value))
+                    .unwrap_err();
+            assert_internal_without_leaking(err, "cluster secret hash", value);
+
+            let err =
+                build_intracluster_auth_headermap(&HeaderMap::new(), "t", value, Some("hash"))
+                    .unwrap_err();
+            assert_internal_without_leaking(err, "user id", value);
+
+            let token = format!("Basic {value}");
+            let err = build_intracluster_auth_headermap(&HeaderMap::new(), &token, "alice", None)
+                .unwrap_err();
+            assert_internal_without_leaking(err, "node token", value);
+        }
+    }
+
+    #[test]
+    fn forwarding_ignores_unused_generated_text() {
+        // a copied credential wins over the node token, so a bad token is never encoded
+        let req = headers(&[("cookie", HeaderValue::from_bytes(b"s=caf\xc3\xa9").unwrap())]);
+        let map = build_intracluster_auth_headermap(&req, "Basic josé", "josé", None).unwrap();
+        assert_eq!(
+            map.get(reqwest::header::COOKIE).unwrap().as_bytes(),
+            b"s=caf\xc3\xa9"
+        );
+        assert!(map.get("intra-cluster-userid").is_none());
+    }
 }

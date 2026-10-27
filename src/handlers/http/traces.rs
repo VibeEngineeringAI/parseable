@@ -37,6 +37,7 @@ use crate::{
         actix::extract_session_key_from_req,
         arrow::record_batches_to_json,
         get_tenant_id_from_request, get_user_from_request,
+        header_parsing::ParseHeaderError,
         time::{TimeRange, parse_start_time_expression, parse_time_expression, truncate_to_minute},
     },
 };
@@ -166,9 +167,18 @@ pub enum TraceError {
     TraceNotFound(String),
 }
 
+impl TraceError {
+    /// A malformed request header. The message never includes the value.
+    pub(crate) fn invalid_header(error: ParseHeaderError) -> Self {
+        Self::BadRequest(error.to_string())
+    }
+}
+
 impl actix_web::ResponseError for TraceError {
     fn status_code(&self) -> StatusCode {
         match self {
+            Self::Query(QueryError::Header(_)) => StatusCode::BAD_REQUEST,
+            Self::Query(QueryError::HeaderBuild(e)) => actix_web::ResponseError::status_code(e),
             Self::Query(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::TimeParse(_) | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::StreamNotFound(_) | Self::TraceNotFound(_) => StatusCode::NOT_FOUND,
@@ -185,7 +195,7 @@ pub async fn list_traces(
     req: HttpRequest,
     Json(body): Json<TraceListRequest>,
 ) -> Result<HttpResponse, TraceError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req).map_err(TraceError::invalid_header)?;
     let target = query_target(&req, &tenant_id)?;
     let response = list_traces_with_target(body, &tenant_id, target).await?;
     Ok(HttpResponse::Ok().json(response))
@@ -280,7 +290,7 @@ pub async fn get_trace_detail(
     req: HttpRequest,
     Json(body): Json<TraceDetailRequest>,
 ) -> Result<HttpResponse, TraceError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req).map_err(TraceError::invalid_header)?;
     let target = query_target(&req, &tenant_id)?;
     let response = get_trace_detail_with_target(body, &tenant_id, target).await?;
     Ok(HttpResponse::Ok().json(response))
@@ -1254,5 +1264,50 @@ FROM (VALUES
             TimeRange::parse_human_time("2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z").unwrap();
         let context = TraceSqlContext::new("traces\"archive", "p_timestamp", &range, None);
         assert_eq!(context.table, "\"traces\"\"archive\"");
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{ResponseError, http::header::HeaderValue, test::TestRequest};
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+    use crate::utils::header_parsing::{HeaderBuildError, ParseHeaderError};
+
+    #[test]
+    fn nested_query_header_errors_keep_their_status() {
+        assert_eq!(
+            TraceError::Query(QueryError::Header(ParseHeaderError::InvalidTenantId)).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            TraceError::Query(QueryError::HeaderBuild(HeaderBuildError::Internal(
+                "querier token"
+            )))
+            .status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[actix_web::test]
+    async fn list_traces_rejects_malformed_tenant_with_400() {
+        let req = TestRequest::default()
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request();
+        let body: TraceListRequest = serde_json::from_value(serde_json::json!({
+            "dataset": "traces",
+            "startTime": "1h",
+            "endTime": "now"
+        }))
+        .expect("minimal trace list request");
+        let Err(err) = list_traces(req, Json(body)).await else {
+            panic!("malformed tenant must be rejected");
+        };
+        assert!(matches!(err, TraceError::BadRequest(_)));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
     }
 }

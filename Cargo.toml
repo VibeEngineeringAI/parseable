@@ -221,6 +221,7 @@ anyhow = "1.0"
 procfs = { version = "0.18.0", default-features = false }
 
 [dev-dependencies]
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 rstest = "0.26.1"
 arrow = "59.2.0"
 temp-dir = "0.1.14"

@@ -49,7 +49,7 @@ pub async fn post_user(
 
     if let Some(body) = body {
         let user: ParseableUser = serde_json::from_value(body.into_inner())?;
-        let req_tenant_id = get_tenant_id_from_request(&req);
+        let req_tenant_id = get_tenant_id_from_request(&req)?;
         let req_tenant = req_tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         if req_tenant.ne(DEFAULT_TENANT)
             && (req_tenant.ne(user.tenant.as_deref().unwrap_or(DEFAULT_TENANT)))
@@ -70,7 +70,7 @@ pub async fn delete_user(
     userid: web::Path<String>,
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
@@ -83,7 +83,7 @@ pub async fn add_roles_to_user(
     _roles_to_add: web::Json<HashSet<String>>,
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
@@ -96,7 +96,7 @@ pub async fn remove_roles_from_user(
     _roles_to_remove: web::Json<HashSet<String>>,
 ) -> Result<HttpResponse, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     sync_stored_user(&userid, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }
@@ -108,7 +108,7 @@ pub async fn post_gen_password(
     userid: web::Path<String>,
 ) -> Result<HttpResponse, RBACError> {
     let username = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     sync_stored_user(&username, &tenant_id).await?;
     Ok(HttpResponse::Ok().status(StatusCode::OK).finish())
 }

@@ -52,6 +52,7 @@ use crate::rbac::role::model::Role;
 use crate::rbac::user::User;
 use crate::stats::Stats;
 use crate::storage::{ObjectStorageError, ObjectStoreFormat};
+use crate::utils::header_parsing::{HeaderBuildError, generated_text_reqwest_header_value};
 use crate::utils::{create_intracluster_auth_headermap, get_tenant_id_from_request};
 
 use super::base_path_without_preceding_slash;
@@ -341,7 +342,7 @@ pub async fn for_each_live_node<F, Fut, E>(tenant_id: &Option<String>, api_fn: F
 where
     F: Fn(NodeMetadata) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<(), E>> + Send,
-    E: From<anyhow::Error> + Send + Sync + 'static,
+    E: From<anyhow::Error> + std::error::Error + Send + Sync + 'static,
 {
     let mut nodes = Vec::new();
 
@@ -379,12 +380,50 @@ where
     }))
     .await;
 
-    // collect results
-    for result in results {
-        result?;
-    }
+    collect_node_results(results)
+}
 
-    Ok(())
+/// A best-effort caller may ignore ordinary node failures, but must still see
+/// a header validation failure from any node. Preserve first-error ordering
+/// when none of the nodes failed header validation.
+fn collect_node_results<E: std::error::Error + 'static>(
+    results: impl IntoIterator<Item = Result<(), E>>,
+) -> Result<(), E> {
+    let mut first_error = None;
+    for result in results {
+        if let Err(error) = result {
+            let mut cause: &(dyn std::error::Error + 'static) = &error;
+            loop {
+                if cause.is::<HeaderBuildError>() {
+                    return Err(error);
+                }
+                match cause.source() {
+                    Some(source) => cause = source,
+                    None => break,
+                }
+            }
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+pub const INTRA_CLUSTER_USERID: &str = "intra-cluster-userid";
+
+/// The `intra-cluster-userid` that [`sync_streams_with_ingestors`] adds when the
+/// forwarded headers don't already carry one: the configured username.
+/// `put_stream` calls this before mutating the stream so that a username that
+/// can't be sent fails the request before any local change or send.
+pub fn fallback_intracluster_userid(
+    has_userid: bool,
+    username: &str,
+) -> Result<Option<reqwest::header::HeaderValue>, HeaderBuildError> {
+    if has_userid {
+        return Ok(None);
+    }
+    generated_text_reqwest_header_value(username, "configured username").map(Some)
 }
 
 // forward the create/update stream request to all ingestors to keep them in sync
@@ -405,6 +444,16 @@ pub async fn sync_streams_with_ingestors(
         }
     }
 
+    if let Some(userid) = fallback_intracluster_userid(
+        reqwest_headers.contains_key(INTRA_CLUSTER_USERID),
+        &PARSEABLE.options.username,
+    )? {
+        reqwest_headers.insert(
+            reqwest::header::HeaderName::from_static(INTRA_CLUSTER_USERID),
+            userid,
+        );
+    }
+
     let body_clone = body.clone();
     let stream_name = stream_name.to_string();
     let reqwest_headers_clone = reqwest_headers.clone();
@@ -417,14 +466,7 @@ pub async fn sync_streams_with_ingestors(
                 base_path_without_preceding_slash(),
                 stream_name
             );
-            let mut headers = reqwest_headers_clone.clone();
-
-            if !headers.contains_key("intra-cluster-userid") {
-                headers.insert(
-                    reqwest::header::HeaderName::from_static("intra-cluster-userid"),
-                    reqwest::header::HeaderValue::from_str(&PARSEABLE.options.username).unwrap(),
-                );
-            }
+            let headers = reqwest_headers_clone.clone();
             let body = body_clone.clone();
             async move {
                 let res = INTRA_CLUSTER_CLIENT
@@ -490,6 +532,7 @@ pub async fn sync_users_with_roles_with_ingestors(
         let headermap =
             create_intracluster_auth_headermap(&headers, &ingestor.token, &caller_userid);
         async move {
+            let headermap = headermap?;
             let res = INTRA_CLUSTER_CLIENT
                 .patch(url)
                 .headers(headermap)
@@ -540,6 +583,7 @@ pub async fn sync_user_deletion_with_ingestors(
         let headermap =
             create_intracluster_auth_headermap(&headers, &ingestor.token, &caller_userid);
         async move {
+            let headermap = headermap?;
             let res = INTRA_CLUSTER_CLIENT
                 .delete(url)
                 // .header(header::AUTHORIZATION, &ingestor.token)
@@ -602,6 +646,7 @@ pub async fn sync_user_creation(
         let user_data = user_data.clone();
 
         async move {
+            let headermap = headermap?;
             let res = INTRA_CLUSTER_CLIENT
                 .post(url)
                 .headers(headermap)
@@ -638,7 +683,7 @@ pub async fn sync_password_reset_with_ingestors(
     caller_userid: &str,
 ) -> Result<(), RBACError> {
     let userid = username.to_owned();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = caller_userid.to_owned();
     let headers = req.headers().clone();
     for_each_live_node(&tenant_id, move |ingestor| {
@@ -651,6 +696,7 @@ pub async fn sync_password_reset_with_ingestors(
         let headermap =
             create_intracluster_auth_headermap(&headers, &ingestor.token, &caller_userid);
         async move {
+            let headermap = headermap?;
             let res = INTRA_CLUSTER_CLIENT
                 .post(url)
                 .headers(headermap)
@@ -702,6 +748,7 @@ pub async fn sync_role_update(
         let headermap = create_intracluster_auth_headermap(&headers, &node.token, &userid);
         let tenant_id = tenant.clone();
         async move {
+            let headermap = headermap?;
             let res = INTRA_CLUSTER_CLIENT
                 .put(url)
                 .headers(headermap)
@@ -750,6 +797,7 @@ pub async fn sync_role_delete(
 
         let headermap = create_intracluster_auth_headermap(&headers, &node.token, &userid);
         async move {
+            let headermap = headermap?;
             let res = INTRA_CLUSTER_CLIENT
                 .delete(url)
                 .headers(headermap)
@@ -939,7 +987,7 @@ pub async fn send_retention_cleanup_request(
 
 /// Fetches cluster information for all nodes (ingestor, indexer, querier and prism)
 pub async fn get_cluster_info(req: HttpRequest) -> Result<impl Responder, StreamError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(actix_web::HttpResponse::Ok().json(get_cluster_info_internal(&tenant_id).await?))
 }
 
@@ -1092,7 +1140,7 @@ async fn fetch_nodes_info<T: Metadata>(
 }
 
 pub async fn get_cluster_metrics(req: HttpRequest) -> Result<impl Responder, PostError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(actix_web::HttpResponse::Ok().json(get_cluster_metrics_internal(&tenant_id).await?))
 }
 
@@ -1922,6 +1970,19 @@ pub async fn mark_querier_available(domain_name: &str) {
     }
 }
 
+/// Extracts the user id from a `Basic <base64(user:password)>` node token as a
+/// header value. The token is server-generated, so any failure is internal.
+fn basic_token_userid_header(
+    token: &str,
+) -> Result<reqwest::header::HeaderValue, HeaderBuildError> {
+    let internal = || HeaderBuildError::Internal("querier token");
+    let encoded = token.split(' ').nth(1).ok_or_else(internal)?;
+    let decoded = BASE64_STANDARD.decode(encoded).map_err(|_| internal())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| internal())?;
+    let (user, _) = decoded.split_once(':').ok_or_else(internal)?;
+    generated_text_reqwest_header_value(user, "querier token")
+}
+
 pub async fn send_query_request(
     auth_token: Option<HeaderMap>,
     query_request: &Query,
@@ -1958,20 +2019,30 @@ pub async fn send_query_request(
             }
         }
     } else {
-        map.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&querier.token).unwrap(),
-        );
+        match generated_text_reqwest_header_value(&querier.token, "querier token") {
+            Ok(token) => {
+                map.insert(reqwest::header::AUTHORIZATION, token);
+            }
+            Err(err) => {
+                mark_querier_available(&domain_name).await;
+                return Err(err.into());
+            }
+        }
     };
     if map.get("intra-cluster-userid").is_none() {
-        let token: Vec<&str> = querier.token().split(' ').collect();
-        let decode = BASE64_STANDARD.decode(token[1]).unwrap();
-        let user = String::from_utf8(decode).unwrap();
-        let user = user.split_once(':').unwrap();
-        map.insert(
-            reqwest::header::HeaderName::from_static("intra-cluster-userid"),
-            reqwest::header::HeaderValue::from_str(user.0).unwrap(),
-        );
+        match basic_token_userid_header(querier.token()) {
+            Ok(userid) => {
+                map.insert(
+                    reqwest::header::HeaderName::from_static("intra-cluster-userid"),
+                    userid,
+                );
+            }
+            Err(err) => {
+                mark_querier_available(&domain_name).await;
+                error!("failed to derive intra-cluster user id from querier token");
+                return Err(err.into());
+            }
+        }
     }
     let res = match INTRA_CLUSTER_CLIENT
         .post(uri)
@@ -2015,5 +2086,138 @@ pub async fn send_query_request(
     } else {
         let err_text = res.text().await?;
         Err(QueryError::JsonParse(err_text))
+    }
+}
+
+#[cfg(test)]
+mod header_build_tests {
+    use super::*;
+
+    #[test]
+    fn node_header_failure_wins_over_earlier_network_failure() {
+        for header_first in [false, true] {
+            let network = RBACError::Network(
+                reqwest::Client::new()
+                    .get("invalid url")
+                    .build()
+                    .unwrap_err(),
+            );
+            let header = RBACError::HeaderBuild(HeaderBuildError::Internal("node token"));
+            let results = if header_first {
+                vec![Err(header), Err(network)]
+            } else {
+                vec![Err(network), Err(header)]
+            };
+            let error = collect_node_results(results).unwrap_err();
+            assert!(matches!(error, RBACError::HeaderBuild(_)));
+            assert_eq!(
+                actix_web::ResponseError::status_code(&error),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert_eq!(
+                error.to_string(),
+                "Failed to build internal request headers"
+            );
+        }
+    }
+
+    #[test]
+    fn node_header_input_failure_preserves_400_through_role_wrapper() {
+        let error = collect_node_results(vec![
+            Err(RoleError::Anyhow(anyhow::anyhow!("node unavailable"))),
+            Err(RoleError::HeaderBuild(HeaderBuildError::Input(
+                crate::utils::header_parsing::ParseHeaderError::InvalidTenantId,
+            ))),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            actix_web::ResponseError::status_code(&error),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(matches!(error, RoleError::HeaderBuild(_)));
+    }
+
+    #[test]
+    fn node_results_preserve_first_ordinary_error_and_success() {
+        let error = collect_node_results(vec![
+            Err(RBACError::Anyhow(anyhow::anyhow!("first node failed"))),
+            Err(RBACError::UserDoesNotExist),
+        ])
+        .unwrap_err();
+        assert!(matches!(error, RBACError::Anyhow(_)));
+        assert_eq!(error.to_string(), "Error: first node failed");
+        assert!(collect_node_results::<ObjectStorageError>([Ok(()), Ok(())]).is_ok());
+    }
+
+    #[test]
+    fn basic_token_userid_header_extracts_user() {
+        let token = format!("Basic {}", BASE64_STANDARD.encode("alice:secret"));
+        assert_eq!(basic_token_userid_header(&token).unwrap(), "alice");
+    }
+
+    #[test]
+    fn basic_token_userid_header_rejects_malformed_tokens_as_internal() {
+        let not_utf8 = format!("Basic {}", BASE64_STANDARD.encode([0xff, 0xfe]));
+        let no_colon = format!("Basic {}", BASE64_STANDARD.encode("alice"));
+        let bad_user = format!("Basic {}", BASE64_STANDARD.encode("al\nice:secret"));
+        // `HeaderValue::from_str` accepts these but the receiver's `to_str` doesn't
+        let unicode_user = format!("Basic {}", BASE64_STANDARD.encode("josé:secret"));
+        let cjk_user = format!("Basic {}", BASE64_STANDARD.encode("用户:secret"));
+        let control_user = format!("Basic {}", BASE64_STANDARD.encode("al\u{1}ice:secret"));
+        for token in [
+            "Basic",
+            "Basic !!!",
+            not_utf8.as_str(),
+            no_colon.as_str(),
+            bad_user.as_str(),
+            unicode_user.as_str(),
+            cjk_user.as_str(),
+            control_user.as_str(),
+        ] {
+            let err = basic_token_userid_header(token).unwrap_err();
+            assert!(matches!(err, HeaderBuildError::Internal("querier token")));
+            assert!(!err.to_string().contains("secret"));
+            assert_eq!(
+                actix_web::ResponseError::status_code(&QueryError::from(err)),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_intracluster_userid_uses_configured_username() {
+        let userid = fallback_intracluster_userid(false, "admin").unwrap();
+        assert_eq!(userid.unwrap(), "admin");
+    }
+
+    #[test]
+    fn fallback_intracluster_userid_defers_to_existing_userid() {
+        // an already-present user id wins, so the username is never encoded
+        assert!(
+            fallback_intracluster_userid(true, "josé")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fallback_intracluster_userid(true, "ad\nmin")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fallback_intracluster_userid_rejects_unreadable_username_as_internal() {
+        for username in ["ad\nmin", "ad\rmin", "ad\u{7f}min", "josé", "用户"] {
+            let err = fallback_intracluster_userid(false, username).unwrap_err();
+            assert!(matches!(
+                err,
+                HeaderBuildError::Internal("configured username")
+            ));
+            assert!(!err.to_string().contains(username));
+            assert_eq!(
+                actix_web::ResponseError::status_code(&StreamError::from(err)),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
     }
 }

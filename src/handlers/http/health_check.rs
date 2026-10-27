@@ -110,7 +110,10 @@ async fn perform_object_store_sync() {
 }
 
 pub async fn readiness(req: HttpRequest) -> HttpResponse {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = match get_tenant_id_from_request(&req) {
+        Ok(tenant_id) => tenant_id,
+        Err(error) => return HttpResponse::BadRequest().body(error.to_string()),
+    };
     HttpResponse::new(readiness_internal(&tenant_id).await)
 }
 
@@ -126,5 +129,24 @@ pub async fn readiness_internal(tenant_id: &Option<String>) -> StatusCode {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{http::header::HeaderValue, test::TestRequest};
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+
+    #[actix_web::test]
+    async fn readiness_rejects_malformed_tenant_with_400() {
+        let req = TestRequest::default()
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request();
+        assert_eq!(readiness(req).await.status(), StatusCode::BAD_REQUEST);
     }
 }

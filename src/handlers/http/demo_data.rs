@@ -53,7 +53,7 @@ pub async fn get_demo_data(req: HttpRequest) -> Result<HttpResponse, PostError> 
     let password = PARSEABLE.options.password.clone();
     let scheme = PARSEABLE.options.get_scheme();
     let standalone_url = format!("{scheme}://{}", PARSEABLE.options.address);
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     match action.as_str() {
         "ingest" => match PARSEABLE.options.mode {
             Mode::All => {

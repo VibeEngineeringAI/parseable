@@ -50,7 +50,7 @@ use crate::{
             API_BASE_PATH, API_VERSION,
             cluster::sync_user_creation,
             modal::{OIDC_CLIENT, utils::rbac_utils::put_metadata},
-            rbac::UPDATE_LOCK,
+            rbac::{RBACError, UPDATE_LOCK},
         },
     },
     oauth::{OAuthProvider, OAuthSession},
@@ -63,6 +63,7 @@ use crate::{
     storage::{ObjectStorageError, StorageMetadata},
     utils::{
         actix::extract_session_key_from_req, get_tenant_id_from_key, get_tenant_id_from_request,
+        header_parsing::HeaderBuildError,
     },
 };
 
@@ -206,7 +207,8 @@ pub async fn reply_login(
     login_query: web::Query<Login>,
 ) -> Result<HttpResponse, OIDCError> {
     let oidc_client = OIDC_CLIENT.get().ok_or(OIDCError::Unauthorized)?;
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)
+        .map_err(|error| OIDCError::BadRequest(error.to_string()))?;
     // An XHR caller forwards the code itself and receives the session as JSON;
     // a browser arrives from the IdP and is redirected on. Check either caller
     // before the code is redeemed: a forged callback must not create a session.
@@ -239,17 +241,16 @@ pub async fn reply_login(
         if let UserType::OAuth(oauth) = &mut cluster_user.ty {
             oauth.bearer = None;
         }
-        if let Err(e) = sync_user_creation(
-            &req,
-            cluster_user,
-            &roles,
-            &tenant_id,
-            &PARSEABLE.options.username,
-        )
-        .await
-        {
-            tracing::error!("Failed to sync OAuth user with roles to cluster nodes: {e}");
-        }
+        best_effort_user_sync(
+            sync_user_creation(
+                &req,
+                cluster_user,
+                &roles,
+                &tenant_id,
+                &PARSEABLE.options.username,
+            )
+            .await,
+        )?;
     }
 
     let cookies = [
@@ -261,6 +262,21 @@ pub async fn reply_login(
     Ok(build_login_response(
         redirect, cookies, id, &username, &user_id,
     ))
+}
+
+/// Syncing the OAuth user to other nodes is best effort: a node or network
+/// failure is logged and login continues. Forwarding headers that can't be
+/// built on any node fail the login rather than being ignored, retaining
+/// its own status (400 client header, generic 500 stored or generated value).
+fn best_effort_user_sync(result: Result<(), RBACError>) -> Result<(), OIDCError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(RBACError::HeaderBuild(e)) => Err(e.into()),
+        Err(e) => {
+            tracing::error!("Failed to sync OAuth user with roles to cluster nodes: {e}");
+            Ok(())
+        }
+    }
 }
 
 /// Extract username, user_id, and UserInfo from the OAuth session.
@@ -837,6 +853,8 @@ pub enum OIDCError {
     BadRequest(String),
     #[error("Unauthorized")]
     Unauthorized,
+    #[error("{0}")]
+    HeaderBuild(#[from] HeaderBuildError),
 }
 
 impl actix_web::ResponseError for OIDCError {
@@ -846,6 +864,7 @@ impl actix_web::ResponseError for OIDCError {
             Self::Serde(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::HeaderBuild(e) => actix_web::ResponseError::status_code(e),
         }
     }
 
@@ -1087,5 +1106,51 @@ mod tests {
                 "redirect from {from}"
             );
         }
+    }
+
+    // a request builder error, so no network is touched
+    fn network_error() -> reqwest::Error {
+        reqwest::Client::new().get("not a url").build().unwrap_err()
+    }
+
+    #[actix_web::test]
+    async fn user_sync_header_build_input_fails_login_with_400() {
+        let err = best_effort_user_sync(Err(HeaderBuildError::Input(
+            crate::utils::header_parsing::ParseHeaderError::InvalidTenantId,
+        )
+        .into()))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OIDCError::HeaderBuild(HeaderBuildError::Input(_))
+        ));
+        assert_eq!(
+            actix_web::ResponseError::status_code(&err),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[actix_web::test]
+    async fn user_sync_header_build_internal_fails_login_with_generic_500() {
+        let err =
+            best_effort_user_sync(Err(HeaderBuildError::Internal("configured username").into()))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            OIDCError::HeaderBuild(HeaderBuildError::Internal("configured username"))
+        ));
+        let response = actix_web::ResponseError::error_response(&err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(body, "Failed to build internal request headers");
+    }
+
+    #[actix_web::test]
+    async fn user_sync_node_and_network_failures_stay_best_effort() {
+        assert!(best_effort_user_sync(Ok(())).is_ok());
+        assert!(best_effort_user_sync(Err(RBACError::Network(network_error()))).is_ok());
+        assert!(best_effort_user_sync(Err(anyhow::anyhow!("node info").into())).is_ok());
     }
 }

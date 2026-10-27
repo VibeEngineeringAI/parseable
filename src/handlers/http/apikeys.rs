@@ -331,7 +331,7 @@ pub async fn create_api_key(
     // can be slow and must not block other create/delete requests.
     drop(guard);
 
-    // Best-effort sync to other live nodes (reuses the standard user sync).
+    // Node delivery is best effort; invalid forwarding headers still fail the request.
     let caller_userid = user
         .as_api_key()
         .map(|k| k.created_by.clone())
@@ -345,6 +345,9 @@ pub async fn create_api_key(
     )
     .await
     {
+        if matches!(&e, RBACError::HeaderBuild(_)) {
+            return Err(e.into());
+        }
         tracing::error!("Failed to sync API-key user creation: {e}");
     }
 
@@ -393,6 +396,9 @@ pub async fn delete_api_key(
     )
     .await
     {
+        if matches!(&e, RBACError::HeaderBuild(_)) {
+            return Err(e.into());
+        }
         tracing::error!("Failed to sync API-key user deletion: {e}");
         return Err(ApiKeyError::RevocationSyncFailed(e.to_string()));
     }
