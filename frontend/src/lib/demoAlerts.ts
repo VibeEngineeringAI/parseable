@@ -188,7 +188,8 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
         name: body.name,
         type: 'webhook',
         endpoint,
-        username: body.username ?? null,
+        // Like the server, configured basic auth masks both halves; absent auth stays null.
+        username: body.username ? '********' : null,
         password: body.password ? '********' : null,
         skipTlsCheck: body.skipTlsCheck,
       };

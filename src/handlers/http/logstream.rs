@@ -33,7 +33,8 @@ use crate::tenants::TenantNotFound;
 use crate::utils::actix::extract_session_key_from_req;
 use crate::utils::get_tenant_id_from_request;
 use crate::utils::json::flatten::{
-    self, convert_to_array, generic_flattening, has_more_than_max_allowed_levels,
+    self, FlattenBudget, FlattenLimits, convert_to_array, has_more_than_max_allowed_levels,
+    pipeline_flattening,
 };
 use crate::{LOCK_EXPECT, stats, validator};
 
@@ -120,7 +121,9 @@ pub async fn detect_schema(Json(json): Json<Value>) -> Result<impl Responder, St
     // flatten before infer
     if !has_more_than_max_allowed_levels(&json, 1) {
         //perform generic flattening, return error if failed to flatten
-        let mut flattened_json = match generic_flattening(&json) {
+        // Charged together with the structural flattening below, before either runs
+        let mut budget = FlattenBudget::new(FlattenLimits::from_config());
+        let mut flattened_json = match pipeline_flattening(&json, &mut budget) {
             Ok(flattened) => match convert_to_array(flattened) {
                 Ok(array) => array,
                 Err(e) => {

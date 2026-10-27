@@ -17,6 +17,7 @@
  */
 
 use actix_web::http::header::USER_AGENT;
+use actix_web::mime::Mime;
 use actix_web::{HttpRequest, web};
 use chrono::Utc;
 use opentelemetry_proto::tonic::{
@@ -49,7 +50,10 @@ use crate::{
     storage::StreamType,
     utils::{
         get_tenant_id_from_request,
-        json::{convert_array_to_object, flatten::convert_to_array},
+        json::{
+            convert_array_to_object,
+            flatten::{FlattenBudget, FlattenLimits, convert_to_array},
+        },
     },
 };
 
@@ -121,6 +125,33 @@ pub async fn process_otel_content(
     }
 }
 
+/// Payload encodings accepted by the OTEL HTTP endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OtelContentType {
+    Json,
+    Protobuf,
+}
+
+/// Classifies a raw `Content-Type` header value by its media-type essence
+/// (`type/subtype`) only. Everything from the first `;` onwards is ignored,
+/// including malformed parameter text, so `application/json; charset=utf-8`
+/// is treated as JSON. Only HTTP optional whitespace (SP/HTAB) around the
+/// essence is trimmed; type and subtype are compared case-insensitively.
+/// Structured-syntax suffixes such as `application/otlp+json` are not aliases.
+fn classify_otel_content_type(content_type: &str) -> Option<OtelContentType> {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches([' ', '\t']);
+    let mime: Mime = essence.parse().ok()?;
+    match mime.essence_str() {
+        CONTENT_TYPE_JSON => Some(OtelContentType::Json),
+        CONTENT_TYPE_PROTOBUF => Some(OtelContentType::Protobuf),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_otel_ingestion(
     body: web::Bytes,
@@ -132,8 +163,8 @@ fn handle_otel_ingestion(
     tenant_id: Option<String>,
 ) -> Result<(), PostError> {
     match content_type {
-        Some(content_type) => {
-            if content_type == CONTENT_TYPE_JSON {
+        Some(content_type) => match classify_otel_content_type(&content_type) {
+            Some(OtelContentType::Json) => {
                 let json: serde_json::Value = match serde_json::from_slice(&body) {
                     Ok(v) => v,
                     Err(e) => {
@@ -155,14 +186,16 @@ fn handle_otel_ingestion(
                     error!("Ingestion failed for stream {stream_name}: {e}");
                     return Err(e);
                 }
-            } else if content_type == CONTENT_TYPE_PROTOBUF {
+            }
+            Some(OtelContentType::Protobuf) => {
                 error!(
                     "Ingestion failed for stream {stream_name}: Protobuf ingestion is not supported in Parseable OSS"
                 );
                 return Err(PostError::Invalid(anyhow::anyhow!(
                     "Ingestion failed for stream {stream_name}: Protobuf ingestion is not supported in Parseable OSS"
                 )));
-            } else {
+            }
+            None => {
                 error!(
                     "Ingestion failed for stream {stream_name}: Unsupported Content-Type: {content_type}. Expected application/json or application/x-protobuf"
                 );
@@ -170,7 +203,7 @@ fn handle_otel_ingestion(
                     "Ingestion failed for stream {stream_name}: Unsupported Content-Type: {content_type}. Expected application/json or application/x-protobuf"
                 )));
             }
-        }
+        },
         None => {
             error!(
                 "Ingestion failed for stream {stream_name}: Missing Content-Type header. Expected application/json or application/x-protobuf"
@@ -208,12 +241,14 @@ pub fn flatten_and_push_logs(
     let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     // Verify the dataset fields count
     verify_dataset_fields_count(stream_name, tenant_id)?;
+    // Shared by every event of this request
+    let mut budget = FlattenBudget::new(FlattenLimits::from_config());
 
     match log_source {
         LogSource::Kinesis => {
             //custom flattening required for Amazon Kinesis
             let message: Message = serde_json::from_value(json)?;
-            let flattened_kinesis_data = flatten_kinesis_logs(message)?;
+            let flattened_kinesis_data = flatten_kinesis_logs(message, &mut budget)?;
             let record = convert_to_array(flattened_kinesis_data)?;
             push_logs(
                 stream_name,
@@ -223,12 +258,13 @@ pub fn flatten_and_push_logs(
                 time_partition,
                 telemetry_type,
                 tenant_id,
+                &mut budget,
             )?;
         }
         LogSource::OtelLogs => {
             let logs: LogsData =
                 deserialize_otel_json(json, PARSEABLE.options.normalise_otel_payload)?;
-            let records = flatten_otel_logs(&logs, tenant_str);
+            let records = flatten_otel_logs(&logs, tenant_str, &mut budget)?;
             if !records.is_empty() {
                 push_logs(
                     stream_name,
@@ -238,6 +274,7 @@ pub fn flatten_and_push_logs(
                     None,
                     telemetry_type,
                     tenant_id,
+                    &mut budget,
                 )?;
             }
         }
@@ -254,6 +291,7 @@ pub fn flatten_and_push_logs(
                     None,
                     telemetry_type,
                     tenant_id,
+                    &mut budget,
                 )?;
             }
         }
@@ -270,6 +308,7 @@ pub fn flatten_and_push_logs(
                     None,
                     telemetry_type,
                     tenant_id,
+                    &mut budget,
                 )?;
             }
         }
@@ -281,6 +320,7 @@ pub fn flatten_and_push_logs(
             time_partition,
             telemetry_type,
             tenant_id,
+            &mut budget,
         )?,
     }
 
@@ -290,9 +330,19 @@ pub fn flatten_and_push_logs(
 #[instrument(
     name = "push_logs",
     level = "info",
-    skip(json, log_source, p_custom_fields, time_partition, telemetry_type, tenant_id),
+    skip(
+        json,
+        log_source,
+        p_custom_fields,
+        time_partition,
+        telemetry_type,
+        tenant_id,
+        budget
+    ),
     fields(stream_name, record_count = tracing::field::Empty)
 )]
+// `budget` is shared with the other parts of the request, so it can not be folded into them
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn push_logs(
     stream_name: &str,
@@ -302,6 +352,7 @@ pub fn push_logs(
     time_partition: Option<String>,
     telemetry_type: TelemetryType,
     tenant_id: &Option<String>,
+    budget: &mut FlattenBudget,
 ) -> Result<(), PostError> {
     let stream = PARSEABLE.get_stream(stream_name, tenant_id)?;
     let time_partition_limit = stream.get_time_partition_limit();
@@ -319,6 +370,7 @@ pub fn push_logs(
         custom_partition.as_ref(),
         schema_version,
         log_source,
+        budget,
     )?;
 
     if data.is_empty() {
@@ -394,7 +446,9 @@ pub fn push_logs(
 
 /// Zero-allocation JSON byte size counter.
 /// Uses serde_json::to_writer with a writer that only counts bytes.
-pub fn json_byte_size(value: &Value) -> u64 {
+/// Exact for values that always serialize, such as a `Value` or a struct of strings and
+/// numbers, which is what it is used for.
+pub fn json_byte_size(value: &(impl serde::Serialize + ?Sized)) -> u64 {
     struct CountingWriter(u64);
     impl std::io::Write for CountingWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -406,7 +460,7 @@ pub fn json_byte_size(value: &Value) -> u64 {
         }
     }
     let mut counter = CountingWriter(0);
-    // serde_json::to_writer won't fail on Value types
+    // serde_json::to_writer won't fail on those
     let _ = serde_json::to_writer(&mut counter, value);
     counter.0
 }
@@ -626,6 +680,216 @@ mod tests {
         assert_eq!(custom_fields.len(), 2);
         assert_eq!(custom_fields.get(USER_AGENT_KEY).unwrap(), "");
         assert_eq!(custom_fields.get(SOURCE_IP_KEY).unwrap(), "unknown");
+    }
+
+    #[test]
+    fn test_classify_otel_content_type_by_essence_only() {
+        use OtelContentType::{Json, Protobuf};
+
+        let cases: &[(&str, Option<OtelContentType>)] = &[
+            // bare media types
+            ("application/json", Some(Json)),
+            ("application/x-protobuf", Some(Protobuf)),
+            // charset parameter, plain and quoted
+            ("application/json; charset=utf-8", Some(Json)),
+            ("application/json;charset=utf-8", Some(Json)),
+            ("application/json; charset=\"utf-8\"", Some(Json)),
+            // unknown and multiple parameters
+            ("application/json; foo=bar", Some(Json)),
+            ("application/json; charset=utf-8; foo=bar", Some(Json)),
+            // type/subtype are case-insensitive
+            ("APPLICATION/JSON", Some(Json)),
+            ("Application/Json; Charset=UTF-8", Some(Json)),
+            // outer SP/HTAB around the whole value
+            ("  application/json  ", Some(Json)),
+            ("\tapplication/json\t", Some(Json)),
+            // SP/HTAB around the parameter separator
+            ("application/json ; charset=utf-8", Some(Json)),
+            ("application/json\t;\tcharset=utf-8", Some(Json)),
+            (" \tapplication/json \t; charset=utf-8", Some(Json)),
+            // malformed parameter text is ignored (essence-only validation)
+            ("application/json;", Some(Json)),
+            ("application/json;;", Some(Json)),
+            ("application/json; charset", Some(Json)),
+            ("application/json; charset=", Some(Json)),
+            ("application/json; charset=\"utf-8", Some(Json)),
+            ("application/json; =utf-8", Some(Json)),
+            ("application/json; a b c", Some(Json)),
+            // parameterised and case-varied protobuf still classifies as protobuf
+            ("application/x-protobuf; charset=utf-8", Some(Protobuf)),
+            ("Application/X-Protobuf", Some(Protobuf)),
+            ("APPLICATION/X-PROTOBUF ; proto=foo", Some(Protobuf)),
+            // whitespace inside the essence is rejected
+            ("application /json", None),
+            ("application/ json", None),
+            ("application\t/json", None),
+            ("application/js on", None),
+            // malformed essences
+            ("", None),
+            ("   ", None),
+            (";charset=utf-8", None),
+            ("application", None),
+            ("application/", None),
+            ("/json", None),
+            ("application/json/extra", None),
+            ("\"application/json\"", None),
+            // unsupported media types and suffix aliases
+            ("*/*", None),
+            ("text/plain", None),
+            ("application/xml", None),
+            ("application/protobuf", None),
+            ("application/jsonl", None),
+            ("application/otlp+json", None),
+            ("application/vnd.api+json", None),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                classify_otel_content_type(input),
+                *expected,
+                "classification of {input:?}"
+            );
+        }
+    }
+
+    const OTEL_TEST_STREAM: &str = "otel-content-type-test";
+    const OTEL_SIGNALS: [(TelemetryType, LogSource); 3] = [
+        (TelemetryType::Logs, LogSource::OtelLogs),
+        (TelemetryType::Metrics, LogSource::OtelMetrics),
+        (TelemetryType::Traces, LogSource::OtelTraces),
+    ];
+
+    // Malformed JSON body: an accepted JSON content type fails in serde
+    // before any PARSEABLE/storage access, so no global state is needed.
+    async fn run_otel_content(
+        content_type: Option<actix_web::http::header::HeaderValue>,
+        telemetry_type: TelemetryType,
+        log_source: &LogSource,
+    ) -> PostError {
+        let mut req = TestRequest::default();
+        if let Some(value) = content_type {
+            req = req.insert_header((actix_web::http::header::CONTENT_TYPE, value));
+        }
+        let req = req.to_http_request();
+        process_otel_content(
+            &req,
+            web::Bytes::from_static(b"{not valid json"),
+            OTEL_TEST_STREAM,
+            log_source,
+            telemetry_type,
+        )
+        .await
+        .expect_err("malformed body or rejected content type must fail")
+    }
+
+    async fn assert_bad_request_body(err: &PostError, expected_body: &str) {
+        use actix_web::ResponseError;
+
+        assert_eq!(err.status_code(), actix_web::http::StatusCode::BAD_REQUEST);
+        let resp = err.error_response();
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get(actix_web::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), expected_body);
+    }
+
+    fn header(value: &'static str) -> Option<actix_web::http::header::HeaderValue> {
+        Some(actix_web::http::header::HeaderValue::from_static(value))
+    }
+
+    #[tokio::test]
+    async fn test_process_otel_content_accepts_parameterised_json() {
+        let accepted = [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/json; charset=\"utf-8\"",
+            "Application/JSON ; foo=bar; charset=utf-8",
+            "\tapplication/json\t;\tcharset=utf-8",
+            "application/json; charset=\"unterminated",
+        ];
+        for (telemetry_type, log_source) in OTEL_SIGNALS {
+            for value in accepted {
+                let err = run_otel_content(header(value), telemetry_type, &log_source).await;
+                assert!(
+                    matches!(err, PostError::SerdeError(_)),
+                    "{log_source} with {value:?} should reach JSON decoding, got {err:?}"
+                );
+                let expected = err.to_string();
+                assert!(expected.starts_with("Could not deserialize into JSON object, "));
+                assert_bad_request_body(&err, &expected).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_otel_content_missing_or_non_text_content_type() {
+        let non_text =
+            actix_web::http::header::HeaderValue::from_bytes(b"application/json\xff").unwrap();
+        for (telemetry_type, log_source) in OTEL_SIGNALS {
+            for content_type in [None, Some(non_text.clone())] {
+                let err = run_otel_content(content_type, telemetry_type, &log_source).await;
+                assert!(matches!(err, PostError::Invalid(_)), "{err:?}");
+                assert_bad_request_body(
+                    &err,
+                    &format!(
+                        "Invalid Request: Ingestion failed for stream {OTEL_TEST_STREAM}: Missing Content-Type header. Expected application/json or application/x-protobuf"
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_otel_content_unsupported_reports_original_value() {
+        let unsupported = [
+            "text/plain; charset=utf-8",
+            "application/otlp+json",
+            "application /json; charset=utf-8",
+            "  Application/XML ; q=1",
+            "",
+        ];
+        for (telemetry_type, log_source) in OTEL_SIGNALS {
+            for value in unsupported {
+                let err = run_otel_content(header(value), telemetry_type, &log_source).await;
+                assert!(matches!(err, PostError::Invalid(_)), "{err:?}");
+                assert_bad_request_body(
+                    &err,
+                    &format!(
+                        "Invalid Request: Ingestion failed for stream {OTEL_TEST_STREAM}: Unsupported Content-Type: {value}. Expected application/json or application/x-protobuf"
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_otel_content_protobuf_variants_still_unsupported() {
+        let protobuf = [
+            "application/x-protobuf",
+            "application/x-protobuf; charset=utf-8",
+            "Application/X-Protobuf",
+            " APPLICATION/X-PROTOBUF\t;proto=foo",
+        ];
+        for (telemetry_type, log_source) in OTEL_SIGNALS {
+            for value in protobuf {
+                let err = run_otel_content(header(value), telemetry_type, &log_source).await;
+                assert!(matches!(err, PostError::Invalid(_)), "{err:?}");
+                assert_bad_request_body(
+                    &err,
+                    &format!(
+                        "Invalid Request: Ingestion failed for stream {OTEL_TEST_STREAM}: Protobuf ingestion is not supported in Parseable OSS"
+                    ),
+                )
+                .await;
+            }
+        }
     }
 
     #[test]

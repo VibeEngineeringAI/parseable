@@ -26,6 +26,7 @@ use crate::handlers::http::cluster::send_query_request;
 use crate::handlers::http::ingest::PostError;
 use crate::handlers::http::middleware::CLUSTER_SECRET;
 use crate::handlers::http::middleware::CLUSTER_SECRET_HEADER;
+use crate::handlers::http::modal::utils::ingest_utils::json_byte_size;
 use crate::handlers::http::query::Query;
 use crate::handlers::http::query::QueryError;
 use crate::handlers::http::query::query;
@@ -42,7 +43,8 @@ use crate::utils::get_user_from_request;
 use crate::utils::header_parsing::{
     HeaderBuildError, ParseHeaderError, generated_text_header_value,
 };
-use crate::utils::json::apply_generic_flattening_for_partition;
+use crate::utils::json::flatten::FlattenLimits;
+use crate::utils::json::flatten::validate_custom_partition;
 use actix_web::HttpRequest;
 use actix_web::HttpResponse;
 use actix_web::Responder;
@@ -119,6 +121,61 @@ struct DatasetStats {
     field_stats: Vec<FieldStat>,
 }
 
+impl DatasetStats {
+    /// The rows of the stats dataset for these stats, borrowed from them: what generic and
+    /// then structural flattening (with `_`) make of the stats as JSON. A row for every
+    /// distinct value of every field, in order, and a row for a field without any.
+    fn rows(&self) -> impl Iterator<Item = StatsRow<'_>> {
+        self.field_stats.iter().flat_map(move |field| {
+            // Generic flattening makes an empty `distinct_stats` array a null
+            let null = DistinctColumns::Null {
+                field_stats_distinct_stats: (),
+            };
+            let no_distinct_values = field.distinct_stats.is_empty().then_some(null);
+            field
+                .distinct_stats
+                .iter()
+                .map(|stat| DistinctColumns::Value {
+                    field_stats_distinct_stats_distinct_value: &stat.distinct_value,
+                    field_stats_distinct_stats_count: stat.count,
+                })
+                .chain(no_distinct_values)
+                .map(move |distinct| StatsRow {
+                    dataset_name: &self.dataset_name,
+                    stats_id: &self.stats_id,
+                    field_stats_field_name: &field.field_name,
+                    field_stats_count: field.count,
+                    field_stats_distinct_count: field.distinct_count,
+                    distinct,
+                })
+        })
+    }
+}
+
+/// A row of the stats dataset, see `DatasetStats::rows`. The fields are in the order of the
+/// flattened row, which the JSON of the row keeps.
+#[derive(Serialize, Debug)]
+struct StatsRow<'a> {
+    dataset_name: &'a str,
+    stats_id: &'a str,
+    field_stats_field_name: &'a str,
+    field_stats_count: i64,
+    field_stats_distinct_count: i64,
+    #[serde(flatten)]
+    distinct: DistinctColumns<'a>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum DistinctColumns<'a> {
+    Value {
+        field_stats_distinct_stats_distinct_value: &'a str,
+        field_stats_distinct_stats_count: i64,
+    },
+    /// `"field_stats_distinct_stats": null`, for a field without distinct values
+    Null { field_stats_distinct_stats: () },
+}
+
 /// Calculates field statistics for the stream and pushes them to the internal stats dataset.
 /// This function creates a new internal stream for stats if it doesn't exist.
 /// It collects statistics for each field in the stream
@@ -174,22 +231,14 @@ async fn calculate_field_stats_inner(
         return Ok(stats_calculated);
     }
     stats_calculated = true;
-    let stats_value =
-        serde_json::to_value(&stats).map_err(|e| ObjectStorageError::Invalid(e.into()))?;
     ensure_dataset_stats_stream(tenant_id).await?;
-    let vec_json = apply_generic_flattening_for_partition(
-        stats_value,
-        None,
-        None,
-        Some(&DATASET_STATS_CUSTOM_PARTITION.to_string()),
-    )?;
     let mut p_custom_fields = HashMap::new();
     p_custom_fields.insert(USER_AGENT_KEY.to_string(), "parseable".to_string());
     let schema = PARSEABLE
         .get_stream(DATASET_STATS_STREAM_NAME, tenant_id)?
         .get_schema_raw();
-    for json in vec_json {
-        let origin_size = crate::handlers::http::modal::utils::ingest_utils::json_byte_size(&json);
+    let max_row_bytes = FlattenLimits::from_config().max_bytes_per_request;
+    for_each_stats_row(&stats, max_row_bytes, |json, origin_size| {
         json::Event {
             json,
             p_timestamp: parquet_ts,
@@ -209,8 +258,53 @@ async fn calculate_field_stats_inner(
             false,
         )?
         .process()?;
-    }
+        Ok(())
+    })?;
     Ok(stats_calculated)
+}
+
+/// Hands the rows of the stats dataset for `stats` (see `DatasetStats::rows`) to `process`
+/// one at a time, each with its size as compact JSON. A row is measured before it is built,
+/// and only built when it is at most `max_row_bytes`, so one row of at most that size is all
+/// that is held at a time, however many fields and distinct values the stats have. A row over
+/// it, which takes a distinct value or a field name of about that size, is skipped with a
+/// warning, and the rows after it are still processed. Returns the number of rows skipped.
+fn for_each_stats_row(
+    stats: &DatasetStats,
+    max_row_bytes: usize,
+    mut process: impl FnMut(serde_json::Value, u64) -> Result<(), PostError>,
+) -> Result<usize, PostError> {
+    let custom_partition = DATASET_STATS_CUSTOM_PARTITION.to_string();
+    let mut skipped = 0;
+    for row in stats.rows() {
+        let size = json_byte_size(&row);
+        if size > max_row_bytes as u64 {
+            warn!(
+                "Skipping a field stats row of field {} for parquet file {} of stream {}: its {size} bytes of JSON are over P_MAX_FLATTEN_BYTES_PER_REQUEST ({max_row_bytes})",
+                shortened(row.field_stats_field_name),
+                stats.stats_id,
+                stats.dataset_name
+            );
+            skipped += 1;
+            continue;
+        }
+        let json = serde_json::to_value(&row).map_err(|e| ObjectStorageError::Invalid(e.into()))?;
+        // As flattening validated the custom partition of every row
+        validate_custom_partition(
+            json.as_object().expect("a stats row is a JSON object"),
+            Some(&custom_partition),
+        )?;
+        process(json, size)?;
+    }
+    Ok(skipped)
+}
+
+/// The first 128 characters of `name`, which can be of any length, for a log message
+fn shortened(name: &str) -> Cow<'_, str> {
+    match name.char_indices().nth(128) {
+        Some((end, _)) => Cow::Owned(format!("{}...", &name[..end])),
+        None => Cow::Borrowed(name),
+    }
 }
 
 fn log_stats_calculation_time(
@@ -229,8 +323,9 @@ fn log_stats_calculation_time(
             "Field stats calculation completed for parquet file {parquet_file} in {elapsed_ms} ms. stream={stream_name}"
         );
     } else {
+        // The caller warns about the error, with the stream, tenant and path
         let err = result.as_ref().expect_err("result checked as error");
-        warn!(
+        debug!(
             "Field stats calculation failed for parquet file {parquet_file} after {elapsed_ms} ms. stream={stream_name}: {err}"
         );
     }
@@ -1126,12 +1221,17 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+    use serde_json::json;
     use temp_dir::TempDir;
 
+    use crate::handlers::http::modal::utils::ingest_utils::json_byte_size;
     use crate::storage::field_stats::{
-        FieldCountState, NULL_VALUE, build_stats_sql,
-        collect_all_field_stats_from_parquet_blocking, collect_field_counts,
+        DATASET_STATS_CUSTOM_PARTITION, DatasetStats, DistinctStat, FieldCountState, FieldStat,
+        NULL_VALUE, build_stats_sql, collect_all_field_stats_from_parquet_blocking,
+        collect_field_counts, for_each_stats_row,
     };
+    use crate::utils::json::apply_generic_flattening_for_partition;
+    use crate::utils::json::flatten::{FlattenBudget, FlattenLimits, GENEROUS_LIMITS, legacy};
 
     async fn create_test_parquet_with_data() -> (TempDir, std::path::PathBuf) {
         let temp_dir = TempDir::new().unwrap();
@@ -1510,6 +1610,247 @@ mod tests {
             HIGH_CARD_FIELDS + LOW_CARD_FIELDS,
             per_run,
             ROWS as f64 / per_run.as_secs_f64()
+        );
+    }
+
+    fn field_stat(name: &str, distinct_values: &[&str]) -> FieldStat {
+        FieldStat {
+            field_name: name.to_owned(),
+            count: 10,
+            distinct_count: distinct_values.len() as i64,
+            distinct_stats: distinct_values
+                .iter()
+                .enumerate()
+                .map(|(i, value)| DistinctStat {
+                    distinct_value: (*value).to_owned(),
+                    count: (distinct_values.len() - i) as i64,
+                })
+                .collect(),
+        }
+    }
+
+    fn dataset_stats(field_stats: Vec<FieldStat>) -> DatasetStats {
+        DatasetStats {
+            dataset_name: "dataset".to_owned(),
+            stats_id: "stats".to_owned(),
+            field_stats,
+        }
+    }
+
+    // `field{i}` with the distinct values `value0`, `value1`, ... up to `distinct_per_field[i]`
+    fn uniform_stats(distinct_per_field: &[usize]) -> DatasetStats {
+        dataset_stats(
+            distinct_per_field
+                .iter()
+                .enumerate()
+                .map(|(field, &distinct)| FieldStat {
+                    field_name: format!("field{field}"),
+                    count: 10,
+                    distinct_count: distinct as i64,
+                    distinct_stats: (0..distinct)
+                        .map(|value| DistinctStat {
+                            distinct_value: format!("value{value}"),
+                            count: 1,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+    }
+
+    // The rows `for_each_stats_row` hands over, with their sizes, and how many it skipped
+    fn streamed_rows(
+        stats: &DatasetStats,
+        max_row_bytes: usize,
+    ) -> (Vec<(serde_json::Value, u64)>, usize) {
+        let mut rows = Vec::new();
+        let skipped = for_each_stats_row(stats, max_row_bytes, |row, size| {
+            rows.push((row, size));
+            Ok(())
+        })
+        .unwrap();
+        (rows, skipped)
+    }
+
+    // The rows the stats used to be ingested as: the stats as JSON, generically and then
+    // structurally flattened by the oracle copies of those functions
+    fn legacy_rows(stats: &DatasetStats) -> Vec<serde_json::Value> {
+        let partition = DATASET_STATS_CUSTOM_PARTITION.to_string();
+        legacy::generic_flattening(&serde_json::to_value(stats).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|mut row| {
+                legacy::flatten(&mut row, "_", Some(&partition), true).unwrap();
+                row
+            })
+            .collect()
+    }
+
+    fn flatten_stats_payload(
+        stats: &DatasetStats,
+        limits: FlattenLimits,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        apply_generic_flattening_for_partition(
+            serde_json::to_value(stats).unwrap(),
+            None,
+            None,
+            Some(&DATASET_STATS_CUSTOM_PARTITION.to_string()),
+            &mut FlattenBudget::new(limits),
+        )
+    }
+
+    #[test]
+    fn stats_rows_are_the_flattened_stats() {
+        let cases = [
+            dataset_stats(vec![field_stat("a", &["x", "y"])]),
+            // A field without distinct values gets a row with a null `distinct_stats`
+            dataset_stats(vec![
+                field_stat("empty", &[]),
+                field_stat("b", &["1"]),
+                field_stat("also_empty", &[]),
+            ]),
+            dataset_stats(vec![field_stat(
+                "esc\"aped\n",
+                &["quo\"te", "back\\slash", "\u{1}ctl", "ünï", ""],
+            )]),
+            uniform_stats(&[3, 0, 2, 1]),
+        ];
+        for stats in cases {
+            let (rows, skipped) =
+                streamed_rows(&stats, FlattenLimits::DEFAULT.max_bytes_per_request);
+            assert_eq!(skipped, 0);
+            for (row, size) in &rows {
+                assert_eq!(*size, json_byte_size(row));
+            }
+            let rows: Vec<_> = rows.into_iter().map(|(row, _)| row).collect();
+            // Serialized, so that the order of the keys is compared too
+            let expected = serde_json::to_string(&legacy_rows(&stats)).unwrap();
+            assert_eq!(serde_json::to_string(&rows).unwrap(), expected);
+            // The same as the stats flattened as one payload, which they were before
+            let flattened = flatten_stats_payload(&stats, GENEROUS_LIMITS).unwrap();
+            assert_eq!(serde_json::to_string(&flattened).unwrap(), expected);
+        }
+
+        let (rows, _) = streamed_rows(
+            &dataset_stats(vec![field_stat("empty", &[]), field_stat("b", &["v"])]),
+            FlattenLimits::DEFAULT.max_bytes_per_request,
+        );
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|(row, _)| serde_json::to_string(row).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                r#"{"dataset_name":"dataset","stats_id":"stats","field_stats_field_name":"empty","field_stats_count":10,"field_stats_distinct_count":0,"field_stats_distinct_stats":null}"#,
+                r#"{"dataset_name":"dataset","stats_id":"stats","field_stats_field_name":"b","field_stats_count":10,"field_stats_distinct_count":1,"field_stats_distinct_stats_distinct_value":"v","field_stats_distinct_stats_count":1}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn stats_rows_keep_the_custom_partition_validation() {
+        let mut stats = dataset_stats(vec![field_stat("a", &["x"])]);
+        stats.dataset_name = "with.period".to_owned();
+        let result = for_each_stats_row(
+            &stats,
+            FlattenLimits::DEFAULT.max_bytes_per_request,
+            |_, _| unreachable!("a row with an invalid custom partition is not processed"),
+        );
+        assert!(result.is_err());
+        assert!(flatten_stats_payload(&stats, GENEROUS_LIMITS).is_err());
+    }
+
+    #[test]
+    fn stats_rows_over_one_byte_limit_are_all_processed() {
+        // 1000 rows of about 225 bytes each, 225 KB together, against a limit of 512 bytes
+        let stats = uniform_stats(&[25; 40]);
+        let max_row_bytes = 512;
+        let (rows, skipped) = streamed_rows(&stats, max_row_bytes);
+        assert_eq!((rows.len(), skipped), (1000, 0));
+        assert!(rows.iter().all(|(_, size)| *size <= max_row_bytes as u64));
+        let total: u64 = rows.iter().map(|(_, size)| size).sum();
+        assert!(total > 400 * max_row_bytes as u64, "{total}");
+        assert_eq!(
+            serde_json::to_string(&rows.into_iter().map(|(row, _)| row).collect::<Vec<_>>())
+                .unwrap(),
+            serde_json::to_string(&legacy_rows(&stats)).unwrap()
+        );
+        // Flattened as one payload under the same limit, nothing was ingested
+        let limits = FlattenLimits {
+            max_rows_per_event: 1000,
+            max_rows_per_request: 1000,
+            max_bytes_per_request: max_row_bytes,
+        };
+        assert!(flatten_stats_payload(&stats, limits).is_err());
+    }
+
+    #[test]
+    fn stats_rows_skip_only_a_row_over_the_byte_limit() {
+        let long_value = "v".repeat(600);
+        let long_name = "f".repeat(600);
+        let stats = dataset_stats(vec![
+            field_stat("a", &["x", long_value.as_str(), "y"]),
+            field_stat(&long_name, &["z"]),
+            field_stat("b", &[]),
+        ]);
+        let (rows, skipped) = streamed_rows(&stats, 512);
+        assert_eq!(skipped, 2);
+        let kept: Vec<_> = rows
+            .iter()
+            .map(|(row, _)| {
+                (
+                    row["field_stats_field_name"].clone(),
+                    row.get("field_stats_distinct_stats_distinct_value")
+                        .cloned(),
+                    row["field_stats_distinct_count"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (json!("a"), Some(json!("x")), json!(3)),
+                (json!("a"), Some(json!("y")), json!(3)),
+                (json!("b"), None, json!(0)),
+            ]
+        );
+        // The rows kept are those the stats were flattened into
+        let legacy: Vec<_> = legacy_rows(&stats)
+            .into_iter()
+            .filter(|row| json_byte_size(row) <= 512)
+            .collect();
+        assert_eq!(
+            serde_json::to_string(&rows.into_iter().map(|(row, _)| row).collect::<Vec<_>>())
+                .unwrap(),
+            serde_json::to_string(&legacy).unwrap()
+        );
+    }
+
+    #[test]
+    fn stats_rows_of_the_widest_payload_fit_the_default_byte_limit() {
+        // Far more rows than the limits for ingested events allow, each processed on its own
+        let fields = 300;
+        let max_field_statistics = 50;
+        let stats = uniform_stats(&[max_field_statistics; 300]);
+        let mut rows = 0;
+        let mut first = None;
+        let skipped = for_each_stats_row(
+            &stats,
+            FlattenLimits::DEFAULT.max_bytes_per_request,
+            |row, _| {
+                if first.is_none() {
+                    first = Some(row);
+                }
+                rows += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((rows, skipped), (fields * max_field_statistics, 0));
+        assert_eq!(
+            first.unwrap()["field_stats_distinct_stats_distinct_value"],
+            "value0"
         );
     }
 }

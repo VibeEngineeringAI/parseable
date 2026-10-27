@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { createDemoClient } from './demo';
-import { alert, alertSummary, alertTargetStatus } from './alertsContract';
+import { alert, alertSummary, alertTarget, alertTargetStatus } from './alertsContract';
 import { alertDraft, buildAlertPayload } from '../features/alerts/helpers';
-import { targetType } from '../features/alerts/targetHelpers';
+import { targetDraft, targetType } from '../features/alerts/targetHelpers';
 import { alertRequest } from './__fixtures__/alerts';
 
 describe('demo alerts', () => {
@@ -61,25 +61,68 @@ describe('demo alerts', () => {
   });
   it('masks every target secret and recognizes the backend Alertmanager shape', async () => {
     const client = createDemoClient();
+    const secrets = ['svc-user', 'secret-pass', 'secret-path', 'header-secret'];
+    const leaks = (value: unknown) =>
+      secrets.filter((secret) => JSON.stringify(value).includes(secret));
     const target = await client.createAlertTarget({
       name: 'AM',
       type: 'alertManager',
-      endpoint: 'https://example.com/api/v2/alerts',
-      username: 'svc',
-      password: 'secret',
+      endpoint: 'https://example.com/secret-path/api/v2/alerts',
+      username: 'svc-user',
+      password: 'secret-pass',
       skipTlsCheck: false,
     });
+    expect(target).toMatchObject({
+      type: 'webhook',
+      endpoint: 'https://********',
+      username: '********',
+      password: '********',
+    });
     expect(targetType(target)).toBe('alertManager');
-    expect(target.password).toBe('********');
-    expect(JSON.stringify(await client.listAlertTargets())).not.toContain('secret');
+    const fetched = (await client.getAlertTarget(target.id)).target;
+    expect(fetched).toEqual(target);
+    expect(alertTarget(fetched)).toBe(true);
+    expect(leaks([target, fetched, await client.listAlertTargets()])).toEqual([]);
+    // The edit form never carries masks forward; the demo uses the same form validation.
+    const form = targetDraft(fetched);
+    expect([form.username, form.password]).toEqual(['', '']);
+    for (const credentials of [
+      { username: '********', password: 'secret-pass' },
+      { username: 'svc-user', password: '********' },
+    ])
+      await expect(
+        client.updateAlertTarget(target.id, {
+          name: 'AM',
+          type: 'alertManager',
+          endpoint: 'https://example.com/api/v2/alerts',
+          ...credentials,
+          skipTlsCheck: false,
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+    const unauthenticated = await client.updateAlertTarget(target.id, {
+      name: 'AM',
+      type: 'alertManager',
+      endpoint: 'https://example.com/api/v2/alerts',
+      skipTlsCheck: false,
+    });
+    expect(unauthenticated).toMatchObject({ username: null, password: null });
+    expect(targetType(unauthenticated)).toBe('alertManager');
     const updated = await client.updateAlertTarget(target.id, {
       name: 'AM',
       type: 'webhook',
-      endpoint: 'https://example.com/new-secret',
-      headers: { 'X-Key': 'secret' },
+      endpoint: 'https://example.com/secret-path',
+      headers: { 'X-Key': 'header-secret' },
       skipTlsCheck: false,
     });
-    expect(updated.headers).toEqual({ 'X-Key': '********' });
+    expect(updated).toMatchObject({
+      endpoint: 'https://********',
+      headers: { 'X-Key': '********' },
+    });
+    expect(updated).not.toHaveProperty('username');
+    expect(targetType(updated)).toBe('webhook');
+    expect(
+      leaks([updated, await client.getAlertTarget(target.id), await client.listAlertTargets()]),
+    ).toEqual([]);
     await client.deleteAlertTarget(target.id);
     await expect(client.getAlertTarget(target.id)).rejects.toMatchObject({ status: 400 });
   });

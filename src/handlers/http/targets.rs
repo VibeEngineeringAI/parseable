@@ -224,4 +224,128 @@ mod tests {
         );
         assert!(!response.to_string().contains(denied_domain));
     }
+
+    #[actix_web::test]
+    async fn post_rejects_malformed_targets_without_echoing_values() {
+        let app = test::init_service(App::new().route("/targets", web::post().to(post))).await;
+        for body in [
+            json!({"name":"t","type":"webhook","endpoint":"SECRET-ENDPOINT https://u:p@h/x"}),
+            json!({"name":"t","type":"webhook","endpoint":"https://h.example","headers":{"X-Api-Key":31337}}),
+            json!({"name":"t","type":"alertManager","endpoint":"https://h.example","username":"SECRET-AUTH-USER","password":"SECRET-AUTH-PASSWORD","notificationConfig":{"interval":"SECRET-AUTH-INTERVAL"}}),
+        ] {
+            let request = test::TestRequest::post()
+                .uri("/targets")
+                .insert_header((
+                    "x-p-tenant",
+                    format!("targets-handler-test-{}", Ulid::new()),
+                ))
+                .set_json(&body)
+                .to_request();
+            let response = test::call_service(&app, request).await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(
+                body.contains("invalid alert target configuration"),
+                "{body}"
+            );
+            for secret in [
+                "SECRET-ENDPOINT",
+                "u:p@h",
+                "31337",
+                "SECRET-AUTH-USER",
+                "SECRET-AUTH-PASSWORD",
+                "SECRET-AUTH-INTERVAL",
+            ] {
+                assert!(!body.contains(secret), "{secret} leaked in: {body}");
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_policy_rejection_hides_target_host() {
+        let tenant = format!("targets-handler-test-{}", Ulid::new());
+        let denied_domain = "secret-denied.internal.example";
+        ALERT_TARGET_POLICY.write().await.insert(
+            tenant.clone(),
+            AlertTargetPolicyConfig {
+                denied_domains: vec![denied_domain.to_string()],
+                ..Default::default()
+            },
+        );
+
+        let app = test::init_service(App::new().route("/targets", web::post().to(post))).await;
+        let request = test::TestRequest::post()
+            .uri("/targets")
+            .insert_header(("x-p-tenant", tenant.clone()))
+            .set_json(json!({
+                "name": "denied",
+                "type": "webhook",
+                "endpoint": format!("https://{denied_domain}/hook/SECRET-PATH?token=SECRET-TOKEN"),
+                "headers": {"X-Api-Key": "SECRET-HEADER"}
+            }))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        let status = response.status();
+        let body: Value = test::read_body_json(response).await;
+
+        ALERT_TARGET_POLICY.write().await.remove(&tenant);
+
+        assert_eq!(status, actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["message"],
+            "Alert target outbound policy rejected request: Target domain is denied by outbound policy"
+        );
+        let text = body.to_string();
+        for secret in [
+            denied_domain,
+            "SECRET-PATH",
+            "SECRET-TOKEN",
+            "SECRET-HEADER",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked in: {text}");
+        }
+        assert!(TARGETS.list(&Some(tenant)).await.unwrap().is_empty());
+    }
+
+    #[actix_web::test]
+    async fn get_masks_alertmanager_username_and_password() {
+        let tenant = format!("targets-handler-test-{}", Ulid::new());
+        let target: Target = serde_json::from_value(json!({
+            "name": "am",
+            "type": "alertManager",
+            "endpoint": "https://203.0.113.10/api/SECRET-PATH",
+            "username": "SECRET-USER",
+            "password": "SECRET-PASSWORD",
+            "tenantId": tenant
+        }))
+        .unwrap();
+        let id = target.id;
+        TARGETS
+            .target_configs
+            .write()
+            .await
+            .entry(tenant.clone())
+            .or_default()
+            .insert(id, target);
+
+        // An IP literal avoids DNS; the public, non-allowlisted address blocks credentials.
+        let response = get_internal(id, &Some(tenant.clone())).await.unwrap();
+        TARGETS.target_configs.write().await.remove(&tenant);
+
+        assert_eq!(response["target"]["username"], "********");
+        assert_eq!(response["target"]["password"], "********");
+        assert_eq!(response["target"]["endpoint"], "https://********");
+        assert_eq!(response["target"]["type"], "webhook");
+        assert_eq!(response["enabled"], false);
+        assert_eq!(response["error"], "Target contains a denied header");
+        let text = response.to_string();
+        for secret in [
+            "SECRET-USER",
+            "SECRET-PASSWORD",
+            "SECRET-PATH",
+            "203.0.113.10",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked in: {text}");
+        }
+    }
 }
