@@ -31,7 +31,7 @@ use tracing::{error, instrument, warn};
 
 use crate::{
     event::{
-        FORMAT_KEY, SOURCE_IP_KEY, USER_AGENT_KEY,
+        FORMAT_KEY, SOURCE_IP_KEY, USER_AGENT_KEY, check_ingested_schemas,
         format::{EventFormat, LogSource, json},
     },
     handlers::{
@@ -437,7 +437,17 @@ pub fn push_logs(
                 )
             })
             .collect();
-        for event in events.map_err(PostError::Invalid)? {
+        let events = events.map_err(PostError::Invalid)?;
+        // Reject an oversized union before processing any events. Each commit
+        // rechecks the limit because concurrent requests may also add fields.
+        let schemas: Vec<_> = events.iter().map(|event| event.rb.schema()).collect();
+        check_ingested_schemas(
+            stream_name,
+            &stream.metadata,
+            &schemas,
+            PARSEABLE.options.dataset_fields_allowed_limit,
+        )?;
+        for event in events {
             event.process()?;
         }
     }
