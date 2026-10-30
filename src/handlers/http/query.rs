@@ -422,11 +422,12 @@ pub async fn get_counts(
     req: HttpRequest,
     counts_request: Json<CountsRequest>,
 ) -> Result<impl Responder, QueryError> {
+    let body = counts_request.into_inner();
+    body.validate_num_bins()?;
+
     let creds = extract_session_key_from_req(&req)?;
     let permissions = Users.get_permissions(&creds);
     let tenant_id = get_tenant_id_from_request(&req)?;
-    let body = counts_request.into_inner();
-
     // does user have access to table?
     user_auth_for_datasets(&permissions, std::slice::from_ref(&body.stream), &tenant_id).await?;
     // Track billing metrics for query calls
@@ -779,6 +780,67 @@ mod response_tests {
     use super::*;
     use actix_web::{ResponseError, body::to_bytes, http::header::CONTENT_TYPE};
     use arrow_array::{Float64Array, TimestampMillisecondArray};
+
+    #[actix_web::test]
+    async fn counts_reject_invalid_num_bins_with_bad_request_before_stream_access() {
+        let app = actix_web::test::init_service(
+            actix_web::App::new().route("/counts", web::post().to(get_counts)),
+        )
+        .await;
+
+        for num_bins in [0, 10_001, 1_000_000_000, u64::MAX] {
+            for filtered in [false, true] {
+                let mut payload = json!({
+                    "stream": "logs",
+                    "startTime": "2024-01-01T00:00:00Z",
+                    "endTime": "2024-01-01T01:00:00Z",
+                    "numBins": num_bins,
+                });
+                if filtered {
+                    payload["conditions"] = json!({"groupBy": ["host"]});
+                }
+                let request = actix_web::test::TestRequest::post()
+                    .uri("/counts")
+                    .set_json(payload)
+                    .to_request();
+                let response = actix_web::test::call_service(&app, request).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    response.headers().get(CONTENT_TYPE).unwrap(),
+                    "text/plain; charset=utf-8"
+                );
+                assert_eq!(
+                    actix_web::test::read_body(response).await.as_ref(),
+                    b"CustomError: numBins must be between 1 and 10000 (inclusive)"
+                );
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn counts_oversized_default_returns_bad_request_before_stream_access() {
+        let request = CountsRequest {
+            stream: "logs".to_string(),
+            start_time: "2000-01-01T00:00:00Z".to_string(),
+            end_time: "2030-01-01T00:00:00Z".to_string(),
+            num_bins: None,
+            conditions: None,
+        };
+        let response = request
+            .get_bin_density(&None)
+            .await
+            .unwrap_err()
+            .error_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap().as_ref(),
+            b"CustomError: numBins must be between 1 and 10000 (inclusive)"
+        );
+    }
 
     #[test]
     fn streaming_batch_bytes_preserve_legacy_rows_and_newline() {
