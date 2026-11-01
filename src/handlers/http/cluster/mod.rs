@@ -459,11 +459,14 @@ fn stream_sync_headers(headers: &HeaderMap) -> (reqwest::header::HeaderMap, bool
 /// tenant's stream in the default tenant, so that needs the cluster secret.
 fn check_stream_sync_tenant(
     needs_node_token: bool,
+    stream_name: &str,
     tenant_id: &Option<String>,
 ) -> Result<(), StreamError> {
-    if needs_node_token && tenant_id.is_some() {
+    if needs_node_token && let Some(tenant) = tenant_id {
         return Err(StreamError::Custom {
-            msg: "P_CLUSTER_SECRET is required to sync a tenant's stream to ingestors".to_string(),
+            msg: format!(
+                "failed to sync stream {stream_name} of tenant {tenant} to ingestors: P_CLUSTER_SECRET is required"
+            ),
             status: StatusCode::INTERNAL_SERVER_ERROR,
         });
     }
@@ -476,13 +479,14 @@ fn check_stream_sync_tenant(
 fn stream_sync_node_headers(
     headers: &reqwest::header::HeaderMap,
     needs_node_token: bool,
+    node: &str,
     node_token: &str,
 ) -> Result<reqwest::header::HeaderMap, StreamError> {
     let mut headers = headers.clone();
     if needs_node_token {
         let token = generated_text_reqwest_header_value(node_token, "node token").map_err(|e| {
             StreamError::Custom {
-                msg: e.to_string(),
+                msg: format!("failed to sync stream to ingestor {node}: {e}"),
                 status: StatusCode::INTERNAL_SERVER_ERROR,
             }
         })?;
@@ -499,7 +503,7 @@ pub async fn sync_streams_with_ingestors(
     tenant_id: &Option<String>,
 ) -> Result<(), StreamError> {
     let (mut reqwest_headers, needs_node_token) = stream_sync_headers(&headers);
-    check_stream_sync_tenant(needs_node_token, tenant_id)?;
+    check_stream_sync_tenant(needs_node_token, &stream_name, tenant_id)?;
 
     if let Some(userid) = fallback_intracluster_userid(
         reqwest_headers.contains_key(INTRA_CLUSTER_USERID),
@@ -524,7 +528,12 @@ pub async fn sync_streams_with_ingestors(
                 stream_name
             );
             let headers =
-                stream_sync_node_headers(&reqwest_headers_clone, needs_node_token, &ingestor.token);
+                stream_sync_node_headers(
+                &reqwest_headers_clone,
+                needs_node_token,
+                &ingestor.domain_name,
+                &ingestor.token,
+            );
             let body = body_clone.clone();
             async move {
                 let headers = headers?;
@@ -2181,34 +2190,45 @@ mod header_build_tests {
             ("cookie", "session=abc"),
             (INTRA_CLUSTER_USERID, "alice"),
         ]));
-        let headers = stream_sync_node_headers(&base, needs_node_token, "Basic node").unwrap();
+        let headers =
+            stream_sync_node_headers(&base, needs_node_token, "node", "Basic node").unwrap();
         assert_eq!(
             headers.get(reqwest::header::AUTHORIZATION).unwrap(),
             "Basic node"
         );
         assert_eq!(headers.get(INTRA_CLUSTER_USERID).unwrap(), "alice");
 
-        let headers = stream_sync_node_headers(&base, false, "Basic node").unwrap();
+        let headers = stream_sync_node_headers(&base, false, "node", "Basic node").unwrap();
         assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
     }
 
     #[test]
     fn stream_sync_bad_node_token_is_a_sync_failure() {
-        let err = stream_sync_node_headers(&reqwest::header::HeaderMap::new(), true, "Basic josé")
-            .unwrap_err();
+        let err = stream_sync_node_headers(
+            &reqwest::header::HeaderMap::new(),
+            true,
+            "node",
+            "Basic josé",
+        )
+        .unwrap_err();
         assert!(matches!(err, StreamError::Custom { .. }));
         assert!(!err.to_string().contains("josé"));
+        assert!(err.to_string().contains("ingestor node"));
     }
 
     #[test]
     fn stream_sync_node_token_is_only_for_the_default_tenant() {
         let tenant = Some("acme".to_string());
-        assert!(check_stream_sync_tenant(true, &None).is_ok());
-        assert!(check_stream_sync_tenant(false, &tenant).is_ok());
+        assert!(check_stream_sync_tenant(true, "logs", &None).is_ok());
+        assert!(check_stream_sync_tenant(false, "logs", &tenant).is_ok());
         assert!(matches!(
-            check_stream_sync_tenant(true, &tenant),
+            check_stream_sync_tenant(true, "logs", &tenant),
             Err(StreamError::Custom { .. })
         ));
+        let msg = check_stream_sync_tenant(true, "logs", &tenant)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("logs") && msg.contains("acme"), "{msg}");
     }
 
     #[test]
