@@ -999,16 +999,7 @@ pub async fn get_dataset_stats(
                     TENANT_METADATA.get_global_query_auth(tenant).as_deref(),
                 )?)
             } else {
-                // Forward the caller's credentials if they sent any. A session
-                // cookie is only valid on this node, so without credentials
-                // `send_query_request` falls back to the querier's own token.
-                req.headers()
-                    .get(actix_web::http::header::AUTHORIZATION)
-                    .map(|auth| {
-                        let mut map = HeaderMap::new();
-                        map.insert(actix_web::http::header::AUTHORIZATION, auth.clone());
-                        map
-                    })
+                Some(prism_auth_without_secret(req.headers())?)
             };
 
             let response = match send_query_request(auth, &query_request, &tenant_id).await {
@@ -1031,6 +1022,24 @@ pub async fn get_dataset_stats(
     let response = HttpResponse::Ok().json(field_stats);
 
     Ok(response)
+}
+
+/// Auth for forwarding a Prism dataset-stats query to a querier without the
+/// cluster secret: the caller's `Authorization` header, so the querier checks
+/// the caller's own access. Anything else is rejected. A session cookie is
+/// only valid on this node, and leaving the auth empty would make
+/// `send_query_request` use the querier's own token and skip those checks.
+fn prism_auth_without_secret(headers: &HeaderMap) -> Result<HeaderMap, QueryError> {
+    let auth = headers
+        .get(actix_web::http::header::AUTHORIZATION)
+        .ok_or_else(|| {
+            QueryError::CustomError(
+                "P_CLUSTER_SECRET is required to forward this request to a querier".to_string(),
+            )
+        })?;
+    let mut map = HeaderMap::new();
+    map.insert(actix_web::http::header::AUTHORIZATION, auth.clone());
+    Ok(map)
 }
 
 /// Headers for forwarding a Prism dataset-stats query to a querier with the
@@ -1856,6 +1865,37 @@ mod tests {
 #[cfg(test)]
 mod forwarding_header_tests {
     use super::*;
+
+    #[test]
+    fn prism_auth_without_secret_forwards_only_authorization() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            actix_web::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        headers.insert(
+            actix_web::http::header::COOKIE,
+            HeaderValue::from_static("session=abc"),
+        );
+        let map = prism_auth_without_secret(&headers).unwrap();
+        assert_eq!(map.get("authorization").unwrap(), "Basic dXNlcjpwYXNz");
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn prism_auth_without_secret_rejects_cookie_and_api_key_callers() {
+        for (name, value) in [("cookie", "session=abc"), ("x-api-key", "key")] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+            assert!(matches!(
+                prism_auth_without_secret(&headers),
+                Err(QueryError::CustomError(_))
+            ));
+        }
+    }
 
     #[test]
     fn prism_forwarding_headers_include_auth_secret_tenant_and_user() {

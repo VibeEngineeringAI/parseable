@@ -43,6 +43,7 @@ use url::Url;
 use utils::{IngestionStats, QueriedStats, StorageStats, check_liveness, to_url_string};
 
 use crate::INTRA_CLUSTER_CLIENT;
+use crate::handlers::http::middleware::CLUSTER_SECRET_HEADER;
 use crate::handlers::http::modal::ingest::SyncRole;
 use crate::handlers::http::query::{Query, QueryError, TIME_ELAPSED_HEADER};
 use crate::metrics::prom_utils::Metrics;
@@ -426,6 +427,33 @@ pub fn fallback_intracluster_userid(
     generated_text_reqwest_header_value(username, "configured username").map(Some)
 }
 
+/// Copies the caller's headers for a stream sync, minus the session cookie:
+/// sessions live only on the node that issued them, so a peer would reject
+/// it. The flag is true when the copy carries no other credential, in which
+/// case the sync authenticates with the target node's token.
+fn stream_sync_headers(headers: &HeaderMap) -> (reqwest::header::HeaderMap, bool) {
+    let mut forwarded = reqwest::header::HeaderMap::new();
+    for (key, value) in headers.iter() {
+        if key == actix_web::http::header::COOKIE {
+            continue;
+        }
+        // Convert actix header name/value to reqwest header name/value
+        if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_str().as_bytes())
+            && let Ok(val) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+        {
+            forwarded.insert(name, val);
+        }
+    }
+    let has_credentials = [
+        CLUSTER_SECRET_HEADER,
+        reqwest::header::AUTHORIZATION.as_str(),
+        "x-api-key",
+    ]
+    .into_iter()
+    .any(|name| forwarded.contains_key(name));
+    (forwarded, !has_credentials)
+}
+
 // forward the create/update stream request to all ingestors to keep them in sync
 pub async fn sync_streams_with_ingestors(
     headers: HeaderMap,
@@ -433,16 +461,7 @@ pub async fn sync_streams_with_ingestors(
     stream_name: &str,
     tenant_id: &Option<String>,
 ) -> Result<(), StreamError> {
-    let mut reqwest_headers = reqwest::header::HeaderMap::new();
-
-    for (key, value) in headers.iter() {
-        // Convert actix header name/value to reqwest header name/value
-        if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_str().as_bytes())
-            && let Ok(val) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
-        {
-            reqwest_headers.insert(name, val);
-        }
-    }
+    let (mut reqwest_headers, needs_node_token) = stream_sync_headers(&headers);
 
     if let Some(userid) = fallback_intracluster_userid(
         reqwest_headers.contains_key(INTRA_CLUSTER_USERID),
@@ -466,9 +485,15 @@ pub async fn sync_streams_with_ingestors(
                 base_path_without_preceding_slash(),
                 stream_name
             );
-            let headers = reqwest_headers_clone.clone();
+            let mut headers = reqwest_headers_clone.clone();
             let body = body_clone.clone();
             async move {
+                if needs_node_token {
+                    headers.insert(
+                        reqwest::header::AUTHORIZATION,
+                        generated_text_reqwest_header_value(&ingestor.token, "node token")?,
+                    );
+                }
                 let res = INTRA_CLUSTER_CLIENT
                     .put(url)
                     .headers(headers)
@@ -2092,6 +2117,44 @@ pub async fn send_query_request(
 #[cfg(test)]
 mod header_build_tests {
     use super::*;
+    use actix_web::http::header::{HeaderName, HeaderValue};
+
+    fn actix_headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn stream_sync_drops_session_cookie_and_needs_node_token() {
+        let (forwarded, needs_node_token) = stream_sync_headers(&actix_headers(&[
+            ("cookie", "session=abc"),
+            ("x-p-log-source", "json"),
+        ]));
+        assert!(forwarded.get(reqwest::header::COOKIE).is_none());
+        assert_eq!(forwarded.get("x-p-log-source").unwrap(), "json");
+        assert!(needs_node_token);
+    }
+
+    #[test]
+    fn stream_sync_keeps_caller_credentials() {
+        for credential in [
+            ("authorization", "Basic dXNlcjpwYXNz"),
+            ("x-api-key", "key"),
+            (CLUSTER_SECRET_HEADER, "hash"),
+        ] {
+            let (forwarded, needs_node_token) =
+                stream_sync_headers(&actix_headers(&[("cookie", "session=abc"), credential]));
+            assert!(forwarded.get(reqwest::header::COOKIE).is_none());
+            assert_eq!(forwarded.get(credential.0).unwrap(), credential.1);
+            assert!(!needs_node_token, "{} is a credential", credential.0);
+        }
+    }
 
     #[test]
     fn node_header_failure_wins_over_earlier_network_failure() {
