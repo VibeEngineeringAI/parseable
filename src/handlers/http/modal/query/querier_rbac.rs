@@ -49,7 +49,7 @@ pub async fn post_user(
     body: Option<web::Json<serde_json::Value>>,
 ) -> Result<impl Responder, RBACError> {
     let username = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     validator::user_role_name(&username)?;
     let _guard = UPDATE_LOCK.lock().await;
@@ -107,9 +107,10 @@ pub async fn post_user(
     // let created_role = user_roles.clone();
     Users.put_user(user.clone());
 
-    if let Err(e) = sync_user_creation(&req, user, &None, &tenant_id, &caller_userid).await {
-        tracing::error!("{e}");
-    };
+    best_effort_sync(
+        sync_user_creation(&req, user, &None, &tenant_id, &caller_userid).await,
+        "Failed to sync user creation to cluster nodes",
+    )?;
 
     Ok(password)
 }
@@ -120,7 +121,7 @@ pub async fn delete_user(
     userid: web::Path<String>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     let _guard = UPDATE_LOCK.lock().await;
@@ -164,14 +165,14 @@ pub async fn delete_user(
     put_metadata(&metadata, &tenant_id).await?;
     apply_user_removal_to_groups(&userid, &tenant_id, &groups_to_update);
 
-    if let Err(e) =
-        sync_user_deletion_with_ingestors(&req, &userid, &tenant_id, &caller_userid).await
-    {
-        tracing::error!("{e}");
-    };
+    let synced = best_effort_sync(
+        sync_user_deletion_with_ingestors(&req, &userid, &tenant_id, &caller_userid).await,
+        "Failed to sync user deletion to cluster nodes",
+    );
 
     // update in mem table
     Users.delete_user(&userid, &tenant_id);
+    synced?;
     Ok(HttpResponse::Ok().json(format!("deleted user: {username}")))
 }
 
@@ -234,7 +235,7 @@ pub async fn add_roles_to_user(
 ) -> Result<String, RBACError> {
     let userid = userid.into_inner();
     let roles_to_add = roles_to_add.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let _guard = UPDATE_LOCK.lock().await;
     let caller_userid = get_user_from_request(&req)?;
     if !Users.contains(&userid, &tenant_id) {
@@ -303,21 +304,22 @@ pub async fn add_roles_to_user(
     put_metadata(&metadata, &tenant_id).await?;
 
     // sync to other nodes before updating in-memory (which invalidates sessions)
-    if let Err(e) = sync_users_with_roles_with_ingestors(
-        &req,
-        &userid,
-        &roles_to_add,
-        "add",
-        &tenant_id,
-        &caller_userid,
-    )
-    .await
-    {
-        tracing::error!("Failed to sync role addition to cluster nodes: {e}");
-    }
+    let synced = best_effort_sync(
+        sync_users_with_roles_with_ingestors(
+            &req,
+            &userid,
+            &roles_to_add,
+            "add",
+            &tenant_id,
+            &caller_userid,
+        )
+        .await,
+        "Failed to sync role addition to cluster nodes",
+    );
 
     // update in mem table (this invalidates the user's session)
     Users.add_roles(&userid.clone(), roles_to_add.clone(), &tenant_id);
+    synced?;
 
     Ok(format!("Roles updated successfully for {username}"))
 }
@@ -330,7 +332,7 @@ pub async fn remove_roles_from_user(
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
     let roles_to_remove = roles_to_remove.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     let _guard = UPDATE_LOCK.lock().await;
@@ -417,21 +419,22 @@ pub async fn remove_roles_from_user(
     put_metadata(&metadata, &tenant_id).await?;
 
     // sync to other nodes before updating in-memory (which invalidates sessions)
-    if let Err(e) = sync_users_with_roles_with_ingestors(
-        &req,
-        &userid,
-        &roles_to_remove,
-        "remove",
-        &tenant_id,
-        &caller_userid,
-    )
-    .await
-    {
-        tracing::error!("Failed to sync role removal to cluster nodes: {e}");
-    }
+    let synced = best_effort_sync(
+        sync_users_with_roles_with_ingestors(
+            &req,
+            &userid,
+            &roles_to_remove,
+            "remove",
+            &tenant_id,
+            &caller_userid,
+        )
+        .await,
+        "Failed to sync role removal to cluster nodes",
+    );
 
     // update in mem table (this invalidates the user's session)
     Users.remove_roles(&userid.clone(), roles_to_remove.clone(), &tenant_id);
+    synced?;
 
     Ok(HttpResponse::Ok().json(format!("Roles updated successfully for {username}")))
 }
@@ -445,7 +448,7 @@ pub async fn post_gen_password(
     let userid = userid.into_inner();
     let mut new_password = String::default();
     let mut new_hash = String::default();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let caller_userid = get_user_from_request(&req)?;
     if Users.is_protected(&userid, &tenant_id) == Some(true) {
         return Err(RBACError::ProtectedUser);
@@ -472,11 +475,28 @@ pub async fn post_gen_password(
     put_metadata(&metadata, &tenant_id).await?;
     Users.change_password_hash(&userid, &new_hash, &tenant_id);
 
-    if let Err(e) = sync_password_reset_with_ingestors(req, &userid, &caller_userid).await {
-        tracing::error!("{e}");
-    };
+    best_effort_sync(
+        sync_password_reset_with_ingestors(req, &userid, &caller_userid).await,
+        "Failed to sync password reset to cluster nodes",
+    )?;
 
     Ok(new_password)
+}
+
+/// Forwarding a change to the other nodes is best effort: a node or network
+/// failure is logged and the local change still succeeds. A `HeaderBuild`
+/// error means a node's forwarding headers could not be built; it retains its
+/// status: 400 for a malformed client header, a generic 500 for a stored or
+/// generated value. Callers apply the local in-memory change first.
+fn best_effort_sync(result: Result<(), RBACError>, context: &str) -> Result<(), RBACError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e @ RBACError::HeaderBuild(_)) => Err(e),
+        Err(e) => {
+            tracing::error!("{context}: {e}");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -810,5 +830,55 @@ mod role_escalation {
         // Other modules' tests watch the RBAC map locks; see `map::TEST_SERIAL`.
         let _serial = TEST_SERIAL.lock().await;
         rejects_addition(Role::create_user_role(vec![DefaultPrivilege::SuperAdmin])).await;
+    }
+}
+
+#[cfg(test)]
+mod sync_policy {
+    use actix_web::{ResponseError, body::to_bytes, http::StatusCode};
+
+    use super::*;
+    use crate::utils::header_parsing::{HeaderBuildError, ParseHeaderError};
+
+    // a request builder error, so no network is touched
+    fn network_error() -> reqwest::Error {
+        reqwest::Client::new().get("not a url").build().unwrap_err()
+    }
+
+    #[actix_web::test]
+    async fn header_build_input_fails_the_request_with_400() {
+        let err = best_effort_sync(
+            Err(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId).into()),
+            "sync",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RBACError::HeaderBuild(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn header_build_internal_fails_the_request_with_generic_500() {
+        let err = best_effort_sync(
+            Err(HeaderBuildError::Internal("configured username").into()),
+            "sync",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RBACError::HeaderBuild(HeaderBuildError::Internal("configured username"))
+        ));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(err.error_response().into_body()).await.unwrap();
+        assert_eq!(body, "Failed to build internal request headers");
+    }
+
+    #[actix_web::test]
+    async fn node_and_network_failures_stay_best_effort() {
+        assert!(best_effort_sync(Ok(()), "sync").is_ok());
+        assert!(best_effort_sync(Err(RBACError::Network(network_error())), "sync").is_ok());
+        assert!(best_effort_sync(Err(anyhow::anyhow!("node info").into()), "sync").is_ok());
     }
 }

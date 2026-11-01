@@ -1,6 +1,11 @@
 use std::{collections::HashMap, ops::ControlFlow};
 
-use actix_web::{HttpRequest, HttpResponse, body::to_bytes_limited, http::header::HeaderMap, web};
+use actix_web::{
+    HttpRequest, HttpResponse, ResponseError,
+    body::to_bytes_limited,
+    http::{StatusCode, header::HeaderMap},
+    web,
+};
 use chrono::{DateTime, Duration, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use futures::{StreamExt, stream};
@@ -34,6 +39,7 @@ use crate::{
     utils::{
         actix::extract_session_key_from_req,
         get_tenant_id_from_request,
+        header_parsing::ParseHeaderError,
         time::{TimeRange, parse_start_time_expression, parse_time_expression, truncate_to_minute},
     },
 };
@@ -2039,6 +2045,22 @@ pub async fn execute_oss_tool_with_query_headers(
     execute_oss_tool_inner(name, arguments, session_key, tenant_id, query_headers).await
 }
 
+/// A malformed request header on a tool call, answered in the same
+/// `ToolCallResult` envelope as the endpoint's other errors. The message
+/// never includes the value.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct ToolCallHeaderError(pub(crate) ParseHeaderError);
+
+impl ResponseError for ToolCallHeaderError {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
+    }
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::build(self.status_code()).json(ToolCallResult::error(self.0.to_string()))
+    }
+}
+
 /// Generic execution endpoint used by external MCP adapters.
 pub async fn call_tool_registry(
     req: HttpRequest,
@@ -2069,7 +2091,10 @@ pub async fn call_tool_registry(
     if let Err(error) = spec.validate_arguments(&call.arguments) {
         return HttpResponse::BadRequest().json(ToolCallResult::error(error));
     }
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = match get_tenant_id_from_request(&req) {
+        Ok(tenant_id) => tenant_id,
+        Err(error) => return ToolCallHeaderError(error).error_response(),
+    };
     if crate::users::dashboard_tools::is_dashboard_tool(spec.name) {
         return match crate::users::dashboard_tools::execute(&req, spec.name, &call.arguments).await
         {

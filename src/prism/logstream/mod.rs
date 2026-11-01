@@ -376,6 +376,8 @@ pub enum PrismLogstreamError {
     SerdeError(#[from] serde_json::Error),
     #[error("ReqwestError: {0}")]
     ReqwestError(#[from] reqwest::Error),
+    #[error("Header: {0}")]
+    Header(#[from] crate::utils::header_parsing::ParseHeaderError),
 }
 
 impl actix_web::ResponseError for PrismLogstreamError {
@@ -385,12 +387,17 @@ impl actix_web::ResponseError for PrismLogstreamError {
             PrismLogstreamError::StreamError(e) => e.status_code(),
             PrismLogstreamError::StreamNotFound(_) => StatusCode::NOT_FOUND,
             PrismLogstreamError::Hottier(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            PrismLogstreamError::Query(QueryError::Header(_)) => StatusCode::BAD_REQUEST,
+            PrismLogstreamError::Query(QueryError::HeaderBuild(e)) => {
+                actix_web::ResponseError::status_code(e)
+            }
             PrismLogstreamError::Query(_) => StatusCode::INTERNAL_SERVER_ERROR,
             PrismLogstreamError::TimeParse(_) => StatusCode::NOT_FOUND,
             PrismLogstreamError::Execute(_) => StatusCode::INTERNAL_SERVER_ERROR,
             PrismLogstreamError::SerdeError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             PrismLogstreamError::ReqwestError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             PrismLogstreamError::Auth(_) => StatusCode::UNAUTHORIZED,
+            PrismLogstreamError::Header(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -398,5 +405,43 @@ impl actix_web::ResponseError for PrismLogstreamError {
         actix_web::HttpResponse::build(self.status_code())
             .insert_header(ContentType::plaintext())
             .body(self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::ResponseError;
+
+    use super::*;
+    use crate::utils::header_parsing::{HeaderBuildError, ParseHeaderError};
+
+    #[test]
+    fn header_errors_map_to_expected_status() {
+        assert_eq!(
+            PrismLogstreamError::from(ParseHeaderError::InvalidTenantId).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            PrismLogstreamError::from(QueryError::Header(ParseHeaderError::InvalidTenantId))
+                .status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            PrismLogstreamError::from(QueryError::HeaderBuild(HeaderBuildError::Internal(
+                "querier token"
+            )))
+            .status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            PrismLogstreamError::from(StreamError::Header(ParseHeaderError::InvalidTenantId))
+                .status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        // unrelated query errors keep their existing 500 mapping
+        assert_eq!(
+            PrismLogstreamError::from(QueryError::EmptyQuery).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

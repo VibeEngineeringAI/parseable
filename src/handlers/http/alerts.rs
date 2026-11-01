@@ -260,7 +260,7 @@ pub async fn post(
     req: HttpRequest,
     Json(alert): Json<AlertRequest>,
 ) -> Result<impl Responder, AlertError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let session_key = extract_session_key_from_req(&req)?;
     Ok(web::Json(
         post_internal(alert, &session_key, &tenant_id).await?,
@@ -356,7 +356,7 @@ pub async fn post_internal(
 pub async fn get(req: HttpRequest, alert_id: Path<Ulid>) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(
         get_internal(&session_key, alert_id, &tenant_id).await?,
     ))
@@ -388,7 +388,7 @@ pub async fn delete(req: HttpRequest, alert_id: Path<Ulid>) -> Result<impl Respo
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
     let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let guard = ALERTS.write().await;
     let alerts = if let Some(alerts) = guard.as_ref() {
         alerts
@@ -435,7 +435,7 @@ pub async fn update_notification_state(
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
     let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let new_notification_state = match new_notification_state.state.as_str() {
         "notify" => NotificationState::Notify,
         "indefinite" => NotificationState::Mute("indefinite".into()),
@@ -492,7 +492,7 @@ pub async fn disable_alert(
 ) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(
         disable_alert_internal(&session_key, alert_id, &tenant_id).await?,
     ))
@@ -534,7 +534,7 @@ pub async fn enable_alert(
 ) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(
         enable_alert_internal(&session_key, alert_id, &tenant_id).await?,
     ))
@@ -591,7 +591,7 @@ pub async fn modify_alert(
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
     let _lifecycle = crate::alerts::promql_alerts::lock_lifecycle(alert_id).await;
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // Get alerts manager reference without holding the global lock
     let alerts = {
         let guard = ALERTS.read().await;
@@ -688,7 +688,7 @@ pub async fn evaluate_alert(
 ) -> Result<impl Responder, AlertError> {
     let session_key = extract_session_key_from_req(&req)?;
     let alert_id = alert_id.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(Json(
         evaluate_alert_internal(&session_key, alert_id, &tenant_id).await?,
     ))
@@ -724,7 +724,7 @@ pub async fn evaluate_alert_internal(
 }
 
 pub async fn list_tags(req: HttpRequest) -> Result<impl Responder, AlertError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(list_tags_internal(&tenant_id).await?))
 }
 

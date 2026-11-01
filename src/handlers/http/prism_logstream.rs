@@ -32,7 +32,7 @@ pub async fn get_info(
     stream_name: Path<String>,
 ) -> Result<impl Responder, PrismLogstreamError> {
     let prism_logstream_info =
-        get_prism_logstream_info(&stream_name, &get_tenant_id_from_request(&req)).await?;
+        get_prism_logstream_info(&stream_name, &get_tenant_id_from_request(&req)?).await?;
 
     Ok(web::Json(prism_logstream_info))
 }
@@ -43,7 +43,7 @@ pub async fn post_datasets(
     req: HttpRequest,
 ) -> Result<impl Responder, PrismLogstreamError> {
     let session_key = extract_session_key_from_req(&req)?;
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let dataset = dataset_req
         .map(|Json(r)| r)
         .unwrap_or_default()

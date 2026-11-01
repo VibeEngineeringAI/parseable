@@ -443,28 +443,65 @@ describe('list filtering, sorting and bounded type discovery', () => {
   });
 });
 describe('target forms', () => {
+  const maskedAlertmanager = {
+    id: 'am',
+    name: 'AM',
+    type: 'webhook' as const,
+    endpoint: 'https://********',
+    username: '********',
+    password: '********',
+  };
   it('recognizes masked Alertmanager, requires re-entry and builds top-level credentials', () => {
-    const target = {
-      id: 'am',
-      name: 'AM',
-      type: 'webhook' as const,
-      endpoint: 'https://********',
-      username: 'svc',
-      password: '********',
-    };
-    expect(targetType(target)).toBe('alertManager');
-    const form = targetDraft(target);
-    expect(form.endpoint).toBe('');
-    expect(form.password).toBe('');
+    expect(targetType(maskedAlertmanager)).toBe('alertManager');
+    expect(targetType({ ...maskedAlertmanager, username: null, password: null })).toBe(
+      'alertManager',
+    );
+    const form = targetDraft(maskedAlertmanager);
+    // Neither mask is prefilled, so it can never be resubmitted as a real credential.
+    expect([form.endpoint, form.username, form.password]).toEqual(['', '', '']);
     expect(validateTarget(form)).toHaveProperty('endpoint');
     form.endpoint = 'https://example.com/api/v2/alerts';
+    form.username = 'svc';
     form.password = 'secret';
-    expect(buildTargetPayload(form)).toMatchObject({
+    expect(validateTarget(form)).toEqual({});
+    expect(buildTargetPayload(form)).toEqual({
+      name: 'AM',
       type: 'alertManager',
+      endpoint: 'https://example.com/api/v2/alerts',
+      skipTlsCheck: false,
       username: 'svc',
       password: 'secret',
     });
-    expect(buildTargetPayload(form)).not.toHaveProperty('auth');
+  });
+  it('removes Alertmanager auth when both credentials are left empty on edit', () => {
+    const form = {
+      ...targetDraft(maskedAlertmanager),
+      endpoint: 'https://example.com/api/v2/alerts',
+    };
+    expect(validateTarget(form)).toEqual({});
+    const payload = buildTargetPayload(form);
+    expect(payload).not.toHaveProperty('username');
+    expect(payload).not.toHaveProperty('password');
+    expect(JSON.stringify(payload)).not.toContain('********');
+  });
+  it('requires the Alertmanager username and password as a pair and rejects masks', () => {
+    const form = {
+      ...targetDraft(maskedAlertmanager),
+      endpoint: 'https://example.com/api/v2/alerts',
+    };
+    const pair = 'Enter both username and password, or leave both empty.';
+    expect(validateTarget({ ...form, username: 'svc' })).toEqual({ password: pair });
+    expect(validateTarget({ ...form, password: 'secret' })).toEqual({ password: pair });
+    expect(validateTarget({ ...form, username: '********', password: 'secret' })).toEqual({
+      username: 'Enter the real username, not the mask.',
+    });
+    expect(validateTarget({ ...form, username: 'svc', password: '********' })).toEqual({
+      password: 'Enter the real password, not the mask.',
+    });
+    expect(validateTarget({ ...form, username: '********', password: '********' })).toEqual({
+      username: 'Enter the real username, not the mask.',
+      password: 'Enter the real password, not the mask.',
+    });
   });
   it('omits TLS and auth fields for Slack', () => {
     const form = {
@@ -487,6 +524,7 @@ describe('target forms', () => {
     for (const headers of [
       [{ id: 'a', key: 'Cookie', value: 'a' }],
       [{ id: 'a', key: 'X-Key', value: '' }],
+      [{ id: 'a', key: 'X-Key', value: '********' }],
       [
         { id: 'a', key: 'X-Key', value: 'a' },
         { id: 'b', key: 'x-key', value: 'b' },

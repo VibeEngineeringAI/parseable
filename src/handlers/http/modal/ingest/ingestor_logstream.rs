@@ -42,7 +42,7 @@ pub async fn retention_cleanup(
 ) -> Result<impl Responder, StreamError> {
     let stream_name = stream_name.into_inner();
     let storage = PARSEABLE.storage().get_object_store();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
@@ -75,7 +75,7 @@ pub async fn delete(
     stream_name: Path<String>,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = stream_name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // Delete from staging
     let stream_dir = PARSEABLE.get_stream(&stream_name, &tenant_id)?;
 
@@ -105,7 +105,7 @@ pub async fn put_stream(
     body: Bytes,
 ) -> Result<impl Responder, StreamError> {
     let stream_name = stream_name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     PARSEABLE
         .create_update_stream(req.headers(), &body, &stream_name, &tenant_id)
         .await?;

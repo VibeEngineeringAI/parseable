@@ -183,7 +183,7 @@ impl Broadcaster {
 pub async fn register_sse_client(
     req: HttpRequest,
 ) -> Result<Sse<InfallibleStream<ReceiverStream<sse::Event>>>, actix_web::Error> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let session = extract_session_key_from_req(&req).unwrap();
     let sessionid = match session {
         SessionKey::SessionId(ulid) => ulid,

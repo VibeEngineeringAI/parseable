@@ -122,7 +122,7 @@ pub async fn query_context(
     context_request: Json<LogContextRequest>,
 ) -> Result<impl Responder, QueryError> {
     let context_request = context_request.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let span = Span::current();
     span.record("dataset", tracing::field::display(&context_request.dataset));
     span.record("tenant", tracing::field::debug(&tenant_id));

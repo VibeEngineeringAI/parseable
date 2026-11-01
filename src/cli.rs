@@ -36,6 +36,9 @@ pub const DEFAULT_USERNAME: &str = "admin";
 pub const DEFAULT_PASSWORD: &str = "admin";
 
 pub const DATASET_FIELD_COUNT_LIMIT: usize = 1000;
+pub const DEFAULT_MAX_FLATTEN_ROWS_PER_EVENT: usize = 1000;
+pub const DEFAULT_MAX_FLATTEN_ROWS_PER_REQUEST: usize = 10_000;
+pub const DEFAULT_MAX_FLATTEN_BYTES_PER_REQUEST: usize = 64 * 1024 * 1024;
 const DEFAULT_PARQUET_METADATA_CACHE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 #[derive(Parser)]
 #[command(
@@ -639,6 +642,35 @@ pub struct Options {
         help = "Maximum allowed event payload size in bytes for ingest endpoints"
     )]
     pub max_event_payload_size: usize,
+
+    // generic flattening expands nested arrays into the cartesian product of their values,
+    // these bound that expansion for JSON/custom sources, Kinesis and OTEL log bodies
+    #[arg(
+        long,
+        env = "P_MAX_FLATTEN_ROWS_PER_EVENT",
+        default_value_t = DEFAULT_MAX_FLATTEN_ROWS_PER_EVENT,
+        value_parser = validation::validate_flatten_limit,
+        help = "Maximum number of rows a single event may expand into when its nested arrays are flattened"
+    )]
+    pub max_flatten_rows_per_event: usize,
+
+    #[arg(
+        long,
+        env = "P_MAX_FLATTEN_ROWS_PER_REQUEST",
+        default_value_t = DEFAULT_MAX_FLATTEN_ROWS_PER_REQUEST,
+        value_parser = validation::validate_flatten_limit,
+        help = "Maximum number of rows all events of an ingest request may expand into when their nested arrays are flattened. Every event takes at least one row, including an event without arrays"
+    )]
+    pub max_flatten_rows_per_request: usize,
+
+    #[arg(
+        long,
+        env = "P_MAX_FLATTEN_BYTES_PER_REQUEST",
+        default_value_t = DEFAULT_MAX_FLATTEN_BYTES_PER_REQUEST,
+        value_parser = validation::validate_flatten_limit,
+        help = "Maximum total size in bytes of the rows, measured as compact JSON, that all events of an ingest request may expand into when their nested arrays are flattened. This is not a bound on the memory used"
+    )]
+    pub max_flatten_bytes_per_request: usize,
 
     #[arg(
         long,

@@ -218,11 +218,19 @@ export function TargetSheet({
         )}
         {draft.type === 'alertManager' && (
           <>
+            {target && (
+              <p className="muted">
+                Stored credentials are masked. Re-enter both username and password to keep basic
+                authentication; leaving both empty removes it.
+              </p>
+            )}
             <Input
               label="Username"
               autoComplete="off"
               value={draft.username}
               disabled={mutation.pending}
+              error={errors.username}
+              onBlur={() => shown.touch('username')}
               onChange={(event) => update('username', event.target.value)}
             />
             <Input
@@ -231,11 +239,7 @@ export function TargetSheet({
               autoComplete="new-password"
               value={draft.password}
               disabled={mutation.pending}
-              hint={
-                target
-                  ? 'Re-enter the password to retain basic authentication, or clear both fields.'
-                  : 'Username and password must both be set, or both empty.'
-              }
+              hint="Username and password must both be set, or both empty."
               error={errors.password}
               onBlur={() => shown.touch('password')}
               onChange={(event) => update('password', event.target.value)}

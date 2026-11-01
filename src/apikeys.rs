@@ -98,7 +98,35 @@ impl actix_web::ResponseError for ApiKeyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        handlers::http::rbac::RBACError,
+        utils::header_parsing::{HeaderBuildError, ParseHeaderError},
+    };
+    use actix_web::{ResponseError, http::StatusCode};
     use serde_json::json;
+
+    #[test]
+    fn sync_header_errors_preserve_status_without_revocation_wrapping() {
+        let error = ApiKeyError::from(RBACError::HeaderBuild(HeaderBuildError::Internal(
+            "configured username",
+        )));
+        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.to_string(),
+            "Failed to build internal request headers"
+        );
+
+        let error = ApiKeyError::from(RBACError::HeaderBuild(HeaderBuildError::Input(
+            ParseHeaderError::InvalidTenantId,
+        )));
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+
+        let network_failure = ApiKeyError::RevocationSyncFailed("network failure".into());
+        assert_eq!(
+            network_failure.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     #[test]
     fn ttl_accepts_inclusive_boundaries_and_no_expiration() {

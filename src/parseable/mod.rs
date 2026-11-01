@@ -691,7 +691,7 @@ impl Parseable {
             dataset_labels,
             infer_timestamp,
             infer_timestamp_set,
-        } = headers.into();
+        } = PutStreamHeaders::try_from(headers)?;
 
         // x-p-infer-timestamp can only be set during stream creation, not on update.
         // It is only valid for otel-metrics datasets.

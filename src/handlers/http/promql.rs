@@ -20,7 +20,7 @@ use crate::promql::{self, Labels, QueryPlan, Sample, Series};
 use crate::rbac::{Users, role::Action};
 use crate::utils::{
     actix::extract_session_key_from_req, arrow::record_batches_to_json, get_tenant_id_from_request,
-    user_auth_for_datasets,
+    header_parsing::ParseHeaderError, user_auth_for_datasets,
 };
 
 const MAX_RANGE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
@@ -43,8 +43,11 @@ static PREVIEW_QUERY_SLOTS: Lazy<Arc<Semaphore>> =
 /// Alerts evaluate in their own slots so dashboard load cannot starve them.
 static ALERT_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(ALERT_CAPACITY)));
 
+/// Path prefix of every PromQL route; all of them answer errors as [`ApiError`].
+pub(crate) const SCOPE: &str = "/prometheus/api/v1";
+
 pub fn scope() -> Scope {
-    web::scope("/prometheus/api/v1")
+    web::scope(SCOPE)
         .service(
             web::resource("/query")
                 .route(web::get().to(instant_get).authorize(Action::Query))
@@ -91,6 +94,10 @@ impl ApiError {
             kind,
             message: message.into(),
         }
+    }
+    /// A malformed request header. The message never includes the value.
+    pub(crate) fn invalid_header(error: ParseHeaderError) -> Self {
+        Self::bad(error.to_string())
     }
     fn auth(error: actix_web::Error) -> Self {
         Self {
@@ -338,7 +345,7 @@ async fn metadata(req: HttpRequest, name: Option<String>) -> Result<HttpResponse
         .try_acquire_owned()
         .map_err(|_| ApiError::unavailable("unavailable", "PromQL request queue is full"))?;
     let work = async {
-        let tenant = get_tenant_id_from_request(&req);
+        let tenant = get_tenant_id_from_request(&req).map_err(ApiError::invalid_header)?;
         authorize_dataset(&req, &dataset, &tenant).await?;
         let permit = QUERY_SLOTS.clone().acquire_owned().await.map_err(|_| {
             ApiError::unavailable("unavailable", "PromQL query service unavailable")
@@ -489,7 +496,7 @@ async fn handle(
         .try_acquire_owned()
         .map_err(|_| ApiError::unavailable("unavailable", "PromQL request queue is full"))?;
     let work = async {
-        let tenant = get_tenant_id_from_request(&req);
+        let tenant = get_tenant_id_from_request(&req).map_err(ApiError::invalid_header)?;
         authorize_dataset(&req, &dataset, &tenant).await?;
         let body = execute_query(
             &QUERY_SLOTS,
@@ -550,7 +557,7 @@ pub(crate) async fn dashboard_query(
     let dataset = dataset_from_request(req, &HashMap::from([("stream".into(), dataset.into())]))?;
     let _request_permit = admit_preview(&PREVIEW_REQUEST_SLOTS)?;
     tokio::time::timeout(Duration::from_secs(30), async {
-        let tenant = get_tenant_id_from_request(req);
+        let tenant = get_tenant_id_from_request(req).map_err(ApiError::invalid_header)?;
         authorize_dataset(req, &dataset, &tenant).await?;
         let preview_permit = PREVIEW_QUERY_SLOTS
             .clone()

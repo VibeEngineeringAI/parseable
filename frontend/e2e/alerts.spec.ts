@@ -560,6 +560,34 @@ test('Slack and Alertmanager targets retain their distinct fields', async ({ pag
       kind === 'slack' ? 'Slack' : 'Alertmanager',
     );
   }
+  // Stored credentials come back masked: neither is prefilled, and both must be re-entered.
+  await rowAction(page, 'Test alertManager', 'Edit');
+  const sheet = page.getByRole('dialog', { name: 'Edit target', exact: true });
+  const username = sheet.getByLabel('Username', { exact: true });
+  const password = sheet.getByLabel('Password', { exact: true });
+  await expect(sheet.getByLabel('Target type')).toHaveValue('alertManager');
+  await expect(username).toHaveValue('');
+  await expect(password).toHaveValue('');
+  await expect(
+    sheet.getByText('Re-enter both username and password to keep basic authentication', {
+      exact: false,
+    }),
+  ).toBeVisible();
+  await sheet.getByLabel('Endpoint URL').fill('https://example.com/api/v2/alerts');
+  await username.fill('********');
+  await password.fill('secret');
+  await sheet.getByRole('button', { name: 'Save target' }).click();
+  await expect(username).toHaveAccessibleDescription('Enter the real username, not the mask.');
+  await username.fill('svc');
+  await password.fill('');
+  await password.blur();
+  await expect(password).toHaveAccessibleDescription(
+    /Enter both username and password, or leave both empty\./,
+  );
+  await password.fill('new-secret');
+  await sheet.getByRole('button', { name: 'Save target' }).click();
+  await expect(sheet).toHaveCount(0);
+  await expect(namedRow(page, 'Test alertManager')).toContainText('Alertmanager');
 });
 test('validation errors describe their controls and block invalid thresholds, frequency and hold', async ({
   page,

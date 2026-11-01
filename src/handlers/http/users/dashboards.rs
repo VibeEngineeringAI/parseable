@@ -27,7 +27,10 @@ use crate::{
         dashboard_service::{self, DashboardActor, DashboardMutation, DashboardWriteOptions},
         dashboards::{Dashboard, Tile, validate_dashboard_id},
     },
-    utils::{get_hash, get_tenant_id_from_request, get_user_and_tenant_from_request, is_admin},
+    utils::{
+        get_hash, get_tenant_id_from_request, get_user_and_tenant_from_request,
+        header_parsing::ParseHeaderError, is_admin,
+    },
 };
 use actix_web::{
     HttpRequest, HttpResponse, Responder,
@@ -108,7 +111,7 @@ pub async fn list_dashboards(req: HttpRequest) -> Result<impl Responder, Dashboa
     // Legacy tag filtering ignores limit. Cursor pagination explicitly opts in
     // to ID order and applies its limit after the cursor.
     let tagged = tags.is_some();
-    let rows = list_dashboards_internal(0, tags, &get_tenant_id_from_request(&req)).await?;
+    let rows = list_dashboards_internal(0, tags, &get_tenant_id_from_request(&req)?).await?;
     Ok(web::Json(filter_listing(rows, &query, tagged, limit)))
 }
 
@@ -239,7 +242,7 @@ pub async fn get_dashboard(
     Ok(document_response(
         dashboard_service::get_json(
             validate_dashboard_id(id.into_inner())?,
-            &get_tenant_id_from_request(&req),
+            &get_tenant_id_from_request(&req)?,
         )
         .await
         .map_err(|error| legacy_error(error, LegacyOperation::Get))?,
@@ -418,7 +421,7 @@ pub async fn add_tile(
 
 pub async fn list_tags(req: HttpRequest) -> Result<impl Responder, DashboardError> {
     Ok(web::Json(
-        list_tags_internal(&get_tenant_id_from_request(&req)).await?,
+        list_tags_internal(&get_tenant_id_from_request(&req)?).await?,
     ))
 }
 
@@ -459,6 +462,8 @@ pub enum DashboardError {
         message: String,
         details: Value,
     },
+    #[error("{0}")]
+    Header(#[from] ParseHeaderError),
 }
 impl DashboardError {
     pub fn api(
@@ -490,7 +495,7 @@ impl actix_web::ResponseError for DashboardError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::ObjectStorage(_) | Self::Custom(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Serde(_) | Self::Metadata(_) | Self::InvalidQueryParameter => {
+            Self::Serde(_) | Self::Metadata(_) | Self::InvalidQueryParameter | Self::Header(_) => {
                 StatusCode::BAD_REQUEST
             }
             Self::UserDoesNotExist(_) => StatusCode::NOT_FOUND,
@@ -722,6 +727,23 @@ mod compatibility_tests {
         assert_eq!(
             DashboardError::api(412, "revision_conflict", "changed", json!({})).status_code(),
             StatusCode::PRECONDITION_FAILED
+        );
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::ResponseError;
+
+    use super::*;
+
+    #[test]
+    fn header_error_is_plaintext_bad_request() {
+        let err = DashboardError::from(ParseHeaderError::InvalidTenantId);
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.to_string(),
+            "Invalid tenant id found in header [tenant]"
         );
     }
 }

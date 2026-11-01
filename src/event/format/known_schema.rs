@@ -43,6 +43,10 @@ pub enum Error {
         "Unsupported log format: '{0}'. This format cannot be parsed by the current version. Please create an issue on our GitHub repository (github.com/parseablehq/parseable) with a sample log event, or reach out in the #support-channel on our Slack community for assistance. Include this error message and your log sample to help us improve compatibility."
     )]
     Unknown(String),
+    #[error(
+        "Event shape is not supported for known log formats. Expected a JSON object or an array of JSON objects."
+    )]
+    InvalidShape,
 }
 
 /// Deserializes a string pattern into a compiled Regex
@@ -193,6 +197,8 @@ impl EventProcessor {
     /// # Returns
     /// * `Ok` - The original JSON will now contain extracted fields
     /// * `Err(Unacceptable)` - JSON provided is acceptable for the known format
+    /// * `Err(Unknown)` - `log_source` is not a known format
+    /// * `Err(InvalidShape)` - JSON is neither an object nor an array
     pub fn extract_from_inline_log(
         &self,
         json: &mut Value,
@@ -227,7 +233,9 @@ impl EventProcessor {
                     p_custom_fields.insert(FORMAT_VERIFY_KEY.to_string(), "false".to_string());
                 }
             }
-            _ => unreachable!("We don't accept events of the form: {json}"),
+            // Scalars (number, string, bool, null) can't carry log fields.
+            // The value is deliberately not echoed back in the error.
+            _ => return Err(Error::InvalidShape),
         }
 
         Ok(fields)
@@ -468,6 +476,145 @@ mod tests {
             second.get("message").unwrap().as_str().unwrap(),
             "Application started"
         );
+    }
+
+    #[test]
+    fn test_extract_from_inline_log_rejects_scalars() {
+        let processor = EventProcessor::new(TEST_CONFIG);
+
+        for scalar in [
+            json!(42),
+            json!(1.5),
+            json!("[ERROR] [2023-10-10T13:55:36Z] do-not-echo-this"),
+            json!(true),
+            Value::Null,
+        ] {
+            let mut json_value = scalar.clone();
+            let mut p_custom_fields = HashMap::new();
+            let result = processor.extract_from_inline_log(
+                &mut json_value,
+                &mut p_custom_fields,
+                "custom_app_log",
+                Some("raw_log"),
+            );
+
+            let err = result.expect_err("scalar events must be rejected");
+            assert!(matches!(err, Error::InvalidShape), "{scalar} gave {err:?}");
+            assert!(!err.to_string().contains("do-not-echo-this"));
+            assert_eq!(json_value, scalar, "scalar event must be left untouched");
+            assert!(p_custom_fields.is_empty());
+            assert_eq!(
+                actix_web::ResponseError::status_code(
+                    &crate::handlers::http::ingest::PostError::from(err)
+                ),
+                actix_web::http::StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_from_inline_log_unknown_source_before_shape() {
+        let processor = EventProcessor::new(TEST_CONFIG);
+        let mut json_value = json!(42);
+        let mut p_custom_fields = HashMap::new();
+
+        let result = processor.extract_from_inline_log(
+            &mut json_value,
+            &mut p_custom_fields,
+            "nonexistent_format",
+            Some("raw_log"),
+        );
+
+        assert!(matches!(result, Err(Error::Unknown(name)) if name == "nonexistent_format"));
+    }
+
+    #[test]
+    fn test_extract_from_inline_log_object_via_processor() {
+        let processor = EventProcessor::new(TEST_CONFIG);
+        let mut json_value = json!({
+            "raw_log": "[ERROR] [2023-10-10T13:55:36Z] Failed to connect to database"
+        });
+        let mut p_custom_fields = HashMap::new();
+
+        let fields = processor
+            .extract_from_inline_log(
+                &mut json_value,
+                &mut p_custom_fields,
+                "custom_app_log",
+                Some("raw_log"),
+            )
+            .unwrap();
+
+        assert!(fields.contains("level"));
+        assert_eq!(json_value["level"], "ERROR");
+        assert!(p_custom_fields.is_empty());
+    }
+
+    #[test]
+    fn test_extract_from_inline_log_object_no_match_marks_unverified() {
+        let processor = EventProcessor::new(TEST_CONFIG);
+        let mut json_value = json!({ "raw_log": "not a known format" });
+        let mut p_custom_fields = HashMap::new();
+
+        let fields = processor
+            .extract_from_inline_log(
+                &mut json_value,
+                &mut p_custom_fields,
+                "custom_app_log",
+                Some("raw_log"),
+            )
+            .unwrap();
+
+        assert!(fields.is_empty());
+        assert_eq!(
+            p_custom_fields.get(FORMAT_VERIFY_KEY).map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn test_extract_from_inline_log_array_skips_non_objects() {
+        let processor = EventProcessor::new(TEST_CONFIG);
+        let mut json_value = json!([
+            42,
+            "plain string",
+            null,
+            { "raw_log": "[INFO] [2023-10-10T13:55:40Z] Application started" }
+        ]);
+        let mut p_custom_fields = HashMap::new();
+
+        let fields = processor
+            .extract_from_inline_log(
+                &mut json_value,
+                &mut p_custom_fields,
+                "custom_app_log",
+                Some("raw_log"),
+            )
+            .unwrap();
+
+        assert!(fields.contains("message"));
+        assert_eq!(json_value[0], json!(42));
+        assert_eq!(json_value[3]["level"], "INFO");
+        assert!(p_custom_fields.is_empty());
+    }
+
+    #[test]
+    fn test_extract_from_inline_log_empty_array() {
+        let processor = EventProcessor::new(TEST_CONFIG);
+        let mut json_value = json!([]);
+        let mut p_custom_fields = HashMap::new();
+
+        let fields = processor
+            .extract_from_inline_log(
+                &mut json_value,
+                &mut p_custom_fields,
+                "custom_app_log",
+                Some("raw_log"),
+            )
+            .unwrap();
+
+        assert!(fields.is_empty());
+        assert!(p_custom_fields.is_empty());
     }
 
     #[test]

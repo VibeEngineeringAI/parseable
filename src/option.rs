@@ -272,6 +272,16 @@ pub mod validation {
         Ok(query.to_owned())
     }
 
+    pub fn validate_flatten_limit(s: &str) -> Result<usize, String> {
+        match s.parse::<usize>() {
+            Ok(limit) if limit > 0 => Ok(limit),
+            _ => Err(format!(
+                "It should be a positive integer no larger than {}",
+                usize::MAX
+            )),
+        }
+    }
+
     pub fn validate_payload_size(s: &str) -> Result<usize, String> {
         const MIN_SIZE: usize = 100; // 100 bytes
         const MAX_SIZE: usize = 100 * 1024 * 1024; // 100 MB
@@ -307,5 +317,81 @@ mod ui_tests {
         assert!(error.contains("removed"));
         assert!(error.contains("Unset P_UI_ROOT"));
         assert!(validation::ui_root("other").is_err());
+    }
+}
+
+#[cfg(test)]
+mod flatten_limit_tests {
+    use clap::{CommandFactory, FromArgMatches};
+
+    use super::validation;
+    use crate::cli::Options;
+    use crate::utils::json::flatten::FlattenLimits;
+
+    // Parses `args` with the env fallbacks of every argument turned off, so that P_*
+    // variables set where the tests run do not change the result
+    fn parse(args: &[&str]) -> Result<Options, clap::Error> {
+        let mut matches = Options::command()
+            .mut_args(|arg| arg.env(None::<&'static str>))
+            .try_get_matches_from(std::iter::once("parseable").chain(args.iter().copied()))?;
+        Options::from_arg_matches_mut(&mut matches)
+    }
+
+    #[test]
+    fn flatten_limits_must_be_positive_integers() {
+        assert_eq!(validation::validate_flatten_limit("1"), Ok(1));
+        assert_eq!(
+            validation::validate_flatten_limit(&usize::MAX.to_string()),
+            Ok(usize::MAX)
+        );
+        for invalid in ["0", "-1", "", "1.5", "ten", "18446744073709551616000"] {
+            assert!(
+                validation::validate_flatten_limit(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn flatten_limits_default_and_override() {
+        let options = parse(&[]).unwrap();
+        assert_eq!(
+            FlattenLimits::from_options(&options),
+            FlattenLimits::DEFAULT
+        );
+        assert_eq!(
+            FlattenLimits::DEFAULT,
+            FlattenLimits {
+                max_rows_per_event: 1000,
+                max_rows_per_request: 10_000,
+                max_bytes_per_request: 67_108_864,
+            }
+        );
+
+        let options = parse(&[
+            "--max-flatten-rows-per-event",
+            "5",
+            "--max-flatten-rows-per-request",
+            "50",
+            "--max-flatten-bytes-per-request",
+            "500",
+        ])
+        .unwrap();
+        assert_eq!(
+            FlattenLimits::from_options(&options),
+            FlattenLimits {
+                max_rows_per_event: 5,
+                max_rows_per_request: 50,
+                max_bytes_per_request: 500,
+            }
+        );
+
+        for flag in [
+            "--max-flatten-rows-per-event",
+            "--max-flatten-rows-per-request",
+            "--max-flatten-bytes-per-request",
+        ] {
+            assert!(parse(&[flag, "0"]).is_err());
+        }
     }
 }

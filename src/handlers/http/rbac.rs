@@ -28,7 +28,10 @@ use crate::{
         utils::to_prism_user,
     },
     storage::ObjectStorageError,
-    utils::get_tenant_id_from_request,
+    utils::{
+        get_tenant_id_from_request,
+        header_parsing::{HeaderBuildError, ParseHeaderError},
+    },
     validator::{self, error::UsernameValidationError},
 };
 use actix_web::http::StatusCode;
@@ -70,9 +73,9 @@ impl From<&user::User> for User {
 
 // Handler for GET /api/v1/user
 // returns list of all registered users
-pub async fn list_users(req: HttpRequest) -> impl Responder {
-    let tenant_id = get_tenant_id_from_request(&req);
-    web::Json(list_users_internal(&tenant_id))
+pub async fn list_users(req: HttpRequest) -> Result<impl Responder, RBACError> {
+    let tenant_id = get_tenant_id_from_request(&req)?;
+    Ok(web::Json(list_users_internal(&tenant_id)))
 }
 
 /// Shared user-list implementation for HTTP handlers and in-process callers.
@@ -82,8 +85,8 @@ pub fn list_users_internal(tenant_id: &Option<String>) -> serde_json::Value {
 
 /// Handler for GET /api/v1/users
 /// returns list of all registered users along with their roles and other info
-pub async fn list_users_prism(req: HttpRequest) -> impl Responder {
-    let tenant_id = get_tenant_id_from_request(&req);
+pub async fn list_users_prism(req: HttpRequest) -> Result<impl Responder, RBACError> {
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     // get all users
     let prism_users = match rbac::map::users().get(tenant_id) {
@@ -100,7 +103,7 @@ pub async fn list_users_prism(req: HttpRequest) -> impl Responder {
             .collect_vec(),
         None => vec![],
     };
-    web::Json(prism_users)
+    Ok(web::Json(prism_users))
 }
 
 /// Function for GET /users/{userid}
@@ -109,7 +112,7 @@ pub async fn get_prism_user(
     userid: Path<String>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(get_user_internal(&userid, &tenant_id)?))
 }
 
@@ -138,7 +141,7 @@ pub async fn post_user(
     body: Option<web::Json<serde_json::Value>>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     validator::user_role_name(&userid)?;
     let _guard = UPDATE_LOCK.lock().await;
     let mut metadata = get_metadata(&tenant_id).await?;
@@ -205,7 +208,7 @@ pub async fn patch_user(
     web::Json(update): web::Json<UpdateUser>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
 
     if let Some(p) = Users.is_protected(&userid, &tenant_id)
         && p
@@ -243,7 +246,7 @@ pub async fn post_gen_password(
     userid: web::Path<String>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     // fail this request if the user is protected
     if let Some(p) = Users.is_protected(&userid, &tenant_id)
         && p
@@ -284,7 +287,7 @@ pub async fn get_role(
     userid: web::Path<String>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(get_role_internal(&userid, &tenant_id)?))
 }
 
@@ -365,7 +368,7 @@ pub async fn delete_user(
     userid: web::Path<String>,
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let _guard = UPDATE_LOCK.lock().await;
     // if user is a part of any groups then don't allow deletion
     if !Users.get_user_groups(&userid, &tenant_id).is_empty() {
@@ -412,7 +415,7 @@ pub async fn add_roles_to_user(
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
     let roles_to_add = roles_to_add.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let _guard = UPDATE_LOCK.lock().await;
     let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     if !Users.contains(&userid, &tenant_id) {
@@ -503,7 +506,7 @@ pub async fn remove_roles_from_user(
 ) -> Result<impl Responder, RBACError> {
     let userid = userid.into_inner();
     let roles_to_remove = roles_to_remove.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let _guard = UPDATE_LOCK.lock().await;
     if !Users.contains(&userid, &tenant_id) {
         return Err(RBACError::UserDoesNotExist);
@@ -631,6 +634,10 @@ pub enum RBACError {
     ResourceInUse(String),
     #[error("{0}")]
     InvalidDeletionRequest(String),
+    #[error("{0}")]
+    Header(#[from] ParseHeaderError),
+    #[error("{0}")]
+    HeaderBuild(#[from] HeaderBuildError),
 }
 
 impl actix_web::ResponseError for RBACError {
@@ -656,6 +663,8 @@ impl actix_web::ResponseError for RBACError {
             Self::UserGroupNotEmpty(_) => StatusCode::BAD_REQUEST,
             Self::ResourceInUse(_) => StatusCode::BAD_REQUEST,
             Self::InvalidDeletionRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Header(_) => StatusCode::BAD_REQUEST,
+            Self::HeaderBuild(e) => actix_web::ResponseError::status_code(e),
         }
     }
 
@@ -722,5 +731,75 @@ mod tests {
             .is_err(),
             "password generation must wait for UPDATE_LOCK before reading metadata"
         );
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{ResponseError, http::header::HeaderValue, test::TestRequest};
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+
+    fn malformed_tenant_request() -> HttpRequest {
+        TestRequest::default()
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request()
+    }
+
+    #[test]
+    fn header_errors_map_to_expected_status() {
+        assert_eq!(
+            RBACError::from(ParseHeaderError::InvalidTenantId).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            RBACError::from(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))
+                .status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            RBACError::from(HeaderBuildError::Internal("node token")).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[actix_web::test]
+    async fn list_users_rejects_malformed_tenant() {
+        let Err(err) = list_users(malformed_tenant_request()).await else {
+            panic!("malformed tenant must be rejected");
+        };
+        assert!(matches!(
+            err,
+            RBACError::Header(ParseHeaderError::InvalidTenantId)
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn list_users_prism_rejects_malformed_tenant() {
+        let Err(err) = list_users_prism(malformed_tenant_request()).await else {
+            panic!("malformed tenant must be rejected");
+        };
+        assert!(matches!(
+            err,
+            RBACError::Header(ParseHeaderError::InvalidTenantId)
+        ));
+    }
+
+    #[actix_web::test]
+    async fn get_prism_user_rejects_malformed_tenant() {
+        let Err(err) =
+            get_prism_user(malformed_tenant_request(), Path::from("alice".to_owned())).await
+        else {
+            panic!("malformed tenant must be rejected");
+        };
+        assert!(matches!(
+            err,
+            RBACError::Header(ParseHeaderError::InvalidTenantId)
+        ));
     }
 }

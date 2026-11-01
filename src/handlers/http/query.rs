@@ -55,6 +55,7 @@ use crate::rbac::Users;
 use crate::response::QueryResponse;
 use crate::storage::ObjectStorageError;
 use crate::utils::actix::extract_session_key_from_req;
+use crate::utils::header_parsing::{HeaderBuildError, ParseHeaderError};
 use crate::utils::time::{TimeParseError, TimeRange, parse_time_expression};
 use crate::utils::{get_tenant_id_from_request, user_auth_for_datasets};
 
@@ -155,7 +156,7 @@ pub async fn get_records_and_fields_for_authorized_query(
 }
 
 pub async fn query(req: HttpRequest, query_request: Query) -> Result<HttpResponse, QueryError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let creds = extract_session_key_from_req(&req)?;
     query_internal(query_request, &creds, &tenant_id).await
 }
@@ -423,7 +424,7 @@ pub async fn get_counts(
 ) -> Result<impl Responder, QueryError> {
     let creds = extract_session_key_from_req(&req)?;
     let permissions = Users.get_permissions(&creds);
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let body = counts_request.into_inner();
 
     // does user have access to table?
@@ -742,6 +743,10 @@ Description: {0}"#
     ParserError(#[from] ParserError),
     #[error(transparent)]
     MetastoreError(#[from] MetastoreError),
+    #[error("{0}")]
+    Header(#[from] ParseHeaderError),
+    #[error("{0}")]
+    HeaderBuild(#[from] HeaderBuildError),
 }
 
 impl actix_web::ResponseError for QueryError {
@@ -750,6 +755,8 @@ impl actix_web::ResponseError for QueryError {
             QueryError::JsonParse(_) => StatusCode::INTERNAL_SERVER_ERROR,
             QueryError::Execute(e) => e.status_code(),
             QueryError::MetastoreError(e) => e.status_code(),
+            QueryError::Header(_) => StatusCode::BAD_REQUEST,
+            QueryError::HeaderBuild(e) => actix_web::ResponseError::status_code(e),
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -861,5 +868,56 @@ mod response_tests {
                 expected.as_bytes()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{ResponseError, http::header::HeaderValue, test::TestRequest};
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+
+    #[test]
+    fn header_errors_map_to_expected_status() {
+        assert_eq!(
+            QueryError::from(ParseHeaderError::InvalidTenantId).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            QueryError::from(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))
+                .status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            QueryError::from(HeaderBuildError::Internal("querier token")).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[actix_web::test]
+    async fn query_rejects_malformed_tenant() {
+        let req = TestRequest::default()
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request();
+        let query_request = Query {
+            query: "SELECT 1".to_owned(),
+            start_time: "1h".to_owned(),
+            end_time: "now".to_owned(),
+            send_null: false,
+            fields: false,
+            streaming: false,
+            filter_tags: None,
+        };
+        let Err(err) = query(req, query_request).await else {
+            panic!("malformed tenant must be rejected");
+        };
+        assert!(matches!(
+            err,
+            QueryError::Header(ParseHeaderError::InvalidTenantId)
+        ));
     }
 }

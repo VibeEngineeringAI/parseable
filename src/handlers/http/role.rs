@@ -36,7 +36,10 @@ use crate::{
         user::UserType,
     },
     storage::{ObjectStorageError, StorageMetadata},
-    utils::get_tenant_id_from_request,
+    utils::{
+        get_tenant_id_from_request,
+        header_parsing::{HeaderBuildError, ParseHeaderError},
+    },
     validator::{self, error::UsernameValidationError},
 };
 
@@ -56,7 +59,7 @@ pub async fn put(
         return Err(RoleError::SuperAdminPrivilege);
     }
     let name = name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
 
     // validate the role name
     validator::user_role_name(&name).map_err(RoleError::ValidationError)?;
@@ -111,7 +114,7 @@ pub async fn put(
 // Fetch role by name
 pub async fn get(req: HttpRequest, name: web::Path<String>) -> Result<impl Responder, RoleError> {
     let name = name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(get_internal(&name, &tenant_id).await?))
 }
 
@@ -128,7 +131,7 @@ pub async fn get_internal(name: &str, tenant_id: &Option<String>) -> Result<Role
 // Handler for GET /api/v1/roles
 // Fetch all roles in the system
 pub async fn list(req: HttpRequest) -> Result<impl Responder, RoleError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(list_internal(&tenant_id).await?))
 }
 
@@ -155,7 +158,7 @@ pub async fn delete(
 ) -> Result<impl Responder, RoleError> {
     let _guard = super::rbac::UPDATE_LOCK.lock().await;
     let name = name.into_inner();
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
     if let Some(tenant_roles) = roles().get(tenant)
         && let Some(role) = tenant_roles.get(&name)
@@ -197,14 +200,14 @@ pub async fn put_default(
     req: HttpRequest,
     name: web::Json<String>,
 ) -> Result<impl Responder, RoleError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     set_default(Some(name.into_inner()), &tenant_id).await?;
     Ok(HttpResponse::Ok().finish())
 }
 
 // Handler for DELETE /api/v1/role/default
 pub async fn delete_default(req: HttpRequest) -> Result<impl Responder, RoleError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     set_default(None, &tenant_id).await?;
     Ok(HttpResponse::Ok().finish())
 }
@@ -262,7 +265,7 @@ async fn set_default(name: Option<String>, tenant_id: &Option<String>) -> Result
 // Handler for GET /api/v1/role/default
 // Delete existing role
 pub async fn get_default(req: HttpRequest) -> Result<impl Responder, RoleError> {
-    let tenant_id = get_tenant_id_from_request(&req);
+    let tenant_id = get_tenant_id_from_request(&req)?;
     Ok(web::Json(get_default_internal(&tenant_id)))
 }
 
@@ -325,6 +328,10 @@ pub enum RoleError {
     ValidationError(#[from] UsernameValidationError),
     #[error("Cannot create a role with superadmin privilege.")]
     SuperAdminPrivilege,
+    #[error("{0}")]
+    Header(#[from] ParseHeaderError),
+    #[error("{0}")]
+    HeaderBuild(#[from] HeaderBuildError),
 }
 
 impl actix_web::ResponseError for RoleError {
@@ -339,6 +346,8 @@ impl actix_web::ResponseError for RoleError {
             Self::SerdeError(_) => StatusCode::BAD_REQUEST,
             Self::Network(_) => StatusCode::BAD_GATEWAY,
             Self::ValidationError(_) => StatusCode::BAD_REQUEST,
+            Self::Header(_) => StatusCode::BAD_REQUEST,
+            Self::HeaderBuild(e) => actix_web::ResponseError::status_code(e),
         }
     }
 
@@ -436,5 +445,48 @@ mod put_tests {
             Some(reader_role()),
             "rejected update must not change the live role"
         );
+    }
+}
+
+#[cfg(test)]
+mod header_error_tests {
+    use actix_web::{ResponseError, http::header::HeaderValue, test::TestRequest};
+
+    use super::*;
+    use crate::handlers::TENANT_ID;
+
+    #[test]
+    fn header_errors_map_to_expected_status() {
+        assert_eq!(
+            RoleError::from(ParseHeaderError::InvalidTenantId).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            RoleError::from(HeaderBuildError::Input(ParseHeaderError::InvalidTenantId))
+                .status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            RoleError::from(HeaderBuildError::Internal("cluster secret hash")).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[actix_web::test]
+    async fn list_rejects_malformed_tenant() {
+        let req = TestRequest::default()
+            .insert_header((
+                TENANT_ID,
+                HeaderValue::from_bytes(b"t\xff").expect("obs-text is a valid header value"),
+            ))
+            .to_http_request();
+        let Err(err) = list(req).await else {
+            panic!("malformed tenant must be rejected");
+        };
+        assert!(matches!(
+            err,
+            RoleError::Header(ParseHeaderError::InvalidTenantId)
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
     }
 }
