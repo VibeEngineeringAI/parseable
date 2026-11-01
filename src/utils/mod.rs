@@ -253,16 +253,37 @@ pub fn is_admin_for_session(session_key: &SessionKey) -> bool {
     false
 }
 
+/// Auth headers for a request this node sends to a peer on behalf of `req`.
+///
+/// With a cluster secret the peer authenticates the caller by `userid`.
+/// Without one, the caller's `Authorization` header is forwarded if present;
+/// otherwise the request authenticates as this node with `node_token`. A
+/// session cookie is never forwarded, since sessions live only on the node
+/// that issued them and the peer would reject it.
 pub fn create_intracluster_auth_headermap(
     req: &HeaderMap,
     node_token: &str,
     userid: &str,
 ) -> reqwest::header::HeaderMap {
+    intracluster_auth_headermap(
+        req,
+        node_token,
+        userid,
+        CLUSTER_SECRET.get().map(|(_, hash)| hash.as_str()),
+    )
+}
+
+fn intracluster_auth_headermap(
+    req: &HeaderMap,
+    node_token: &str,
+    userid: &str,
+    cluster_secret_hash: Option<&str>,
+) -> reqwest::header::HeaderMap {
     let mut map = reqwest::header::HeaderMap::new();
     let tenant_id = req
         .get(TENANT_ID)
         .map(|tenant_value| tenant_value.to_str().unwrap().to_owned());
-    if let Some((_, hash)) = CLUSTER_SECRET.get() {
+    if let Some(hash) = cluster_secret_hash {
         // also insert server secret along with other required headers for query forwarding
         map.insert(
             reqwest::header::HeaderName::from_static(CLUSTER_SECRET_HEADER),
@@ -282,14 +303,6 @@ pub fn create_intracluster_auth_headermap(
             reqwest::header::AUTHORIZATION,
             reqwest::header::HeaderValue::from_bytes(auth.as_bytes()).unwrap(),
         );
-    } else if req.contains_key(actix_web::http::header::COOKIE) {
-        // multiple cookies
-        for cookie in req.get_all(actix_web::http::header::COOKIE) {
-            map.insert(
-                reqwest::header::COOKIE,
-                reqwest::header::HeaderValue::from_bytes(cookie.as_bytes()).unwrap(),
-            );
-        }
     } else {
         map.insert(
             reqwest::header::AUTHORIZATION,
@@ -297,4 +310,60 @@ pub fn create_intracluster_auth_headermap(
         );
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::http::header::{AUTHORIZATION, COOKIE, HeaderValue};
+
+    use super::*;
+
+    const NODE_TOKEN: &str = "Basic bm9kZTpzZWNyZXQ=";
+
+    fn headers(pairs: &[(actix_web::http::header::HeaderName, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(name.clone(), HeaderValue::from_static(value));
+        }
+        map
+    }
+
+    #[test]
+    fn session_cookie_is_replaced_by_node_token() {
+        let req = headers(&[(COOKIE, "session=01M6ARA6TCK200TXKYC6CWRN5D; username=admin")]);
+        let map = intracluster_auth_headermap(&req, NODE_TOKEN, "admin", None);
+        assert!(map.get(reqwest::header::COOKIE).is_none());
+        assert_eq!(map.get(reqwest::header::AUTHORIZATION).unwrap(), NODE_TOKEN);
+    }
+
+    #[test]
+    fn caller_authorization_is_forwarded() {
+        let req = headers(&[
+            (AUTHORIZATION, "Basic dXNlcjpwYXNz"),
+            (COOKIE, "session=01M6ARA6TCK200TXKYC6CWRN5D"),
+        ]);
+        let map = intracluster_auth_headermap(&req, NODE_TOKEN, "user", None);
+        assert!(map.get(reqwest::header::COOKIE).is_none());
+        assert_eq!(
+            map.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Basic dXNlcjpwYXNz"
+        );
+    }
+
+    #[test]
+    fn no_credentials_use_node_token() {
+        let map = intracluster_auth_headermap(&HeaderMap::new(), NODE_TOKEN, "admin", None);
+        assert_eq!(map.get(reqwest::header::AUTHORIZATION).unwrap(), NODE_TOKEN);
+    }
+
+    #[test]
+    fn cluster_secret_identifies_caller_without_credentials() {
+        let req = headers(&[(COOKIE, "session=01M6ARA6TCK200TXKYC6CWRN5D")]);
+        let map = intracluster_auth_headermap(&req, NODE_TOKEN, "admin", Some("hash"));
+        assert_eq!(map.get(CLUSTER_SECRET_HEADER).unwrap(), "hash");
+        assert_eq!(map.get("intra-cluster-userid").unwrap(), "admin");
+        assert_eq!(map.get("intra-cluster-tenant").unwrap(), DEFAULT_TENANT);
+        assert!(map.get(reqwest::header::COOKIE).is_none());
+        assert!(map.get(reqwest::header::AUTHORIZATION).is_none());
+    }
 }

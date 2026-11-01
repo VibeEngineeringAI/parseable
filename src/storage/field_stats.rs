@@ -36,7 +36,6 @@ use crate::parseable::PARSEABLE;
 use crate::storage::ObjectStorageError;
 use crate::storage::StreamType;
 use crate::tenants::TENANT_METADATA;
-use crate::utils::create_intracluster_auth_headermap;
 use crate::utils::get_tenant_id_from_request;
 use crate::utils::get_user_from_request;
 use crate::utils::json::apply_generic_flattening_for_partition;
@@ -916,21 +915,16 @@ pub async fn get_dataset_stats(
                 );
                 Some(map)
             } else {
-                let auth = create_intracluster_auth_headermap(
-                    req.headers(),
-                    "",
-                    &get_user_from_request(&req).unwrap(),
-                );
-                let mut map = HeaderMap::new();
-
-                for (key, value) in auth.iter() {
-                    if let Ok(name) = HeaderName::from_bytes(key.as_str().as_bytes())
-                        && let Ok(val) = HeaderValue::from_bytes(value.as_bytes())
-                    {
-                        map.insert(name, val);
-                    }
-                }
-                Some(map)
+                // Forward the caller's credentials if they sent any. A session
+                // cookie is only valid on this node, so without credentials
+                // `send_query_request` falls back to the querier's own token.
+                req.headers()
+                    .get(actix_web::http::header::AUTHORIZATION)
+                    .map(|auth| {
+                        let mut map = HeaderMap::new();
+                        map.insert(actix_web::http::header::AUTHORIZATION, auth.clone());
+                        map
+                    })
             };
 
             let response = match send_query_request(auth, &query_request, &tenant_id).await {
