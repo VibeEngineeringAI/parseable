@@ -503,7 +503,7 @@ pub async fn sync_streams_with_ingestors(
     tenant_id: &Option<String>,
 ) -> Result<(), StreamError> {
     let (mut reqwest_headers, needs_node_token) = stream_sync_headers(&headers);
-    check_stream_sync_tenant(needs_node_token, &stream_name, tenant_id)?;
+    check_stream_sync_tenant(needs_node_token, stream_name, tenant_id)?;
 
     if let Some(userid) = fallback_intracluster_userid(
         reqwest_headers.contains_key(INTRA_CLUSTER_USERID),
