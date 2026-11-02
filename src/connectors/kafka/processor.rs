@@ -111,6 +111,9 @@ fn build_and_process_event(
     let mut p_custom_fields = HashMap::new();
     p_custom_fields.insert(USER_AGENT_KEY.to_string(), "kafka".to_string());
 
+    // Offsets are committed whether or not the chunk is ingested and the
+    // producer gets no rejection signal, so the dataset field limit is not
+    // enforced here: rejecting would silently drop the whole chunk.
     json::Event::new(Value::Array(json_vec), Utc::now())
         .into_event(
             stream_name,
@@ -126,7 +129,7 @@ fn build_and_process_event(
             &tenant_id,
             meta.infer_timestamp,
         )?
-        .process()?;
+        .process_without_field_limit()?;
 
     Ok(())
 }
@@ -198,9 +201,13 @@ where
             .for_each_concurrent(None, |records| async {
                 if let Some(last_record) = records.iter().max_by_key(|r| r.offset) {
                     let tpl = last_record.offset_to_commit().unwrap();
+                    let record_count = records.len();
 
                     if let Err(e) = self.processor.process(records).await {
-                        error!("Failed to process records for {:?}: {:?}", tp, e);
+                        error!(
+                            "Failed to process {} records for {:?}; offsets up to {:?} will still be committed and these records are dropped: {:?}",
+                            record_count, tp, tpl, e
+                        );
                     }
 
                     //CommitMode::Async race condition.

@@ -63,6 +63,22 @@ pub struct Event {
 
 // Events holds the schema related to a each event for a single log stream
 impl Event {
+    /// Processes the event, holding user-defined streams to the configured
+    /// dataset field limit.
+    pub fn process(self) -> Result<(), EventError> {
+        let limit = PARSEABLE.options.dataset_fields_allowed_limit;
+        self.process_with_field_limit(limit)
+    }
+
+    /// Processes the event without enforcing the dataset field limit.
+    ///
+    /// For connector ingestion (such as Kafka), which commits source offsets
+    /// regardless of the outcome and cannot report a rejection back to the
+    /// producer; enforcing the limit there would silently drop data.
+    pub fn process_without_field_limit(self) -> Result<(), EventError> {
+        self.process_with_field_limit(usize::MAX)
+    }
+
     #[instrument(
         name = "event_process",
         level = "info",
@@ -74,7 +90,7 @@ impl Event {
         )
     )]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub fn process(self) -> Result<(), EventError> {
+    fn process_with_field_limit(self, field_limit: usize) -> Result<(), EventError> {
         let mut key = get_schema_key(&self.rb.schema().fields);
         if self.time_partition.is_some() {
             let parsed_timestamp_to_min = self.parsed_timestamp.format("%Y%m%dT%H%M").to_string();
@@ -89,14 +105,14 @@ impl Event {
 
         let stream = PARSEABLE.get_or_create_stream(&self.stream_name, &self.tenant_id);
 
-        // User ingestion is held to the configured field limit; internal
+        // User ingestion is held to the given field limit; internal
         // streams have fixed schemas and are exempt.
         let schema_committed = if self.stream_type == StreamType::UserDefined {
             commit_ingested_schema(
                 &self.stream_name,
                 &stream.metadata,
                 &self.rb.schema(),
-                PARSEABLE.options.dataset_fields_allowed_limit,
+                field_limit,
                 self.is_first_event,
             )?
         } else if self.is_first_event {
@@ -461,6 +477,16 @@ mod tests {
         let stream = metadata(vec![]);
         assert_limit_error(ingest(&stream, record("f", 1500), &[], 1000), 1501, 1000);
         assert!(field_names(&stream).is_empty());
+    }
+
+    #[test]
+    fn unlimited_commit_accepts_wide_and_over_limit_streams() {
+        // The connector path commits with no effective limit
+        let stream = metadata(vec![]);
+        assert!(ingest(&stream, record("f", 1500), &[], usize::MAX).unwrap());
+        assert_eq!(field_names(&stream).len(), 1501);
+        assert!(ingest(&stream, record("g", 5), &[], usize::MAX).unwrap());
+        assert_eq!(field_names(&stream).len(), 1506);
     }
 
     #[test]
