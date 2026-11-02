@@ -197,6 +197,9 @@ pub fn commit_schema(
 /// would exceed `limit`, which includes streams already over the limit. A first
 /// event's schema is merged in. Any other event on a dynamic schema has its
 /// missing fields, such as new header fields, added without merging the rest.
+/// Non-first events on a static schema never change the stored schema, so only
+/// the stored schema is checked against the limit; the generated `p_` and
+/// header fields such events carry are not counted.
 /// The final count and commit happen under one write lock on the stream
 /// metadata, so concurrent events cannot each pass the check and together
 /// exceed the limit; events adding nothing only take a read lock. Startup and
@@ -212,15 +215,25 @@ pub(crate) fn commit_ingested_schema(
 ) -> Result<bool, EventError> {
     {
         let metadata = metadata.read().expect(LOCK_EXPECT);
+        if !is_first_event && metadata.static_schema_flag {
+            // The stored schema cannot grow, so the event's extra fields
+            // (generated and header columns) must not count.
+            check_field_limit(stream_name, metadata.schema.len(), limit)?;
+            return Ok(false);
+        }
         let new_fields = new_field_names(&metadata.schema, [schema]).len();
         check_field_limit(stream_name, metadata.schema.len() + new_fields, limit)?;
-        if !is_first_event && (new_fields == 0 || metadata.static_schema_flag) {
+        if !is_first_event && new_fields == 0 {
             return Ok(false);
         }
     }
 
     let _span = info_span!("commit_ingested_schema", stream_name).entered();
     let mut metadata = metadata.write().expect(LOCK_EXPECT);
+    if !is_first_event && metadata.static_schema_flag {
+        check_field_limit(stream_name, metadata.schema.len(), limit)?;
+        return Ok(false);
+    }
     let new_fields = new_field_names(&metadata.schema, [schema]).len();
     check_field_limit(stream_name, metadata.schema.len() + new_fields, limit)?;
     if is_first_event {
@@ -240,6 +253,9 @@ pub(crate) fn commit_ingested_schema(
 /// Checks that the stream's fields together with every schema in `schemas`
 /// stay within `limit`, counting each new field name once.
 ///
+/// For static-schema streams only the stored schema is checked, since
+/// ingestion cannot grow it.
+///
 /// Lets a request that yields several events reject before processing any of
 /// them. It does not reserve room: `commit_ingested_schema` still enforces the
 /// limit as each event is processed.
@@ -250,6 +266,9 @@ pub(crate) fn check_ingested_schemas(
     limit: usize,
 ) -> Result<(), EventError> {
     let metadata = metadata.read().expect(LOCK_EXPECT);
+    if metadata.static_schema_flag {
+        return check_field_limit(stream_name, metadata.schema.len(), limit);
+    }
     let new_fields =
         new_field_names(&metadata.schema, schemas.iter().map(|schema| &**schema)).len();
     check_field_limit(stream_name, metadata.schema.len() + new_fields, limit)
@@ -559,14 +578,24 @@ mod tests {
     }
 
     #[test]
-    fn static_schema_known_event_is_counted_but_not_committed() {
+    fn static_schema_known_event_ignores_uncommitted_header_fields() {
         let stream = metadata(vec![p_timestamp(), Field::new("msg", DataType::Utf8, true)]);
         stream.write().unwrap().static_schema_flag = true;
         let json = json!({"msg": "hello"});
-        let headers = [("env", "prod")];
+        let headers = [("env", "prod"), ("p_user_agent", "curl")];
 
-        assert_limit_error(ingest(&stream, json.clone(), &headers, 2), 3, 2);
-        assert!(!ingest(&stream, json, &headers, 3).unwrap());
+        // The stored schema is exactly at the limit; header fields are never
+        // committed to a static schema, so they must not count, every time.
+        assert!(!ingest(&stream, json.clone(), &headers, 2).unwrap());
+        assert!(!ingest(&stream, json.clone(), &headers, 2).unwrap());
+        assert_eq!(field_names(&stream).len(), 2);
+
+        // The whole-request check ignores them too
+        let (schema, _) = event_schema(&stream, json.clone(), &headers);
+        check_ingested_schemas(STREAM, &stream, &[schema], 2).unwrap();
+
+        // A static schema already over the limit is still rejected
+        assert_limit_error(ingest(&stream, json, &headers, 1), 2, 1);
         assert_eq!(field_names(&stream).len(), 2);
     }
 
