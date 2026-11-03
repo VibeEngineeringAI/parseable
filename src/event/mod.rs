@@ -75,6 +75,10 @@ impl Event {
     /// For connector ingestion (such as Kafka), which commits source offsets
     /// regardless of the outcome and cannot report a rejection back to the
     /// producer; enforcing the limit there would silently drop data.
+    ///
+    /// Also used for events whose schemas were already checked and committed
+    /// together with `commit_ingested_schemas`, so that a request yielding
+    /// several events cannot fail on the limit after some were staged.
     pub fn process_without_field_limit(self) -> Result<(), EventError> {
         self.process_with_field_limit(usize::MAX)
     }
@@ -213,8 +217,8 @@ pub fn commit_schema(
 /// would exceed `limit`, which includes streams already over the limit. A first
 /// event's schema is merged in. Any other event on a dynamic schema has its
 /// missing fields, such as new header fields, added without merging the rest.
-/// Non-first events on a static schema never change the stored schema, so only
-/// the stored schema is checked against the limit; the generated `p_` and
+/// Events on a static schema (first or not) never change the stored schema, so
+/// only the stored schema is checked against the limit; the generated `p_` and
 /// header fields such events carry are not counted.
 /// The final count and commit happen under one write lock on the stream
 /// metadata, so concurrent events cannot each pass the check and together
@@ -231,22 +235,25 @@ pub(crate) fn commit_ingested_schema(
 ) -> Result<bool, EventError> {
     {
         let metadata = metadata.read().expect(LOCK_EXPECT);
-        if !is_first_event && metadata.static_schema_flag {
+        if metadata.static_schema_flag {
             // The stored schema cannot grow, so the event's extra fields
             // (generated and header columns) must not count.
             check_field_limit(stream_name, metadata.schema.len(), limit)?;
             return Ok(false);
         }
-        let new_fields = new_field_names(&metadata.schema, [schema]).len();
-        check_field_limit(stream_name, metadata.schema.len() + new_fields, limit)?;
-        if !is_first_event && new_fields == 0 {
+        if !is_first_event && !has_new_fields(&metadata.schema, schema) {
+            // Common case: nothing to count or commit, so avoid building the
+            // set of new field names.
+            check_field_limit(stream_name, metadata.schema.len(), limit)?;
             return Ok(false);
         }
+        let new_fields = new_field_names(&metadata.schema, [schema]).len();
+        check_field_limit(stream_name, metadata.schema.len() + new_fields, limit)?;
     }
 
     let _span = info_span!("commit_ingested_schema", stream_name).entered();
     let mut metadata = metadata.write().expect(LOCK_EXPECT);
-    if !is_first_event && metadata.static_schema_flag {
+    if metadata.static_schema_flag {
         check_field_limit(stream_name, metadata.schema.len(), limit)?;
         return Ok(false);
     }
@@ -255,14 +262,68 @@ pub(crate) fn commit_ingested_schema(
     if is_first_event {
         merge_into_schema(&mut metadata.schema, schema).map_err(StagingError::from)?;
     } else {
+        if new_fields == 0 {
+            return Ok(false);
+        }
         // Only add the missing fields: a header field sharing a name with a
         // typed stream field was never merged and must not fail the event.
-        for field in schema.fields() {
-            if !metadata.schema.contains_key(field.name()) {
-                metadata.schema.insert(field.name().clone(), field.clone());
-            }
+        add_missing_fields(&mut metadata.schema, schema);
+    }
+    Ok(true)
+}
+
+/// Checks the union of several events' schemas against the stream's field
+/// limit and commits all of them under a single write lock, applying the same
+/// per-event rules as `commit_ingested_schema` (merge first events, add only
+/// missing fields for others, never grow a static schema).
+///
+/// Either every schema is committed or none is, so a request yielding several
+/// events reserves its fields before staging any event. The events can then
+/// be processed without a further limit check, so the request cannot fail on
+/// the limit partway even if concurrent requests add fields meanwhile.
+///
+/// Returns whether the schema was committed.
+pub(crate) fn commit_ingested_schemas(
+    stream_name: &str,
+    metadata: &RwLock<LogStreamMetadata>,
+    schemas: &[(SchemaRef, bool)],
+    limit: usize,
+) -> Result<bool, EventError> {
+    let any_first_event = schemas.iter().any(|(_, is_first)| *is_first);
+    {
+        let metadata = metadata.read().expect(LOCK_EXPECT);
+        let new_fields = check_schemas_locked(
+            stream_name,
+            &metadata,
+            schemas.iter().map(|(schema, _)| &**schema),
+            limit,
+        )?;
+        if metadata.static_schema_flag || (new_fields == 0 && !any_first_event) {
+            return Ok(false);
         }
     }
+
+    let _span = info_span!("commit_ingested_schemas", stream_name).entered();
+    let mut metadata = metadata.write().expect(LOCK_EXPECT);
+    let new_fields = check_schemas_locked(
+        stream_name,
+        &metadata,
+        schemas.iter().map(|(schema, _)| &**schema),
+        limit,
+    )?;
+    if metadata.static_schema_flag || (new_fields == 0 && !any_first_event) {
+        return Ok(false);
+    }
+    // Build the result on a copy so a merge failure leaves the schema as is.
+    let mut merged = metadata.schema.clone();
+    for (schema, is_first_event) in schemas {
+        if *is_first_event {
+            merge_into_schema(&mut merged, schema).map_err(StagingError::from)?;
+        } else {
+            add_missing_fields(&mut merged, schema);
+        }
+    }
+    metadata.schema = merged;
     Ok(true)
 }
 
@@ -272,9 +333,8 @@ pub(crate) fn commit_ingested_schema(
 /// For static-schema streams only the stored schema is checked, since
 /// ingestion cannot grow it.
 ///
-/// Lets a request that yields several events reject before processing any of
-/// them. It does not reserve room: `commit_ingested_schema` still enforces the
-/// limit as each event is processed.
+/// It does not reserve room; use `commit_ingested_schemas` for that.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn check_ingested_schemas(
     stream_name: &str,
     metadata: &RwLock<LogStreamMetadata>,
@@ -282,12 +342,48 @@ pub(crate) fn check_ingested_schemas(
     limit: usize,
 ) -> Result<(), EventError> {
     let metadata = metadata.read().expect(LOCK_EXPECT);
+    check_schemas_locked(
+        stream_name,
+        &metadata,
+        schemas.iter().map(|schema| &**schema),
+        limit,
+    )
+    .map(|_| ())
+}
+
+/// Checks `schemas` against the limit given already locked stream metadata,
+/// returning the number of new field names (always 0 for static schemas).
+fn check_schemas_locked<'a>(
+    stream_name: &str,
+    metadata: &LogStreamMetadata,
+    schemas: impl IntoIterator<Item = &'a Schema>,
+    limit: usize,
+) -> Result<usize, EventError> {
     if metadata.static_schema_flag {
-        return check_field_limit(stream_name, metadata.schema.len(), limit);
+        check_field_limit(stream_name, metadata.schema.len(), limit)?;
+        return Ok(0);
     }
-    let new_fields =
-        new_field_names(&metadata.schema, schemas.iter().map(|schema| &**schema)).len();
-    check_field_limit(stream_name, metadata.schema.len() + new_fields, limit)
+    let new_fields = new_field_names(&metadata.schema, schemas).len();
+    check_field_limit(stream_name, metadata.schema.len() + new_fields, limit)?;
+    Ok(new_fields)
+}
+
+/// Whether `schema` has any field name that `current` lacks.
+fn has_new_fields(current: &HashMap<String, Arc<Field>>, schema: &Schema) -> bool {
+    schema
+        .fields()
+        .iter()
+        .any(|field| !current.contains_key(field.name()))
+}
+
+/// Adds the fields of `schema` whose names `map` lacks, leaving existing
+/// fields untouched.
+fn add_missing_fields(map: &mut HashMap<String, Arc<Field>>, schema: &Schema) {
+    for field in schema.fields() {
+        if !map.contains_key(field.name()) {
+            map.insert(field.name().clone(), field.clone());
+        }
+    }
 }
 
 /// Names of the fields in `schemas` that `current` lacks, without duplicates.
@@ -356,8 +452,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DEFAULT_TIMESTAMP_KEY, check_ingested_schemas, commit_ingested_schema, error::EventError,
-        merge_into_schema,
+        DEFAULT_TIMESTAMP_KEY, check_ingested_schemas, commit_ingested_schema,
+        commit_ingested_schemas, error::EventError, merge_into_schema,
     };
     use crate::{
         event::format::{EventFormat, json},
@@ -626,6 +722,27 @@ mod tests {
     }
 
     #[test]
+    fn static_schema_first_event_neither_counts_nor_merges_extra_fields() {
+        let stream = metadata(vec![p_timestamp(), Field::new("msg", DataType::Utf8, true)]);
+        stream.write().unwrap().static_schema_flag = true;
+        let schema = Schema::new(vec![
+            p_timestamp(),
+            Field::new("msg", DataType::Utf8, true),
+            Field::new("p_user_agent", DataType::Utf8, true),
+            Field::new("env", DataType::Utf8, true),
+        ]);
+
+        // Treated like a non-first event: the stored schema is at the limit
+        // and must not grow.
+        assert!(!commit_ingested_schema(STREAM, &stream, &schema, 2, true).unwrap());
+        assert!(!commit_ingested_schema(STREAM, &stream, &schema, 2, false).unwrap());
+        assert!(
+            !commit_ingested_schemas(STREAM, &stream, &[(Arc::new(schema), true)], 2).unwrap()
+        );
+        assert_eq!(field_names(&stream).len(), 2);
+    }
+
+    #[test]
     fn over_limit_stream_rejects_ingestion_but_stays_recoverable() {
         let mut wide = utf8_fields("f", 19);
         wide.push(p_timestamp());
@@ -671,6 +788,45 @@ mod tests {
         check_ingested_schemas(STREAM, &stream, std::slice::from_ref(&b), 12).unwrap();
         assert_limit_error(check_ingested_schemas(STREAM, &stream, &[a, b], 12), 13, 12);
         assert_eq!(field_names(&stream).len(), 1);
+    }
+
+    #[test]
+    fn whole_request_commit_is_all_or_nothing() {
+        let stream = metadata(vec![p_timestamp()]);
+        let a: SchemaRef = Arc::new(Schema::new(utf8_fields("a", 6)));
+        let b: SchemaRef = Arc::new(Schema::new(utf8_fields("b", 6)));
+
+        // The union does not fit: nothing is committed
+        assert_limit_error(
+            commit_ingested_schemas(STREAM, &stream, &[(a.clone(), true), (b.clone(), true)], 12),
+            13,
+            12,
+        );
+        assert_eq!(field_names(&stream).len(), 1);
+
+        // The union fits: everything is committed at once, so processing the
+        // events afterwards adds nothing and cannot hit the limit
+        assert!(
+            commit_ingested_schemas(STREAM, &stream, &[(a.clone(), true), (b.clone(), false)], 13)
+                .unwrap()
+        );
+        assert_eq!(field_names(&stream).len(), 13);
+        assert!(!commit_ingested_schema(STREAM, &stream, &b, 13, false).unwrap());
+        // Nothing new: no commit
+        assert!(!commit_ingested_schemas(STREAM, &stream, &[(b, false)], 13).unwrap());
+
+        // A type conflict in any event leaves the schema untouched
+        let before = field_names(&stream);
+        let c: SchemaRef = Arc::new(Schema::new(utf8_fields("c", 1)));
+        let conflict: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "a0",
+            DataType::Int64,
+            true,
+        )]));
+        let result =
+            commit_ingested_schemas(STREAM, &stream, &[(c, true), (conflict, true)], 100);
+        assert!(matches!(result, Err(EventError::Staging(_))), "{result:?}");
+        assert_eq!(field_names(&stream), before);
     }
 
     #[test]
