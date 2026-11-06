@@ -1533,6 +1533,25 @@ pub(crate) fn stream_relative_path(
     }
 }
 
+/// Builds the path of a stream's data directory, or of a partition directory
+/// inside it such as `date=…` or `hour=…`. A tenant other than the default
+/// keeps its data under `{tenant}/`, as [`stream_relative_path`] writes it.
+pub(crate) fn stream_data_path(
+    tenant_id: &Option<String>,
+    stream_name: &str,
+    partitions: &[&str],
+) -> RelativePathBuf {
+    let tenant = tenant_id
+        .as_deref()
+        .filter(|tenant| *tenant != DEFAULT_TENANT);
+    RelativePathBuf::from_iter(
+        tenant
+            .into_iter()
+            .chain([stream_name])
+            .chain(partitions.iter().copied()),
+    )
+}
+
 pub fn sync_all_streams(joinset: &mut JoinSet<Result<(), ObjectStorageError>>) {
     let object_store = PARSEABLE.storage().get_object_store();
     let tenants = if let Some(tenants) = PARSEABLE.list_tenants() {
@@ -1839,6 +1858,50 @@ pub fn own_manifest_file_name() -> String {
 #[inline]
 pub fn manifest_segment_matches(manifest_path_str: &str, file_name: &str) -> bool {
     manifest_path_str.rsplit('/').next() == Some(file_name)
+}
+
+#[cfg(test)]
+mod stream_data_path_tests {
+    use super::{stream_data_path, stream_relative_path};
+    use crate::parseable::DEFAULT_TENANT;
+
+    #[test]
+    fn default_tenant_data_is_at_the_root() {
+        for tenant in [None, Some(DEFAULT_TENANT.to_owned())] {
+            assert_eq!(stream_data_path(&tenant, "app", &[]).as_str(), "app");
+            assert_eq!(
+                stream_data_path(&tenant, "app", &["date=2026-01-02"]).as_str(),
+                "app/date=2026-01-02"
+            );
+        }
+    }
+
+    #[test]
+    fn other_tenants_data_is_under_the_tenant() {
+        let tenant = Some("acme".to_owned());
+        assert_eq!(stream_data_path(&tenant, "app", &[]).as_str(), "acme/app");
+        assert_eq!(
+            stream_data_path(&tenant, "app", &["date=2026-01-02", "hour=03"]).as_str(),
+            "acme/app/date=2026-01-02/hour=03"
+        );
+    }
+
+    #[test]
+    fn matches_where_parquet_files_are_uploaded() {
+        let filename = "date=2026-01-02.hour=03.minute=04.host.data.parquet";
+        for tenant in [
+            None,
+            Some(DEFAULT_TENANT.to_owned()),
+            Some("acme".to_owned()),
+        ] {
+            let file = stream_relative_path("app", filename, &None, &tenant);
+            let date_dir = stream_data_path(&tenant, "app", &["date=2026-01-02"]);
+            assert!(
+                file.starts_with(&format!("{date_dir}/")),
+                "{file} is not under {date_dir}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -67,7 +67,9 @@ use crate::{
 use super::{
     CONNECT_TIMEOUT_SECS, DEFAULT_MAX_OBJECT_STORE_REQUESTS, ObjectStorage, ObjectStorageError,
     ObjectStorageProvider, PARSEABLE_ROOT_DIRECTORY, REQUEST_TIMEOUT_SECS,
-    STREAM_METADATA_FILE_NAME, metrics_layer::MetricLayer, object_storage::parseable_json_path,
+    STREAM_METADATA_FILE_NAME,
+    metrics_layer::MetricLayer,
+    object_storage::{parseable_json_path, stream_data_path},
     partial_path, to_object_store_path,
 };
 use crate::storage::GET_OBJECTS_CONCURRENCY;
@@ -642,11 +644,8 @@ impl S3 {
         stream: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let (prefix, tenant_str) = if let Some(tenant) = tenant_id {
-            (format!("{}/{}/", tenant, stream), tenant.as_str())
-        } else {
-            (format!("{}/", stream), DEFAULT_TENANT)
-        };
+        let prefix = format!("{}/", stream_data_path(tenant_id, stream, &[]));
+        let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         let resp: Result<object_store::ListResult, object_store::Error> = self
             .client
             .list_with_delimiter(Some(&(prefix.as_str().into())))
@@ -1243,11 +1242,8 @@ impl ObjectStorage for S3 {
         date: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let (pre, tenant_str) = if let Some(tenant) = tenant_id {
-            (format!("{tenant}/{stream_name}/{date}/"), tenant.as_str())
-        } else {
-            (format!("{stream_name}/{date}/"), DEFAULT_TENANT)
-        };
+        let pre = format!("{}/", stream_data_path(tenant_id, stream_name, &[date]));
+        let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         let resp = self
             .client
             .list_with_delimiter(Some(&object_store::path::Path::from(pre.as_str())))
@@ -1290,14 +1286,11 @@ impl ObjectStorage for S3 {
         hour: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let (pre, tenant_str) = if let Some(tenant) = tenant_id {
-            (
-                format!("{tenant}/{stream_name}/{date}/{hour}/"),
-                tenant.as_str(),
-            )
-        } else {
-            (format!("{stream_name}/{date}/{hour}/"), DEFAULT_TENANT)
-        };
+        let pre = format!(
+            "{}/",
+            stream_data_path(tenant_id, stream_name, &[date, hour])
+        );
+        let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         let resp = self
             .client
             .list_with_delimiter(Some(&object_store::path::Path::from(pre.as_str())))

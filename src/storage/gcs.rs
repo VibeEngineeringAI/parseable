@@ -62,7 +62,9 @@ use tracing::error;
 use super::{
     CONNECT_TIMEOUT_SECS, DEFAULT_MAX_OBJECT_STORE_REQUESTS, ObjectStorage, ObjectStorageError,
     ObjectStorageProvider, PARSEABLE_ROOT_DIRECTORY, REQUEST_TIMEOUT_SECS,
-    STREAM_METADATA_FILE_NAME, metrics_layer::MetricLayer, object_storage::parseable_json_path,
+    STREAM_METADATA_FILE_NAME,
+    metrics_layer::MetricLayer,
+    object_storage::{parseable_json_path, stream_data_path},
     partial_path, to_object_store_path,
 };
 use crate::storage::GET_OBJECTS_CONCURRENCY;
@@ -425,9 +427,10 @@ impl Gcs {
         stream: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
+        let prefix = format!("{}/", stream_data_path(tenant_id, stream, &[]));
         let resp: Result<object_store::ListResult, object_store::Error> = self
             .client
-            .list_with_delimiter(Some(&(stream.into())))
+            .list_with_delimiter(Some(&(prefix.as_str().into())))
             .await;
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         increment_object_store_calls_by_date("LIST", &Utc::now().date_naive().to_string(), tenant);
@@ -451,7 +454,7 @@ impl Gcs {
         // return prefixes at the root level
         let dates: Vec<_> = common_prefixes
             .iter()
-            .filter_map(|path| path.as_ref().strip_prefix(&format!("{stream}/")))
+            .filter_map(|path| path.as_ref().strip_prefix(&prefix))
             .map(String::from)
             .collect();
         tracing::Span::current().record("dates", dates.len());
@@ -1005,7 +1008,8 @@ impl ObjectStorage for Gcs {
         date: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let pre = object_store::path::Path::from(format!("{}/{}/", stream_name, date));
+        let prefix = format!("{}/", stream_data_path(tenant_id, stream_name, &[date]));
+        let pre = object_store::path::Path::from(prefix.as_str());
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         let resp = self.client.list_with_delimiter(Some(&pre)).await?;
         increment_files_scanned_in_object_store_calls_by_date(
@@ -1021,8 +1025,7 @@ impl ObjectStorage for Gcs {
             .iter()
             .filter_map(|path| {
                 let path_str = path.as_ref();
-                if let Some(stripped) = path_str.strip_prefix(&format!("{}/{}/", stream_name, date))
-                {
+                if let Some(stripped) = path_str.strip_prefix(&prefix) {
                     // Remove trailing slash if present, otherwise use as is
                     let clean_path = stripped.strip_suffix('/').unwrap_or(stripped);
                     Some(clean_path.to_string())
@@ -1043,7 +1046,11 @@ impl ObjectStorage for Gcs {
         hour: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let pre = object_store::path::Path::from(format!("{}/{}/{}/", stream_name, date, hour));
+        let prefix = format!(
+            "{}/",
+            stream_data_path(tenant_id, stream_name, &[date, hour])
+        );
+        let pre = object_store::path::Path::from(prefix.as_str());
         let resp = self.client.list_with_delimiter(Some(&pre)).await?;
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         increment_files_scanned_in_object_store_calls_by_date(
@@ -1058,9 +1065,7 @@ impl ObjectStorage for Gcs {
             .iter()
             .filter_map(|path| {
                 let path_str = path.as_ref();
-                if let Some(stripped) =
-                    path_str.strip_prefix(&format!("{}/{}/{}/", stream_name, date, hour))
-                {
+                if let Some(stripped) = path_str.strip_prefix(&prefix) {
                     // Remove trailing slash if present, otherwise use as is
                     let clean_path = stripped.strip_suffix('/').unwrap_or(stripped);
                     Some(clean_path.to_string())

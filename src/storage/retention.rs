@@ -209,11 +209,11 @@ impl From<Retention> for Vec<TaskView> {
 mod action {
     use crate::catalog::remove_manifest_from_snapshot;
     use crate::parseable::PARSEABLE;
+    use crate::storage::object_storage::stream_data_path;
     use crate::tenants::TENANT_METADATA;
     use chrono::{Days, NaiveDate, Utc};
     use futures::{StreamExt, stream::FuturesUnordered};
     use itertools::Itertools;
-    use relative_path::RelativePathBuf;
     use tracing::{error, info};
 
     pub(super) async fn delete(stream_name: String, days: u32, tenant_id: &Option<String>) {
@@ -251,7 +251,8 @@ mod action {
             }
 
             for date in dates_to_delete {
-                let path = RelativePathBuf::from_iter([&stream_name, &date]);
+                // The tenant's own data, not a same-named stream of the default tenant.
+                let path = stream_data_path(tenant_id, &stream_name, &[&date]);
                 delete_tasks.push(async move {
                     PARSEABLE
                         .storage
