@@ -1908,17 +1908,15 @@ mod stream_data_path_tests {
     fn listed_children_strip_to_their_names_for_any_stream_name() {
         // Uploads and listings go through `object_store::path::Path`, which
         // percent-encodes non-ASCII stream names such as `café`.
-        for (stream, tenant) in [
-            ("app", None),
-            ("app", Some("acme".to_owned())),
-            ("café", None),
-            ("café", Some("acme".to_owned())),
+        for (stream, tenant, stored) in [
+            ("app", None, "app/"),
+            ("app", Some("acme".to_owned()), "acme/app/"),
+            ("café", None, "caf%C3%A9/"),
+            ("café", Some("acme".to_owned()), "acme/caf%C3%A9/"),
         ] {
             let (path, prefix) = stream_data_listing_prefix(stream, &[], &tenant);
-            assert_eq!(
-                path,
-                object_store::path::Path::from(stream_data_path(stream, &[], &tenant).as_str())
-            );
+            assert_eq!(prefix, stored);
+            assert_eq!(format!("{path}/"), stored);
             let uploaded = stream_relative_path(
                 stream,
                 "date=2026-01-02.hour=03.minute=04.host.data.parquet",

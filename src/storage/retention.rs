@@ -207,7 +207,8 @@ impl From<Retention> for Vec<TaskView> {
 }
 
 mod action {
-    use crate::catalog::remove_manifest_from_snapshot;
+    use crate::catalog::{ingestor_cleanup_reaches_tenant, remove_manifest_from_snapshot};
+    use crate::option::Mode;
     use crate::parseable::PARSEABLE;
     use crate::storage::object_storage::stream_data_path;
     use crate::tenants::TENANT_METADATA;
@@ -221,6 +222,19 @@ mod action {
             .as_deref()
             .is_some_and(|tenant| TENANT_METADATA.is_workspace_suspended(tenant))
         {
+            return;
+        }
+
+        // Deleting the data without pruning the ingestors' snapshots would leave
+        // them listing deleted manifests, which breaks counts and stats for
+        // those dates and can't be cleaned up later. Keep the data instead.
+        if matches!(PARSEABLE.options.mode, Mode::Query | Mode::Prism)
+            && !ingestor_cleanup_reaches_tenant(tenant_id)
+        {
+            error!(
+                "Skipping retention for stream {stream_name} of tenant {tenant_id:?}: \
+                 ingestor snapshots can't be cleaned up for this tenant yet"
+            );
             return;
         }
 

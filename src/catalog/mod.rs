@@ -495,10 +495,10 @@ async fn create_manifest(
 /// the request authenticates with the node token, whose user has no tenant.
 /// Until a tenant can be sent with authority, only the default tenant's
 /// cleanup can be forwarded.
-fn ingestor_cleanup_reaches_tenant(tenant_id: &Option<String>) -> bool {
+pub(crate) fn ingestor_cleanup_reaches_tenant(tenant_id: &Option<String>) -> bool {
     tenant_id
         .as_deref()
-        .is_none_or(|tenant| tenant == DEFAULT_TENANT)
+        .is_none_or(|tenant| tenant.is_empty() || tenant == DEFAULT_TENANT)
 }
 
 pub async fn remove_manifest_from_snapshot(
@@ -606,6 +606,7 @@ mod ingestor_cleanup_tests {
         assert!(ingestor_cleanup_reaches_tenant(&Some(
             DEFAULT_TENANT.to_owned()
         )));
+        assert!(ingestor_cleanup_reaches_tenant(&Some(String::new())));
         assert!(!ingestor_cleanup_reaches_tenant(&Some("acme".to_owned())));
     }
 }
