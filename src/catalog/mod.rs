@@ -491,6 +491,16 @@ async fn create_manifest(
     }
 }
 
+/// An ingestor resolves the retention cleanup request to the default tenant:
+/// the request authenticates with the node token, whose user has no tenant.
+/// Until a tenant can be sent with authority, only the default tenant's
+/// cleanup can be forwarded.
+fn ingestor_cleanup_reaches_tenant(tenant_id: &Option<String>) -> bool {
+    tenant_id
+        .as_deref()
+        .is_none_or(|tenant| tenant == DEFAULT_TENANT)
+}
+
 pub async fn remove_manifest_from_snapshot(
     storage: &Arc<dyn ObjectStorage>,
     stream_name: &str,
@@ -529,6 +539,13 @@ pub async fn remove_manifest_from_snapshot(
     }
 
     if !dates.is_empty() && matches!(PARSEABLE.options.mode, Mode::Query | Mode::Prism) {
+        if !ingestor_cleanup_reaches_tenant(tenant_id) {
+            error!(
+                "Retention for stream {stream_name} of tenant {tenant_id:?} cannot clean up ingestor snapshots: \
+                 the cleanup request can't carry a tenant, so ingestors would prune the default tenant's stream instead"
+            );
+            return Ok(());
+        }
         let stream_name_clone = stream_name.to_string();
         let dates_clone = dates.clone();
 
@@ -575,5 +592,20 @@ pub fn partition_path(
         RelativePathBuf::from_iter([root, stream, &format!("date={lower}")])
     } else {
         RelativePathBuf::from_iter([root, stream, &format!("date={lower}:{upper}")])
+    }
+}
+
+#[cfg(test)]
+mod ingestor_cleanup_tests {
+    use super::ingestor_cleanup_reaches_tenant;
+    use crate::parseable::DEFAULT_TENANT;
+
+    #[test]
+    fn only_the_default_tenant_is_forwarded() {
+        assert!(ingestor_cleanup_reaches_tenant(&None));
+        assert!(ingestor_cleanup_reaches_tenant(&Some(
+            DEFAULT_TENANT.to_owned()
+        )));
+        assert!(!ingestor_cleanup_reaches_tenant(&Some("acme".to_owned())));
     }
 }

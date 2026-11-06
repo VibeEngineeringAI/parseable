@@ -1533,13 +1533,14 @@ pub(crate) fn stream_relative_path(
     }
 }
 
-/// Builds the path of a stream's data directory, or of a partition directory
-/// inside it such as `date=…` or `hour=…`. A tenant other than the default
-/// keeps its data under `{tenant}/`, as [`stream_relative_path`] writes it.
+/// Builds the path of a stream's parquet data directory, or of a partition
+/// directory inside it such as `date=…` or `hour=…`. A tenant other than the
+/// default keeps its data under `{tenant}/`, as [`stream_relative_path`]
+/// uploads it. Stream metadata and manifests use their own path helpers.
 pub(crate) fn stream_data_path(
-    tenant_id: &Option<String>,
     stream_name: &str,
     partitions: &[&str],
+    tenant_id: &Option<String>,
 ) -> RelativePathBuf {
     let tenant = tenant_id
         .as_deref()
@@ -1550,6 +1551,22 @@ pub(crate) fn stream_data_path(
             .chain([stream_name])
             .chain(partitions.iter().copied()),
     )
+}
+
+/// The listing prefix for the children of [`stream_data_path`]: the object
+/// store path to list, and its encoded form with a trailing `/`. Object store
+/// paths percent-encode characters such as non-ASCII letters, so listed
+/// children must be stripped of the encoded prefix, not of the raw path.
+pub(crate) fn stream_data_listing_prefix(
+    stream_name: &str,
+    partitions: &[&str],
+    tenant_id: &Option<String>,
+) -> (object_store::path::Path, String) {
+    let path = object_store::path::Path::from(
+        stream_data_path(stream_name, partitions, tenant_id).as_str(),
+    );
+    let prefix = format!("{path}/");
+    (path, prefix)
 }
 
 pub fn sync_all_streams(joinset: &mut JoinSet<Result<(), ObjectStorageError>>) {
@@ -1862,15 +1879,16 @@ pub fn manifest_segment_matches(manifest_path_str: &str, file_name: &str) -> boo
 
 #[cfg(test)]
 mod stream_data_path_tests {
-    use super::{stream_data_path, stream_relative_path};
+    use super::{stream_data_listing_prefix, stream_data_path, stream_relative_path};
     use crate::parseable::DEFAULT_TENANT;
 
     #[test]
     fn default_tenant_data_is_at_the_root() {
-        for tenant in [None, Some(DEFAULT_TENANT.to_owned())] {
-            assert_eq!(stream_data_path(&tenant, "app", &[]).as_str(), "app");
+        // `Some("")` is what some metastore callers pass for the default tenant.
+        for tenant in [None, Some(DEFAULT_TENANT.to_owned()), Some(String::new())] {
+            assert_eq!(stream_data_path("app", &[], &tenant).as_str(), "app");
             assert_eq!(
-                stream_data_path(&tenant, "app", &["date=2026-01-02"]).as_str(),
+                stream_data_path("app", &["date=2026-01-02"], &tenant).as_str(),
                 "app/date=2026-01-02"
             );
         }
@@ -1879,11 +1897,45 @@ mod stream_data_path_tests {
     #[test]
     fn other_tenants_data_is_under_the_tenant() {
         let tenant = Some("acme".to_owned());
-        assert_eq!(stream_data_path(&tenant, "app", &[]).as_str(), "acme/app");
+        assert_eq!(stream_data_path("app", &[], &tenant).as_str(), "acme/app");
         assert_eq!(
-            stream_data_path(&tenant, "app", &["date=2026-01-02", "hour=03"]).as_str(),
+            stream_data_path("app", &["date=2026-01-02", "hour=03"], &tenant).as_str(),
             "acme/app/date=2026-01-02/hour=03"
         );
+    }
+
+    #[test]
+    fn listed_children_strip_to_their_names_for_any_stream_name() {
+        // Uploads and listings go through `object_store::path::Path`, which
+        // percent-encodes non-ASCII stream names such as `café`.
+        for (stream, tenant) in [
+            ("app", None),
+            ("app", Some("acme".to_owned())),
+            ("café", None),
+            ("café", Some("acme".to_owned())),
+        ] {
+            let (path, prefix) = stream_data_listing_prefix(stream, &[], &tenant);
+            assert_eq!(
+                path,
+                object_store::path::Path::from(stream_data_path(stream, &[], &tenant).as_str())
+            );
+            let uploaded = stream_relative_path(
+                stream,
+                "date=2026-01-02.hour=03.minute=04.host.data.parquet",
+                &None,
+                &tenant,
+            );
+            // A delimited listing returns the directory under the prefix.
+            let listed = object_store::path::Path::from(uploaded.as_str())
+                .parts()
+                .take(path.parts().count() + 1)
+                .collect::<object_store::path::Path>();
+            assert_eq!(
+                listed.as_ref().strip_prefix(&prefix),
+                Some("date=2026-01-02"),
+                "{listed} under {prefix}"
+            );
+        }
     }
 
     #[test]
@@ -1895,7 +1947,7 @@ mod stream_data_path_tests {
             Some("acme".to_owned()),
         ] {
             let file = stream_relative_path("app", filename, &None, &tenant);
-            let date_dir = stream_data_path(&tenant, "app", &["date=2026-01-02"]);
+            let date_dir = stream_data_path("app", &["date=2026-01-02"], &tenant);
             assert!(
                 file.starts_with(&format!("{date_dir}/")),
                 "{file} is not under {date_dir}"

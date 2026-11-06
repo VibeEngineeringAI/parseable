@@ -69,7 +69,7 @@ use super::{
     ObjectStorageProvider, PARSEABLE_ROOT_DIRECTORY, REQUEST_TIMEOUT_SECS,
     STREAM_METADATA_FILE_NAME,
     metrics_layer::MetricLayer,
-    object_storage::{parseable_json_path, stream_data_path},
+    object_storage::{parseable_json_path, stream_data_listing_prefix},
     partial_path, to_object_store_path,
 };
 use crate::storage::GET_OBJECTS_CONCURRENCY;
@@ -644,12 +644,10 @@ impl S3 {
         stream: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let prefix = format!("{}/", stream_data_path(tenant_id, stream, &[]));
+        let (pre, prefix) = stream_data_listing_prefix(stream, &[], tenant_id);
         let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let resp: Result<object_store::ListResult, object_store::Error> = self
-            .client
-            .list_with_delimiter(Some(&(prefix.as_str().into())))
-            .await;
+        let resp: Result<object_store::ListResult, object_store::Error> =
+            self.client.list_with_delimiter(Some(&pre)).await;
         increment_object_store_calls_by_date(
             "LIST",
             &Utc::now().date_naive().to_string(),
@@ -1242,12 +1240,9 @@ impl ObjectStorage for S3 {
         date: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let pre = format!("{}/", stream_data_path(tenant_id, stream_name, &[date]));
+        let (pre_path, pre) = stream_data_listing_prefix(stream_name, &[date], tenant_id);
         let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let resp = self
-            .client
-            .list_with_delimiter(Some(&object_store::path::Path::from(pre.as_str())))
-            .await?;
+        let resp = self.client.list_with_delimiter(Some(&pre_path)).await?;
         increment_files_scanned_in_object_store_calls_by_date(
             "LIST",
             resp.common_prefixes.len() as u64,
@@ -1286,15 +1281,9 @@ impl ObjectStorage for S3 {
         hour: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<String>, ObjectStorageError> {
-        let pre = format!(
-            "{}/",
-            stream_data_path(tenant_id, stream_name, &[date, hour])
-        );
+        let (pre_path, pre) = stream_data_listing_prefix(stream_name, &[date, hour], tenant_id);
         let tenant_str = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-        let resp = self
-            .client
-            .list_with_delimiter(Some(&object_store::path::Path::from(pre.as_str())))
-            .await?;
+        let resp = self.client.list_with_delimiter(Some(&pre_path)).await?;
         increment_files_scanned_in_object_store_calls_by_date(
             "LIST",
             resp.common_prefixes.len() as u64,

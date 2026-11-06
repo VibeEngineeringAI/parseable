@@ -252,7 +252,7 @@ mod action {
 
             for date in dates_to_delete {
                 // The tenant's own data, not a same-named stream of the default tenant.
-                let path = stream_data_path(tenant_id, &stream_name, &[&date]);
+                let path = stream_data_path(&stream_name, &[&date], tenant_id);
                 delete_tasks.push(async move {
                     PARSEABLE
                         .storage
