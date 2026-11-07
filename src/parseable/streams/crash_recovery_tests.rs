@@ -742,6 +742,80 @@ fn unlink_failure_reserves_sources_at_restart_and_periodic_retry_finishes() {
 }
 
 #[test]
+fn deferred_startup_regroup_retries_unjournaled_rows_without_restart() {
+    use super::conversion_journal::JournalFault;
+    for invalid_inventory in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let stream = fixture(&dir, Case::default());
+        let output = crash_initial(&stream, Case::default());
+        clear_hook(&stream);
+        let source = stream.inprocess_arrow_files().pop().unwrap();
+        let extra_dir = if invalid_inventory {
+            let path = stream.data_path.join("processing_unrelated");
+            fs::create_dir(&path).unwrap();
+            path
+        } else {
+            source.parent().unwrap().to_path_buf()
+        };
+        let extra = extra_dir.join(format!(
+            "extra.{}",
+            source.file_name().unwrap().to_str().unwrap()
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::new(schema(false)),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![0; 2])),
+                Arc::new(Int32Array::from(vec![201, 202])),
+            ],
+        )
+        .unwrap();
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(
+            File::create(&extra).unwrap(),
+            batch.schema().as_ref(),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        let journal = journal_path(&output);
+        let original = fs::read(&journal).unwrap();
+        let options = Arc::clone(&stream.options);
+        drop(stream);
+        let restarted = fresh(options);
+        if invalid_inventory {
+            fs::write(&journal, b"{").unwrap();
+        } else {
+            *restarted.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
+        }
+        assert!(restarted.prepare_startup_sync(None).is_err());
+        assert!(extra.exists());
+        assert_eq!(capture_pairs(&restarted), (vec![], expected_pairs(false)));
+        // Also exercise init grouping while a parseable journal reserves the
+        // shared directory, independently of the early startup error above.
+        if !invalid_inventory {
+            let (claim, groups) =
+                restarted.claim_conversion_groups(SystemTime::now(), 1, true, false);
+            assert!(groups.is_empty());
+            drop(claim);
+        }
+        fs::write(&journal, original).unwrap();
+        restarted.prepare_parquet(false, false, &None).unwrap();
+        let mut expected = expected_pairs(false);
+        expected.extend([(201, None), (202, None)]);
+        assert_eq!(capture_pairs(&restarted), (vec![], expected.clone()));
+        assert_eq!(
+            read_all(&listed_parquet(&restarted.data_path)).pairs,
+            expected
+        );
+        assert!(restarted.inprocess_arrow_files().is_empty());
+        assert!(!journal.exists());
+        // Another periodic pass must leave the exact multiset unchanged.
+        restarted.prepare_parquet(false, false, &None).unwrap();
+        assert_eq!(capture_pairs(&restarted), (vec![], expected));
+    }
+}
+
+#[test]
 fn journal_removal_failure_allows_upload_and_empty_stream_runtime_retry() {
     use super::conversion_journal::JournalFault;
     let dir = TempDir::new().unwrap();

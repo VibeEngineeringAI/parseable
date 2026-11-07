@@ -468,6 +468,9 @@ struct ConversionClaims {
     journal_dirs: HashSet<PathBuf>,
     retry_dirs: HashSet<PathBuf>,
     journals_blocked: bool,
+    // Startup may return before grouping, or skip journal-reserved directories
+    // containing other groups. Retry that inventory after journal resolution.
+    startup_regroup_deferred: bool,
     next_claim: u64,
     dirs: HashMap<PathBuf, u64>,
     outputs: HashMap<PathBuf, u64>,
@@ -1135,6 +1138,7 @@ impl Stream {
     /// running conversion is either not listed yet or already registered.
     fn claim_unowned_inprocess_dirs(&self, claim: &mut ConversionClaim) -> Vec<PathBuf> {
         let mut registry = lock_conversion_claims(&self.conversion_claims);
+        registry.startup_regroup_deferred = true;
         if let Err(err) = self.inventory_conversion_journals(&mut registry) {
             error!(
                 "Blocking processing-directory regroup for stream {} at {}: {err}",
@@ -1164,6 +1168,7 @@ impl Stream {
                     && !registry.journal_dirs.contains(path)
             })
             .collect();
+        registry.startup_regroup_deferred = !registry.journal_dirs.is_empty();
         if !unowned.is_empty() {
             warn!(
                 "Replaying legacy processing directories without journals for stream {}: {:?}; rows may duplicate if staging was produced by a pre-journal version",
@@ -1171,6 +1176,7 @@ impl Stream {
             );
         }
         for dir in &unowned {
+            registry.retry_dirs.remove(dir);
             registry.dirs.insert(dir.clone(), claim.id);
         }
         claim.dirs.extend(unowned.iter().cloned());
@@ -1182,6 +1188,10 @@ impl Stream {
     /// startup. Journal-owned directories always take the resolver path.
     fn claim_retry_inprocess_dirs(&self, claim: &mut ConversionClaim) -> Vec<PathBuf> {
         let mut registry = lock_conversion_claims(&self.conversion_claims);
+        if registry.startup_regroup_deferred {
+            drop(registry);
+            return self.claim_unowned_inprocess_dirs(claim);
+        }
         if self.inventory_conversion_journals(&mut registry).is_err() || registry.journals_blocked {
             return Vec::new();
         }
@@ -3419,6 +3429,7 @@ impl Stream {
         self: &Arc<Self>,
         tenant_id: Option<String>,
     ) -> Result<StartupSyncPlan, StagingError> {
+        lock_conversion_claims(&self.conversion_claims).startup_regroup_deferred = true;
         self.resolve_conversion_journals(&tenant_id)?;
         self.recover_orphan_part_files();
         #[cfg(test)]
@@ -3468,6 +3479,7 @@ impl Stream {
     ) -> Result<(), StagingError> {
         // On init, recover any orphaned .part files from previous interrupted runs
         if init_signal {
+            lock_conversion_claims(&self.conversion_claims).startup_regroup_deferred = true;
             self.resolve_conversion_journals(tenant_id)?;
             self.recover_orphan_part_files();
         }
