@@ -99,6 +99,9 @@ use super::{
     },
 };
 
+mod conversion_journal;
+use conversion_journal::{ConversionJournal, has_journal, sync_directory};
+
 static HOSTNAME: OnceCell<String> = OnceCell::new();
 static METRIC_PARQUET_THREADPOOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
     rayon::ThreadPoolBuilder::new()
@@ -402,6 +405,8 @@ pub struct Stream {
     /// when taking this leaf lock; it acquires no other locks while held.
     /// Separate Stream objects, including delete/recreate, do not share it.
     conversion_claims: Arc<Mutex<ConversionClaims>>,
+    #[cfg(test)]
+    journal_fault: Mutex<Option<conversion_journal::JournalFault>>,
     pub ingestor_id: Option<String>,
     #[cfg(test)]
     conversion_hook: Mutex<Option<ConversionHook>>,
@@ -458,6 +463,11 @@ pub(crate) type LifecycleHook = Arc<dyn Fn(LifecyclePhase) + Send + Sync>;
 /// object; deletion and recreation at the same path are not coordinated here.
 #[derive(Default)]
 struct ConversionClaims {
+    // One Stream/process must own this staging tree. Delete/recreate with old
+    // Stream references and multiple processes sharing it are not coordinated.
+    journal_dirs: HashSet<PathBuf>,
+    retry_dirs: HashSet<PathBuf>,
+    journals_blocked: bool,
     next_claim: u64,
     dirs: HashMap<PathBuf, u64>,
     outputs: HashMap<PathBuf, u64>,
@@ -528,6 +538,18 @@ enum ConversionPhase<'a> {
     BeforePublish(&'a Path),
     /// The Parquet file is visible; its sources' memory is not yet released.
     Published,
+    /// Valid, synced part; schema and journal installation have not started.
+    PartSynced,
+    /// Journal and part installed; publication has not started (also resolver).
+    JournalInstalled,
+    /// Rename, pending release, and directory sync complete; no unlink yet.
+    AfterPublish,
+    SourceRemoved {
+        source: &'a Path,
+        ordinal: usize,
+    },
+    /// All sources absent and their directories synced; J still exists.
+    SourcesRetired,
 }
 
 #[cfg(test)]
@@ -857,6 +879,8 @@ impl Stream {
             part_lifecycle: RwLock::new(()),
             schema_writer: Mutex::new(()),
             conversion_claims: Arc::default(),
+            #[cfg(test)]
+            journal_fault: Mutex::default(),
             ingestor_id,
             #[cfg(test)]
             lifecycle_hook: Mutex::new(None),
@@ -1070,7 +1094,10 @@ impl Stream {
         } else {
             let arrow_files = self.fetch_arrow_files_for_conversion(exclude, shutdown_signal);
             if arrow_files.is_empty() {
-                return (claim, Vec::new());
+                let dirs = self.claim_retry_inprocess_dirs(&mut claim);
+                let groups = self.group_arrow_files_in_dirs(&dirs, &Ulid::new().to_string());
+                let groups = self.claim_conversion_outputs(&mut claim, groups);
+                return (claim, groups);
             }
 
             let inprocess_dir = match self.claim_new_inprocess_folder(&mut claim, group_minute) {
@@ -1094,6 +1121,11 @@ impl Stream {
             }
             groups
         };
+        let mut groups = groups;
+        if !init_signal {
+            let dirs = self.claim_retry_inprocess_dirs(&mut claim);
+            groups.extend(self.group_arrow_files_in_dirs(&dirs, &Ulid::new().to_string()));
+        }
         let groups = self.claim_conversion_outputs(&mut claim, groups);
         (claim, groups)
     }
@@ -1103,6 +1135,17 @@ impl Stream {
     /// running conversion is either not listed yet or already registered.
     fn claim_unowned_inprocess_dirs(&self, claim: &mut ConversionClaim) -> Vec<PathBuf> {
         let mut registry = lock_conversion_claims(&self.conversion_claims);
+        if let Err(err) = self.inventory_conversion_journals(&mut registry) {
+            error!(
+                "Blocking processing-directory regroup for stream {} at {}: {err}",
+                self.stream_name,
+                self.data_path.display()
+            );
+            return Vec::new();
+        }
+        if registry.journals_blocked {
+            return Vec::new();
+        }
         let Ok(dir) = self.data_path.read_dir() else {
             return Vec::new();
         };
@@ -1115,13 +1158,47 @@ impl Stream {
                     .is_some_and(|name| name.starts_with(INPROCESS_DIR_PREFIX))
             })
             .map(|entry| entry.path())
-            .filter(|path| path.is_dir() && !registry.dirs.contains_key(path))
+            .filter(|path| {
+                path.is_dir()
+                    && !registry.dirs.contains_key(path)
+                    && !registry.journal_dirs.contains(path)
+            })
             .collect();
+        if !unowned.is_empty() {
+            warn!(
+                "Replaying legacy processing directories without journals for stream {}: {:?}; rows may duplicate if staging was produced by a pre-journal version",
+                self.stream_name, unowned
+            );
+        }
         for dir in &unowned {
             registry.dirs.insert(dir.clone(), claim.id);
         }
         claim.dirs.extend(unowned.iter().cloned());
         unowned
+    }
+
+    /// Retry pre-journal failures during the next runtime cycle. After restart
+    /// these are ordinary legacy/uncommitted processing directories handled by
+    /// startup. Journal-owned directories always take the resolver path.
+    fn claim_retry_inprocess_dirs(&self, claim: &mut ConversionClaim) -> Vec<PathBuf> {
+        let mut registry = lock_conversion_claims(&self.conversion_claims);
+        if self.inventory_conversion_journals(&mut registry).is_err() || registry.journals_blocked {
+            return Vec::new();
+        }
+        let dirs: Vec<_> = registry
+            .retry_dirs
+            .iter()
+            .filter(|dir| {
+                !registry.dirs.contains_key(*dir) && !registry.journal_dirs.contains(*dir)
+            })
+            .cloned()
+            .collect();
+        for dir in &dirs {
+            registry.retry_dirs.remove(dir);
+            registry.dirs.insert(dir.clone(), claim.id);
+        }
+        claim.dirs.extend(dirs.iter().cloned());
+        dirs
     }
 
     /// Creates a fresh processing directory owned by `claim`.
@@ -1131,7 +1208,17 @@ impl Stream {
         minute: u128,
     ) -> std::io::Result<PathBuf> {
         let mut registry = lock_conversion_claims(&self.conversion_claims);
-        let dir = self.create_inprocess_folder(minute, &registry.dirs)?;
+        self.inventory_conversion_journals(&mut registry)
+            .unwrap_or_else(|err| {
+                error!(
+                    "Invalid conversion journal in {}: {err}",
+                    self.data_path.display()
+                );
+                Vec::new()
+            });
+        let mut reserved = registry.dirs.clone();
+        reserved.extend(registry.journal_dirs.iter().cloned().map(|dir| (dir, 0)));
+        let dir = self.create_inprocess_folder(minute, &reserved)?;
         registry.dirs.insert(dir.clone(), claim.id);
         claim.dirs.push(dir.clone());
         Ok(dir)
@@ -1394,6 +1481,9 @@ impl Stream {
             self.stream_name
         );
 
+        // The sync loop visits every stream, even without Arrow or Parquet
+        // files. This is the retry owner; the upload scheduler may skip them.
+        let recovery = self.resolve_conversion_journals(tenant_id);
         let time_partition = self.get_time_partition();
         let custom_partition = self.get_custom_partition();
 
@@ -1406,7 +1496,8 @@ impl Stream {
             shutdown_signal,
             tenant_id,
         )?;
-        self.finish_arrow_file_conversion(outcome)
+        self.finish_arrow_file_conversion(outcome)?;
+        recovery
     }
 
     pub fn stage_schema_file(&self, mut schema: Schema) -> Result<(), StagingError> {
@@ -1438,8 +1529,12 @@ impl Stream {
         // save the merged schema on staging disk
         // the path should be stream/.ingestor.{id}.schema
         info!("writing schema to path - {path:?}");
+        #[cfg(test)]
+        self.fail_journal_io(conversion_journal::JournalFault::Schema)?;
         write(&tmp_path, to_bytes(&schema))?;
+        File::open(&tmp_path)?.sync_all()?;
         fs::rename(tmp_path, path)?;
+        sync_directory(&self.data_path)?;
 
         Ok(())
     }
@@ -1614,21 +1709,35 @@ impl Stream {
         let _publication = match self.publication.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
-                Self::remove_partial_parquet_file(part_path);
                 return Err(StagingError::PoisonError(PoisonError::new(format!(
                     "Publication lock poisoned while publishing {parquet_path:?} for stream {} - {}",
                     self.stream_name, poisoned
                 ))));
             }
         };
+        let output_exists = match fs::symlink_metadata(parquet_path) {
+            Ok(_) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(err.into()),
+        };
+        if output_exists {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Refusing to overwrite {}", parquet_path.display()),
+            )
+            .into());
+        }
         if let Err(err) = std::fs::rename(part_path, parquet_path) {
             error!("Couldn't rename part file: {part_path:?} -> {parquet_path:?}, error = {err}");
-            Self::remove_partial_parquet_file(part_path);
             return Err(err.into());
         }
         #[cfg(test)]
         self.conversion_phase(ConversionPhase::Published);
         self.release_pending(sources);
+        drop(_publication);
+        sync_directory(&self.data_path)?;
+        #[cfg(test)]
+        self.conversion_phase(ConversionPhase::AfterPublish);
         Ok(())
     }
 
@@ -2244,11 +2353,20 @@ impl Stream {
         let convert = |(parquet_path, arrow_files): (PathBuf, Vec<PathBuf>)| {
             let result = self.convert_arrow_group(
                 parquet_path.clone(),
-                arrow_files,
+                arrow_files.clone(),
                 time_partition,
                 custom_partition,
                 tenant_id,
             );
+            if result.is_err() {
+                lock_conversion_claims(&self.conversion_claims)
+                    .retry_dirs
+                    .extend(
+                        arrow_files
+                            .iter()
+                            .filter_map(|file| file.parent().map(Path::to_path_buf)),
+                    );
+            }
             (parquet_path, result)
         };
         let results: Vec<_> = match execution {
@@ -2302,23 +2420,16 @@ impl Stream {
         })
     }
 
-    /// Stages schemas from successful groups before surfacing an unresolved
-    /// group failure to the caller.
+    /// Releases live claims after every group has staged its schema and either
+    /// completed or retained durable ownership, then surfaces the first error.
     fn finish_arrow_file_conversion(
         &self,
         outcome: ArrowFileConversionOutcome,
     ) -> Result<(), StagingError> {
         let ArrowFileConversionOutcome {
-            schema,
-            first_error,
-            claim,
+            first_error, claim, ..
         } = outcome;
-        let staged = match schema {
-            Some(schema) if !self.get_static_schema_flag() => self.stage_schema_file(schema),
-            _ => Ok(()),
-        };
         drop(claim);
-        staged?;
         if let Some(err) = first_error {
             return Err(err);
         }
@@ -2337,6 +2448,13 @@ impl Stream {
     ) -> Result<Option<Schema>, StagingError> {
         // Metrics sort every output row group explicitly, so reading their IPC
         // streams forward avoids reverse seeks and a full-column row reversal.
+        if has_journal(&parquet_path) {
+            return Err(std::io::Error::other(format!(
+                "Journal owns {}; resolve instead of encoding",
+                parquet_path.display()
+            ))
+            .into());
+        }
         let record_reader =
             ConversionRecordReader::for_stream(&arrow_files, self.is_otel_metrics());
         self.remove_invalid_arrow_files(record_reader.invalid_files(), tenant_id);
@@ -2392,8 +2510,30 @@ impl Stream {
             }
         }
 
+        File::open(&part_path)?.sync_all()?;
+        #[cfg(test)]
+        self.conversion_phase(ConversionPhase::PartSynced);
+        let journal_result = (|| {
+            if !self.get_static_schema_flag() {
+                self.stage_schema_file(merged_schema.clone())?;
+            }
+            let journal = ConversionJournal::new(self, &parquet_path, &readable_arrow_files)?;
+            self.install_conversion_journal(&journal)?;
+            Ok::<_, StagingError>(journal)
+        })();
+        let journal = match journal_result {
+            Ok(journal) => journal,
+            Err(err) => {
+                // Before J, intact sources can rebuild T. An install that
+                // failed after its rename already owns T: the guard retains it.
+                Self::remove_partial_parquet_file(&part_path);
+                return Err(err);
+            }
+        };
+        #[cfg(test)]
+        self.conversion_phase(ConversionPhase::JournalInstalled);
         self.publish_parquet(&part_path, &parquet_path, &readable_arrow_files)?;
-        self.cleanup_arrow_files_and_dir(&readable_arrow_files, tenant_id);
+        self.retire_conversion_sources(&journal, tenant_id)?;
         Ok(Some(merged_schema))
     }
 
@@ -2605,6 +2745,11 @@ impl Stream {
 
     /// Removes a temporary Parquet output left by a failed conversion.
     fn remove_partial_parquet_file(part_path: &Path) {
+        // Structural guard: after J exists the only legal removal of T is
+        // publication rename. This also covers validation/error cleanup.
+        if has_journal(&part_path.with_extension("")) {
+            return;
+        }
         match remove_file(part_path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -2719,7 +2864,13 @@ impl Stream {
 
         // One logical startup group can span several processing directories.
         // Remove every contributing directory once its final file is gone.
+        let registry = lock_conversion_claims(&self.conversion_claims);
         for parent_dir in processing_dirs {
+            // Another output in this directory may still have a journal even
+            // after its last source was removed. Keep its parent for retries.
+            if registry.journal_dirs.contains(&parent_dir) || registry.journals_blocked {
+                continue;
+            }
             match fs::read_dir(&parent_dir) {
                 Ok(mut entries) => {
                     if entries.next().is_none()
@@ -3095,6 +3246,12 @@ impl Stream {
         self.lifecycle_phase(LifecyclePhase::RecoveryCandidates(candidates.clone()));
 
         for path in candidates {
+            // Check before zero-length handling too, independently of whether
+            // the caller ran journal recovery first. A live writer is claimed
+            // before creation, so a candidate cannot acquire a new journal.
+            if has_journal(&path.with_extension("")) {
+                continue;
+            }
             if path
                 .extension()
                 .is_some_and(|ext| ext == PART_FILE_EXTENSION)
@@ -3262,6 +3419,7 @@ impl Stream {
         self: &Arc<Self>,
         tenant_id: Option<String>,
     ) -> Result<StartupSyncPlan, StagingError> {
+        self.resolve_conversion_journals(&tenant_id)?;
         self.recover_orphan_part_files();
         #[cfg(test)]
         self.lifecycle_phase(LifecyclePhase::StartupRecovered);
@@ -3310,6 +3468,7 @@ impl Stream {
     ) -> Result<(), StagingError> {
         // On init, recover any orphaned .part files from previous interrupted runs
         if init_signal {
+            self.resolve_conversion_journals(tenant_id)?;
             self.recover_orphan_part_files();
         }
 
@@ -3952,6 +4111,11 @@ mod tests {
         let weak = Arc::downgrade(&staging);
         set_conversion_hook(&staging, move |phase| match phase {
             ConversionPhase::BeforeSealRename(_) => {}
+            ConversionPhase::PartSynced
+            | ConversionPhase::JournalInstalled
+            | ConversionPhase::AfterPublish
+            | ConversionPhase::SourceRemoved { .. }
+            | ConversionPhase::SourcesRetired => {}
             ConversionPhase::BeforePublish(_) => {
                 paused_tx.send(()).unwrap();
                 resume_rx
@@ -4025,6 +4189,11 @@ mod tests {
         let weak = Arc::downgrade(&staging);
         set_conversion_hook(&staging, move |phase| match phase {
             ConversionPhase::BeforeSealRename(_) => {}
+            ConversionPhase::PartSynced
+            | ConversionPhase::JournalInstalled
+            | ConversionPhase::AfterPublish
+            | ConversionPhase::SourceRemoved { .. }
+            | ConversionPhase::SourcesRetired => {}
             ConversionPhase::BeforePublish(_) => {
                 before_tx.send(()).unwrap();
                 before_resume_rx

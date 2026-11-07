@@ -20,6 +20,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sha2::{Digest, Sha256};
 use temp_dir::TempDir;
 
+use super::conversion_journal::journal_path;
 use super::*;
 
 const NAME: &str = "issue95-conversion-recovery";
@@ -34,6 +35,34 @@ struct Case {
     uploaded: bool,
     crash_again: bool,
     mixed: bool,
+    boundary: Boundary,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum Boundary {
+    PartSynced,
+    JournalInstalled,
+    #[default]
+    AfterPublish,
+    SourcesRetired,
+}
+
+fn arm_boundary(stream: &Stream, boundary: Boundary) {
+    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        let hit = matches!(
+            (boundary, phase),
+            (Boundary::PartSynced, ConversionPhase::PartSynced)
+                | (
+                    Boundary::JournalInstalled,
+                    ConversionPhase::JournalInstalled
+                )
+                | (Boundary::AfterPublish, ConversionPhase::AfterPublish)
+                | (Boundary::SourcesRetired, ConversionPhase::SourcesRetired)
+        );
+        if hit {
+            panic!("{CRASH}");
+        }
+    }));
 }
 
 fn expected_pairs(mixed: bool) -> Vec<Pair> {
@@ -62,11 +91,22 @@ fn fresh(options: Arc<Options>) -> StreamRef {
 }
 
 fn fixture(dir: &TempDir, case: Case) -> StreamRef {
-    let stream = fresh(Arc::new(Options {
-        local_staging_path: dir.path().to_path_buf(),
-        row_group_size: 1048576,
-        ..Default::default()
-    }));
+    fixture_named(dir, case, NAME)
+}
+
+fn fixture_named(dir: &TempDir, case: Case, name: &str) -> StreamRef {
+    let stream = Stream::new(
+        Arc::new(Options {
+            local_staging_path: dir.path().to_path_buf(),
+            row_group_size: 1048576,
+            ..Default::default()
+        }),
+        name,
+        LogStreamMetadata::default(),
+        None,
+        &None,
+    );
+    stream.writer.lock().unwrap().mem = Some(Default::default());
     stream.stage_schema_file(schema(false)).unwrap();
     let now = DateTime::parse_from_rfc3339("2020-01-02T12:34:30.500Z")
         .unwrap()
@@ -243,19 +283,17 @@ fn assert_injected_crash(action: impl FnOnce()) {
 }
 
 fn arm_crash(stream: &Stream, remove: Vec<PathBuf>) {
-    // Published runs inside the publication lock, before memory release. The
-    // old Stream is discarded after unwinding; no poisoned locks are reused.
-    // Manual unlink produces the exact process-crash state of partial cleanup.
-    // The fix must re-point this hook to its durable publication/retirement
-    // boundaries; do not weaken the final row/value/NULL oracle.
-    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
-        if let ConversionPhase::Published = phase {
-            for path in &remove {
-                fs::remove_file(path).unwrap();
+    if remove.is_empty() {
+        arm_boundary(stream, Boundary::AfterPublish);
+    } else {
+        *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if let ConversionPhase::SourceRemoved { source, ordinal } = phase {
+                assert_eq!(ordinal, 0);
+                assert!(remove.iter().any(|path| path == source));
+                panic!("{CRASH}");
             }
-            panic!("{CRASH}");
-        }
-    }));
+        }));
+    }
 }
 
 fn crash_initial(stream: &Stream, case: Case) -> PathBuf {
@@ -283,21 +321,48 @@ fn crash_initial(stream: &Stream, case: Case) -> PathBuf {
         .removed_source
         .map(|index| vec![sources[index].clone()])
         .unwrap_or_default();
+    if let Some(index) = case.removed_source {
+        // Drive the actual unlink loop in both logical source directions.
+        sources.swap(0, index);
+    }
     arm_crash(stream, remove.clone());
+    if case.removed_source.is_none() {
+        arm_boundary(stream, case.boundary);
+    }
     assert_injected_crash(|| {
         stream
             .convert_arrow_group(output.clone(), sources.clone(), None, None, &None)
             .unwrap();
     });
-    assert_eq!(
-        read_all(std::slice::from_ref(&output)).pairs,
-        expected_pairs(case.mixed)
+    let before_publish = matches!(
+        case.boundary,
+        Boundary::PartSynced | Boundary::JournalInstalled
     );
-    assert!(!parquet_part_path(&output).exists());
+    let encoded = if before_publish {
+        parquet_part_path(&output)
+    } else {
+        output.clone()
+    };
+    assert_eq!(read_all(&[encoded]).pairs, expected_pairs(case.mixed));
+    assert_eq!(parquet_part_path(&output).exists(), before_publish);
+    assert_eq!(
+        journal_path(&output).exists(),
+        !matches!(case.boundary, Boundary::PartSynced)
+    );
     for path in &sources {
-        assert_eq!(path.exists(), !remove.contains(path));
+        assert_eq!(
+            path.exists(),
+            !remove.contains(path) && !matches!(case.boundary, Boundary::SourcesRetired)
+        );
     }
-    assert_eq!(stream.inprocess_arrow_files().len(), 2 - remove.len());
+    assert_eq!(
+        stream.inprocess_arrow_files().len(),
+        if matches!(case.boundary, Boundary::SourcesRetired) {
+            0
+        } else {
+            2 - remove.len()
+        }
+    );
     drop(claim);
     output
 }
@@ -308,11 +373,13 @@ fn observe(case: Case, control: bool) -> Snapshot {
     fs::create_dir(&remote).unwrap();
     let stream = fixture(&dir, case);
     let options = Arc::clone(&stream.options);
+    let mut original_output = None;
     if control {
         stream.prepare_parquet(false, true, &None).unwrap();
         assert_eq!(snapshot(&stream, &remote).pairs, expected_pairs(case.mixed));
     } else {
         let output = crash_initial(&stream, case);
+        original_output = Some(output.clone());
         if case.uploaded {
             // A durable fake remote object plus local deletion; no real upload,
             // manifest publication, query handoff, or remote schema is modeled.
@@ -326,10 +393,14 @@ fn observe(case: Case, control: bool) -> Snapshot {
 
     if case.crash_again {
         let restarted = fresh(Arc::clone(&options));
-        arm_crash(&restarted, Vec::new());
-        let plan = restarted.prepare_startup_sync(None).unwrap();
-        assert_injected_crash(|| plan.execute().unwrap());
-        assert_eq!(restarted.inprocess_arrow_files().len(), 2);
+        arm_boundary(&restarted, case.boundary);
+        assert_injected_crash(|| {
+            restarted
+                .prepare_startup_sync(None)
+                .unwrap()
+                .execute()
+                .unwrap()
+        });
         eprintln!(
             "recovery crashed again: {:?}",
             snapshot(&restarted, &remote)
@@ -355,7 +426,32 @@ fn observe(case: Case, control: bool) -> Snapshot {
             restarted.inprocess_arrow_files().is_empty(),
             "fixture: processing sources not drained"
         );
+        if case.mixed {
+            let staged = Schema::try_merge(restarted.get_schemas_if_present().unwrap()).unwrap();
+            assert!(
+                staged.field_with_name("added").is_ok(),
+                "evolved field must survive source retirement"
+            );
+        }
         let current = snapshot(&restarted, &remote);
+        if !control
+            && matches!(
+                case.boundary,
+                Boundary::JournalInstalled | Boundary::SourcesRetired
+            )
+        {
+            let original = original_output.as_ref().unwrap();
+            let expected = if case.uploaded {
+                remote.join(original.file_name().unwrap())
+            } else {
+                original.clone()
+            };
+            assert_eq!(
+                current.parquet_sha256.keys().cloned().collect::<Vec<_>>(),
+                vec![expected],
+                "journal recovery must preserve ORIGINAL output identity"
+            );
+        }
         eprintln!("case={case:?}, clean_restart={restart}: {current:?}");
         if let Some(previous) = &previous {
             assert_eq!(
@@ -396,13 +492,11 @@ fn completed_cleanup_control() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn all_sources_survive() {
     exactly_once(Case::default());
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn first_source_removed() {
     exactly_once(Case {
         removed_source: Some(0),
@@ -411,7 +505,6 @@ fn first_source_removed() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn second_source_removed() {
     exactly_once(Case {
         removed_source: Some(1),
@@ -420,7 +513,6 @@ fn second_source_removed() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn multiple_dirs_all_survive() {
     exactly_once(Case {
         multiple_dirs: true,
@@ -429,7 +521,6 @@ fn multiple_dirs_all_survive() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn multiple_dirs_first_source_removed() {
     exactly_once(Case {
         multiple_dirs: true,
@@ -439,7 +530,6 @@ fn multiple_dirs_first_source_removed() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn multiple_dirs_second_source_removed() {
     exactly_once(Case {
         multiple_dirs: true,
@@ -449,7 +539,6 @@ fn multiple_dirs_second_source_removed() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn recovery_crashes_again() {
     exactly_once(Case {
         crash_again: true,
@@ -458,7 +547,6 @@ fn recovery_crashes_again() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn uploaded_all_survive() {
     exactly_once(Case {
         uploaded: true,
@@ -467,7 +555,6 @@ fn uploaded_all_survive() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn uploaded_first_source_removed() {
     exactly_once(Case {
         uploaded: true,
@@ -477,7 +564,6 @@ fn uploaded_first_source_removed() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn uploaded_second_source_removed() {
     exactly_once(Case {
         uploaded: true,
@@ -487,7 +573,6 @@ fn uploaded_second_source_removed() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn mixed_schema_all_survive() {
     exactly_once(Case {
         mixed: true,
@@ -496,7 +581,6 @@ fn mixed_schema_all_survive() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn mixed_schema_first_source_removed() {
     exactly_once(Case {
         mixed: true,
@@ -506,11 +590,689 @@ fn mixed_schema_first_source_removed() {
 }
 
 #[test]
-#[ignore = "#95: fails on main; enabled by the fix"]
 fn mixed_schema_second_source_removed() {
     exactly_once(Case {
         mixed: true,
         removed_source: Some(1),
         ..Case::default()
     });
+}
+
+#[test]
+fn before_journal_discards_uncommitted_part() {
+    exactly_once(Case {
+        boundary: Boundary::PartSynced,
+        ..Case::default()
+    });
+}
+
+#[test]
+fn journal_installed_recovers_original_output_and_repeated_interruption() {
+    exactly_once(Case {
+        boundary: Boundary::JournalInstalled,
+        crash_again: true,
+        ..Case::default()
+    });
+}
+
+#[test]
+fn sources_retired_collects_journal_after_repeated_interruption() {
+    exactly_once(Case {
+        boundary: Boundary::SourcesRetired,
+        crash_again: true,
+        ..Case::default()
+    });
+}
+
+fn clear_hook(stream: &Stream) {
+    *stream.conversion_hook.lock().unwrap() = None;
+}
+
+fn capture_pairs(stream: &Stream) -> (Vec<Pair>, Vec<Pair>) {
+    let (memory, disk) = stream
+        .capture_staging(&Arc::new(schema(true)), |dir| {
+            read_all(&listed_parquet(dir)).pairs
+        })
+        .unwrap();
+    let mut memory = memory.iter().flat_map(batch_pairs).collect::<Vec<_>>();
+    memory.sort();
+    (memory, disk)
+}
+
+#[test]
+fn init_flush_resolves_journal_before_orphan_part_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let case = Case {
+        boundary: Boundary::JournalInstalled,
+        ..Case::default()
+    };
+    let stream = fixture(&dir, case);
+    let output = crash_initial(&stream, case);
+    let options = Arc::clone(&stream.options);
+    drop(stream);
+    let restarted = fresh(options);
+    restarted.flush_and_convert(true, false, &None).unwrap();
+    assert_eq!(listed_parquet(&restarted.data_path), vec![output]);
+    assert_eq!(
+        read_all(&restarted.parquet_files()).pairs,
+        expected_pairs(false)
+    );
+    assert!(restarted.inprocess_arrow_files().is_empty());
+}
+
+#[test]
+fn orphan_cleanup_preserves_even_zero_length_journaled_part() {
+    let dir = TempDir::new().unwrap();
+    let case = Case {
+        boundary: Boundary::JournalInstalled,
+        ..Case::default()
+    };
+    let stream = fixture(&dir, case);
+    let output = crash_initial(&stream, case);
+    clear_hook(&stream);
+    let part = parquet_part_path(&output);
+    fs::write(&part, []).unwrap();
+    stream.recover_orphan_part_files();
+    assert!(part.exists());
+    assert!(stream.resolve_conversion_journals(&None).is_err());
+    assert!(journal_path(&output).exists());
+    assert_eq!(stream.inprocess_arrow_files().len(), 2);
+    assert!(
+        stream
+            .arrow_files_grouped_exclude_time(SystemTime::now(), 1, true, false)
+            .is_empty()
+    );
+}
+
+#[test]
+fn schema_failure_keeps_sources_and_memory_and_periodic_retry_succeeds() {
+    use super::conversion_journal::JournalFault;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(
+        &dir,
+        Case {
+            mixed: true,
+            ..Case::default()
+        },
+    );
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::Schema);
+    assert!(stream.prepare_parquet(false, true, &None).is_err());
+    assert!(stream.parquet_files().is_empty());
+    assert_eq!(stream.inprocess_arrow_files().len(), 2);
+    assert!(
+        !fs::read_dir(&stream.data_path)
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|e| e == "sources"))
+    );
+    assert_eq!(capture_pairs(&stream), (expected_pairs(true), vec![]));
+    stream.prepare_parquet(false, true, &None).unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(true)));
+    assert!(
+        Schema::try_merge(stream.get_schemas_if_present().unwrap())
+            .unwrap()
+            .field_with_name("added")
+            .is_ok()
+    );
+}
+
+#[test]
+fn unlink_failure_reserves_sources_at_restart_and_periodic_retry_finishes() {
+    use super::conversion_journal::JournalFault;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
+    assert!(stream.prepare_parquet(false, true, &None).is_err());
+    let original = read_all(&stream.parquet_files());
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    let options = Arc::clone(&stream.options);
+    drop(stream);
+    let restarted = fresh(options);
+    *restarted.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
+    assert!(restarted.prepare_startup_sync(None).is_err());
+    assert!(
+        restarted
+            .arrow_files_grouped_exclude_time(SystemTime::now(), 1, true, false)
+            .is_empty()
+    );
+    assert_eq!(restarted.inprocess_arrow_files().len(), 2);
+    restarted.prepare_parquet(false, false, &None).unwrap();
+    assert!(restarted.inprocess_arrow_files().is_empty());
+    assert_eq!(read_all(&restarted.parquet_files()), original);
+}
+
+#[test]
+fn journal_removal_failure_allows_upload_and_empty_stream_runtime_retry() {
+    use super::conversion_journal::JournalFault;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::JournalRemoval);
+    assert!(stream.prepare_parquet(false, true, &None).is_err());
+    assert!(stream.inprocess_arrow_files().is_empty());
+    let outputs = stream.parquet_files();
+    assert_eq!(
+        outputs.len(),
+        1,
+        "lingering journal must not hide upload eligibility"
+    );
+    let journal = journal_path(&outputs[0]);
+    assert!(journal.exists());
+    let remote = dir.path().join("remote.parquet");
+    fs::copy(&outputs[0], &remote).unwrap();
+    fs::remove_file(&outputs[0]).unwrap();
+    // No Arrow and no local P: only prepare_parquet can own this retry.
+    stream.prepare_parquet(false, false, &None).unwrap();
+    assert!(!journal.exists());
+    assert!(stream.parquet_files().is_empty());
+    assert_eq!(read_all(&[remote]).pairs, expected_pairs(false));
+}
+
+fn edit_journal(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    edit(&mut value);
+    let mut journal: ConversionJournal = serde_json::from_value(value).unwrap();
+    journal.resign_for_test();
+    fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+#[test]
+fn invalid_inventory_blocks_all_regrouping_and_repair_reopens_stream() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    for bad in [
+        "truncated",
+        "checksum",
+        "version",
+        "stream",
+        "relative",
+        "absolute",
+        "duplicate",
+        "conflict",
+        "oversized",
+        "symlink",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let case = Case {
+            boundary: Boundary::JournalInstalled,
+            ..Case::default()
+        };
+        let stream = fixture(&dir, case);
+        let output = crash_initial(&stream, case);
+        clear_hook(&stream);
+        let journal = journal_path(&output);
+        let original = fs::read(&journal).unwrap();
+        let spare = stream.data_path.join("processing_spare");
+        fs::create_dir(&spare).unwrap();
+        let extra_journal = stream.data_path.join("other.parquet.sources");
+        match bad {
+            "truncated" => fs::write(&journal, b"{").unwrap(),
+            "checksum" => {
+                let mut bytes = original.clone();
+                let index = bytes.iter().position(|b| *b == b'1').unwrap();
+                bytes[index] = b'2';
+                fs::write(&journal, bytes).unwrap();
+            }
+            "version" => edit_journal(&journal, |v| v["record"]["version"] = 99.into()),
+            "stream" => edit_journal(&journal, |v| v["record"]["stream"] = "other".into()),
+            "relative" => edit_journal(&journal, |v| {
+                v["record"]["sources"][0]["path"] = "../outside.arrows".into()
+            }),
+            "absolute" => edit_journal(&journal, |v| {
+                v["record"]["sources"][0]["path"] = "/tmp/outside.arrows".into()
+            }),
+            "duplicate" => edit_journal(&journal, |v| {
+                v["record"]["sources"][1] = v["record"]["sources"][0].clone();
+            }),
+            "conflict" => {
+                fs::copy(&journal, &extra_journal).unwrap();
+                edit_journal(&extra_journal, |v| {
+                    v["record"]["output"] = "other.parquet".into()
+                });
+            }
+            "oversized" => fs::write(&journal, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap(),
+            "symlink" => {
+                fs::remove_file(&journal).unwrap();
+                std::os::unix::fs::symlink(dir.path().join("missing"), &journal).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(stream.resolve_conversion_journals(&None).is_err(), "{bad}");
+        assert!(
+            stream
+                .arrow_files_grouped_exclude_time(SystemTime::now(), 1, true, false)
+                .is_empty(),
+            "{bad}"
+        );
+        assert!(lock_conversion_claims(&stream.conversion_claims).journals_blocked);
+        let mut gated_claim = ConversionClaim::new(&stream.conversion_claims);
+        assert!(
+            stream
+                .claim_unowned_inprocess_dirs(&mut gated_claim)
+                .is_empty(),
+            "invalid journal must gate even unrelated processing_spare: {bad}"
+        );
+        assert_eq!(stream.inprocess_arrow_files().len(), 2);
+        assert!(parquet_part_path(&output).exists());
+        assert!(stream.parquet_files().is_empty());
+        stream.recover_orphan_part_files();
+        assert!(parquet_part_path(&output).exists());
+        // An independent stream's recovery/conversion remains available.
+        let other = fixture_named(&dir, Case::default(), "issue95-unaffected");
+        other.prepare_parquet(false, true, &None).unwrap();
+        assert_eq!(
+            read_all(&other.parquet_files()).pairs,
+            expected_pairs(false)
+        );
+        if bad == "conflict" {
+            fs::remove_file(extra_journal).unwrap();
+        }
+        if bad == "symlink" {
+            fs::remove_file(&journal).unwrap();
+        }
+        fs::write(&journal, original).unwrap();
+        stream.resolve_conversion_journals(&None).unwrap();
+        assert!(!lock_conversion_claims(&stream.conversion_claims).journals_blocked);
+        let mut reopened_claim = ConversionClaim::new(&stream.conversion_claims);
+        assert_eq!(
+            stream.claim_unowned_inprocess_dirs(&mut reopened_claim),
+            vec![spare]
+        );
+        assert_eq!(listed_parquet(&stream.data_path), vec![output]);
+        assert_eq!(
+            read_all(&stream.parquet_files()).pairs,
+            expected_pairs(false)
+        );
+    }
+}
+
+#[test]
+fn source_size_mismatch_retains_journal_and_directory_reservation() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let output = crash_initial(&stream, Case::default());
+    clear_hook(&stream);
+    let source = stream.inprocess_arrow_files().pop().unwrap();
+    let original = fs::read(&source).unwrap();
+    fs::write(&source, b"replacement of different size").unwrap();
+    assert!(stream.resolve_conversion_journals(&None).is_err());
+    assert!(journal_path(&output).exists());
+    assert!(source.exists());
+    assert!(source.parent().unwrap().exists());
+    assert!(!lock_conversion_claims(&stream.conversion_claims).journals_blocked);
+    assert!(
+        stream
+            .arrow_files_grouped_exclude_time(SystemTime::now(), 1, true, false)
+            .is_empty()
+    );
+    fs::write(source, original).unwrap();
+    stream.resolve_conversion_journals(&None).unwrap();
+    assert_eq!(
+        read_all(&stream.parquet_files()).pairs,
+        expected_pairs(false)
+    );
+}
+
+#[test]
+fn unjournaled_legacy_processing_sources_still_replay_possible_duplicates() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let output = crash_initial(&stream, Case::default());
+    // Model pre-journal staging: lineage cannot be reconstructed automatically.
+    fs::remove_file(journal_path(&output)).unwrap();
+    clear_hook(&stream);
+    stream
+        .prepare_startup_sync(None)
+        .unwrap()
+        .execute()
+        .unwrap();
+    let mut duplicated = expected_pairs(false);
+    duplicated.extend(expected_pairs(false));
+    duplicated.sort();
+    assert_eq!(read_all(&stream.parquet_files()).pairs, duplicated);
+}
+
+#[test]
+fn live_conversion_journal_is_skipped_by_resolver_and_init_grouping() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let (paused_tx, paused_rx) = channel();
+    let (resume_tx, resume_rx) = channel();
+    let resume_rx = Mutex::new(resume_rx);
+    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, ConversionPhase::JournalInstalled) {
+            paused_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+        }
+    }));
+    let converter = {
+        let stream = Arc::clone(&stream);
+        std::thread::spawn(move || stream.prepare_parquet(false, true, &None))
+    };
+    paused_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    stream.resolve_conversion_journals(&None).unwrap();
+    assert!(
+        stream
+            .arrow_files_grouped_exclude_time(SystemTime::now(), 1, true, false)
+            .is_empty()
+    );
+    assert_eq!(capture_pairs(&stream), (expected_pairs(false), vec![]));
+    assert_eq!(stream.inprocess_arrow_files().len(), 2);
+    resume_tx.send(()).unwrap();
+    converter.join().unwrap().unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+}
+
+#[test]
+fn query_capture_sees_memory_xor_parquet_during_conversion_and_resolver_publication() {
+    use std::sync::mpsc::{TryRecvError, channel};
+    use std::time::Duration;
+    for resolver in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let stream = fixture(&dir, Case::default());
+        if resolver {
+            crash_initial(
+                &stream,
+                Case {
+                    boundary: Boundary::JournalInstalled,
+                    ..Case::default()
+                },
+            );
+            clear_hook(&stream);
+        }
+        assert_eq!(capture_pairs(&stream), (expected_pairs(false), vec![]));
+        let (paused_tx, paused_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let resume_rx = Mutex::new(resume_rx);
+        let weak = Arc::downgrade(&stream);
+        *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            let hit = if resolver {
+                matches!(phase, ConversionPhase::Published)
+            } else {
+                matches!(phase, ConversionPhase::AfterPublish)
+            };
+            if hit {
+                assert_eq!(
+                    weak.upgrade().unwrap().publication.try_read().is_err(),
+                    resolver
+                );
+                paused_tx.send(()).unwrap();
+                resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap();
+            }
+        }));
+        let worker = {
+            let stream = Arc::clone(&stream);
+            std::thread::spawn(move || {
+                if resolver {
+                    stream.resolve_conversion_journals(&None)
+                } else {
+                    stream.prepare_parquet(false, true, &None)
+                }
+            })
+        };
+        paused_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let (captured_tx, captured_rx) = channel();
+        let (started_tx, started_rx) = channel();
+        let query = {
+            let stream = Arc::clone(&stream);
+            std::thread::spawn(move || {
+                assert_eq!(stream.publication.try_read().is_err(), resolver);
+                started_tx.send(()).unwrap();
+                captured_tx.send(capture_pairs(&stream)).unwrap();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        if resolver {
+            assert!(matches!(captured_rx.try_recv(), Err(TryRecvError::Empty)));
+            resume_tx.send(()).unwrap();
+            assert_eq!(
+                captured_rx.recv_timeout(Duration::from_secs(20)).unwrap(),
+                (vec![], expected_pairs(false))
+            );
+        } else {
+            assert_eq!(
+                captured_rx.recv_timeout(Duration::from_secs(20)).unwrap(),
+                (vec![], expected_pairs(false))
+            );
+            resume_tx.send(()).unwrap();
+        }
+        query.join().unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            read_all(&stream.parquet_files()).pairs,
+            expected_pairs(false)
+        );
+    }
+}
+
+#[test]
+fn resolver_interrupted_after_each_remaining_unlink_keeps_exact_values() {
+    for removed_source in [0, 1] {
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        fs::create_dir(&remote).unwrap();
+        let case = Case {
+            removed_source: Some(removed_source),
+            multiple_dirs: true,
+            mixed: true,
+            ..Case::default()
+        };
+        let stream = fixture(&dir, case);
+        let output = crash_initial(&stream, case);
+        let options = Arc::clone(&stream.options);
+        drop(stream);
+        let restarted = fresh(Arc::clone(&options));
+        *restarted.conversion_hook.lock().unwrap() = Some(Arc::new(|phase| {
+            if let ConversionPhase::SourceRemoved { ordinal, .. } = phase {
+                assert_eq!(ordinal, 1);
+                panic!("{CRASH}");
+            }
+        }));
+        assert_injected_crash(|| {
+            restarted
+                .prepare_startup_sync(None)
+                .unwrap()
+                .execute()
+                .unwrap()
+        });
+        assert!(restarted.inprocess_arrow_files().is_empty());
+        assert!(journal_path(&output).exists());
+        drop(restarted);
+        let mut previous = None;
+        for _ in 0..3 {
+            let restarted = fresh(Arc::clone(&options));
+            restarted
+                .prepare_startup_sync(None)
+                .unwrap()
+                .execute()
+                .unwrap();
+            let current = snapshot(&restarted, &remote);
+            assert_eq!(
+                current.pairs,
+                expected_pairs(true),
+                "FINAL_ISSUE95_EXACTLY_ONCE_VALUES_NULLS"
+            );
+            assert_eq!(
+                current.parquet_sha256.keys().cloned().collect::<Vec<_>>(),
+                vec![output.clone()]
+            );
+            if let Some(previous) = previous {
+                assert_eq!(current, previous);
+            }
+            previous = Some(current);
+        }
+    }
+}
+
+#[test]
+fn publication_collision_retains_original_part_journal_and_pending_memory() {
+    let dir = TempDir::new().unwrap();
+    let case = Case {
+        boundary: Boundary::JournalInstalled,
+        ..Case::default()
+    };
+    let stream = fixture(&dir, case);
+    let output = crash_initial(&stream, case);
+    clear_hook(&stream);
+    let part = parquet_part_path(&output);
+    let original = fs::read(&part).unwrap();
+    fs::write(&output, b"unrelated existing output").unwrap();
+    assert!(stream.resolve_conversion_journals(&None).is_err());
+    assert_eq!(fs::read(&part).unwrap(), original);
+    assert_eq!(fs::read(&output).unwrap(), b"unrelated existing output");
+    assert!(journal_path(&output).exists());
+    assert_eq!(stream.inprocess_arrow_files().len(), 2);
+    assert_eq!(
+        stream
+            .recordbatches_cloned(&Arc::new(schema(false)))
+            .unwrap()
+            .iter()
+            .flat_map(batch_pairs)
+            .collect::<Vec<_>>()
+            .len(),
+        4
+    );
+    fs::remove_file(&output).unwrap();
+    stream.resolve_conversion_journals(&None).unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+}
+
+#[test]
+fn poisoned_publication_never_discards_journaled_part() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _guard = stream.publication.write().unwrap();
+            panic!("poison publication for test");
+        }))
+        .is_err()
+    );
+    assert!(stream.prepare_parquet(false, true, &None).is_err());
+    assert!(stream.parquet_files().is_empty());
+    let parts: Vec<_> = fs::read_dir(&stream.data_path)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".parquet.part"))
+        .collect();
+    assert_eq!(parts.len(), 1);
+    assert!(journal_path(&parts[0].with_extension("")).exists());
+    assert_eq!(read_all(&parts).pairs, expected_pairs(false));
+    assert_eq!(stream.inprocess_arrow_files().len(), 2);
+    assert!(
+        stream
+            .capture_staging(&Arc::new(schema(false)), |_| ())
+            .is_err()
+    );
+    assert_eq!(
+        stream
+            .recordbatches_cloned(&Arc::new(schema(false)))
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        4
+    );
+    let options = Arc::clone(&stream.options);
+    drop(stream);
+    let restarted = fresh(options);
+    restarted
+        .prepare_startup_sync(None)
+        .unwrap()
+        .execute()
+        .unwrap();
+    assert_eq!(
+        read_all(&restarted.parquet_files()).pairs,
+        expected_pairs(false)
+    );
+}
+
+#[test]
+fn unreadable_footer_retains_journal_and_all_sources() {
+    let dir = TempDir::new().unwrap();
+    let case = Case {
+        boundary: Boundary::JournalInstalled,
+        ..Case::default()
+    };
+    let stream = fixture(&dir, case);
+    let output = crash_initial(&stream, case);
+    clear_hook(&stream);
+    let part = parquet_part_path(&output);
+    let original = fs::read(&part).unwrap();
+    let mut corrupted = original.clone();
+    let len = corrupted.len();
+    corrupted[len - 4..].fill(0);
+    fs::write(&part, corrupted).unwrap();
+    assert!(stream.resolve_conversion_journals(&None).is_err());
+    assert!(part.exists());
+    assert!(journal_path(&output).exists());
+    assert_eq!(stream.inprocess_arrow_files().len(), 2);
+    fs::write(&part, original).unwrap();
+    stream.resolve_conversion_journals(&None).unwrap();
+    assert_eq!(
+        read_all(&stream.parquet_files()).pairs,
+        expected_pairs(false)
+    );
+}
+
+#[test]
+fn empty_source_directories_remain_reserved_until_journal_collection() {
+    use super::conversion_journal::JournalFault;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let now = SystemTime::now();
+    let (claim, mut groups) = stream.claim_conversion_groups(now, 4242, false, true);
+    let (output, sources) = groups.pop().unwrap();
+    let parent = sources[0].parent().unwrap().to_path_buf();
+    assert_eq!(parent, Stream::inprocess_folder(&stream.data_path, 4242));
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::JournalRemoval);
+    assert!(
+        stream
+            .convert_arrow_group(output.clone(), sources, None, None, &None)
+            .is_err()
+    );
+    drop(claim);
+    assert!(parent.is_dir());
+    assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+    // Even if external housekeeping removed the empty directory, a surviving
+    // journal prevents a runtime conversion from taking the same path.
+    fs::remove_dir(&parent).unwrap();
+    let mut new_claim = ConversionClaim::new(&stream.conversion_claims);
+    let new_dir = stream
+        .claim_new_inprocess_folder(&mut new_claim, 4242)
+        .unwrap();
+    assert_ne!(new_dir, parent);
+    fs::create_dir(&parent).unwrap();
+    stream.prepare_parquet(false, false, &None).unwrap();
+    assert!(!journal_path(&output).exists());
+    assert!(!parent.exists());
+}
+
+#[test]
+fn static_schema_conversion_preserves_no_staging_policy() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    stream.metadata.write().unwrap().static_schema_flag = true;
+    for file in stream.schema_files() {
+        fs::remove_file(file).unwrap();
+    }
+    stream.prepare_parquet(false, true, &None).unwrap();
+    assert!(stream.schema_files().is_empty());
+    assert_eq!(
+        read_all(&stream.parquet_files()).pairs,
+        expected_pairs(false)
+    );
 }
