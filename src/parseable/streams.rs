@@ -412,6 +412,8 @@ pub struct Stream {
     conversion_hook: Mutex<Option<ConversionHook>>,
     #[cfg(test)]
     lifecycle_hook: Mutex<Option<LifecycleHook>>,
+    #[cfg(test)]
+    conversion_clock: Mutex<Option<SystemTime>>,
 }
 
 /// Test-only pause points in the part lifecycle, for forcing interleavings.
@@ -473,6 +475,11 @@ struct ConversionClaims {
     startup_regroup_deferred: bool,
     next_claim: u64,
     dirs: HashMap<PathBuf, u64>,
+    // Only atomic directory creation grants this exemption from the inventory
+    // gate. It expires with the creating claim, including pre-journal failures.
+    // Value counts journals installed by this claim in the directory, so an
+    // invalid unrelated inventory cannot prevent collecting our empty dirs.
+    fresh_dirs: HashMap<PathBuf, usize>,
     outputs: HashMap<PathBuf, u64>,
 }
 
@@ -507,6 +514,7 @@ impl Drop for ConversionClaim {
         for dir in &self.dirs {
             if registry.dirs.get(dir) == Some(&self.id) {
                 registry.dirs.remove(dir);
+                registry.fresh_dirs.remove(dir);
             }
         }
         for output in &self.outputs {
@@ -543,6 +551,8 @@ enum ConversionPhase<'a> {
     Published,
     /// Valid, synced part; schema and journal installation have not started.
     PartSynced,
+    /// Tmp journal fsynced outside the registry lock; rename has not happened.
+    JournalTmpSynced,
     /// Journal and part installed; publication has not started (also resolver).
     JournalInstalled,
     /// Rename, pending release, and directory sync complete; no unlink yet.
@@ -888,6 +898,8 @@ impl Stream {
             #[cfg(test)]
             lifecycle_hook: Mutex::new(None),
             #[cfg(test)]
+            conversion_clock: Mutex::new(None),
+            #[cfg(test)]
             conversion_hook: Mutex::new(None),
         })
     }
@@ -1171,7 +1183,7 @@ impl Stream {
         registry.startup_regroup_deferred = !registry.journal_dirs.is_empty();
         if !unowned.is_empty() {
             warn!(
-                "Replaying legacy processing directories without journals for stream {}: {:?}; rows may duplicate if staging was produced by a pre-journal version",
+                "Replaying processing directories without journals for stream {}: {:?}; an interrupted conversion that never published is safe to retry; staging from a pre-journal version may duplicate rows",
                 self.stream_name, unowned
             );
         }
@@ -1218,18 +1230,26 @@ impl Stream {
         minute: u128,
     ) -> std::io::Result<PathBuf> {
         let mut registry = lock_conversion_claims(&self.conversion_claims);
-        self.inventory_conversion_journals(&mut registry)
+        let inventory_valid = self
+            .inventory_conversion_journals(&mut registry)
+            .map(|_| true)
             .unwrap_or_else(|err| {
                 error!(
                     "Invalid conversion journal in {}: {err}",
                     self.data_path.display()
                 );
-                Vec::new()
+                false
             });
         let mut reserved = registry.dirs.clone();
         reserved.extend(registry.journal_dirs.iter().cloned().map(|dir| (dir, 0)));
+        if !inventory_valid {
+            // Unknown records may reserve an absent minute-based name. Use a
+            // fresh ULID generation, as for all colliding directory names.
+            reserved.insert(Self::inprocess_folder(&self.data_path, minute), 0);
+        }
         let dir = self.create_inprocess_folder(minute, &reserved)?;
         registry.dirs.insert(dir.clone(), claim.id);
+        registry.fresh_dirs.insert(dir.clone(), 0);
         claim.dirs.push(dir.clone());
         Ok(dir)
     }
@@ -2324,6 +2344,8 @@ impl Stream {
         let _guard = span.enter();
 
         let now = SystemTime::now();
+        #[cfg(test)]
+        let now = self.conversion_clock.lock().unwrap().unwrap_or(now);
         let group_minute = minute_from_system_time(now) - 1;
         let (claim, staging_files) =
             self.claim_conversion_groups(now, group_minute, init_signal, shutdown_signal);
@@ -2465,6 +2487,12 @@ impl Stream {
             ))
             .into());
         }
+        // Refuse gated older sources before opening readers or encoding a part.
+        self.check_conversion_sources(
+            &mut lock_conversion_claims(&self.conversion_claims),
+            &parquet_path,
+            &arrow_files,
+        )?;
         let record_reader =
             ConversionRecordReader::for_stream(&arrow_files, self.is_otel_metrics());
         self.remove_invalid_arrow_files(record_reader.invalid_files(), tenant_id);
@@ -3430,7 +3458,12 @@ impl Stream {
         tenant_id: Option<String>,
     ) -> Result<StartupSyncPlan, StagingError> {
         lock_conversion_claims(&self.conversion_claims).startup_regroup_deferred = true;
-        self.resolve_conversion_journals(&tenant_id)?;
+        if let Err(err) = self.resolve_conversion_journals(&tenant_id) {
+            error!(
+                "Startup conversion recovery for stream {}: {err}",
+                self.stream_name
+            );
+        }
         self.recover_orphan_part_files();
         #[cfg(test)]
         self.lifecycle_phase(LifecyclePhase::StartupRecovered);
@@ -3480,7 +3513,12 @@ impl Stream {
         // On init, recover any orphaned .part files from previous interrupted runs
         if init_signal {
             lock_conversion_claims(&self.conversion_claims).startup_regroup_deferred = true;
-            self.resolve_conversion_journals(tenant_id)?;
+            if let Err(err) = self.resolve_conversion_journals(tenant_id) {
+                error!(
+                    "Init conversion recovery for stream {}: {err}",
+                    self.stream_name
+                );
+            }
             self.recover_orphan_part_files();
         }
 
@@ -4124,6 +4162,7 @@ mod tests {
         set_conversion_hook(&staging, move |phase| match phase {
             ConversionPhase::BeforeSealRename(_) => {}
             ConversionPhase::PartSynced
+            | ConversionPhase::JournalTmpSynced
             | ConversionPhase::JournalInstalled
             | ConversionPhase::AfterPublish
             | ConversionPhase::SourceRemoved { .. }
@@ -4202,6 +4241,7 @@ mod tests {
         set_conversion_hook(&staging, move |phase| match phase {
             ConversionPhase::BeforeSealRename(_) => {}
             ConversionPhase::PartSynced
+            | ConversionPhase::JournalTmpSynced
             | ConversionPhase::JournalInstalled
             | ConversionPhase::AfterPublish
             | ConversionPhase::SourceRemoved { .. }

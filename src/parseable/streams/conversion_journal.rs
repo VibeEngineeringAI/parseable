@@ -265,27 +265,58 @@ impl Stream {
         result
     }
 
+    /// Freshly created, still claimed directories cannot belong to an older
+    /// journal. Every older directory needs a valid inventory, even if it was
+    /// successfully claimed before another journal became unreadable.
+    pub(super) fn check_conversion_sources(
+        &self,
+        registry: &mut ConversionClaims,
+        output: &Path,
+        sources: &[PathBuf],
+    ) -> Result<(), StagingError> {
+        let owner = registry.outputs.get(&parquet_part_path(output));
+        let fresh = owner.is_some()
+            && !sources.is_empty()
+            && sources.iter().all(|source| {
+                source.parent().is_some_and(|dir| {
+                    registry.fresh_dirs.contains_key(dir) && registry.dirs.get(dir) == owner
+                })
+            });
+        if !fresh {
+            let journals = self.inventory_conversion_journals(registry)?;
+            if registry.journals_blocked
+                || journals
+                    .iter()
+                    .any(|journal| journal.sources(self).iter().any(|s| sources.contains(s)))
+            {
+                return Err(invalid(
+                    output,
+                    "source ownership is reserved by conversion recovery",
+                )
+                .into());
+            }
+        }
+        if has_journal(output) {
+            return Err(invalid(output, "conflicting conversion ownership").into());
+        }
+        Ok(())
+    }
+
     pub(super) fn install_conversion_journal(
         &self,
         journal: &ConversionJournal,
     ) -> Result<(), StagingError> {
-        let mut registry = lock_conversion_claims(&self.conversion_claims);
-        let journals = self.inventory_conversion_journals(&mut registry)?;
         let output = journal.output(self);
         let path = journal_path(&output);
-        if has_journal(&output)
-            || journals.iter().any(|j| {
-                j.record
-                    .sources
-                    .iter()
-                    .any(|s| journal.record.sources.iter().any(|new| new.path == s.path))
-            })
-        {
-            return Err(invalid(&path, "conflicting conversion ownership").into());
-        }
         let bytes = serde_json::to_vec(journal)?;
         if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-            return Err(invalid(&path, "record exceeds size limit").into());
+            let reason = format!(
+                "record has {} bytes for {} sources, exceeding the {MAX_JOURNAL_BYTES}-byte limit; conversion retains its sources and requires a smaller group",
+                bytes.len(),
+                journal.record.sources.len()
+            );
+            error!("Conversion journal {}: {reason}", path.display());
+            return Err(invalid(&path, reason).into());
         }
         let tmp = path.with_extension("sources.tmp");
         let mut file = OpenOptions::new()
@@ -295,6 +326,12 @@ impl Stream {
             .open(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        #[cfg(test)]
+        self.conversion_phase(ConversionPhase::JournalTmpSynced);
+        // Output claims protect tmp writes/cleanup. Keep only conflict check,
+        // install rename and reservations atomic under the registry lock.
+        let mut registry = lock_conversion_claims(&self.conversion_claims);
+        self.check_conversion_sources(&mut registry, &output, &journal.sources(self))?;
         fs::rename(tmp, path)?;
         // Reserve before a possible sync failure: J is already installed.
         registry.journal_dirs.extend(
@@ -303,6 +340,17 @@ impl Stream {
                 .iter()
                 .filter_map(|s| s.parent().map(Path::to_path_buf)),
         );
+        for dir in journal
+            .sources(self)
+            .iter()
+            .filter_map(|s| s.parent())
+            .collect::<HashSet<_>>()
+        {
+            if let Some(count) = registry.fresh_dirs.get_mut(dir) {
+                *count += 1;
+            }
+        }
+        drop(registry);
         sync_directory(&self.data_path)?;
         Ok(())
     }
@@ -314,6 +362,30 @@ impl Stream {
         let mut claim = ConversionClaim::new(&self.conversion_claims);
         let journals = {
             let mut registry = lock_conversion_claims(&self.conversion_claims);
+            // Tmp files are never ownership records. A live output claim is
+            // installed before its tmp is opened, so this check and deletion
+            // cannot race that writer. Run even when the inventory is invalid.
+            if let Ok(entries) = fs::read_dir(&self.data_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(output) = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.strip_suffix(".parquet.sources.tmp"))
+                    {
+                        let output = self.data_path.join(format!("{output}.parquet"));
+                        if !registry.outputs.contains_key(&parquet_part_path(&output))
+                            && let Err(err) = remove_file(&path)
+                            && err.kind() != io::ErrorKind::NotFound
+                        {
+                            warn!(
+                                "Cannot remove abandoned journal tmp {}: {err}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
             let journals = self.inventory_conversion_journals(&mut registry)?;
             registry.journals_blocked = false;
             journals
@@ -416,11 +488,17 @@ impl Stream {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
-            // Include parents of sources already absent on retries. Retain
-            // these directories until journal collection has completed.
-            sync_directory(parent)?;
             #[cfg(not(test))]
             let _ = ordinal;
+        }
+        // Sync each distinct parent once, including parents whose sources were
+        // already absent. A missing parent necessarily has no remaining source.
+        for dir in &dirs {
+            match sync_directory(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         #[cfg(test)]
         self.conversion_phase(ConversionPhase::SourcesRetired);
@@ -428,12 +506,22 @@ impl Stream {
         self.fail_journal_io(JournalFault::JournalRemoval)?;
         let mut registry = lock_conversion_claims(&self.conversion_claims);
         remove_file(journal_path(&output))?;
+        for dir in &dirs {
+            if let Some(count) = registry.fresh_dirs.get_mut(dir) {
+                *count -= 1;
+                if *count == 0 {
+                    registry.journal_dirs.remove(dir);
+                }
+            }
+        }
         sync_directory(&self.data_path)?;
         // Refresh exclusions and do housekeeping under the registry lock so
         // another grouper cannot reuse a name while it is being removed.
-        self.inventory_conversion_journals(&mut registry)?;
+        let inventory_valid = self.inventory_conversion_journals(&mut registry).is_ok();
         for dir in dirs {
-            if !registry.journal_dirs.contains(&dir) {
+            if (inventory_valid && !registry.journal_dirs.contains(&dir))
+                || registry.fresh_dirs.get(&dir) == Some(&0)
+            {
                 match fs::remove_dir(&dir) {
                     Ok(()) => {}
                     Err(e)

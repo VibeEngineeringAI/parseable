@@ -418,6 +418,7 @@ fn observe(case: Case, control: bool) -> Snapshot {
             .execute()
             .unwrap();
         restarted.prepare_parquet(false, true, &None).unwrap();
+        assert_clean_residue(&restarted);
         assert!(
             restarted.arrow_files().is_empty(),
             "fixture: root sources not drained"
@@ -628,6 +629,375 @@ fn clear_hook(stream: &Stream) {
     *stream.conversion_hook.lock().unwrap() = None;
 }
 
+/// Exact root residue: only schema files and the independently decoded outputs.
+/// This rejects empty processing dirs, journals, parts and journal tmp files too.
+fn assert_clean_residue(stream: &Stream) {
+    let mut expected = stream.schema_files();
+    expected.extend(listed_parquet(&stream.data_path));
+    expected.sort();
+    let mut actual = fs::read_dir(&stream.data_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    actual.sort();
+    assert_eq!(actual, expected, "unexpected recovery residue");
+    assert!(
+        actual
+            .iter()
+            .all(|p| fs::symlink_metadata(p).unwrap().is_file())
+    );
+}
+
+fn push_extra(stream: &Stream) {
+    push_extra_ids(stream, [201, 202]);
+}
+
+fn push_extra_ids(stream: &Stream, ids: [i32; 2]) {
+    let now = DateTime::parse_from_rfc3339("2020-01-02T12:35:30.500Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema(false)),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![
+                now.timestamp_millis();
+                2
+            ])),
+            Arc::new(Int32Array::from(ids.to_vec())),
+        ],
+    )
+    .unwrap();
+    stream
+        .push(
+            "extra",
+            &batch,
+            now.naive_utc(),
+            &HashMap::new(),
+            StreamType::UserDefined,
+        )
+        .unwrap();
+    stream.flush_with_clock(true, || now).unwrap();
+}
+
+// Periodic eligibility uses file creation time, not the row timestamp. Advance
+// only the conversion clock so newly created fixture files are overdue.
+fn next_periodic_cycle(stream: &Stream) {
+    *stream.conversion_clock.lock().unwrap() =
+        Some(SystemTime::now() + std::time::Duration::from_secs(120));
+}
+
+fn expected_with_extra() -> Vec<Pair> {
+    let mut pairs = expected_pairs(false);
+    pairs.extend([(201, None), (202, None)]);
+    pairs
+}
+
+#[test]
+fn invalid_journal_allows_new_ingestion_and_releases_only_its_memory() {
+    for dangling_symlink in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let case = Case {
+            boundary: Boundary::JournalInstalled,
+            ..Case::default()
+        };
+        let stream = fixture(&dir, case);
+        let output = crash_initial(&stream, case);
+        clear_hook(&stream);
+        let journal = journal_path(&output);
+        let original_journal = fs::read(&journal).unwrap();
+        let part_bytes = fs::read(parquet_part_path(&output)).unwrap();
+        let sources = stream
+            .inprocess_arrow_files()
+            .into_iter()
+            .map(|p| {
+                let bytes = fs::read(&p).unwrap();
+                (p, bytes)
+            })
+            .collect::<Vec<_>>();
+        if dangling_symlink {
+            fs::remove_file(&journal).unwrap();
+            std::os::unix::fs::symlink(stream.data_path.join("missing-journal"), &journal).unwrap();
+        } else {
+            fs::write(&journal, b"{").unwrap();
+        }
+        // Multiple periodic cycles must drain new memory and directories, even
+        // though prepare_parquet still reports the unrelated recovery error.
+        let mut extras = Vec::new();
+        for cycle in 0..3 {
+            let ids = [201 + cycle * 10, 202 + cycle * 10];
+            push_extra_ids(&stream, ids);
+            next_periodic_cycle(&stream);
+            assert!(stream.prepare_parquet(false, false, &None).is_err());
+            extras.extend(ids.into_iter().map(|id| (id, None)));
+            extras.sort();
+            assert_eq!(
+                capture_pairs(&stream),
+                (expected_pairs(false), extras.clone())
+            );
+            assert_eq!(stream.inprocess_dirs().len(), 1);
+            assert_eq!(fs::read(parquet_part_path(&output)).unwrap(), part_bytes);
+            for (path, bytes) in &sources {
+                assert_eq!(&fs::read(path).unwrap(), bytes);
+            }
+            if dangling_symlink {
+                assert!(
+                    fs::symlink_metadata(&journal)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+            } else {
+                assert_eq!(fs::read(&journal).unwrap(), b"{");
+            }
+            assert!(
+                stream
+                    .arrow_files_grouped_exclude_time(SystemTime::now(), 1, true, false)
+                    .is_empty()
+            );
+        }
+        if dangling_symlink {
+            fs::remove_file(&journal).unwrap();
+        }
+        fs::write(&journal, original_journal).unwrap();
+        stream.prepare_parquet(false, false, &None).unwrap();
+        let mut expected = expected_pairs(false);
+        expected.extend(extras);
+        expected.sort();
+        assert_eq!(capture_pairs(&stream), (vec![], expected));
+        assert_clean_residue(&stream);
+    }
+}
+
+#[test]
+fn older_claim_is_gated_before_encoding_if_inventory_becomes_invalid() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(
+        &dir,
+        Case {
+            multiple_dirs: true,
+            ..Case::default()
+        },
+    );
+    let (claim, mut groups) = stream.claim_conversion_groups(SystemTime::now(), 1, true, false);
+    let (output, sources) = groups.pop().unwrap();
+    fs::write(stream.data_path.join("bad.parquet.sources"), b"{").unwrap();
+    *stream.lifecycle_hook.lock().unwrap() = Some(Arc::new(|phase| {
+        assert!(!matches!(
+            phase,
+            LifecyclePhase::ConversionReadersOpened { .. } | LifecyclePhase::ParquetPartCreated(_)
+        ));
+    }));
+    assert!(
+        stream
+            .convert_arrow_group(output.clone(), sources.clone(), None, None, &None)
+            .is_err()
+    );
+    assert!(!parquet_part_path(&output).exists());
+    assert!(sources.iter().all(|p| p.exists()));
+    drop(claim);
+}
+
+#[test]
+fn startup_and_init_recover_orphan_arrow_despite_unresolvable_journal() {
+    for init in [false, true] {
+        for invalid_inventory in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let stream = fixture(&dir, Case::default());
+            let output = crash_initial(&stream, Case::default());
+            clear_hook(&stream);
+            push_extra(&stream);
+            let root = stream.arrow_files().pop().unwrap();
+            let mut orphan = root.clone();
+            orphan.add_extension("part");
+            fs::rename(&root, &orphan).unwrap();
+            let journal = journal_path(&output);
+            let journal_bytes = fs::read(&journal).unwrap();
+            let source = stream.inprocess_arrow_files().pop().unwrap();
+            let source_bytes = fs::read(&source).unwrap();
+            if invalid_inventory {
+                fs::write(&journal, b"{").unwrap();
+            } else {
+                fs::write(&source, b"wrong source size").unwrap();
+            }
+            let options = Arc::clone(&stream.options);
+            drop(stream);
+            let restarted = fresh(options);
+            assert_eq!(capture_pairs(&restarted), (vec![], expected_pairs(false)));
+            if init {
+                assert!(restarted.flush_and_convert(true, false, &None).is_err());
+            } else {
+                restarted
+                    .prepare_startup_sync(None)
+                    .unwrap()
+                    .execute()
+                    .unwrap();
+            }
+            assert!(
+                !orphan.exists(),
+                "startup must recover the orphan despite journal failure"
+            );
+            assert_eq!(restarted.arrow_files().len(), 1);
+            next_periodic_cycle(&restarted);
+            assert!(restarted.prepare_parquet(false, false, &None).is_err());
+            assert_eq!(capture_pairs(&restarted), (vec![], expected_with_extra()));
+            assert!(journal.exists());
+            fs::write(&journal, journal_bytes).unwrap();
+            fs::write(&source, source_bytes).unwrap();
+            restarted.prepare_parquet(false, false, &None).unwrap();
+            restarted.prepare_parquet(false, false, &None).unwrap();
+            assert_eq!(capture_pairs(&restarted), (vec![], expected_with_extra()));
+            assert_clean_residue(&restarted);
+        }
+    }
+}
+
+#[test]
+fn journal_and_prejournal_failure_sharing_directory_retry_exactly_once() {
+    use super::conversion_journal::JournalFault;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    push_extra(&stream);
+    let (claim, mut groups) = stream.claim_conversion_groups(SystemTime::now(), 1, false, true);
+    assert_eq!(groups.len(), 2);
+    groups.sort_by_key(|(_, sources)| source_pairs(&sources[0])[0].0);
+    let (x_output, x_sources) = groups.remove(0);
+    let (y_output, y_sources) = groups.remove(0);
+    assert_eq!(x_sources[0].parent(), y_sources[0].parent());
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
+    assert!(
+        stream
+            .convert_arrow_group(x_output.clone(), x_sources, None, None, &None)
+            .is_err()
+    );
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::Schema);
+    assert!(
+        stream
+            .convert_arrow_group(y_output.clone(), y_sources.clone(), None, None, &None)
+            .is_err()
+    );
+    assert!(!journal_path(&y_output).exists());
+    assert!(!parquet_part_path(&y_output).exists());
+    drop(claim);
+    let options = Arc::clone(&stream.options);
+    drop(stream);
+    let restarted = fresh(options);
+    *restarted.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
+    let plan = restarted.prepare_startup_sync(None).unwrap();
+    assert!(plan.staging_files.is_empty());
+    plan.execute().unwrap();
+    *restarted.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
+    assert!(restarted.prepare_parquet(false, false, &None).is_err());
+    assert!(y_sources.iter().all(|p| p.exists()));
+    assert_eq!(capture_pairs(&restarted), (vec![], expected_pairs(false)));
+    restarted.prepare_parquet(false, false, &None).unwrap();
+    restarted.prepare_parquet(false, false, &None).unwrap();
+    assert_eq!(capture_pairs(&restarted), (vec![], expected_with_extra()));
+    assert_clean_residue(&restarted);
+}
+
+#[test]
+fn overlapping_resolvers_publish_the_same_journal_once() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::channel,
+    };
+    use std::time::Duration;
+    let dir = TempDir::new().unwrap();
+    let case = Case {
+        boundary: Boundary::JournalInstalled,
+        ..Case::default()
+    };
+    let stream = fixture(&dir, case);
+    let output = crash_initial(&stream, case);
+    clear_hook(&stream);
+    let (paused_tx, paused_rx) = channel();
+    let (resume_tx, resume_rx) = channel();
+    let resume_rx = Mutex::new(resume_rx);
+    let publications = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&publications);
+    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, ConversionPhase::JournalInstalled) {
+            paused_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+        }
+        if matches!(phase, ConversionPhase::Published) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let first = {
+        let stream = Arc::clone(&stream);
+        std::thread::spawn(move || stream.resolve_conversion_journals(&None))
+    };
+    paused_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    let second = {
+        let stream = Arc::clone(&stream);
+        std::thread::spawn(move || stream.resolve_conversion_journals(&None))
+    };
+    second.join().unwrap().unwrap();
+    assert!(parquet_part_path(&output).exists());
+    assert_eq!(capture_pairs(&stream), (expected_pairs(false), vec![]));
+    resume_tx.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    assert_eq!(publications.load(Ordering::SeqCst), 1);
+    assert_eq!(listed_parquet(&stream.data_path), vec![output]);
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert_clean_residue(&stream);
+}
+
+#[test]
+fn resolver_collects_abandoned_journal_tmp_but_preserves_live_tmp() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    next_periodic_cycle(&stream);
+    let (paused_tx, paused_rx) = channel();
+    let (resume_tx, resume_rx) = channel();
+    let resume_rx = Mutex::new(resume_rx);
+    let weak = Arc::downgrade(&stream);
+    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, ConversionPhase::JournalTmpSynced) {
+            // A synced tmp must not require holding the registry mutex.
+            assert!(weak.upgrade().unwrap().conversion_claims.try_lock().is_ok());
+            paused_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+        }
+    }));
+    let worker = {
+        let stream = Arc::clone(&stream);
+        std::thread::spawn(move || stream.prepare_parquet(false, false, &None))
+    };
+    paused_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    let tmp = fs::read_dir(&stream.data_path)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(".parquet.sources.tmp"))
+        .unwrap();
+    let bytes = fs::read(&tmp).unwrap();
+    let stale = stream.data_path.join("abandoned.parquet.sources.tmp");
+    let invalid = stream.data_path.join("bad.parquet.sources");
+    fs::write(&stale, b"stale tmp").unwrap();
+    fs::write(&invalid, b"{").unwrap();
+    assert!(stream.resolve_conversion_journals(&None).is_err());
+    assert!(!stale.exists());
+    assert_eq!(fs::read(&invalid).unwrap(), b"{");
+    assert_eq!(fs::read(&tmp).unwrap(), bytes);
+    fs::remove_file(&invalid).unwrap();
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert_clean_residue(&stream);
+}
+
 fn capture_pairs(stream: &Stream) -> (Vec<Pair>, Vec<Pair>) {
     let (memory, disk) = stream
         .capture_staging(&Arc::new(schema(true)), |dir| {
@@ -729,7 +1099,9 @@ fn unlink_failure_reserves_sources_at_restart_and_periodic_retry_finishes() {
     drop(stream);
     let restarted = fresh(options);
     *restarted.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
-    assert!(restarted.prepare_startup_sync(None).is_err());
+    let plan = restarted.prepare_startup_sync(None).unwrap();
+    assert!(plan.staging_files.is_empty());
+    plan.execute().unwrap();
     assert!(
         restarted
             .arrow_files_grouped_exclude_time(SystemTime::now(), 1, true, false)
@@ -787,7 +1159,9 @@ fn deferred_startup_regroup_retries_unjournaled_rows_without_restart() {
         } else {
             *restarted.journal_fault.lock().unwrap() = Some(JournalFault::SourceUnlink);
         }
-        assert!(restarted.prepare_startup_sync(None).is_err());
+        let plan = restarted.prepare_startup_sync(None).unwrap();
+        assert!(plan.staging_files.is_empty());
+        plan.execute().unwrap();
         assert!(extra.exists());
         assert_eq!(capture_pairs(&restarted), (vec![], expected_pairs(false)));
         // Also exercise init grouping while a parseable journal reserves the
@@ -1329,7 +1703,6 @@ fn empty_source_directories_remain_reserved_until_journal_collection() {
         .claim_new_inprocess_folder(&mut new_claim, 4242)
         .unwrap();
     assert_ne!(new_dir, parent);
-    fs::create_dir(&parent).unwrap();
     stream.prepare_parquet(false, false, &None).unwrap();
     assert!(!journal_path(&output).exists());
     assert!(!parent.exists());
