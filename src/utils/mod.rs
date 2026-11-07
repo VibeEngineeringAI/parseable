@@ -265,6 +265,12 @@ pub fn is_admin_for_session(session_key: &SessionKey) -> bool {
 
 /// Builds the auth headers used to forward a request to another node.
 ///
+/// With a cluster secret the peer authenticates the caller by `userid`.
+/// Without one, the caller's `Authorization` header is forwarded if present;
+/// otherwise the request authenticates as this node with `node_token`. A
+/// session cookie is never forwarded, since sessions live only on the node
+/// that issued them and the peer would reject it.
+///
 /// A malformed tenant header on the incoming request is a client error
 /// (`HeaderBuildError::Input`, 400). Values the server stored or generated
 /// itself (cluster secret hash, user id, node token) failing to encode is a
@@ -318,11 +324,6 @@ fn build_intracluster_auth_headermap(
         );
     } else if let Some(auth) = req.get(actix_web::http::header::AUTHORIZATION) {
         map.insert(reqwest::header::AUTHORIZATION, copied_header_value(auth)?);
-    } else if req.contains_key(actix_web::http::header::COOKIE) {
-        // multiple cookies
-        for cookie in req.get_all(actix_web::http::header::COOKIE) {
-            map.insert(reqwest::header::COOKIE, copied_header_value(cookie)?);
-        }
     } else {
         map.insert(
             reqwest::header::AUTHORIZATION,
@@ -456,11 +457,38 @@ mod tests {
     }
 
     #[test]
-    fn forwarding_copies_cookie_header() {
+    fn forwarding_replaces_session_cookie_with_node_token() {
+        let req = headers(&[(
+            "cookie",
+            HeaderValue::from_static("session=01M6ARA6TCK200TXKYC6CWRN5D; username=admin"),
+        )]);
+        let map = build_intracluster_auth_headermap(&req, "Basic node", "alice", None).unwrap();
+        assert!(map.get(reqwest::header::COOKIE).is_none());
+        assert_eq!(
+            map.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Basic node"
+        );
+    }
+
+    #[test]
+    fn forwarding_never_copies_cookie() {
         let req = headers(&[("cookie", HeaderValue::from_static("session=abc"))]);
-        let map = build_intracluster_auth_headermap(&req, "node", "alice", None).unwrap();
-        assert_eq!(map.get(reqwest::header::COOKIE).unwrap(), "session=abc");
-        assert!(map.get(reqwest::header::AUTHORIZATION).is_none());
+        for (req, secret) in [
+            (req.clone(), Some("hash")),
+            (
+                headers(&[
+                    ("cookie", HeaderValue::from_static("session=abc")),
+                    (
+                        "authorization",
+                        HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+                    ),
+                ]),
+                None,
+            ),
+        ] {
+            let map = build_intracluster_auth_headermap(&req, "node", "alice", secret).unwrap();
+            assert!(map.get(reqwest::header::COOKIE).is_none());
+        }
     }
 
     #[test]
@@ -531,11 +559,14 @@ mod tests {
     #[test]
     fn forwarding_ignores_unused_generated_text() {
         // a copied credential wins over the node token, so a bad token is never encoded
-        let req = headers(&[("cookie", HeaderValue::from_bytes(b"s=caf\xc3\xa9").unwrap())]);
+        let req = headers(&[(
+            "authorization",
+            HeaderValue::from_bytes(b"Basic caf\xc3\xa9").unwrap(),
+        )]);
         let map = build_intracluster_auth_headermap(&req, "Basic josé", "josé", None).unwrap();
         assert_eq!(
-            map.get(reqwest::header::COOKIE).unwrap().as_bytes(),
-            b"s=caf\xc3\xa9"
+            map.get(reqwest::header::AUTHORIZATION).unwrap().as_bytes(),
+            b"Basic caf\xc3\xa9"
         );
         assert!(map.get("intra-cluster-userid").is_none());
     }
