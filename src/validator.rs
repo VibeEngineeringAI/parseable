@@ -76,6 +76,22 @@ pub fn stream_name(
     Ok(())
 }
 
+/// Validates the name of a stream being created. On top of [`stream_name`],
+/// it must be ASCII: object stores percent-encode other characters in keys,
+/// and the storage layer doesn't handle the encoded form everywhere, so such
+/// a stream couldn't be listed or reloaded. Existing streams are still
+/// checked with [`stream_name`] alone.
+pub fn new_stream_name(
+    name: &str,
+    stream_type: StreamType,
+) -> Result<(), StreamNameValidationError> {
+    stream_name(name, stream_type)?;
+    if !name.is_ascii() {
+        return Err(StreamNameValidationError::NonAsciiName(name.to_owned()));
+    }
+    Ok(())
+}
+
 static RESERVED_NAMES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
         "super-admin",
@@ -180,6 +196,8 @@ pub mod error {
         NameWhiteSpace(String),
         #[error("Stream name cannot contain special character: {c}")]
         NameSpecialChar { c: char },
+        #[error("Stream name {0} must use only ASCII letters, digits, '-' and '_'")]
+        NonAsciiName(String),
         #[error("SQL keyword cannot be used as stream name")]
         SQLKeyword(String),
         #[error("The stream name {0} is reserved for internal use")]
@@ -234,6 +252,27 @@ pub mod error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_stream_names_must_be_ascii() {
+        for name in ["café", "données", "日志", "app-é"] {
+            assert!(
+                matches!(
+                    new_stream_name(name, StreamType::UserDefined),
+                    Err(StreamNameValidationError::NonAsciiName(rejected)) if rejected == name
+                ),
+                "{name}"
+            );
+            // Existing streams with such names still validate.
+            assert!(stream_name(name, StreamType::UserDefined).is_ok(), "{name}");
+        }
+        assert!(new_stream_name("app-1_x", StreamType::UserDefined).is_ok());
+        // The other checks still come first.
+        assert!(matches!(
+            new_stream_name("select", StreamType::UserDefined),
+            Err(StreamNameValidationError::SQLKeyword(_))
+        ));
+    }
 
     #[test]
     fn stream_name_rejects_default_tenant() {
