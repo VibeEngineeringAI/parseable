@@ -90,6 +90,7 @@ type BoxedBatchStream = SendableRecordBatchStream;
 /// Result type returned by query execution: either collected batches or a streaming adapter, plus field names.
 type QueryResult = Result<(Either<Vec<RecordBatch>, BoxedBatchStream>, Vec<String>), ExecuteError>;
 const DEFAULT_COUNTS_TOP_K: usize = 10;
+const MAX_COUNT_BINS: u64 = 10_000;
 
 pub static SCHEMA_PROVIDER: OnceCell<Box<dyn ParseableSchemaProvider>> = OnceCell::new();
 
@@ -733,7 +734,7 @@ pub struct CountsRequest {
     pub start_time: String,
     /// Excluded end time for counts query
     pub end_time: String,
-    /// optional number of bins to divide the time range into
+    /// Optional number of bins to divide the time range into (1 through 10,000).
     pub num_bins: Option<u64>,
     /// Conditions
     pub conditions: Option<CountConditions>,
@@ -743,7 +744,24 @@ fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+fn validate_count_bins(num_bins: u64) -> Result<(), QueryError> {
+    if !(1..=MAX_COUNT_BINS).contains(&num_bins) {
+        return Err(QueryError::CustomError(format!(
+            "numBins must be between 1 and {MAX_COUNT_BINS} (inclusive)"
+        )));
+    }
+    Ok(())
+}
+
 impl CountsRequest {
+    /// Validate explicit bin counts before stream access or query planning.
+    pub(crate) fn validate_num_bins(&self) -> Result<(), QueryError> {
+        if let Some(num_bins) = self.num_bins {
+            validate_count_bins(num_bins)?;
+        }
+        Ok(())
+    }
+
     /// This function is supposed to read maninfest files for the given stream,
     /// get the sum of `num_rows` between the `startTime` and `endTime`,
     /// divide that by number of bins and return in a manner acceptable for the console
@@ -751,16 +769,16 @@ impl CountsRequest {
         &self,
         tenant_id: &Option<String>,
     ) -> Result<Vec<CountsRecord>, QueryError> {
+        self.validate_num_bins()?;
+        let time_range = TimeRange::parse_human_time(&self.start_time, &self.end_time)?;
+        let counts = self.get_bounds(&time_range)?;
+
         let time_partition = PARSEABLE
             .get_stream(&self.stream, tenant_id)
             .map_err(|err| anyhow::Error::msg(err.to_string()))?
             .get_time_partition()
             .unwrap_or_else(|| DEFAULT_TIMESTAMP_KEY.to_owned());
-        // get time range
-        let time_range = TimeRange::parse_human_time(&self.start_time, &self.end_time)?;
         let all_manifest_files = get_manifest_list(&self.stream, &time_range, tenant_id).await?;
-        // get bounds
-        let counts = self.get_bounds(&time_range)?;
 
         // we have start and end times for each bin
         // we also have all the manifest files for the given time range
@@ -828,47 +846,24 @@ impl CountsRequest {
             }
         };
 
-        if num_bins == 0 {
-            return Err(QueryError::CustomError(
-                "numBins must be greater than 0".to_string(),
-            ));
-        }
+        validate_count_bins(num_bins)?;
 
         // divide minutes by num bins to get minutes per bin
         let quotient = total_minutes / num_bins;
-        let remainder = total_minutes % num_bins;
-        let have_remainder = remainder > 0;
 
         // now create multiple bounds [startTime, endTime)
-        // Should we exclude the last one???
-        let mut bounds = vec![];
-
+        let mut bounds = Vec::with_capacity(num_bins as usize);
         let mut start = time_range.start;
-
-        let loop_end = if have_remainder {
-            num_bins
-        } else {
-            num_bins - 1
-        };
-
-        // Create bins for all but the last date
-        for _ in 0..loop_end {
-            let end = start + Duration::minutes(quotient as i64);
+        for bin in 0..num_bins {
+            // Keep the existing interval for preceding bins and include any
+            // remainder in the final bin instead of allocating an extra bin.
+            let end = if bin == num_bins - 1 {
+                time_range.end
+            } else {
+                start + Duration::minutes(quotient as i64)
+            };
             bounds.push(TimeBounds { start, end });
             start = end;
-        }
-
-        // Add the last bin, accounting for any remainder, should we include it?
-        if have_remainder {
-            bounds.push(TimeBounds {
-                start,
-                end: start + Duration::minutes(remainder as i64),
-            });
-        } else {
-            bounds.push(TimeBounds {
-                start,
-                end: start + Duration::minutes(quotient as i64),
-            });
         }
 
         Ok(bounds)
@@ -876,6 +871,7 @@ impl CountsRequest {
 
     /// This function will get executed only if self.conditions is some
     pub async fn get_df_sql(&self, time_column: String) -> Result<String, QueryError> {
+        self.validate_num_bins()?;
         // unwrap because we have asserted that it is some
         let count_conditions = self.conditions.as_ref().unwrap();
 
@@ -1301,8 +1297,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AbortQueryOnDrop, DataFusionError, RecordBatch, RecordBatchStreamAdapter,
-        forward_partition_batches,
+        AbortQueryOnDrop, DataFusionError, DateTime, Duration, MAX_COUNT_BINS, RecordBatch,
+        RecordBatchStreamAdapter, TimeRange, Utc, forward_partition_batches,
     };
     use crate::query::{
         CountConditions, CountsRequest, flatten_objects_for_count, resolve_stream_names,
@@ -1373,6 +1369,152 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(conditions.top_k, Some(3));
+    }
+
+    fn counts_request_for_minutes(num_bins: Option<u64>, minutes: i64) -> CountsRequest {
+        let start = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        CountsRequest {
+            stream: "logs".to_string(),
+            start_time: start.to_rfc3339(),
+            end_time: (start + Duration::minutes(minutes)).to_rfc3339(),
+            num_bins,
+            conditions: None,
+        }
+    }
+
+    #[test]
+    fn test_counts_bounds_respect_bin_limits_and_cover_range() {
+        for (num_bins, minutes) in [
+            (1, 11),
+            (1, 0),
+            (3, 10),
+            (MAX_COUNT_BINS, 10_000),
+            (MAX_COUNT_BINS, 10_001),
+            (MAX_COUNT_BINS, 1),
+        ] {
+            let request = counts_request_for_minutes(Some(num_bins), minutes);
+            let range =
+                TimeRange::parse_human_time(&request.start_time, &request.end_time).unwrap();
+            let bounds = request.get_bounds(&range).unwrap();
+
+            assert_eq!(bounds.len(), num_bins as usize);
+            assert!(bounds.len() <= MAX_COUNT_BINS as usize);
+            assert_eq!(bounds.first().unwrap().start, range.start);
+            assert_eq!(bounds.last().unwrap().end, range.end);
+            assert!(bounds.iter().all(|bin| bin.start <= bin.end));
+            assert!(bounds.windows(2).all(|pair| pair[0].end == pair[1].start));
+            // Earlier boundaries remain unchanged; the last bin absorbs the remainder.
+            let quotient = minutes / num_bins as i64;
+            for bin in &bounds[..bounds.len() - 1] {
+                assert_eq!(bin.end - bin.start, Duration::minutes(quotient));
+            }
+        }
+    }
+
+    #[test]
+    fn test_counts_bounds_reject_invalid_num_bins() {
+        for num_bins in [0, MAX_COUNT_BINS + 1, 1_000_000_000, u64::MAX] {
+            let request = counts_request_for_minutes(Some(num_bins), 60);
+            let range =
+                TimeRange::parse_human_time(&request.start_time, &request.end_time).unwrap();
+            let error = request.get_bounds(&range).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "CustomError: numBins must be between 1 and 10000 (inclusive)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_counts_default_bounds_preserve_bin_counts() {
+        for (minutes, expected_bins) in [
+            (60, 60),
+            (300, 300),
+            (301, 61),
+            (1440, 288),
+            (1441, 25),
+            (14_400, 240),
+            (14_401, 11),
+            (10_000 * 1440, 10_000),
+        ] {
+            let request = counts_request_for_minutes(None, minutes);
+            let range =
+                TimeRange::parse_human_time(&request.start_time, &request.end_time).unwrap();
+            let bounds = request.get_bounds(&range).unwrap();
+            assert_eq!(bounds.len(), expected_bins);
+            assert_eq!(bounds.first().unwrap().start, range.start);
+            assert_eq!(bounds.last().unwrap().end, range.end);
+            assert!(bounds.windows(2).all(|pair| pair[0].end == pair[1].start));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_counts_manifest_rejects_oversized_default_before_stream_access() {
+        let request = counts_request_for_minutes(None, 10_001 * 1440);
+        let range = TimeRange::parse_human_time(&request.start_time, &request.end_time).unwrap();
+        assert!(request.get_bounds(&range).is_err());
+        let error = request.get_bin_density(&None).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "CustomError: numBins must be between 1 and 10000 (inclusive)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_counts_methods_reject_invalid_num_bins_before_stream_access() {
+        for num_bins in [0, MAX_COUNT_BINS + 1, 1_000_000_000, u64::MAX] {
+            let mut request = counts_request_for_minutes(Some(num_bins), 60);
+            // Invalid times prove explicit limits are checked before any other work.
+            request.start_time = "invalid".to_string();
+            request.end_time = "invalid".to_string();
+            let error = request.get_bin_density(&None).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "CustomError: numBins must be between 1 and 10000 (inclusive)"
+            );
+
+            request.conditions = Some(CountConditions {
+                conditions: None,
+                group_by: None,
+                top_k: None,
+            });
+            let error = request
+                .get_df_sql("p_timestamp".to_string())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "CustomError: numBins must be between 1 and 10000 (inclusive)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_counts_sql_preserves_default_intervals_for_valid_num_bins() {
+        for (minutes, interval) in [
+            (60, "1m"),
+            (300, "1m"),
+            (301, "5m"),
+            (1440, "5m"),
+            (1441, "1h"),
+            (14_399, "1h"),
+            (14_400, "1d"),
+            (14_401, "1d"),
+        ] {
+            for num_bins in [None, Some(1), Some(MAX_COUNT_BINS)] {
+                let mut request = counts_request_for_minutes(num_bins, minutes);
+                request.conditions = Some(CountConditions {
+                    conditions: None,
+                    group_by: None,
+                    top_k: None,
+                });
+                let sql = request.get_df_sql("p_timestamp".to_string()).await.unwrap();
+                assert!(sql.contains(&format!("DATE_BIN('{interval}',")));
+                assert!(sql.contains(&format!("INTERVAL '{interval}'")));
+            }
+        }
     }
 
     #[tokio::test]

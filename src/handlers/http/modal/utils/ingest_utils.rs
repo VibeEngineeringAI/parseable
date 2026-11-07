@@ -31,7 +31,8 @@ use tracing::{error, instrument, warn};
 
 use crate::{
     event::{
-        FORMAT_KEY, SOURCE_IP_KEY, USER_AGENT_KEY,
+        FORMAT_KEY, SOURCE_IP_KEY, USER_AGENT_KEY, commit_ingested_schemas,
+        error::EventError,
         format::{EventFormat, LogSource, json},
     },
     handlers::{
@@ -437,8 +438,29 @@ pub fn push_logs(
                 )
             })
             .collect();
-        for event in events.map_err(PostError::Invalid)? {
-            event.process()?;
+        let events = events.map_err(PostError::Invalid)?;
+        // Check the union of all events' fields against the limit and commit
+        // it under one write lock before processing any event. The fields are
+        // then reserved, so processing cannot fail on the limit partway through
+        // (leaving earlier events staged) even if concurrent requests add
+        // fields meanwhile.
+        let schemas: Vec<_> = events
+            .iter()
+            .map(|event| (event.rb.schema(), event.is_first_event))
+            .collect();
+        let committed = commit_ingested_schemas(
+            stream_name,
+            &stream.metadata,
+            &schemas,
+            PARSEABLE.options.dataset_fields_allowed_limit,
+        )?;
+        if committed && !stream.get_static_schema_flag() {
+            stream
+                .stage_schema_file(stream.get_schema().as_ref().clone())
+                .map_err(EventError::from)?;
+        }
+        for event in events {
+            event.process_without_field_limit()?;
         }
     }
     Ok(())

@@ -494,7 +494,7 @@ pub enum PostError {
     #[error("Header Error: {0}")]
     Header(#[from] ParseHeaderError),
     #[error("Event Error: {0}")]
-    Event(#[from] EventError),
+    Event(#[source] EventError),
     #[error("Invalid Request: {0}")]
     Invalid(#[from] anyhow::Error),
     #[error("{0}")]
@@ -542,6 +542,18 @@ pub enum PostError {
     MetastoreError(#[from] MetastoreError),
     #[error("Stream {0} is being deleted, please retry after some time")]
     StreamBeingDeleted(String),
+}
+
+impl From<EventError> for PostError {
+    fn from(err: EventError) -> Self {
+        match err {
+            // A client error, so it must not surface as a generic event failure
+            EventError::FieldsCountLimitExceeded(stream_name, count, limit) => {
+                PostError::FieldsCountLimitExceeded(stream_name, count, limit)
+            }
+            err => PostError::Event(err),
+        }
+    }
 }
 
 impl actix_web::ResponseError for PostError {
@@ -1136,6 +1148,47 @@ mod tests {
             rb.column_by_name("c_b").unwrap().as_float64_arr().unwrap(),
             &Float64Array::from(vec![None, None, None, Some(2.0)])
         );
+    }
+
+    #[test]
+    fn field_limit_event_error_is_bad_request() {
+        use actix_web::{ResponseError, http::StatusCode};
+
+        use super::PostError;
+        use crate::event::error::EventError;
+
+        let err = PostError::from(EventError::FieldsCountLimitExceeded(
+            "logs".to_owned(),
+            1001,
+            1000,
+        ));
+
+        assert!(matches!(
+            &err,
+            PostError::FieldsCountLimitExceeded(name, 1001, 1000) if name == "logs"
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        let message = err.to_string();
+        assert!(message.contains("logs"), "{message}");
+        assert!(message.contains("1001"), "{message}");
+        assert!(message.contains("1000"), "{message}");
+    }
+
+    #[test]
+    fn other_event_errors_stay_server_errors() {
+        use actix_web::{ResponseError, http::StatusCode};
+        use arrow_schema::ArrowError;
+
+        use super::PostError;
+        use crate::{event::error::EventError, parseable::StagingError};
+
+        let err = PostError::from(EventError::Staging(StagingError::Arrow(
+            ArrowError::SchemaError("conflict".to_owned()),
+        )));
+
+        assert!(matches!(err, PostError::Event(EventError::Staging(_))));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(std::error::Error::source(&err).is_some());
     }
 
     #[test]

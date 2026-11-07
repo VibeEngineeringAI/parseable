@@ -60,6 +60,52 @@ use crate::utils::time::{TimeParseError, TimeRange, parse_time_expression};
 use crate::utils::{get_tenant_id_from_request, user_auth_for_datasets};
 
 pub const TIME_ELAPSED_HEADER: &str = "p-time-elapsed";
+
+/// Maximum number of bins accepted by the manifest-based counts path.
+const MAX_COUNTS_BINS: u64 = 10_000;
+
+/// Mirrors the default bin sizing used by `CountsRequest::get_bounds` when
+/// `numBins` is omitted.
+fn default_counts_bins(total_minutes: u64) -> u64 {
+    if total_minutes <= 60 * 5 {
+        // till 5 hours, 1 bin = 1 min
+        total_minutes
+    } else if total_minutes <= 60 * 24 {
+        // till 1 day, 1 bin = 5 min
+        total_minutes.div_ceil(5)
+    } else if total_minutes <= 60 * 24 * 10 {
+        // till 10 days, 1 bin = 1 hour
+        total_minutes.div_ceil(60)
+    } else {
+        // > 10 days, 1 bin = 1 day
+        total_minutes.div_ceil(1440)
+    }
+}
+
+/// Returns an explicit bin count only when the server-derived default would
+/// fall outside the accepted range. In-range defaults are left to
+/// `get_bounds` so existing bin layouts are unchanged; out-of-range defaults
+/// are clamped so callers that omit `numBins` are never rejected for it.
+fn clamped_default_counts_bins(total_minutes: u64) -> Option<u64> {
+    let num_bins = default_counts_bins(total_minutes);
+    (!(1..=MAX_COUNTS_BINS).contains(&num_bins)).then(|| num_bins.clamp(1, MAX_COUNTS_BINS))
+}
+
+/// Computes a clamped default bin count for a counts request that omitted
+/// `numBins`. Unparseable or inverted ranges are left untouched so the
+/// existing error handling in `get_bin_density` still applies.
+fn clamped_default_counts_bins_for_range(start_time: &str, end_time: &str) -> Option<u64> {
+    let time_range = TimeRange::parse_human_time(start_time, end_time).ok()?;
+    let total_minutes = time_range
+        .end
+        .signed_duration_since(time_range.start)
+        .num_minutes();
+    if total_minutes < 0 {
+        return None;
+    }
+    clamped_default_counts_bins(total_minutes as u64)
+}
+
 /// Query Request through http endpoint.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -422,11 +468,18 @@ pub async fn get_counts(
     req: HttpRequest,
     counts_request: Json<CountsRequest>,
 ) -> Result<impl Responder, QueryError> {
+    let mut body = counts_request.into_inner();
+    if body.conditions.is_some() {
+        // The SQL/grouped counts path derives its bin interval from the time
+        // range and never reads numBins, so values it ignores are not rejected.
+        body.num_bins = None;
+    } else {
+        body.validate_num_bins()?;
+    }
+
     let creds = extract_session_key_from_req(&req)?;
     let permissions = Users.get_permissions(&creds);
     let tenant_id = get_tenant_id_from_request(&req)?;
-    let body = counts_request.into_inner();
-
     // does user have access to table?
     user_auth_for_datasets(&permissions, std::slice::from_ref(&body.stream), &tenant_id).await?;
     // Track billing metrics for query calls
@@ -537,6 +590,12 @@ pub async fn get_counts(
                 "No data returned for counts SQL".into(),
             ));
         }
+    }
+
+    if body.num_bins.is_none() {
+        // The caller did not send numBins; clamp an out-of-range server
+        // default instead of rejecting the request for a parameter it omitted.
+        body.num_bins = clamped_default_counts_bins_for_range(&body.start_time, &body.end_time);
     }
 
     let records = body.get_bin_density(&tenant_id).await?;
@@ -779,6 +838,62 @@ mod response_tests {
     use super::*;
     use actix_web::{ResponseError, body::to_bytes, http::header::CONTENT_TYPE};
     use arrow_array::{Float64Array, TimestampMillisecondArray};
+
+    #[actix_web::test]
+    async fn counts_reject_invalid_num_bins_with_bad_request_before_stream_access() {
+        let app = actix_web::test::init_service(
+            actix_web::App::new().route("/counts", web::post().to(get_counts)),
+        )
+        .await;
+
+        // Only the manifest-based (unfiltered) path uses numBins, so only it
+        // rejects out-of-range values.
+        for num_bins in [0, 10_001, 1_000_000_000, u64::MAX] {
+            let payload = json!({
+                "stream": "logs",
+                "startTime": "2024-01-01T00:00:00Z",
+                "endTime": "2024-01-01T01:00:00Z",
+                "numBins": num_bins,
+            });
+            let request = actix_web::test::TestRequest::post()
+                .uri("/counts")
+                .set_json(payload)
+                .to_request();
+            let response = actix_web::test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(
+                actix_web::test::read_body(response).await.as_ref(),
+                b"CustomError: numBins must be between 1 and 10000 (inclusive)"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_default_bins_are_clamped_instead_of_rejected() {
+        // In-range defaults are left to get_bounds unchanged.
+        assert_eq!(clamped_default_counts_bins(60), None);
+        assert_eq!(clamped_default_counts_bins(60 * 24 * 10), None);
+        assert_eq!(clamped_default_counts_bins(MAX_COUNTS_BINS * 1440), None);
+        // Out-of-range defaults are clamped into the accepted range.
+        assert_eq!(clamped_default_counts_bins(0), Some(1));
+        assert_eq!(
+            clamped_default_counts_bins(MAX_COUNTS_BINS * 1440 + 1),
+            Some(MAX_COUNTS_BINS)
+        );
+        // A ~30 year range without numBins no longer fails on numBins.
+        assert_eq!(
+            clamped_default_counts_bins_for_range("2000-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+            Some(MAX_COUNTS_BINS)
+        );
+        assert_eq!(
+            clamped_default_counts_bins_for_range("2024-01-01T00:00:00Z", "2024-01-01T01:00:00Z"),
+            None
+        );
+    }
 
     #[test]
     fn streaming_batch_bytes_preserve_legacy_rows_and_newline() {
