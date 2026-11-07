@@ -3543,6 +3543,9 @@ fn lexsort_to_indices_rows(
 }
 
 #[cfg(test)]
+mod crash_recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{io::Write, sync::Barrier, thread::spawn, time::Duration};
 
