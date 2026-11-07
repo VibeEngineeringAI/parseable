@@ -508,35 +508,59 @@ impl Stream {
         remove_file(journal_path(&output))?;
         for dir in &dirs {
             if let Some(count) = registry.fresh_dirs.get_mut(dir) {
-                *count -= 1;
+                *count = count.saturating_sub(1);
                 if *count == 0 {
                     registry.journal_dirs.remove(dir);
                 }
             }
         }
-        sync_directory(&self.data_path)?;
+        #[cfg(test)]
+        let sync_result = self
+            .fail_journal_io(JournalFault::PostJournalRemovalSync)
+            .and_then(|()| sync_directory(&self.data_path));
+        #[cfg(not(test))]
+        let sync_result = sync_directory(&self.data_path);
+        if let Err(err) = &sync_result {
+            error!(
+                "Cannot sync journal removal in {}: {err}",
+                self.data_path.display()
+            );
+        }
         // Refresh exclusions and do housekeeping under the registry lock so
         // another grouper cannot reuse a name while it is being removed.
         let inventory_valid = self.inventory_conversion_journals(&mut registry).is_ok();
+        let owner = registry.outputs.get(&parquet_part_path(&output)).copied();
         for dir in dirs {
-            if (inventory_valid && !registry.journal_dirs.contains(&dir))
-                || registry.fresh_dirs.get(&dir) == Some(&0)
+            let owned_elsewhere = registry.dirs.get(&dir).is_some_and(|id| Some(*id) != owner);
+            if !owned_elsewhere
+                && !registry.journal_dirs.contains(&dir)
+                && (inventory_valid || registry.fresh_dirs.get(&dir) == Some(&0))
             {
                 match fs::remove_dir(&dir) {
-                    Ok(()) => {}
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-                        ) => {}
-                    Err(e) => warn!(
-                        "Cannot remove empty processing directory {}: {e}",
-                        dir.display()
-                    ),
+                    Ok(()) => {
+                        registry.retry_dirs.remove(&dir);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        registry.retry_dirs.remove(&dir);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(e) => {
+                        registry.retry_dirs.insert(dir.clone());
+                        warn!(
+                            "Cannot remove empty processing directory {}: {e}",
+                            dir.display()
+                        );
+                    }
                 }
+            } else {
+                // Retry cleanup when another claim or a journal inventory gate
+                // prevented proving that this older directory was unreserved.
+                registry.retry_dirs.insert(dir);
             }
         }
-        sync_directory(&self.data_path)?;
+        let cleanup_sync = sync_directory(&self.data_path);
+        sync_result?;
+        cleanup_sync?;
         Ok(())
     }
 }
@@ -547,6 +571,7 @@ pub(super) enum JournalFault {
     Schema,
     SourceUnlink,
     JournalRemoval,
+    PostJournalRemovalSync,
 }
 
 #[cfg(test)]

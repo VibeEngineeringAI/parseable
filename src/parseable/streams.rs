@@ -470,9 +470,10 @@ struct ConversionClaims {
     journal_dirs: HashSet<PathBuf>,
     retry_dirs: HashSet<PathBuf>,
     journals_blocked: bool,
-    // Startup may return before grouping, or skip journal-reserved directories
-    // containing other groups. Retry that inventory after journal resolution.
-    startup_regroup_deferred: bool,
+    // Retry only directories actually skipped at startup, once their journal
+    // reservations or inventory gate clear. Unrelated journals do not re-arm it.
+    startup_regroup_dirs: HashSet<PathBuf>,
+    replay_warned_dirs: HashSet<PathBuf>,
     next_claim: u64,
     dirs: HashMap<PathBuf, u64>,
     // Only atomic directory creation grants this exemption from the inventory
@@ -1076,6 +1077,8 @@ impl Stream {
     /// the returned groups are unowned, and concurrent conversion can subsequently
     /// move or remove their files. Prefer Stream-managed flushing/conversion,
     /// whose internal claimed conversion paths retain ownership through mutation.
+    /// Snapshots do not consume runtime retries or alter deferred startup regroup.
+    /// Non-init snapshots select root files only, leaving retries to conversion.
     pub fn arrow_files_grouped_exclude_time(
         &self,
         exclude: SystemTime,
@@ -1083,8 +1086,14 @@ impl Stream {
         init_signal: bool,
         shutdown_signal: bool,
     ) -> Vec<(PathBuf, Vec<PathBuf>)> {
-        self.claim_conversion_groups(exclude, group_minute, init_signal, shutdown_signal)
-            .1
+        self.claim_conversion_groups_inner(
+            exclude,
+            group_minute,
+            init_signal,
+            shutdown_signal,
+            false,
+        )
+        .1
     }
 
     /// Claims sealed Arrow files for one conversion and groups them by output.
@@ -1102,14 +1111,31 @@ impl Stream {
         init_signal: bool,
         shutdown_signal: bool,
     ) -> (ConversionClaim, Vec<(PathBuf, Vec<PathBuf>)>) {
+        self.claim_conversion_groups_inner(
+            exclude,
+            group_minute,
+            init_signal,
+            shutdown_signal,
+            true,
+        )
+    }
+
+    fn claim_conversion_groups_inner(
+        &self,
+        exclude: SystemTime,
+        group_minute: u128,
+        init_signal: bool,
+        shutdown_signal: bool,
+        track_recovery: bool,
+    ) -> (ConversionClaim, Vec<(PathBuf, Vec<PathBuf>)>) {
         let mut claim = ConversionClaim::new(&self.conversion_claims);
         let groups = if init_signal {
-            let dirs = self.claim_unowned_inprocess_dirs(&mut claim);
+            let dirs = self.claim_unowned_inprocess_dirs(&mut claim, track_recovery);
             self.group_arrow_files_in_dirs(&dirs, &Ulid::new().to_string())
         } else {
             let arrow_files = self.fetch_arrow_files_for_conversion(exclude, shutdown_signal);
             if arrow_files.is_empty() {
-                let dirs = self.claim_retry_inprocess_dirs(&mut claim);
+                let dirs = self.claim_retry_inprocess_dirs(&mut claim, track_recovery);
                 let groups = self.group_arrow_files_in_dirs(&dirs, &Ulid::new().to_string());
                 let groups = self.claim_conversion_outputs(&mut claim, groups);
                 return (claim, groups);
@@ -1138,7 +1164,7 @@ impl Stream {
         };
         let mut groups = groups;
         if !init_signal {
-            let dirs = self.claim_retry_inprocess_dirs(&mut claim);
+            let dirs = self.claim_retry_inprocess_dirs(&mut claim, track_recovery);
             groups.extend(self.group_arrow_files_in_dirs(&dirs, &Ulid::new().to_string()));
         }
         let groups = self.claim_conversion_outputs(&mut claim, groups);
@@ -1148,9 +1174,21 @@ impl Stream {
     /// Claims every existing processing directory that no running conversion
     /// owns. Listing under the registry lock means a directory created by a
     /// running conversion is either not listed yet or already registered.
-    fn claim_unowned_inprocess_dirs(&self, claim: &mut ConversionClaim) -> Vec<PathBuf> {
+    fn claim_unowned_inprocess_dirs(
+        &self,
+        claim: &mut ConversionClaim,
+        track_recovery: bool,
+    ) -> Vec<PathBuf> {
         let mut registry = lock_conversion_claims(&self.conversion_claims);
-        registry.startup_regroup_deferred = true;
+        let dirs = self.inprocess_dirs();
+        if track_recovery {
+            let unowned = dirs
+                .iter()
+                .filter(|dir| !registry.dirs.contains_key(*dir))
+                .cloned()
+                .collect::<Vec<_>>();
+            registry.startup_regroup_dirs.extend(unowned);
+        }
         if let Err(err) = self.inventory_conversion_journals(&mut registry) {
             error!(
                 "Blocking processing-directory regroup for stream {} at {}: {err}",
@@ -1162,65 +1200,78 @@ impl Stream {
         if registry.journals_blocked {
             return Vec::new();
         }
-        let Ok(dir) = self.data_path.read_dir() else {
-            return Vec::new();
-        };
-        let unowned: Vec<PathBuf> = dir
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(INPROCESS_DIR_PREFIX))
-            })
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_dir()
-                    && !registry.dirs.contains_key(path)
-                    && !registry.journal_dirs.contains(path)
-            })
-            .collect();
-        registry.startup_regroup_deferred = !registry.journal_dirs.is_empty();
-        if !unowned.is_empty() {
-            warn!(
-                "Replaying processing directories without journals for stream {}: {:?}; an interrupted conversion that never published is safe to retry; staging from a pre-journal version may duplicate rows",
-                self.stream_name, unowned
-            );
-        }
-        for dir in &unowned {
-            registry.retry_dirs.remove(dir);
-            registry.dirs.insert(dir.clone(), claim.id);
-        }
-        claim.dirs.extend(unowned.iter().cloned());
-        unowned
+        self.claim_available_inprocess_dirs(&mut registry, claim, dirs, track_recovery, true)
     }
 
-    /// Retry pre-journal failures during the next runtime cycle. After restart
-    /// these are ordinary legacy/uncommitted processing directories handled by
-    /// startup. Journal-owned directories always take the resolver path.
-    fn claim_retry_inprocess_dirs(&self, claim: &mut ConversionClaim) -> Vec<PathBuf> {
+    /// Remember startup candidates before recovery/flush can return early.
+    fn defer_unowned_inprocess_dirs(&self) {
         let mut registry = lock_conversion_claims(&self.conversion_claims);
-        if registry.startup_regroup_deferred {
-            drop(registry);
-            return self.claim_unowned_inprocess_dirs(claim);
+        let dirs = self
+            .inprocess_dirs()
+            .into_iter()
+            .filter(|dir| !registry.dirs.contains_key(dir))
+            .collect::<Vec<_>>();
+        registry.startup_regroup_dirs.extend(dirs);
+    }
+
+    /// Claim only explicit runtime retries and the specific startup directories
+    /// previously held behind recovery. Snapshot callers leave both sets alone.
+    fn claim_retry_inprocess_dirs(
+        &self,
+        claim: &mut ConversionClaim,
+        track_recovery: bool,
+    ) -> Vec<PathBuf> {
+        if !track_recovery {
+            return Vec::new();
         }
+        let mut registry = lock_conversion_claims(&self.conversion_claims);
         if self.inventory_conversion_journals(&mut registry).is_err() || registry.journals_blocked {
             return Vec::new();
         }
-        let dirs: Vec<_> = registry
+        let dirs = registry
             .retry_dirs
-            .iter()
-            .filter(|dir| {
-                !registry.dirs.contains_key(*dir) && !registry.journal_dirs.contains(*dir)
-            })
+            .union(&registry.startup_regroup_dirs)
             .cloned()
             .collect();
-        for dir in &dirs {
-            registry.retry_dirs.remove(dir);
+        self.claim_available_inprocess_dirs(&mut registry, claim, dirs, true, false)
+    }
+
+    // Called under the registry lock; remove_dir only collects empty directories
+    // with no journal reservation and no other claim, including retirement residue.
+    fn claim_available_inprocess_dirs(
+        &self,
+        registry: &mut ConversionClaims,
+        claim: &mut ConversionClaim,
+        dirs: Vec<PathBuf>,
+        track_recovery: bool,
+        startup: bool,
+    ) -> Vec<PathBuf> {
+        let mut claimed = Vec::new();
+        for dir in dirs {
+            if registry.dirs.contains_key(&dir) || registry.journal_dirs.contains(&dir) {
+                continue;
+            }
+            if track_recovery {
+                let deferred = registry.startup_regroup_dirs.remove(&dir);
+                registry.retry_dirs.remove(&dir);
+                match fs::remove_dir(&dir) {
+                    Ok(()) => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {}
+                }
+                if (startup || deferred) && registry.replay_warned_dirs.insert(dir.clone()) {
+                    warn!(
+                        "Replaying processing directory without journals for stream {}: {}; an interrupted conversion that never published is safe to retry; staging from a pre-journal version may duplicate rows",
+                        self.stream_name,
+                        dir.display()
+                    );
+                }
+            }
             registry.dirs.insert(dir.clone(), claim.id);
+            claim.dirs.push(dir.clone());
+            claimed.push(dir);
         }
-        claim.dirs.extend(dirs.iter().cloned());
-        dirs
+        claimed
     }
 
     /// Creates a fresh processing directory owned by `claim`.
@@ -3457,7 +3508,7 @@ impl Stream {
         self: &Arc<Self>,
         tenant_id: Option<String>,
     ) -> Result<StartupSyncPlan, StagingError> {
-        lock_conversion_claims(&self.conversion_claims).startup_regroup_deferred = true;
+        self.defer_unowned_inprocess_dirs();
         if let Err(err) = self.resolve_conversion_journals(&tenant_id) {
             error!(
                 "Startup conversion recovery for stream {}: {err}",
@@ -3512,7 +3563,7 @@ impl Stream {
     ) -> Result<(), StagingError> {
         // On init, recover any orphaned .part files from previous interrupted runs
         if init_signal {
-            lock_conversion_claims(&self.conversion_claims).startup_regroup_deferred = true;
+            self.defer_unowned_inprocess_dirs();
             if let Err(err) = self.resolve_conversion_journals(tenant_id) {
                 error!(
                     "Init conversion recovery for stream {}: {err}",
@@ -7359,7 +7410,7 @@ mod tests {
         let mut startup = ConversionClaim::new(&staging.conversion_claims);
         assert!(
             staging
-                .claim_unowned_inprocess_dirs(&mut startup)
+                .claim_unowned_inprocess_dirs(&mut startup, true)
                 .is_empty()
         );
 

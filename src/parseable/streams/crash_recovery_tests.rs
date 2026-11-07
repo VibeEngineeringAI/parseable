@@ -1087,6 +1087,148 @@ fn schema_failure_keeps_sources_and_memory_and_periodic_retry_succeeds() {
 }
 
 #[test]
+fn snapshots_preserve_failed_group_retry_and_deferred_startup_state() {
+    use super::conversion_journal::JournalFault;
+    for init in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let stream = fixture(
+            &dir,
+            Case {
+                mixed: true,
+                ..Case::default()
+            },
+        );
+        *stream.journal_fault.lock().unwrap() = Some(JournalFault::Schema);
+        assert!(stream.prepare_parquet(false, true, &None).is_err());
+        let retry = lock_conversion_claims(&stream.conversion_claims)
+            .retry_dirs
+            .clone();
+        assert!(!retry.is_empty());
+        // Include a deferred candidate too: neither snapshot mode may consume
+        // it or invent another startup replay obligation.
+        lock_conversion_claims(&stream.conversion_claims).startup_regroup_dirs = retry.clone();
+        stream.arrow_files_grouped_exclude_time(SystemTime::now(), 1, init, false);
+        {
+            let registry = lock_conversion_claims(&stream.conversion_claims);
+            assert_eq!(registry.retry_dirs, retry);
+            assert_eq!(registry.startup_regroup_dirs, retry);
+        }
+        stream.prepare_parquet(false, false, &None).unwrap();
+        assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(true)));
+        assert_clean_residue(&stream);
+    }
+}
+
+#[test]
+fn post_journal_removal_sync_failure_still_collects_processing_directory() {
+    use super::conversion_journal::JournalFault;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::PostJournalRemovalSync);
+    assert!(stream.prepare_parquet(false, true, &None).is_err());
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert!(stream.inprocess_dirs().is_empty());
+    stream.prepare_parquet(false, false, &None).unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert_clean_residue(&stream);
+}
+
+#[test]
+fn retirement_cleanup_retries_after_inventory_becomes_invalid() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(
+        &dir,
+        Case {
+            multiple_dirs: true,
+            ..Case::default()
+        },
+    );
+    let options = Arc::clone(&stream.options);
+    drop(stream);
+    let stream = fresh(options);
+    let bad = stream.data_path.join("bad.parquet.sources");
+    let bad_hook = bad.clone();
+    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, ConversionPhase::SourcesRetired) {
+            fs::write(&bad_hook, b"{").unwrap();
+        }
+    }));
+    stream.prepare_parquet(true, false, &None).unwrap();
+    clear_hook(&stream);
+    assert!(stream.inprocess_arrow_files().is_empty());
+    assert!(!stream.inprocess_dirs().is_empty());
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert!(stream.prepare_parquet(false, false, &None).is_err());
+    fs::remove_file(bad).unwrap();
+    stream.prepare_parquet(false, false, &None).unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert_clean_residue(&stream);
+}
+
+#[test]
+fn unresolvable_journal_does_not_reclaim_an_unrelated_retained_group() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let output = crash_initial(&stream, Case::default());
+    clear_hook(&stream);
+    let source = stream.inprocess_arrow_files().pop().unwrap();
+    let original = fs::read(&source).unwrap();
+    fs::write(&source, b"wrong source size").unwrap();
+    push_extra(&stream);
+    let unrelated = stream.data_path.join("processing_unrelated");
+    fs::create_dir(&unrelated).unwrap();
+    let extra = stream.arrow_files().pop().unwrap();
+    let extra_path = unrelated.join(extra.file_name().unwrap());
+    stream.move_arrow_files(vec![extra], &unrelated);
+    let extra = extra_path;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_hook = Arc::clone(&attempts);
+    *stream.lifecycle_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if let LifecyclePhase::ParquetPartClosed(part) = phase {
+            attempts_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // A deterministic Ok(None) leaves valid inputs retained, as does
+            // an unattributable decode failure, without a runtime retry entry.
+            fs::write(part, b"invalid footer").unwrap();
+        }
+    }));
+    stream
+        .prepare_startup_sync(None)
+        .unwrap()
+        .execute()
+        .unwrap();
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(extra.exists());
+    assert!(journal_path(&output).exists());
+    let deferred = lock_conversion_claims(&stream.conversion_claims)
+        .startup_regroup_dirs
+        .clone();
+    assert_eq!(
+        deferred,
+        HashSet::from([source.parent().unwrap().to_path_buf()])
+    );
+    for _ in 0..3 {
+        assert!(stream.prepare_parquet(false, false, &None).is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            lock_conversion_claims(&stream.conversion_claims).startup_regroup_dirs,
+            deferred
+        );
+        assert!(extra.exists());
+    }
+    assert_eq!(
+        lock_conversion_claims(&stream.conversion_claims).replay_warned_dirs,
+        HashSet::from([unrelated])
+    );
+    *stream.lifecycle_hook.lock().unwrap() = None;
+    fs::write(source, original).unwrap();
+    // An explicit init pass may retry retained groups, preserving the legacy
+    // restart behavior; periodic cycles above must leave this group alone.
+    stream.prepare_parquet(true, false, &None).unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_with_extra()));
+    assert_clean_residue(&stream);
+}
+
+#[test]
 fn unlink_failure_reserves_sources_at_restart_and_periodic_retry_finishes() {
     use super::conversion_journal::JournalFault;
     let dir = TempDir::new().unwrap();
@@ -1298,7 +1440,7 @@ fn invalid_inventory_blocks_all_regrouping_and_repair_reopens_stream() {
         let mut gated_claim = ConversionClaim::new(&stream.conversion_claims);
         assert!(
             stream
-                .claim_unowned_inprocess_dirs(&mut gated_claim)
+                .claim_unowned_inprocess_dirs(&mut gated_claim, true)
                 .is_empty(),
             "invalid journal must gate even unrelated processing_spare: {bad}"
         );
@@ -1324,9 +1466,14 @@ fn invalid_inventory_blocks_all_regrouping_and_repair_reopens_stream() {
         stream.resolve_conversion_journals(&None).unwrap();
         assert!(!lock_conversion_claims(&stream.conversion_claims).journals_blocked);
         let mut reopened_claim = ConversionClaim::new(&stream.conversion_claims);
-        assert_eq!(
-            stream.claim_unowned_inprocess_dirs(&mut reopened_claim),
-            vec![spare]
+        assert!(
+            stream
+                .claim_unowned_inprocess_dirs(&mut reopened_claim, true)
+                .is_empty()
+        );
+        assert!(
+            !spare.exists(),
+            "the unreserved empty directory is collected"
         );
         assert_eq!(listed_parquet(&stream.data_path), vec![output]);
         assert_eq!(
