@@ -18,6 +18,7 @@
 
 mod filter_optimizer;
 mod listing_table_builder;
+mod partition_budget;
 pub mod stream_schema_provider;
 
 use actix_web::Either;
@@ -63,6 +64,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::Instrument;
 
 use self::error::ExecuteError;
+use self::partition_budget::{PartitionBudget, QueryLease, query_context};
 pub use self::stream_schema_provider::PartialTimeFilter;
 use self::stream_schema_provider::{
     GlobalSchemaProvider, HotTierStreamKey,
@@ -121,6 +123,13 @@ pub static QUERY_SESSION: Lazy<InMemorySessionContext> = Lazy::new(|| {
     InMemorySessionContext {
         session_context: Arc::new(RwLock::new(ctx)),
     }
+});
+
+static QUERY_PARTITION_BUDGET: Lazy<PartitionBudget> = Lazy::new(|| {
+    PartitionBudget::new(
+        PARSEABLE.options.query_partition_budget,
+        PARSEABLE.options.min_query_partitions,
+    )
 });
 
 /// Trait to enable implementation of SchemaProvider
@@ -435,7 +444,7 @@ impl Query {
         )
     )]
     pub async fn execute(&self, is_streaming: bool, tenant_id: &Option<String>) -> QueryResult {
-        let ctx = QUERY_SESSION.get_ctx();
+        let (ctx, query_lease) = query_context(QUERY_SESSION.get_ctx(), &QUERY_PARTITION_BUDGET);
         let mut logical_plan = self.final_logical_plan(tenant_id);
         let (hot_tier_guards, guarded_hot_tier_streams) =
             hot_tier_query_guards(&logical_plan, &self.time_range).await?;
@@ -484,6 +493,7 @@ impl Query {
                 plan: plan.clone(),
                 active_streams: AtomicUsize::new(output_partitions),
                 _hot_tier_guards: hot_tier_guards,
+                _query_lease: query_lease.clone(),
             });
 
             let partition_streams = execute_stream_partitioned(plan.clone(), task_ctx.clone())?;
@@ -502,8 +512,16 @@ impl Query {
             drop(tx);
 
             let merged = UnboundedReceiverStream::new(rx);
-            let final_stream = RecordBatchStreamAdapter::new(plan.schema(), merged);
-            Either::Right(Box::pin(final_stream) as SendableRecordBatchStream)
+            let final_stream = Box::pin(RecordBatchStreamAdapter::new(plan.schema(), merged))
+                as SendableRecordBatchStream;
+            Either::Right(if query_lease.is_some() {
+                Box::pin(partition_budget::LeasedQueryStream::new(
+                    final_stream,
+                    query_lease,
+                ))
+            } else {
+                final_stream
+            })
         };
 
         Ok((results, fields))
@@ -1209,6 +1227,7 @@ struct MonitorState {
     plan: Arc<dyn ExecutionPlan>,
     active_streams: AtomicUsize,
     _hot_tier_guards: Vec<HotTierQueryGuard>,
+    _query_lease: Option<Arc<QueryLease>>,
 }
 
 /// A wrapper that monitors the ExecutionPlan and logs metrics when the stream finishes.

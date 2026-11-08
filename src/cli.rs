@@ -244,6 +244,23 @@ pub struct Options {
     )]
     pub target_partitions: u64,
 
+    #[arg(
+        long,
+        env = "P_DATAFUSION_QUERY_PARTITION_BUDGET",
+        value_parser = value_parser!(u64).range(1..),
+        help = "Opt-in advisory partition budget divided among active queries; target partitions remains the per-query ceiling"
+    )]
+    pub query_partition_budget: Option<u64>,
+
+    #[arg(
+        long,
+        env = "P_DATAFUSION_MIN_QUERY_PARTITIONS",
+        default_value = "1",
+        value_parser = value_parser!(u64).range(1..),
+        help = "Per-query partition floor when the advisory budget is enabled, capped by target partitions; tune for storage latency"
+    )]
+    pub min_query_partitions: u64,
+
     // DataFusion bloom filter position
     // defaults to true, which means `BloomFilterPosition::AfterRowGroup`
     #[arg(
