@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-//! #95 process-crash reproductions, adapted from the handoff's crash recovery,
-//! restart matrix, and mixed-schema fixtures. This is not a power-loss test or
-//! an HTTP/object-store integration test. Successful pushes form the ID ledger.
-//! Each desired oracle runs recovery and two further quiescent restarts before
-//! checking multiplicity. No passing duplicate characterization is a health test.
+//! Process-interruption recovery and mixed-schema restart tests for #95.
+//! Panics simulate kills. Unwinding runs Drop (unlike a kill), but restart uses
+//! a fresh Stream, so released in-memory claims do not affect restart behavior.
+//! This is not a power-loss or HTTP/object-store integration test. Successful
+//! pushes form the ID ledger. Each recovery oracle includes two further
+//! quiescent restarts before checking multiplicity.
 
 use std::{
     collections::BTreeMap,
@@ -382,7 +383,7 @@ fn observe(case: Case, control: bool) -> Snapshot {
         original_output = Some(output.clone());
         if case.uploaded {
             // A durable fake remote object plus local deletion; no real upload,
-            // manifest publication, query handoff, or remote schema is modeled.
+            // manifest publication, query capture, or remote schema is modeled.
             let destination = remote.join(output.file_name().unwrap());
             fs::copy(&output, &destination).unwrap();
             fs::remove_file(&output).unwrap();
@@ -401,16 +402,12 @@ fn observe(case: Case, control: bool) -> Snapshot {
                 .execute()
                 .unwrap()
         });
-        eprintln!(
-            "recovery crashed again: {:?}",
-            snapshot(&restarted, &remote)
-        );
         drop(restarted);
     }
 
     let mut previous = None;
     // First successful recovery, then TWO additional clean/quiescent restarts.
-    for restart in 1..=3 {
+    for _restart in 1..=3 {
         let restarted = fresh(Arc::clone(&options));
         restarted
             .prepare_startup_sync(None)
@@ -453,7 +450,6 @@ fn observe(case: Case, control: bool) -> Snapshot {
                 "journal recovery must preserve ORIGINAL output identity"
             );
         }
-        eprintln!("case={case:?}, clean_restart={restart}: {current:?}");
         if let Some(previous) = &previous {
             assert_eq!(
                 &current, previous,
@@ -473,7 +469,7 @@ fn exactly_once(case: Case) {
         assert_eq!(
             actual,
             expected_pairs(true),
-            "FINAL_ISSUE95_EXACTLY_ONCE_VALUES_NULLS: {case:?}"
+            "exactly-once values and NULLs: {case:?}"
         );
     } else {
         let actual_ids = actual
@@ -483,7 +479,7 @@ fn exactly_once(case: Case) {
                 id
             })
             .collect::<Vec<_>>();
-        assert_eq!(actual_ids, IDS, "FINAL_ISSUE95_EXACTLY_ONCE_IDS: {case:?}");
+        assert_eq!(actual_ids, IDS, "exactly-once IDs: {case:?}");
     }
 }
 
@@ -781,6 +777,8 @@ fn older_claim_is_gated_before_encoding_if_inventory_becomes_invalid() {
     let (claim, mut groups) = stream.claim_conversion_groups(SystemTime::now(), 1, true, false);
     let (output, sources) = groups.pop().unwrap();
     fs::write(stream.data_path.join("bad.parquet.sources"), b"{").unwrap();
+    // External corruption becomes visible at the next resolver inventory.
+    assert!(stream.resolve_conversion_journals(&None).is_err());
     *stream.lifecycle_hook.lock().unwrap() = Some(Arc::new(|phase| {
         assert!(!matches!(
             phase,
@@ -869,7 +867,9 @@ fn journal_and_prejournal_failure_sharing_directory_retry_exactly_once() {
             .convert_arrow_group(x_output.clone(), x_sources, None, None, &None)
             .is_err()
     );
-    *stream.journal_fault.lock().unwrap() = Some(JournalFault::Schema);
+    // X already durably staged this schema, so Y skips schema I/O. Inject
+    // its pre-journal failure at the part barrier instead.
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::PartSync);
     assert!(
         stream
             .convert_arrow_group(y_output.clone(), y_sources.clone(), None, None, &None)
@@ -1120,12 +1120,10 @@ fn snapshots_preserve_failed_group_retry_and_deferred_startup_state() {
 }
 
 #[test]
-fn post_journal_removal_sync_failure_still_collects_processing_directory() {
-    use super::conversion_journal::JournalFault;
+fn journal_removal_collects_processing_directory_without_an_extra_sync() {
     let dir = TempDir::new().unwrap();
     let stream = fixture(&dir, Case::default());
-    *stream.journal_fault.lock().unwrap() = Some(JournalFault::PostJournalRemovalSync);
-    assert!(stream.prepare_parquet(false, true, &None).is_err());
+    stream.prepare_parquet(false, true, &None).unwrap();
     assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
     assert!(stream.inprocess_dirs().is_empty());
     stream.prepare_parquet(false, false, &None).unwrap();
@@ -1148,9 +1146,16 @@ fn retirement_cleanup_retries_after_inventory_becomes_invalid() {
     let stream = fresh(options);
     let bad = stream.data_path.join("bad.parquet.sources");
     let bad_hook = bad.clone();
+    let weak = Arc::downgrade(&stream);
     *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
         if matches!(phase, ConversionPhase::SourcesRetired) {
             fs::write(&bad_hook, b"{").unwrap();
+            assert!(
+                weak.upgrade()
+                    .unwrap()
+                    .resolve_conversion_journals(&None)
+                    .is_err()
+            );
         }
     }));
     stream.prepare_parquet(true, false, &None).unwrap();
@@ -1697,7 +1702,7 @@ fn resolver_interrupted_after_each_remaining_unlink_keeps_exact_values() {
             assert_eq!(
                 current.pairs,
                 expected_pairs(true),
-                "FINAL_ISSUE95_EXACTLY_ONCE_VALUES_NULLS"
+                "exactly-once values and NULLs"
             );
             assert_eq!(
                 current.parquet_sha256.keys().cloned().collect::<Vec<_>>(),
@@ -1764,7 +1769,7 @@ fn poisoned_publication_never_discards_journaled_part() {
         .filter(|p| p.to_string_lossy().ends_with(".parquet.part"))
         .collect();
     assert_eq!(parts.len(), 1);
-    assert!(journal_path(&parts[0].with_extension("")).exists());
+    assert!(has_journal_for_part(&parts[0]));
     assert_eq!(read_all(&parts).pairs, expected_pairs(false));
     assert_eq!(stream.inprocess_arrow_files().len(), 2);
     assert!(
@@ -1870,3 +1875,4 @@ fn static_schema_conversion_preserves_no_staging_policy() {
         expected_pairs(false)
     );
 }
+
