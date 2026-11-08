@@ -506,6 +506,16 @@ pub struct Options {
     )]
     pub row_group_size: usize,
 
+    // Opt-in physical clustering of log rows inside each Parquet row group.
+    // Unset (the default) keeps the existing writer behaviour.
+    #[arg(
+        long,
+        env = "P_LOG_SEVERITY_CLUSTER_COLUMN",
+        value_parser = validation::cluster_column,
+        help = "Top-level log column (for example severity_text) used to cluster rows inside each Parquet row group; unset disables clustering"
+    )]
+    pub log_severity_cluster_column: Option<String>,
+
     #[arg(
         long,
         env = "P_EXECUTION_BATCH_SIZE",

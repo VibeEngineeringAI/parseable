@@ -1291,3 +1291,389 @@ async fn preserved_production_file() {
     }
     checks.finish();
 }
+
+// ---------------------------------------------------------------------------
+// Opt-in severity-clustered files (P_LOG_SEVERITY_CLUSTER_COLUMN)
+// ---------------------------------------------------------------------------
+
+/// `(p_timestamp ms, id, severity_text, message)` as ingested.
+type LogRecord = (Option<i64>, i64, Option<String>, Option<String>);
+
+const CLUSTER_BASE_MS: i64 = 1_760_700_000_000;
+
+fn log_record_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            DEFAULT_TIMESTAMP_KEY,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("id", DataType::Int64, false),
+        Field::new("severity_text", DataType::Utf8, true),
+        Field::new("message", DataType::Utf8, true),
+    ]))
+}
+
+/// 3,000 records in 60 requests whose times interleave, as concurrent producers
+/// leave them, spanning about ten minutes with repeats, NULL times, NULL and
+/// case-variant severities.
+fn log_records() -> Vec<Vec<LogRecord>> {
+    (0..60_i64)
+        .map(|request| {
+            (0..50_i64)
+                .map(|offset| {
+                    let id = request * 50 + offset;
+                    let slot = (request * 7 + offset * 13) % 600;
+                    let time = (id % 101 != 0).then_some(CLUSTER_BASE_MS + slot * 1_000);
+                    let severity = match (id * 31 + 7) % 20 {
+                        0 | 1 => Some("ERROR"),
+                        2 => Some("error"),
+                        3 => None,
+                        4..=6 => Some("WARN"),
+                        7..=9 => Some("DEBUG"),
+                        _ => Some("INFO"),
+                    };
+                    let message = (id % 17 != 0).then(|| format!("event {}", (id * 7) % 29));
+                    (time, id, severity.map(str::to_owned), message)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn log_batch(schema: &Arc<Schema>, records: &[LogRecord]) -> RecordBatch {
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(
+                records.iter().map(|r| r.0).collect_vec(),
+            )),
+            Arc::new(Int64Array::from_iter_values(records.iter().map(|r| r.1))),
+            Arc::new(arrow_array::StringArray::from(
+                records.iter().map(|r| r.2.clone()).collect_vec(),
+            )),
+            Arc::new(arrow_array::StringArray::from(
+                records.iter().map(|r| r.3.clone()).collect_vec(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// Converts one minute through the production staging writer.
+fn write_log_minute(temp_dir: &TempDir, cluster: Option<&str>) -> PathBuf {
+    let options = Arc::new(Options {
+        local_staging_path: temp_dir.path().to_path_buf(),
+        row_group_size: 256,
+        log_severity_cluster_column: cluster.map(str::to_owned),
+        ..Default::default()
+    });
+    let stream = Stream::new(
+        options,
+        "clustered",
+        LogStreamMetadata::default(),
+        None,
+        &None,
+    );
+    let schema = log_record_schema();
+    for (index, records) in log_records().iter().enumerate() {
+        stream
+            .push(
+                "clustered",
+                &log_batch(&schema, records),
+                staging_minute(),
+                &HashMap::new(),
+                StreamType::UserDefined,
+            )
+            .unwrap();
+        if index % 9 == 8 {
+            stream.flush(true).unwrap();
+        }
+    }
+    stream.flush(true).unwrap();
+    stream
+        .convert_disk_files_to_parquet(None, None, false, true, &None)
+        .unwrap();
+    let files = stream.parquet_files();
+    assert_eq!(files.len(), 1);
+    files.into_iter().next().unwrap()
+}
+
+/// Rows of a result, timestamps as epoch ms and every other value as text.
+fn canonical_rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                let cast = if matches!(column.data_type(), DataType::Timestamp(_, _)) {
+                    let millis = arrow::compute::cast(
+                        column,
+                        &DataType::Timestamp(TimeUnit::Millisecond, None),
+                    )
+                    .unwrap();
+                    arrow::compute::cast(&millis, &DataType::Int64).unwrap()
+                } else {
+                    arrow::compute::cast(column, &DataType::Utf8).unwrap()
+                };
+                (0..batch.num_rows())
+                    .map(|row| {
+                        if cast.is_null(row) {
+                            "NULL".to_owned()
+                        } else if let Some(values) = cast.as_any().downcast_ref::<Int64Array>() {
+                            values.value(row).to_string()
+                        } else {
+                            cast.as_any()
+                                .downcast_ref::<arrow_array::StringArray>()
+                                .unwrap()
+                                .value(row)
+                                .to_owned()
+                        }
+                    })
+                    .collect_vec()
+            })
+            .collect_vec();
+        for row in 0..batch.num_rows() {
+            rows.push(columns.iter().map(|column| column[row].clone()).collect());
+        }
+    }
+    rows
+}
+
+fn text(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "NULL".to_owned())
+}
+
+fn time_text(value: Option<i64>) -> String {
+    value.map_or_else(|| "NULL".to_owned(), |time| time.to_string())
+}
+
+fn record_row(record: &LogRecord) -> Vec<String> {
+    vec![
+        time_text(record.0),
+        record.1.to_string(),
+        text(&record.2),
+        text(&record.3),
+    ]
+}
+
+/// `DESC NULLS LAST` (or `NULLS FIRST`) comparison of optional times.
+fn time_desc(a: Option<i64>, b: Option<i64>, nulls_first: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) if nulls_first => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) if nulls_first => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+    }
+}
+
+/// SQL and its independently computed result over the ingested records.
+fn clustering_cases(records: &[LogRecord]) -> Vec<(String, Vec<Vec<String>>)> {
+    let columns = "p_timestamp, id, severity_text, message";
+    let window = (CLUSTER_BASE_MS + 120_000, CLUSTER_BASE_MS + 180_000);
+    let in_window = |r: &&LogRecord| r.0.is_some_and(|t| t >= window.0 && t < window.1);
+    let mut cases = Vec::new();
+
+    let mut desc = records.to_vec();
+    desc.sort_by(|a, b| time_desc(a.0, b.0, false).then(b.1.cmp(&a.1)));
+    cases.push((
+        format!("SELECT {columns} FROM t ORDER BY p_timestamp DESC NULLS LAST, id DESC"),
+        desc.iter().map(record_row).collect_vec(),
+    ));
+    cases.push((
+        format!(
+            "SELECT {columns} FROM t ORDER BY p_timestamp DESC NULLS LAST, id DESC LIMIT 25 OFFSET 40"
+        ),
+        desc.iter().skip(40).take(25).map(record_row).collect_vec(),
+    ));
+
+    let mut desc_nulls_first = records.to_vec();
+    desc_nulls_first.sort_by(|a, b| time_desc(a.0, b.0, true).then(a.1.cmp(&b.1)));
+    cases.push((
+        format!("SELECT {columns} FROM t ORDER BY p_timestamp DESC, id ASC LIMIT 100"),
+        desc_nulls_first
+            .iter()
+            .take(100)
+            .map(record_row)
+            .collect_vec(),
+    ));
+
+    // ASC defaults to NULLS LAST.
+    let mut asc = records.to_vec();
+    asc.sort_by(|a, b| {
+        a.0.is_none()
+            .cmp(&b.0.is_none())
+            .then(a.0.cmp(&b.0))
+            .then(a.1.cmp(&b.1))
+    });
+    cases.push((
+        format!("SELECT {columns} FROM t ORDER BY p_timestamp ASC, id ASC"),
+        asc.iter().map(record_row).collect_vec(),
+    ));
+
+    let errors = desc
+        .iter()
+        .filter(|r| r.2.as_deref() == Some("ERROR"))
+        .filter(in_window)
+        .collect_vec();
+    cases.push((
+        format!(
+            "SELECT {columns} FROM t WHERE severity_text = 'ERROR' AND p_timestamp >= to_timestamp_millis({}) AND p_timestamp < to_timestamp_millis({}) ORDER BY p_timestamp DESC NULLS LAST, id DESC LIMIT 50",
+            window.0, window.1
+        ),
+        errors.iter().take(50).map(|r| record_row(r)).collect_vec(),
+    ));
+
+    let mut groups = BTreeMap::<Option<String>, i64>::new();
+    for record in &errors {
+        *groups.entry(record.3.clone()).or_default() += 1;
+    }
+    let mut groups = groups.into_iter().collect_vec();
+    // n DESC, message ASC NULLS LAST.
+    groups.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(a.0.is_none().cmp(&b.0.is_none()))
+            .then(a.0.cmp(&b.0))
+    });
+    cases.push((
+        format!(
+            "SELECT message, COUNT(*) AS n FROM t WHERE severity_text = 'ERROR' AND p_timestamp >= to_timestamp_millis({}) AND p_timestamp < to_timestamp_millis({}) GROUP BY message ORDER BY n DESC, message ASC NULLS LAST",
+            window.0, window.1
+        ),
+        groups
+            .iter()
+            .map(|(message, n)| vec![text(message), n.to_string()])
+            .collect_vec(),
+    ));
+
+    let mut severities = BTreeMap::<Option<String>, i64>::new();
+    for record in records {
+        *severities.entry(record.2.clone()).or_default() += 1;
+    }
+    // BTreeMap orders None first, matching NULLS FIRST.
+    cases.push((
+        "SELECT severity_text, COUNT(*) AS n FROM t GROUP BY severity_text ORDER BY severity_text ASC NULLS FIRST".to_owned(),
+        severities
+            .iter()
+            .map(|(severity, n)| vec![text(severity), n.to_string()])
+            .collect_vec(),
+    ));
+
+    cases.push((
+        format!(
+            "SELECT COUNT(*) AS n FROM t WHERE p_timestamp >= to_timestamp_millis({}) AND p_timestamp < to_timestamp_millis({})",
+            window.0, window.1
+        ),
+        vec![vec![records.iter().filter(in_window).count().to_string()]],
+    ));
+
+    let mut null_ids = records
+        .iter()
+        .filter(|r| r.2.is_none())
+        .map(|r| r.1)
+        .collect_vec();
+    null_ids.sort_unstable();
+    cases.push((
+        "SELECT id FROM t WHERE severity_text IS NULL ORDER BY id".to_owned(),
+        null_ids.iter().map(|id| vec![id.to_string()]).collect_vec(),
+    ));
+
+    let mut by_severity = records.to_vec();
+    by_severity.sort_by(|a, b| {
+        a.2.is_none()
+            .cmp(&b.2.is_none())
+            .then(a.2.cmp(&b.2))
+            .then(time_desc(a.0, b.0, false))
+            .then(a.1.cmp(&b.1))
+    });
+    cases.push((
+        format!(
+            "SELECT {columns} FROM t ORDER BY severity_text ASC NULLS LAST, p_timestamp DESC NULLS LAST, id ASC LIMIT 300"
+        ),
+        by_severity.iter().take(300).map(record_row).collect_vec(),
+    ));
+
+    let mut minutes = BTreeMap::<i64, i64>::new();
+    for time in records.iter().filter_map(|r| r.0) {
+        *minutes.entry(time - time.rem_euclid(60_000)).or_default() += 1;
+    }
+    cases.push((
+        "SELECT date_bin(INTERVAL '1 minute', p_timestamp, TIMESTAMP '1970-01-01 00:00:00') AS b, COUNT(*) AS n FROM t WHERE p_timestamp IS NOT NULL GROUP BY b ORDER BY b DESC".to_owned(),
+        minutes
+            .iter()
+            .rev()
+            .map(|(bin, n)| vec![bin.to_string(), n.to_string()])
+            .collect_vec(),
+    ));
+    cases
+}
+
+/// Clustered and default files answer every deterministic query exactly like
+/// an independent oracle over the ingested records, through the production
+/// manifest scan, and neither advertises an ordering.
+#[tokio::test]
+async fn severity_clustered_files_match_oracle() {
+    let records = log_records().concat();
+    let cases = clustering_cases(&records);
+    let default_dir = TempDir::new().unwrap();
+    let clustered_dir = TempDir::new().unwrap();
+    let default_file = StoredFile::open(write_log_minute(&default_dir, None), "p_timestamp", "id");
+    let clustered_file = StoredFile::open(
+        write_log_minute(&clustered_dir, Some("severity_text")),
+        "p_timestamp",
+        "id",
+    );
+    default_file.assert_manifest_claims_time_desc();
+    assert!(clustered_file.manifest.sort_order_id.is_empty());
+    assert!(
+        footer_sorting_columns(&clustered_file.path)
+            .iter()
+            .all(Option::is_none)
+    );
+    assert_eq!(default_file.schema, clustered_file.schema);
+    assert_eq!(
+        default_file.row_groups.iter().map(Vec::len).collect_vec(),
+        clustered_file.row_groups.iter().map(Vec::len).collect_vec()
+    );
+    // Physical layout really differs while the stored rows do not.
+    assert_ne!(default_file.row_groups, clustered_file.row_groups);
+    let mut default_rows = default_file.rows();
+    let mut clustered_rows = clustered_file.rows();
+    default_rows.sort_unstable();
+    clustered_rows.sort_unstable();
+    assert_eq!(default_rows, clustered_rows);
+    assert_eq!(default_rows.len(), records.len());
+
+    let mut failures = Vec::new();
+    for (sql, expected) in &cases {
+        for (label, file) in [("default", &default_file), ("clustered", &clustered_file)] {
+            let outcome = run(file.table(), sql).await;
+            assert!(
+                outcome.advertised_order.iter().all(|ordered| !ordered),
+                "{label}: scan advertised an ordering for {sql}"
+            );
+            let actual = canonical_rows(&outcome.batches);
+            println!(
+                "CLUSTERING_JSON {}",
+                json!({
+                    "file": label,
+                    "sql": sql,
+                    "rows": actual.len(),
+                    "matches": &actual == expected,
+                })
+            );
+            if &actual != expected {
+                let index = actual.iter().zip(expected).position(|(a, b)| a != b);
+                failures.push(format!(
+                    "{label}: {sql}: actual {} rows, expected {}; first difference at {index:?}",
+                    actual.len(),
+                    expected.len()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

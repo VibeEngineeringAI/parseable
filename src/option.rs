@@ -164,6 +164,20 @@ pub mod validation {
         }
     }
 
+    pub fn cluster_column(s: &str) -> Result<String, String> {
+        let column = s.trim();
+        if column.is_empty() {
+            return Err(
+                "P_LOG_SEVERITY_CLUSTER_COLUMN must name a column; unset it to disable clustering"
+                    .to_string(),
+            );
+        }
+        if column.contains(',') {
+            return Err("P_LOG_SEVERITY_CLUSTER_COLUMN accepts exactly one column".to_string());
+        }
+        Ok(column.to_string())
+    }
+
     pub fn compression(s: &str) -> Result<Compression, String> {
         match s {
             "uncompressed" => Ok(Compression::Uncompressed),
