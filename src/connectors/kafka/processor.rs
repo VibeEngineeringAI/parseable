@@ -16,9 +16,10 @@
  *
  */
 
-//! Kafka custom-partition streams accept one JSON object per record, with all
-//! configured partition fields present and valid. Arrays, non-objects, invalid
-//! JSON/partition values, conversion failures, and conflicting field types are
+//! Kafka time/custom-partition streams accept one JSON object per record, with all
+//! configured partition fields present and valid (including HTTP time-age limits).
+//! Arrays, non-objects, invalid JSON/partition values, conversion failures, and
+//! conflicting field types are
 //! skipped with the record's topic, partition, offset, and tenant in the warning.
 //! Schemas are accumulated in record order and published as one union; only
 //! conflicting records are skipped, without adding any of their fields.
@@ -39,7 +40,7 @@ use crate::{
     metadata::{LogStreamMetadata, SchemaVersion},
     parseable::{PARSEABLE, StagingError},
     storage::StreamType,
-    utils::json::flatten::validate_custom_partition,
+    utils::json::flatten::{validate_custom_partition, validate_time_partition},
 };
 use arrow_schema::{ArrowError, Field, Schema};
 use async_trait::async_trait;
@@ -48,6 +49,7 @@ use futures_util::StreamExt;
 use rdkafka::consumer::{CommitMode, Consumer};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
@@ -84,6 +86,7 @@ impl ParseableSinkProcessor {
         Ok(StreamMeta {
             schema: stream.get_schema_raw(),
             time_partition: stream.get_time_partition(),
+            time_partition_limit: stream.get_time_partition_limit(),
             custom_partition: stream.get_custom_partition(),
             static_schema_flag: stream.get_static_schema_flag(),
             schema_version: stream.get_schema_version(),
@@ -95,10 +98,17 @@ impl ParseableSinkProcessor {
 struct StreamMeta {
     schema: HashMap<String, Arc<Field>>,
     time_partition: Option<String>,
+    time_partition_limit: Option<NonZeroU32>,
     custom_partition: Option<String>,
     static_schema_flag: bool,
     schema_version: SchemaVersion,
     infer_timestamp: bool,
+}
+
+impl StreamMeta {
+    fn is_partitioned(&self) -> bool {
+        self.time_partition.is_some() || self.custom_partition.is_some()
+    }
 }
 
 /// JSON parse + Arrow record-batch encode for a chunk of records. CPU-bound,
@@ -116,7 +126,7 @@ fn build_and_process_event(
     // producer gets no rejection signal, so the dataset field limit is not
     // enforced here: rejecting would silently drop the whole chunk.
     let mut events = build_events(&records, &stream_name, &tenant_id, &meta)?;
-    if meta.custom_partition.is_some() && !events.is_empty() {
+    if meta.is_partitioned() && !events.is_empty() {
         // Select schemas in source order, then stage the accepted union once.
         let stream = PARSEABLE.get_stream(&stream_name, &tenant_id)?;
         let (accepted, committed) = commit_compatible_events(&stream.metadata, events)?;
@@ -137,7 +147,7 @@ fn build_and_process_event(
 
 struct RecordEvent<'a> {
     event: Event,
-    // For the non-custom-partition batch path this identifies its first record.
+    // For the non-partitioned batch path this identifies its first record.
     record: &'a ConsumerRecord,
 }
 
@@ -233,7 +243,7 @@ fn finish_schema_commit(
 }
 
 /// Builds events without accessing stream state, keeping partition values and
-/// payload sizes attached to their individual records for custom partitions.
+/// payload sizes attached to their individual records for either partition type.
 fn build_events<'a>(
     records: &'a [ConsumerRecord],
     stream_name: &str,
@@ -279,15 +289,20 @@ fn build_events<'a>(
             }
         };
 
-        if let Some(custom_partition) = &meta.custom_partition {
+        if meta.is_partitioned() {
             let Some(object) = value.as_object() else {
-                warn!(
-                    custom_partition = %custom_partition,
-                    "Skipping Kafka record: custom partition fields require a JSON object"
-                );
+                warn!("Skipping Kafka record: partition fields require a JSON object");
                 continue;
             };
-            if let Err(err) = validate_custom_partition(object, Some(custom_partition)) {
+            if let Err(err) = validate_time_partition(
+                object,
+                meta.time_partition.as_ref(),
+                meta.time_partition_limit,
+            ) {
+                warn!(error = %err, "Skipping Kafka record with invalid time partition");
+                continue;
+            }
+            if let Err(err) = validate_custom_partition(object, meta.custom_partition.as_ref()) {
                 warn!(error = %err, "Skipping Kafka record with invalid custom partition");
                 continue;
             }
@@ -306,7 +321,7 @@ fn build_events<'a>(
 
     // Empty chunks (including chunks with only invalid payloads) are a no-op;
     // Arrow's decoder expects at least one record.
-    if meta.custom_partition.is_none()
+    if !meta.is_partitioned()
         && !json_vec.is_empty()
         && let Some(record) = records.first()
     {
@@ -426,6 +441,7 @@ mod tests {
         StreamMeta {
             schema: HashMap::new(),
             time_partition: None,
+            time_partition_limit: None,
             custom_partition: custom_partition.map(str::to_owned),
             static_schema_flag: false,
             schema_version: SchemaVersion::V1,
@@ -644,6 +660,18 @@ mod tests {
             record.offset = offset as i64 + 100;
             record.tenant_id = Some("test-tenant".to_owned());
         }
+        let mut time_records = vec![
+            record(r#"{"region":"missing"}"#),
+            record(r#"{"ts":"invalid"}"#),
+            record(r#"{"ts":123}"#),
+            timed_record(Utc::now() - chrono::Duration::days(2), "old"),
+            record("[]"),
+        ];
+        for (offset, record) in time_records.iter_mut().enumerate() {
+            record.partition = 7;
+            record.offset = offset as i64 + 200;
+            record.tenant_id = Some("test-tenant".to_owned());
+        }
         #[derive(Clone)]
         struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for LogWriter {
@@ -670,12 +698,24 @@ mod tests {
             let metadata = RwLock::new(LogStreamMetadata::default());
             let (accepted, _) = commit_compatible_events(&metadata, events).unwrap();
             assert_eq!(accepted.len(), 1);
+            let _time_state = crate::utils::json::flatten::time_partition_test_state(1);
+            let events = build_events(
+                &time_records,
+                "test",
+                &None,
+                &time_stream_meta(None, Some(1)),
+            )
+            .unwrap();
+            assert!(events.is_empty());
         };
         tracing::subscriber::with_default(subscriber, check);
         let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         let warnings: Vec<_> = output.lines().collect();
-        assert_eq!(warnings.len(), 7, "{output}");
-        for (warning, offset) in warnings.iter().zip([100, 101, 102, 103, 106, 107, 105]) {
+        assert_eq!(warnings.len(), 12, "{output}");
+        for (warning, offset) in warnings
+            .iter()
+            .zip([100, 101, 102, 103, 106, 107, 105, 200, 201, 202, 203, 204])
+        {
             for field in [
                 "topic=test".to_owned(),
                 "partition=7".to_owned(),
@@ -687,6 +727,8 @@ mod tests {
             }
         }
         assert!(output.contains("conflicting schema"), "{output}");
+        assert!(output.contains("invalid time partition"), "{output}");
+        assert!(output.contains("more than 1 days old"), "{output}");
     }
 
     #[test]
@@ -776,6 +818,137 @@ mod tests {
             events[0].event.custom_partition_values,
             HashMap::from([("region".to_owned(), "false".to_owned())])
         );
+    }
+
+    fn time_stream_meta(custom_partition: Option<&str>, limit: Option<u32>) -> StreamMeta {
+        StreamMeta {
+            time_partition: Some("ts".to_owned()),
+            time_partition_limit: limit.and_then(NonZeroU32::new),
+            ..stream_meta(custom_partition)
+        }
+    }
+
+    fn timed_record(timestamp: chrono::DateTime<Utc>, region: &str) -> ConsumerRecord {
+        record(&serde_json::json!({"ts": timestamp.to_rfc3339(), "region": region}).to_string())
+    }
+
+    #[test]
+    fn time_partition_builds_events_with_each_records_timestamp() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _time_state = crate::utils::json::flatten::time_partition_test_state(1);
+        let first = Utc::now();
+        let second = first + chrono::Duration::minutes(1);
+        let records = [timed_record(first, "west"), timed_record(second, "east")];
+        let meta = time_stream_meta(None, Some(1));
+        // A single-record chunk must also avoid the batch-array path.
+        for chunk in [&records[..1], &records[..]] {
+            let events = build_events(chunk, "test", &None, &meta).unwrap();
+            assert_eq!(events.len(), chunk.len());
+            for (index, event) in events.iter().enumerate() {
+                assert_eq!(
+                    event.event.parsed_timestamp,
+                    [first, second][index].naive_utc()
+                );
+                assert_eq!(event.event.rb.num_rows(), 1);
+                assert!(event.event.custom_partition_values.is_empty());
+                assert!(std::ptr::eq(event.record, &records[index]));
+                assert_eq!(
+                    event.event.origin_size,
+                    records[index].payload.as_ref().unwrap().len() as u64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn time_partition_skips_missing_invalid_fields_and_non_objects() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _time_state = crate::utils::json::flatten::time_partition_test_state(1);
+        let now = Utc::now();
+        let records = vec![
+            timed_record(now, "west"),
+            record(r#"{"region":"missing"}"#),
+            record(r#"{"ts":"invalid"}"#),
+            record(r#"{"ts":123}"#),
+            record(r#"{"ts":null}"#),
+            record(r#"{"ts":{}}"#),
+            record(r#"{"ts":[]}"#),
+            record("[]"),
+            record("null"),
+            timed_record(now, "east"),
+        ];
+        let events =
+            build_events(&records, "test", &None, &time_stream_meta(None, Some(1))).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(std::ptr::eq(events[0].record, &records[0]));
+        assert!(std::ptr::eq(events[1].record, &records[9]));
+    }
+
+    #[test]
+    fn time_partition_enforces_configured_and_default_initial_limits() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let now = Utc::now();
+        for (limit, old_days, accepted_hours) in [(Some(1), 2, 12), (None, 31, 48)] {
+            let _time_state = crate::utils::json::flatten::time_partition_test_state(1);
+            let accepted = now - chrono::Duration::hours(accepted_hours);
+            let records = vec![
+                timed_record(now - chrono::Duration::days(old_days), "old"),
+                timed_record(accepted, "accepted"),
+            ];
+            let events =
+                build_events(&records, "test", &None, &time_stream_meta(None, limit)).unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(std::ptr::eq(events[0].record, &records[1]));
+            assert_eq!(events[0].event.parsed_timestamp, accepted.naive_utc());
+        }
+    }
+
+    #[test]
+    fn time_partition_enforces_http_reference_relative_age() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _time_state = crate::utils::json::flatten::time_partition_test_state(1);
+        let now = Utc::now();
+        let max_age = 1;
+        let records = vec![
+            timed_record(now, "reference"),
+            timed_record(now - chrono::Duration::hours(max_age + 1), "old"),
+            timed_record(now + chrono::Duration::minutes(1), "new"),
+        ];
+        let events =
+            build_events(&records, "test", &None, &time_stream_meta(None, Some(30))).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(std::ptr::eq(events[0].record, &records[0]));
+        assert!(std::ptr::eq(events[1].record, &records[2]));
+    }
+
+    #[test]
+    fn combined_partitions_keep_per_record_values_and_validate_time() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _time_state = crate::utils::json::flatten::time_partition_test_state(1);
+        let now = Utc::now();
+        let second = now + chrono::Duration::minutes(1);
+        let records = vec![
+            timed_record(now - chrono::Duration::days(2), "old"),
+            timed_record(now, "west"),
+            record(r#"{"region":"invalid","ts":"invalid"}"#),
+            record(&serde_json::json!({"ts": now.to_rfc3339()}).to_string()),
+            timed_record(second, "east"),
+        ];
+        let meta = time_stream_meta(Some("region"), Some(1));
+        let events = build_events(&records, "test", &None, &meta).unwrap();
+        assert_eq!(events.len(), 2);
+        for (event, index, timestamp, region) in [
+            (&events[0], 1, now, "west"),
+            (&events[1], 4, second, "east"),
+        ] {
+            assert!(std::ptr::eq(event.record, &records[index]));
+            assert_eq!(event.event.parsed_timestamp, timestamp.naive_utc());
+            assert_eq!(event.event.custom_partition_values["region"], region);
+        }
+        let metadata = RwLock::new(LogStreamMetadata::default());
+        let (events, committed) = commit_compatible_events(&metadata, events).unwrap();
+        assert!(committed);
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
