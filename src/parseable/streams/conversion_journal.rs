@@ -86,7 +86,7 @@ fn plain_components(path: &Path, count: usize) -> bool {
 fn regular_or_absent(path: &Path, directory: bool) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if (directory && meta.is_dir()) || (!directory && meta.is_file()) => Ok(()),
-        Ok(_) => Err(invalid(path, "symlink or unexpected file type")),
+        Ok(_) => Err(invalid(path, "unexpected file type")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
@@ -185,13 +185,15 @@ impl ConversionJournal {
                 || relative
                     .extension()
                     .is_none_or(|s| s != ARROW_FILE_EXTENSION)
-                || !seen.insert(relative)
             {
-                return Err(invalid(
-                    path,
-                    format!("invalid or duplicate source {}", relative.display()),
-                )
-                .into());
+                return Err(
+                    invalid(path, format!("invalid source path: {}", relative.display())).into(),
+                );
+            }
+            if !seen.insert(relative) {
+                return Err(
+                    invalid(path, format!("duplicate source: {}", relative.display())).into(),
+                );
             }
             let absolute = stream.data_path.join(relative);
             regular_or_absent(absolute.parent().unwrap(), true)?;
