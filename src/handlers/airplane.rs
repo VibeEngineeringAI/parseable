@@ -36,7 +36,7 @@ use crate::handlers::http::modal::{NodeMetadata, NodeType};
 use crate::handlers::http::query::into_query;
 use crate::handlers::livetail::cross_origin_config;
 use crate::metrics::QUERY_EXECUTE_TIME;
-use crate::parseable::PARSEABLE;
+use crate::parseable::{DEFAULT_TENANT, PARSEABLE};
 use crate::query::{QUERY_SESSION, execute, resolve_stream_names};
 use crate::utils::arrow::flight::{
     append_temporary_events, get_query_from_ticket, into_flight_data, run_do_get_rpc,
@@ -240,7 +240,7 @@ impl FlightService for AirServiceImpl {
 
         let time = time.elapsed().as_secs_f64();
         QUERY_EXECUTE_TIME
-            .with_label_values(&[&format!("flight-query-{stream_name}")])
+            .with_label_values(&[&format!("flight-query-{stream_name}"), DEFAULT_TENANT])
             .observe(time);
 
         // Airplane takes off 🛫
