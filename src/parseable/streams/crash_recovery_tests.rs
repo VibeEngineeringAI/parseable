@@ -1876,3 +1876,228 @@ fn static_schema_conversion_preserves_no_staging_policy() {
     );
 }
 
+#[test]
+fn conversion_schema_cache_skips_second_group_and_retire_skips_inventory() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let writes = Arc::new(AtomicUsize::new(0));
+    let scans = Arc::new(AtomicUsize::new(0));
+    let writes_hook = Arc::clone(&writes);
+    let scans_hook = Arc::clone(&scans);
+    let weak = Arc::downgrade(&stream);
+    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| match phase {
+        ConversionPhase::SchemaStaged => {
+            writes_hook.fetch_add(1, Ordering::Relaxed);
+        }
+        ConversionPhase::InventoryScan => {
+            // Inventory must not scan while holding the claims lock.
+            assert!(weak.upgrade().unwrap().conversion_claims.try_lock().is_ok());
+            scans_hook.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }));
+    // Preserve another group with the same schema in the root for cycle two.
+    let root_sources = stream.arrow_files();
+    let saved: Vec<_> = root_sources
+        .iter()
+        .map(|path| (path.clone(), fs::read(path).unwrap()))
+        .collect();
+    stream.prepare_parquet(false, true, &None).unwrap();
+    assert_eq!(writes.load(Ordering::Relaxed), 1);
+    assert_eq!(scans.load(Ordering::Relaxed), 1);
+    for (path, bytes) in saved {
+        fs::write(path, bytes).unwrap();
+    }
+    stream.prepare_parquet(false, true, &None).unwrap();
+    assert_eq!(
+        writes.load(Ordering::Relaxed),
+        1,
+        "covered schema must not be written twice"
+    );
+    assert_eq!(
+        scans.load(Ordering::Relaxed),
+        2,
+        "one journal inventory per healthy cycle, none in retire"
+    );
+    let mut twice = expected_pairs(false);
+    twice.extend(expected_pairs(false));
+    twice.sort();
+    assert_eq!(capture_pairs(&stream), (vec![], twice));
+    assert_clean_residue(&stream);
+}
+
+#[test]
+fn schema_conflict_still_publishes_exactly_once_and_reports_cycle_error() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    fs::write(
+        stream.data_path.join(".ingestor.conflict.schema"),
+        serde_json::to_vec(&Schema::new(vec![Field::new("id", DataType::Utf8, false)])).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        stream.prepare_parquet(false, true, &None),
+        Err(StagingError::Arrow(_))
+    ));
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert_clean_residue(&stream);
+    let options = Arc::clone(&stream.options);
+    drop(stream);
+    let restarted = fresh(options);
+    restarted.prepare_parquet(true, false, &None).unwrap();
+    restarted.prepare_parquet(false, false, &None).unwrap();
+    assert_eq!(capture_pairs(&restarted), (vec![], expected_pairs(false)));
+    assert_clean_residue(&restarted);
+}
+
+#[test]
+fn uploader_deleted_schema_is_restaged_with_cached_and_new_fields() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(
+        &dir,
+        Case {
+            mixed: true,
+            ..Case::default()
+        },
+    );
+    stream.stage_conversion_schema(schema(false)).unwrap();
+    fs::remove_file(stream.data_path.join(".schema")).unwrap();
+    stream.prepare_parquet(false, true, &None).unwrap();
+    let staged = Schema::try_merge(stream.get_schemas_if_present().unwrap()).unwrap();
+    assert!(staged.contains(&schema(true)));
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(true)));
+    assert_clean_residue(&stream);
+    // Even a covered group is restaged after an uploader deletion.
+    fs::remove_file(stream.data_path.join(".schema")).unwrap();
+    stream.stage_conversion_schema(schema(false)).unwrap();
+    let staged = Schema::try_merge(stream.get_schemas_if_present().unwrap()).unwrap();
+    assert!(
+        staged.contains(&schema(true)),
+        "cached union preserves earlier fields"
+    );
+}
+
+#[test]
+fn deterministic_pre_journal_failure_stops_encoding_until_restart() {
+    use super::conversion_journal::JournalFault;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let encodes = Arc::new(AtomicUsize::new(0));
+    let encodes_hook = Arc::clone(&encodes);
+    let weak = Arc::downgrade(&stream);
+    *stream.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, ConversionPhase::PartSynced) {
+            encodes_hook.fetch_add(1, Ordering::Relaxed);
+            *weak.upgrade().unwrap().journal_fault.lock().unwrap() = Some(JournalFault::Schema);
+        }
+    }));
+    for attempt in 0..MAX_CONVERSION_ATTEMPTS + 4 {
+        let result = stream.prepare_parquet(false, attempt == 0, &None);
+        assert_eq!(result.is_err(), attempt < MAX_CONVERSION_ATTEMPTS);
+    }
+    assert_eq!(encodes.load(Ordering::Relaxed), MAX_CONVERSION_ATTEMPTS);
+    assert_eq!(capture_pairs(&stream), (expected_pairs(false), vec![]));
+    assert!(listed_parquet(&stream.data_path).is_empty());
+    assert!(fs::read_dir(&stream.data_path).unwrap().all(|e| {
+        !e.unwrap()
+            .path()
+            .to_string_lossy()
+            .ends_with(".parquet.part")
+    }));
+    let options = Arc::clone(&stream.options);
+    drop(stream);
+    let restarted = fresh(options);
+    restarted.prepare_parquet(true, false, &None).unwrap();
+    assert_eq!(capture_pairs(&restarted), (vec![], expected_pairs(false)));
+    assert_clean_residue(&restarted);
+    let registry = lock_conversion_claims(&restarted.conversion_claims);
+    assert!(registry.retry_attempts.is_empty());
+    assert!(registry.replay_warned_dirs.is_empty());
+}
+
+#[test]
+fn removed_directory_prunes_exhausted_retry_and_replay_warning() {
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    let gone = stream.data_path.join("processing_gone");
+    let corrupt_dir = stream.data_path.join("processing_corrupt");
+    fs::create_dir(&corrupt_dir).unwrap();
+    let corrupt = corrupt_dir.join("invalid.arrows");
+    fs::write(&corrupt, b"invalid IPC").unwrap();
+    {
+        let mut registry = lock_conversion_claims(&stream.conversion_claims);
+        registry.retry_dirs.insert(gone.clone());
+        registry
+            .retry_attempts
+            .insert(gone.clone(), MAX_CONVERSION_ATTEMPTS);
+        registry.replay_warned_dirs.insert(gone);
+        registry.retry_attempts.insert(corrupt_dir.clone(), 1);
+        registry.replay_warned_dirs.insert(corrupt_dir.clone());
+    }
+    stream.remove_invalid_arrow_files(&[corrupt], &None);
+    assert!(!corrupt_dir.exists());
+    assert!(
+        !lock_conversion_claims(&stream.conversion_claims)
+            .retry_attempts
+            .contains_key(&corrupt_dir)
+    );
+    stream.prepare_parquet(false, true, &None).unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert_clean_residue(&stream);
+    let registry = lock_conversion_claims(&stream.conversion_claims);
+    assert!(registry.retry_attempts.is_empty());
+    assert!(registry.replay_warned_dirs.is_empty());
+}
+
+#[test]
+fn cycle_schema_merge_is_deferred_and_preserves_first_error() {
+    let incompatible = vec![
+        schema(false),
+        Schema::new(vec![Field::new("id", DataType::Utf8, false)]),
+    ];
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    // Preparation does not need a union across independently published groups.
+    stream
+        .finish_arrow_file_conversion(ArrowFileConversionOutcome {
+            schemas: incompatible.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(matches!(
+        ArrowFileConversionOutcome {
+            schemas: incompatible.clone(),
+            ..Default::default()
+        }
+        .into_result(),
+        Err(StagingError::Arrow(_))
+    ));
+    let error = ArrowFileConversionOutcome {
+        schemas: incompatible,
+        first_error: Some(std::io::Error::other("original group error").into()),
+        ..Default::default()
+    }
+    .into_result()
+    .unwrap_err();
+    assert!(error.to_string().contains("original group error"));
+}
+
+#[test]
+fn failed_part_sync_removes_unjournaled_part_and_retries_sources() {
+    use super::conversion_journal::JournalFault;
+    let dir = TempDir::new().unwrap();
+    let stream = fixture(&dir, Case::default());
+    *stream.journal_fault.lock().unwrap() = Some(JournalFault::PartSync);
+    assert!(stream.prepare_parquet(false, true, &None).is_err());
+    assert_eq!(capture_pairs(&stream), (expected_pairs(false), vec![]));
+    assert!(fs::read_dir(&stream.data_path).unwrap().all(|entry| {
+        let path = entry.unwrap().path();
+        !path.to_string_lossy().ends_with(".parquet.part")
+            && !path.to_string_lossy().ends_with(".sources")
+    }));
+    stream.prepare_parquet(false, false, &None).unwrap();
+    assert_eq!(capture_pairs(&stream), (vec![], expected_pairs(false)));
+    assert_clean_residue(&stream);
+}
