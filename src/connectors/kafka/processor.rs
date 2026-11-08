@@ -26,6 +26,7 @@ use crate::{
     metadata::SchemaVersion,
     parseable::PARSEABLE,
     storage::StreamType,
+    utils::json::flatten::validate_custom_partition,
 };
 use arrow_schema::Field;
 use async_trait::async_trait;
@@ -36,7 +37,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use super::{ConsumerRecord, StreamConsumer, TopicPartition, config::BufferConfig};
 
@@ -98,26 +99,31 @@ fn build_and_process_event(
     tenant_id: Option<String>,
     meta: StreamMeta,
 ) -> anyhow::Result<()> {
-    let mut json_vec = Vec::with_capacity(records.len());
-    let mut total_payload_size = 0u64;
-
-    for record in records.iter().filter_map(|r| r.payload.as_ref()) {
-        total_payload_size += record.len() as u64;
-        if let Ok(value) = serde_json::from_slice::<Value>(record) {
-            json_vec.push(value);
-        }
-    }
-
-    let mut p_custom_fields = HashMap::new();
-    p_custom_fields.insert(USER_AGENT_KEY.to_string(), "kafka".to_string());
-
     // Offsets are committed whether or not the chunk is ingested and the
     // producer gets no rejection signal, so the dataset field limit is not
     // enforced here: rejecting would silently drop the whole chunk.
-    json::Event::new(Value::Array(json_vec), Utc::now())
-        .into_event(
-            stream_name,
-            total_payload_size,
+    for event in build_events(&records, &stream_name, &tenant_id, &meta)? {
+        event.process_without_field_limit()?;
+    }
+
+    Ok(())
+}
+
+/// Builds events without accessing stream state, keeping partition values and
+/// payload sizes attached to their individual records for custom partitions.
+fn build_events(
+    records: &[ConsumerRecord],
+    stream_name: &str,
+    tenant_id: &Option<String>,
+    meta: &StreamMeta,
+) -> anyhow::Result<Vec<crate::event::Event>> {
+    let mut p_custom_fields = HashMap::new();
+    p_custom_fields.insert(USER_AGENT_KEY.to_string(), "kafka".to_string());
+
+    let into_event = |value, origin_size| {
+        json::Event::new(value, Utc::now()).into_event(
+            stream_name.to_owned(),
+            origin_size,
             &meta.schema,
             meta.static_schema_flag,
             meta.custom_partition.as_ref(),
@@ -126,12 +132,50 @@ fn build_and_process_event(
             StreamType::UserDefined,
             &p_custom_fields,
             TelemetryType::Logs,
-            &tenant_id,
+            tenant_id,
             meta.infer_timestamp,
-        )?
-        .process_without_field_limit()?;
+        )
+    };
 
-    Ok(())
+    let mut events = Vec::new();
+    let mut json_vec = Vec::with_capacity(records.len());
+    let mut total_payload_size = 0u64;
+
+    for record in records.iter().filter_map(|r| r.payload.as_ref()) {
+        total_payload_size += record.len() as u64;
+        let value = match serde_json::from_slice::<Value>(record) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(error = %err, "Skipping Kafka record with unparsable payload");
+                continue;
+            }
+        };
+
+        if let Some(custom_partition) = &meta.custom_partition {
+            let Some(object) = value.as_object() else {
+                warn!(
+                    custom_partition = %custom_partition,
+                    "Skipping Kafka record: custom partition fields require a JSON object"
+                );
+                continue;
+            };
+            if let Err(err) = validate_custom_partition(object, Some(custom_partition)) {
+                warn!(error = %err, "Skipping Kafka record with invalid custom partition");
+                continue;
+            }
+            events.push(into_event(value, record.len() as u64)?);
+        } else {
+            json_vec.push(value);
+        }
+    }
+
+    // Empty chunks (including chunks with only invalid payloads) are a no-op;
+    // Arrow's decoder expects at least one record.
+    if meta.custom_partition.is_none() && !json_vec.is_empty() {
+        events.push(into_event(Value::Array(json_vec), total_payload_size)?);
+    }
+
+    Ok(events)
 }
 
 #[async_trait]
@@ -225,5 +269,133 @@ where
         self.processor.post_stream().await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_meta(custom_partition: Option<&str>) -> StreamMeta {
+        StreamMeta {
+            schema: HashMap::new(),
+            time_partition: None,
+            custom_partition: custom_partition.map(str::to_owned),
+            static_schema_flag: false,
+            schema_version: SchemaVersion::V1,
+            infer_timestamp: false,
+        }
+    }
+
+    fn record(payload: &str) -> ConsumerRecord {
+        ConsumerRecord::new(
+            Some(payload.as_bytes().to_vec()),
+            None,
+            "test".to_owned(),
+            0,
+            0,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn custom_partition_builds_one_event_per_valid_record() {
+        let records = vec![
+            record(r#" {"region": "west", "status": 200} "#),
+            record(r#"{"message": "missing region", "status": 200}"#),
+            record("not json"),
+            record(r#"{"region": "east", "status": 500}"#),
+        ];
+        let tenant_id = Some("tenant".to_owned());
+        let events = build_events(
+            &records,
+            "test",
+            &tenant_id,
+            &stream_meta(Some(" region , status ")),
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        for (event, record_index, region, status) in [
+            (&events[0], 0, "west", "200"),
+            (&events[1], 3, "east", "500"),
+        ] {
+            assert_eq!(
+                event.custom_partition_values,
+                HashMap::from([
+                    ("region".to_owned(), region.to_owned()),
+                    ("status".to_owned(), status.to_owned()),
+                ])
+            );
+            assert_eq!(event.rb.num_rows(), 1);
+            assert_eq!(
+                event.origin_size,
+                records[record_index].payload.as_ref().unwrap().len() as u64
+            );
+            assert_eq!(event.stream_name, "test");
+            assert_eq!(event.tenant_id, tenant_id);
+        }
+    }
+
+    #[test]
+    fn custom_partition_skips_invalid_values_and_non_objects() {
+        let records = vec![
+            record(r#"{"region": null}"#),
+            record(r#"{"region": ""}"#),
+            record(r#"{"region": {}}"#),
+            record(r#"{"region": []}"#),
+            record(r#"{"region": "us.west"}"#),
+            record(r#"{"region": 1.5}"#),
+            record(r#"[{"region": "west"}]"#),
+            record("null"),
+            record("42"),
+            record(r#""west""#),
+            record(r#"{"region": false}"#),
+        ];
+        let events = build_events(&records, "test", &None, &stream_meta(Some("region"))).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].custom_partition_values,
+            HashMap::from([("region".to_owned(), "false".to_owned())])
+        );
+    }
+
+    #[test]
+    fn non_partitioned_chunk_builds_single_event() {
+        let records = vec![
+            record(r#"{"region": "west", "message": "first"}"#),
+            record("not json"),
+            record(r#"{"message": "second"}"#),
+        ];
+        let events = build_events(&records, "test", &None, &stream_meta(None)).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rb.num_rows(), 2);
+        assert!(events[0].custom_partition_values.is_empty());
+        assert_eq!(
+            events[0].origin_size,
+            records
+                .iter()
+                .map(|record| record.payload.as_ref().unwrap().len() as u64)
+                .sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn empty_or_invalid_chunks_build_no_events() {
+        let mut missing_payload = record("");
+        missing_payload.payload = None;
+        let invalid_records = vec![record("not json"), missing_payload];
+        for custom_partition in [None, Some("region")] {
+            let meta = stream_meta(custom_partition);
+            assert!(build_events(&[], "test", &None, &meta).unwrap().is_empty());
+            assert!(
+                build_events(&invalid_records, "test", &None, &meta)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }
