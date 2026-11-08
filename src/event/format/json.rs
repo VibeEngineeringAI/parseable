@@ -105,6 +105,9 @@ impl EventFormat for Event {
     // Convert the Data type (defined above) to arrow record batch
     fn decode(data: Self::Data, schema: Arc<Schema>) -> Result<RecordBatch, anyhow::Error> {
         let _span = info_span!("json_to_recordbatch", record_count = data.len()).entered();
+        if data.is_empty() {
+            return Err(anyhow!("JSON batch must contain at least one event"));
+        }
         let array_capacity = round_upto_multiple_of_64(data.len());
         let mut reader = ReaderBuilder::new(schema)
             .with_batch_size(array_capacity)
@@ -115,7 +118,7 @@ impl EventFormat for Event {
         match reader.flush() {
             Ok(Some(recordbatch)) => Ok(recordbatch),
             Err(err) => Err(anyhow!("Failed to create recordbatch due to {:?}", err)),
-            Ok(None) => unreachable!("all records are added to one rb"),
+            Ok(None) => Err(anyhow!("JSON decoder produced no record batch")),
         }
     }
 
@@ -637,6 +640,55 @@ mod tests {
 
     use super::*;
     use crate::otel::metrics::SERIES_HASH_COLUMN;
+
+    #[test]
+    fn empty_json_batch_is_rejected_with_bad_request_without_panicking() {
+        use crate::handlers::http::ingest::PostError;
+        use actix_web::{ResponseError, http::StatusCode};
+
+        for storage_schema in [
+            HashMap::new(),
+            HashMap::from([(
+                "value".to_owned(),
+                Arc::new(Field::new("value", DataType::Int64, true)),
+            )]),
+        ] {
+            let error = Event::decode(
+                vec![],
+                Arc::new(Schema::new(
+                    storage_schema.values().cloned().collect::<Vec<_>>(),
+                )),
+            )
+            .expect_err("decoding an empty JSON batch must return a normal input error");
+            assert_eq!(
+                error.to_string(),
+                "JSON batch must contain at least one event"
+            );
+
+            for static_schema in [false, true] {
+                for version in [SchemaVersion::V0, SchemaVersion::V1] {
+                    let error = Event::new(json!([]), Utc::now())
+                        .into_recordbatch(
+                            &storage_schema,
+                            static_schema,
+                            None,
+                            version,
+                            &HashMap::new(),
+                            true,
+                        )
+                        .expect_err("an empty JSON batch must return a normal input error");
+                    assert_eq!(
+                        error.to_string(),
+                        "JSON batch must contain at least one event"
+                    );
+                    assert_eq!(
+                        PostError::Invalid(error).status_code(),
+                        StatusCode::BAD_REQUEST
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn series_hash_is_decoded_as_uint64_without_precision_loss() {
