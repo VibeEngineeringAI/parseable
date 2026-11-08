@@ -35,6 +35,48 @@ use crate::parseable::PARSEABLE;
 // Global variable to track the first timestamp encountered during validation
 static REFERENCE_TIMESTAMP: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
 
+// Tests use a scoped age setting instead of initializing the server CLI singleton.
+#[cfg(test)]
+thread_local! {
+    static TEST_MAX_CHUNK_AGE_HOURS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+// Serialize and restore tests that replace the process-wide reference timestamp.
+#[cfg(test)]
+static TIME_PARTITION_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+pub(crate) struct TimePartitionTestState {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    reference: Option<DateTime<Utc>>,
+    max_age_hours: Option<i64>,
+}
+
+#[cfg(test)]
+impl Drop for TimePartitionTestState {
+    fn drop(&mut self) {
+        *REFERENCE_TIMESTAMP.lock().unwrap() = self.reference;
+        TEST_MAX_CHUNK_AGE_HOURS.set(self.max_age_hours);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn time_partition_test_state(max_age_hours: i64) -> TimePartitionTestState {
+    let lock = TIME_PARTITION_TEST_LOCK.lock().unwrap();
+    TimePartitionTestState {
+        _lock: lock,
+        reference: REFERENCE_TIMESTAMP.lock().unwrap().take(),
+        max_age_hours: TEST_MAX_CHUNK_AGE_HOURS.replace(Some(max_age_hours)),
+    }
+}
+
+fn max_chunk_age_hours() -> i64 {
+    #[cfg(test)]
+    if let Some(hours) = TEST_MAX_CHUNK_AGE_HOURS.get() {
+        return hours;
+    }
+    PARSEABLE.options.event_max_chunk_age as i64
+}
+
 #[derive(Error, Debug)]
 pub enum JsonFlattenError {
     #[error("Cannot flatten this JSON")]
@@ -237,7 +279,7 @@ pub fn validate_time_partition(
         }
         Some(ref_timestamp) => {
             // Subsequent timestamps - validate they're not more than configured hours older than reference
-            let max_age_hours = PARSEABLE.options.event_max_chunk_age as i64;
+            let max_age_hours = max_chunk_age_hours();
             let max_age_before_ref = ref_timestamp - Duration::hours(max_age_hours);
             if parsed_timestamp >= max_age_before_ref {
                 Ok(())
@@ -1467,6 +1509,47 @@ mod tests {
         pipeline_flattening_owned,
     };
     use serde_json::{Map, Value, json};
+
+    #[test]
+    fn time_validation_applies_initial_limit_then_reference_age() {
+        let _state = super::time_partition_test_state(3);
+        let key = "ts".to_owned();
+        let now = chrono::Utc::now();
+        let mut old = json!({"ts": (now - chrono::Duration::days(2)).to_rfc3339()});
+        assert!(matches!(
+            flatten(
+                &mut old,
+                "_",
+                Some(&key),
+                std::num::NonZeroU32::new(1),
+                None,
+                true
+            ),
+            Err(JsonFlattenError::TimestampTooOld(_, 1, _))
+        ));
+        let mut valid = json!({"ts": now.to_rfc3339()});
+        flatten(
+            &mut valid,
+            "_",
+            Some(&key),
+            std::num::NonZeroU32::new(1),
+            None,
+            true,
+        )
+        .unwrap();
+        let mut old = json!({"ts": (now - chrono::Duration::hours(4)).to_rfc3339()});
+        assert!(matches!(
+            flatten(
+                &mut old,
+                "_",
+                Some(&key),
+                std::num::NonZeroU32::new(1),
+                None,
+                true
+            ),
+            Err(JsonFlattenError::TimestampTooOldRelative(_, 3, _, _))
+        ));
+    }
 
     // Serialization keeps key order, which `==` on maps may ignore
     fn ordered(result: Result<Vec<Value>, JsonFlattenError>) -> Result<String, String> {
