@@ -141,7 +141,7 @@ impl EventFormat for Event {
         let custom_partition_values = match custom_partitions.as_ref() {
             Some(custom_partition) => {
                 let custom_partitions = custom_partition.split(',').collect_vec();
-                extract_custom_partition_values(&self.json, &custom_partitions)
+                extract_custom_partition_values(&self.json, &custom_partitions)?
             }
             None => HashMap::new(),
         };
@@ -370,10 +370,21 @@ fn is_known_scalar_type(data_type: &DataType) -> bool {
 pub fn extract_custom_partition_values(
     json: &Value,
     custom_partition_list: &[&str],
-) -> HashMap<String, String> {
+) -> Result<HashMap<String, String>, anyhow::Error> {
+    let json = json
+        .as_object()
+        .ok_or_else(|| anyhow!("Expected a JSON object for custom partition fields"))?;
     let mut custom_partition_values: HashMap<String, String> = HashMap::new();
     for custom_partition_field in custom_partition_list {
-        let custom_partition_value = json.get(custom_partition_field.trim()).unwrap().to_owned();
+        let custom_partition_value = json
+            .get(custom_partition_field.trim())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Missing field for custom partition in json: {}",
+                    custom_partition_field.trim()
+                )
+            })?
+            .to_owned();
         let custom_partition_value = match custom_partition_value {
             e @ Value::Number(_) | e @ Value::Bool(_) => e.to_string(),
             Value::String(s) => s,
@@ -384,7 +395,7 @@ pub fn extract_custom_partition_values(
             custom_partition_value,
         );
     }
-    custom_partition_values
+    Ok(custom_partition_values)
 }
 
 /// Returns the parsed timestamp of deignated time partition from json object
@@ -640,6 +651,87 @@ mod tests {
 
     use super::*;
     use crate::otel::metrics::SERIES_HASH_COLUMN;
+
+    fn custom_partition_event(value: Value) -> anyhow::Result<crate::event::Event> {
+        Event::new(value, Utc::now()).into_event(
+            "test".to_owned(),
+            0,
+            &HashMap::new(),
+            false,
+            Some(&"region".to_owned()),
+            None,
+            SchemaVersion::V1,
+            StreamType::UserDefined,
+            &HashMap::new(),
+            TelemetryType::Logs,
+            &None,
+            false,
+        )
+    }
+
+    #[test]
+    fn custom_partition_array_returns_error() {
+        let value = json!([{"region": "west"}]);
+        let err = extract_custom_partition_values(&value, &["region"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Expected a JSON object for custom partition fields"
+        );
+        let err = custom_partition_event(value)
+            .err()
+            .expect("conversion must fail");
+        assert_eq!(
+            err.to_string(),
+            "Expected a JSON object for custom partition fields"
+        );
+    }
+
+    #[test]
+    fn custom_partition_missing_field_returns_error() {
+        let value = json!({"message": "missing region"});
+        let err = extract_custom_partition_values(&value, &["region"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Missing field for custom partition in json: region"
+        );
+        let err = custom_partition_event(value)
+            .err()
+            .expect("conversion must fail");
+        assert_eq!(
+            err.to_string(),
+            "Missing field for custom partition in json: region"
+        );
+    }
+
+    #[test]
+    fn custom_partition_non_object_returns_error() {
+        for value in [Value::Null, json!(true), json!(42), json!("west")] {
+            assert!(extract_custom_partition_values(&value, &["region"]).is_err());
+            assert!(custom_partition_event(value).is_err());
+        }
+    }
+
+    #[test]
+    fn custom_partition_valid_object_preserves_values() {
+        let value = json!({"region": "west", "status": 200, "active": true});
+        let partitions =
+            extract_custom_partition_values(&value, &[" region ", "status", "active"]).unwrap();
+        assert_eq!(
+            partitions,
+            HashMap::from([
+                ("region".to_owned(), "west".to_owned()),
+                ("status".to_owned(), "200".to_owned()),
+                ("active".to_owned(), "true".to_owned()),
+            ])
+        );
+
+        let event = custom_partition_event(value).unwrap();
+        assert_eq!(
+            event.custom_partition_values,
+            HashMap::from([("region".to_owned(), "west".to_owned())])
+        );
+        assert_eq!(event.rb.num_rows(), 1);
+    }
 
     #[test]
     fn empty_json_batch_is_rejected_with_bad_request_without_panicking() {
