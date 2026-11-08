@@ -20,17 +20,18 @@
 //! configured partition fields present and valid. Arrays, non-objects, invalid
 //! JSON/partition values, conversion failures, and conflicting field types are
 //! skipped with the record's topic, partition, offset, and tenant in the warning.
-//! Compatible schemas are committed as a union; on a type conflict, schemas are
-//! retried in record order and only conflicting records are skipped.
+//! Schemas are accumulated in record order and published as one union; only
+//! conflicting records are skipped, without adding any of their fields.
 //!
 //! Offsets are committed after processing, including when records are skipped or
 //! processing fails. Storage is not atomic across the chunk: a later store error
 //! can leave earlier records stored while the rest are dropped (tracked separately).
 
 use crate::{
+    LOCK_EXPECT,
     connectors::common::processor::Processor,
     event::{
-        Event, USER_AGENT_KEY, commit_ingested_schemas,
+        Event, USER_AGENT_KEY,
         error::EventError,
         format::{EventFormat, LogSourceEntry, json},
     },
@@ -40,7 +41,7 @@ use crate::{
     storage::StreamType,
     utils::json::flatten::validate_custom_partition,
 };
-use arrow_schema::{ArrowError, Field};
+use arrow_schema::{ArrowError, Field, Schema};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -116,15 +117,16 @@ fn build_and_process_event(
     // enforced here: rejecting would silently drop the whole chunk.
     let mut events = build_events(&records, &stream_name, &tenant_id, &meta)?;
     if meta.custom_partition.is_some() && !events.is_empty() {
-        // Preserve the atomic union commit in the compatible case. A conflict
-        // falls back to per-record commits before staging the surviving events.
+        // Select schemas in source order, then stage the accepted union once.
         let stream = PARSEABLE.get_stream(&stream_name, &tenant_id)?;
-        let (accepted, committed) =
-            commit_compatible_events(&stream_name, &stream.metadata, events)?;
+        let (accepted, committed) = commit_compatible_events(&stream.metadata, events)?;
         events = accepted;
-        if committed && !stream.get_static_schema_flag() {
-            stream.stage_schema_file(stream.get_schema().as_ref().clone())?;
-        }
+        finish_schema_commit(&mut events, committed, || {
+            if !stream.get_static_schema_flag() {
+                stream.stage_schema_file(stream.get_schema().as_ref().clone())?;
+            }
+            Ok(())
+        })?;
     }
     for event in events {
         event.event.process_without_field_limit()?;
@@ -149,55 +151,85 @@ fn record_span(record: &ConsumerRecord) -> tracing::Span {
     )
 }
 
-fn is_schema_conflict(err: &EventError) -> bool {
-    matches!(
-        err,
-        EventError::Staging(StagingError::Arrow(ArrowError::SchemaError(_)))
-    )
+/// Checks only this record's fields, buffering changes until every field is
+/// compatible. Rejection never mutates the accumulator, even if a new field
+/// precedes the conflicting field. Work is proportional to the record's schema,
+/// rather than to all fields accumulated from preceding records.
+fn merge_record_schema(
+    accumulated: &mut HashMap<String, Arc<Field>>,
+    schema: &Schema,
+    is_first_event: bool,
+) -> Result<bool, ArrowError> {
+    let mut updates = Vec::new();
+    for field in schema.fields() {
+        match accumulated.get(field.name()) {
+            Some(current) if is_first_event && current != field => {
+                let mut merged = current.as_ref().clone();
+                merged.try_merge(field)?;
+                updates.push(Arc::new(merged));
+            }
+            None => updates.push(field.clone()),
+            _ => {}
+        }
+    }
+    let changed = is_first_event || !updates.is_empty();
+    for field in updates {
+        accumulated.insert(field.name().clone(), field);
+    }
+    Ok(changed)
 }
 
-/// Commits compatible schemas atomically, retrying in source order on conflict.
-/// Each retry is itself atomic, so rejected records cannot add metadata fields.
+/// Selects compatible records in source order under one metadata lock. Clone
+/// the stored index once and publish the accepted union once, including when
+/// some records conflict. Static schemas retain their existing no-growth rule.
 fn commit_compatible_events<'a>(
-    stream_name: &str,
     metadata: &RwLock<LogStreamMetadata>,
     events: Vec<RecordEvent<'a>>,
 ) -> Result<(Vec<RecordEvent<'a>>, bool), EventError> {
-    match commit_chunk_schemas(stream_name, metadata, &events) {
-        Ok(committed) => return Ok((events, committed)),
-        Err(err) if is_schema_conflict(&err) => {}
-        Err(err) => return Err(err),
+    let mut metadata = metadata.write().expect(LOCK_EXPECT);
+    if metadata.static_schema_flag {
+        return Ok((events, false));
     }
-
+    let mut accumulated = metadata.schema.clone();
     let mut accepted = Vec::with_capacity(events.len());
     let mut committed = false;
     for event in events {
-        match commit_chunk_schemas(stream_name, metadata, std::slice::from_ref(&event)) {
+        match merge_record_schema(
+            &mut accumulated,
+            &event.event.rb.schema(),
+            event.event.is_first_event,
+        ) {
             Ok(changed) => {
                 committed |= changed;
                 accepted.push(event);
             }
-            Err(err) if is_schema_conflict(&err) => {
+            Err(err @ ArrowError::SchemaError(_)) => {
                 let _span = record_span(event.record).entered();
                 warn!(error = %err, "Skipping Kafka record with conflicting schema");
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(StagingError::from(err).into()),
         }
+    }
+    if committed {
+        metadata.schema = accumulated;
     }
     Ok((accepted, committed))
 }
 
-/// Commits a chunk's schemas together so a conflict leaves stream metadata unchanged.
-fn commit_chunk_schemas(
-    stream_name: &str,
-    metadata: &RwLock<LogStreamMetadata>,
-    events: &[RecordEvent<'_>],
-) -> Result<bool, EventError> {
-    let schemas: Vec<_> = events
-        .iter()
-        .map(|event| (event.event.rb.schema(), event.event.is_first_event))
-        .collect();
-    commit_ingested_schemas(stream_name, metadata, &schemas, usize::MAX)
+/// Normal event processing must not merge and stage these schemas again.
+/// Clear the inference flag only after the chunk's schema staging succeeds.
+fn finish_schema_commit(
+    events: &mut [RecordEvent<'_>],
+    committed: bool,
+    stage: impl FnOnce() -> Result<(), StagingError>,
+) -> Result<(), StagingError> {
+    if committed {
+        stage()?;
+    }
+    for event in events {
+        event.event.is_first_event = false;
+    }
+    Ok(())
 }
 
 /// Builds events without accessing stream state, keeping partition values and
@@ -414,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_chunk_schemas_commits_compatible_new_fields() {
+    fn committed_chunk_stages_once_and_clears_inference_flags() {
         let _guard = TEST_LOCK.lock().unwrap();
         let records = vec![
             record(r#"{"region":"south","n":3,"x":1}"#),
@@ -428,7 +460,16 @@ mod tests {
         let events = build_events(&records, "test", &None, &meta).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert!(commit_chunk_schemas("test", &metadata, &events).unwrap());
+        assert!(events.iter().all(|event| event.event.is_first_event));
+        let (mut events, committed) = commit_compatible_events(&metadata, events).unwrap();
+        let mut stages = 0;
+        finish_schema_commit(&mut events, committed, || {
+            stages += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stages, 1);
+        assert!(events.iter().all(|event| !event.event.is_first_event));
         let stored = metadata.read().unwrap();
         assert_eq!(stored.schema["x"].data_type(), &DataType::Float64);
         assert_eq!(stored.schema["y"].data_type(), &DataType::Utf8);
@@ -440,32 +481,90 @@ mod tests {
     }
 
     #[test]
-    fn commit_chunk_schemas_rejects_type_conflict_atomically() {
+    fn staging_failure_leaves_inference_flags_set() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let records = vec![
-            record(r#"{"region":"south","n":3,"x":1}"#),
-            record(r#"{"region":"south","n":4,"x":"text"}"#),
-        ];
-        let mut meta = stream_meta(Some("region"));
-        for field in [
-            Field::new("region", DataType::Utf8, true),
-            Field::new("n", DataType::Float64, true),
-        ] {
-            meta.schema.insert(field.name().clone(), Arc::new(field));
+        let records = vec![record(r#"{"region":"west","n":1}"#)];
+        let mut events =
+            build_events(&records, "test", &None, &stream_meta(Some("region"))).unwrap();
+        let result = finish_schema_commit(&mut events, true, || {
+            Err(ArrowError::SchemaError("staging failed".to_owned()).into())
+        });
+        assert!(result.is_err());
+        assert!(events[0].event.is_first_event);
+    }
+
+    #[test]
+    fn record_schema_conflict_does_not_apply_partial_field_updates() {
+        let mut accumulated = HashMap::from([
+            (
+                "x".to_owned(),
+                Arc::new(Field::new("x", DataType::Float64, false)),
+            ),
+            (
+                "nullable".to_owned(),
+                Arc::new(Field::new("nullable", DataType::Boolean, false)),
+            ),
+        ]);
+        let before = accumulated.clone();
+        let schema = Schema::new(vec![
+            Field::new("new_field", DataType::Boolean, true),
+            Field::new("nullable", DataType::Boolean, true),
+            Field::new("x", DataType::Utf8, true),
+        ]);
+        assert!(merge_record_schema(&mut accumulated, &schema, true).is_err());
+        assert_eq!(accumulated, before);
+    }
+
+    #[test]
+    fn many_records_accumulate_distinct_fields_including_after_conflicts() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for conflict in [false, true] {
+            let records: Vec<_> = (0..1_000)
+                .map(|i| {
+                    let value = if conflict && i % 10 == 1 {
+                        "\"bad\""
+                    } else {
+                        "1"
+                    };
+                    record(&format!(
+                        r#"{{"region":"west","x":{value},"field_{i}":{i}}}"#
+                    ))
+                })
+                .collect();
+            let events =
+                build_events(&records, "test", &None, &stream_meta(Some("region"))).unwrap();
+            let base_fields = events[0].event.rb.schema().fields().len() - 1;
+            let metadata = RwLock::new(LogStreamMetadata::default());
+            let (accepted, committed) = commit_compatible_events(&metadata, events).unwrap();
+            let expected = if conflict { 900 } else { 1_000 };
+            assert!(committed);
+            assert_eq!(accepted.len(), expected);
+            let stored = metadata.read().unwrap();
+            assert_eq!(stored.schema.len(), base_fields + expected);
+            assert_eq!(stored.schema["x"].data_type(), &DataType::Float64);
+            for i in 0..1_000 {
+                assert_eq!(
+                    stored.schema.contains_key(&format!("field_{i}")),
+                    !conflict || i % 10 != 1
+                );
+            }
         }
+    }
+
+    #[test]
+    fn static_schema_chunk_keeps_metadata_and_does_not_stage() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let records = vec![record(r#"{"region":"west","new_field":1}"#)];
+        let events = build_events(&records, "test", &None, &stream_meta(Some("region"))).unwrap();
         let metadata = RwLock::new(LogStreamMetadata {
-            schema: meta.schema.clone(),
+            static_schema_flag: true,
             ..Default::default()
         });
-        let before = metadata.read().unwrap().schema.clone();
-        let events = build_events(&records, "test", &None, &meta).unwrap();
-
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|event| event.event.is_first_event));
-        let result = commit_chunk_schemas("test", &metadata, &events);
-
-        assert!(matches!(result, Err(EventError::Staging(_))), "{result:?}");
-        assert_eq!(metadata.read().unwrap().schema, before);
+        let (mut accepted, committed) = commit_compatible_events(&metadata, events).unwrap();
+        finish_schema_commit(&mut accepted, committed, || panic!("static schema staged")).unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert!(!accepted[0].event.is_first_event);
+        assert!(metadata.read().unwrap().schema.is_empty());
     }
 
     #[test]
@@ -479,7 +578,7 @@ mod tests {
         let meta = stream_meta(Some("region"));
         let metadata = RwLock::new(LogStreamMetadata::default());
         let events = build_events(&records, "test", &None, &meta).unwrap();
-        let (accepted, committed) = commit_compatible_events("test", &metadata, events).unwrap();
+        let (accepted, committed) = commit_compatible_events(&metadata, events).unwrap();
 
         assert!(committed);
         assert_eq!(accepted.len(), 2);
@@ -519,7 +618,7 @@ mod tests {
         let before = metadata.read().unwrap().schema.clone();
         let events = build_events(&records, "test", &None, &meta).unwrap();
         assert_eq!(events.len(), 2);
-        let (accepted, committed) = commit_compatible_events("test", &metadata, events).unwrap();
+        let (accepted, committed) = commit_compatible_events(&metadata, events).unwrap();
 
         assert!(accepted.is_empty());
         assert!(!committed);
@@ -569,7 +668,7 @@ mod tests {
             let meta = stream_meta(Some("region"));
             let events = build_events(&records, "test", &None, &meta).unwrap();
             let metadata = RwLock::new(LogStreamMetadata::default());
-            let (accepted, _) = commit_compatible_events("test", &metadata, events).unwrap();
+            let (accepted, _) = commit_compatible_events(&metadata, events).unwrap();
             assert_eq!(accepted.len(), 1);
         };
         tracing::subscriber::with_default(subscriber, check);
