@@ -16,6 +16,17 @@
  *
  */
 
+//! Kafka custom-partition streams accept one JSON object per record, with all
+//! configured partition fields present and valid. Arrays, non-objects, invalid
+//! JSON/partition values, conversion failures, and conflicting field types are
+//! skipped with the record's topic, partition, offset, and tenant in the warning.
+//! Compatible schemas are committed as a union; on a type conflict, schemas are
+//! retried in record order and only conflicting records are skipped.
+//!
+//! Offsets are committed after processing, including when records are skipped or
+//! processing fails. Storage is not atomic across the chunk: a later store error
+//! can leave earlier records stored while the rest are dropped (tracked separately).
+
 use crate::{
     connectors::common::processor::Processor,
     event::{
@@ -25,11 +36,11 @@ use crate::{
     },
     handlers::TelemetryType,
     metadata::{LogStreamMetadata, SchemaVersion},
-    parseable::PARSEABLE,
+    parseable::{PARSEABLE, StagingError},
     storage::StreamType,
     utils::json::flatten::validate_custom_partition,
 };
-use arrow_schema::Field;
+use arrow_schema::{ArrowError, Field};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -103,47 +114,100 @@ fn build_and_process_event(
     // Offsets are committed whether or not the chunk is ingested and the
     // producer gets no rejection signal, so the dataset field limit is not
     // enforced here: rejecting would silently drop the whole chunk.
-    let events = build_events(&records, &stream_name, &tenant_id, &meta)?;
+    let mut events = build_events(&records, &stream_name, &tenant_id, &meta)?;
     if meta.custom_partition.is_some() && !events.is_empty() {
-        // Custom-partitioned chunks yield one event per record, all built
-        // against the same schema snapshot. As in the HTTP per-record path,
-        // commit the union of their schemas before staging any of them, so a
-        // conflict between records rejects the chunk instead of staging only
-        // the events processed before it.
+        // Preserve the atomic union commit in the compatible case. A conflict
+        // falls back to per-record commits before staging the surviving events.
         let stream = PARSEABLE.get_stream(&stream_name, &tenant_id)?;
-        let committed = commit_chunk_schemas(&stream_name, &stream.metadata, &events)?;
+        let (accepted, committed) =
+            commit_compatible_events(&stream_name, &stream.metadata, events)?;
+        events = accepted;
         if committed && !stream.get_static_schema_flag() {
             stream.stage_schema_file(stream.get_schema().as_ref().clone())?;
         }
     }
     for event in events {
-        event.process_without_field_limit()?;
+        event.event.process_without_field_limit()?;
     }
 
     Ok(())
+}
+
+struct RecordEvent<'a> {
+    event: Event,
+    // For the non-custom-partition batch path this identifies its first record.
+    record: &'a ConsumerRecord,
+}
+
+fn record_span(record: &ConsumerRecord) -> tracing::Span {
+    tracing::warn_span!(
+        "kafka_record",
+        topic = %record.topic,
+        partition = record.partition,
+        offset = record.offset,
+        tenant = record.tenant_id.as_deref(),
+    )
+}
+
+fn is_schema_conflict(err: &EventError) -> bool {
+    matches!(
+        err,
+        EventError::Staging(StagingError::Arrow(ArrowError::SchemaError(_)))
+    )
+}
+
+/// Commits compatible schemas atomically, retrying in source order on conflict.
+/// Each retry is itself atomic, so rejected records cannot add metadata fields.
+fn commit_compatible_events<'a>(
+    stream_name: &str,
+    metadata: &RwLock<LogStreamMetadata>,
+    events: Vec<RecordEvent<'a>>,
+) -> Result<(Vec<RecordEvent<'a>>, bool), EventError> {
+    match commit_chunk_schemas(stream_name, metadata, &events) {
+        Ok(committed) => return Ok((events, committed)),
+        Err(err) if is_schema_conflict(&err) => {}
+        Err(err) => return Err(err),
+    }
+
+    let mut accepted = Vec::with_capacity(events.len());
+    let mut committed = false;
+    for event in events {
+        match commit_chunk_schemas(stream_name, metadata, std::slice::from_ref(&event)) {
+            Ok(changed) => {
+                committed |= changed;
+                accepted.push(event);
+            }
+            Err(err) if is_schema_conflict(&err) => {
+                let _span = record_span(event.record).entered();
+                warn!(error = %err, "Skipping Kafka record with conflicting schema");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok((accepted, committed))
 }
 
 /// Commits a chunk's schemas together so a conflict leaves stream metadata unchanged.
 fn commit_chunk_schemas(
     stream_name: &str,
     metadata: &RwLock<LogStreamMetadata>,
-    events: &[Event],
+    events: &[RecordEvent<'_>],
 ) -> Result<bool, EventError> {
     let schemas: Vec<_> = events
         .iter()
-        .map(|event| (event.rb.schema(), event.is_first_event))
+        .map(|event| (event.event.rb.schema(), event.event.is_first_event))
         .collect();
     commit_ingested_schemas(stream_name, metadata, &schemas, usize::MAX)
 }
 
 /// Builds events without accessing stream state, keeping partition values and
 /// payload sizes attached to their individual records for custom partitions.
-fn build_events(
-    records: &[ConsumerRecord],
+fn build_events<'a>(
+    records: &'a [ConsumerRecord],
     stream_name: &str,
     tenant_id: &Option<String>,
     meta: &StreamMeta,
-) -> anyhow::Result<Vec<crate::event::Event>> {
+) -> anyhow::Result<Vec<RecordEvent<'a>>> {
     let mut p_custom_fields = HashMap::new();
     p_custom_fields.insert(USER_AGENT_KEY.to_string(), "kafka".to_string());
 
@@ -168,9 +232,14 @@ fn build_events(
     let mut json_vec = Vec::with_capacity(records.len());
     let mut total_payload_size = 0u64;
 
-    for record in records.iter().filter_map(|r| r.payload.as_ref()) {
-        total_payload_size += record.len() as u64;
-        let value = match serde_json::from_slice::<Value>(record) {
+    for record in records {
+        let _span = record_span(record).entered();
+        let Some(payload) = record.payload.as_ref() else {
+            warn!("Skipping Kafka record without a payload");
+            continue;
+        };
+        total_payload_size += payload.len() as u64;
+        let value = match serde_json::from_slice::<Value>(payload) {
             Ok(value) => value,
             Err(err) => {
                 warn!(error = %err, "Skipping Kafka record with unparsable payload");
@@ -192,8 +261,8 @@ fn build_events(
             }
             // Records are validated and converted individually here, so skip a
             // record that fails conversion instead of dropping the whole chunk.
-            match into_event(value, record.len() as u64) {
-                Ok(event) => events.push(event),
+            match into_event(value, payload.len() as u64) {
+                Ok(event) => events.push(RecordEvent { event, record }),
                 Err(err) => {
                     warn!(error = %err, "Skipping Kafka record that failed event conversion");
                 }
@@ -205,8 +274,14 @@ fn build_events(
 
     // Empty chunks (including chunks with only invalid payloads) are a no-op;
     // Arrow's decoder expects at least one record.
-    if meta.custom_partition.is_none() && !json_vec.is_empty() {
-        events.push(into_event(Value::Array(json_vec), total_payload_size)?);
+    if meta.custom_partition.is_none()
+        && !json_vec.is_empty()
+        && let Some(record) = records.first()
+    {
+        events.push(RecordEvent {
+            event: into_event(Value::Array(json_vec), total_payload_size)?,
+            record,
+        });
     }
 
     Ok(events)
@@ -311,6 +386,10 @@ mod tests {
     use super::*;
     use arrow_schema::DataType;
 
+    // Keep first-use tracing callsite registration in these tests from racing
+    // the scoped subscriber used to assert warning fields.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn stream_meta(custom_partition: Option<&str>) -> StreamMeta {
         StreamMeta {
             schema: HashMap::new(),
@@ -336,6 +415,7 @@ mod tests {
 
     #[test]
     fn commit_chunk_schemas_commits_compatible_new_fields() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let records = vec![
             record(r#"{"region":"south","n":3,"x":1}"#),
             record(r#"{"region":"south","n":4,"y":"text"}"#),
@@ -353,7 +433,7 @@ mod tests {
         assert_eq!(stored.schema["x"].data_type(), &DataType::Float64);
         assert_eq!(stored.schema["y"].data_type(), &DataType::Utf8);
         for event in &events {
-            for field in event.rb.schema().fields() {
+            for field in event.event.rb.schema().fields() {
                 assert_eq!(stored.schema.get(field.name()), Some(field));
             }
         }
@@ -361,6 +441,7 @@ mod tests {
 
     #[test]
     fn commit_chunk_schemas_rejects_type_conflict_atomically() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let records = vec![
             record(r#"{"region":"south","n":3,"x":1}"#),
             record(r#"{"region":"south","n":4,"x":"text"}"#),
@@ -380,7 +461,7 @@ mod tests {
         let events = build_events(&records, "test", &None, &meta).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|event| event.is_first_event));
+        assert!(events.iter().all(|event| event.event.is_first_event));
         let result = commit_chunk_schemas("test", &metadata, &events);
 
         assert!(matches!(result, Err(EventError::Staging(_))), "{result:?}");
@@ -388,7 +469,130 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_record_keeps_compatible_records_and_only_their_fields() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let records = vec![
+            record(r#"{"region":"west","n":1,"x":1}"#),
+            record(r#"{"region":"east","n":2,"x":"text","rejected_field":true}"#),
+            record(r#"{"region":"north","n":3,"x":2,"accepted_field":true}"#),
+        ];
+        let meta = stream_meta(Some("region"));
+        let metadata = RwLock::new(LogStreamMetadata::default());
+        let events = build_events(&records, "test", &None, &meta).unwrap();
+        let (accepted, committed) = commit_compatible_events("test", &metadata, events).unwrap();
+
+        assert!(committed);
+        assert_eq!(accepted.len(), 2);
+        assert!(std::ptr::eq(accepted[0].record, &records[0]));
+        assert!(std::ptr::eq(accepted[1].record, &records[2]));
+        let stored = metadata.read().unwrap();
+        assert_eq!(stored.schema["x"].data_type(), &DataType::Float64);
+        assert_eq!(
+            stored.schema["accepted_field"].data_type(),
+            &DataType::Boolean
+        );
+        assert!(!stored.schema.contains_key("rejected_field"));
+        for accepted in &accepted {
+            for field in accepted.event.rb.schema().fields() {
+                assert_eq!(stored.schema.get(field.name()), Some(field));
+            }
+        }
+    }
+
+    #[test]
+    fn all_conflicting_records_leave_metadata_unchanged() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let records = vec![
+            record(r#"{"region":"west","x":"bad","rejected_a":1}"#),
+            record(r#"{"region":"east","x":true,"rejected_b":2}"#),
+        ];
+        // A schema snapshot may become stale before commit (another worker can
+        // establish x's type); both events build but neither may commit.
+        let meta = stream_meta(Some("region"));
+        let metadata = RwLock::new(LogStreamMetadata {
+            schema: HashMap::from([(
+                "x".to_owned(),
+                Arc::new(Field::new("x", DataType::Float64, true)),
+            )]),
+            ..Default::default()
+        });
+        let before = metadata.read().unwrap().schema.clone();
+        let events = build_events(&records, "test", &None, &meta).unwrap();
+        assert_eq!(events.len(), 2);
+        let (accepted, committed) = commit_compatible_events("test", &metadata, events).unwrap();
+
+        assert!(accepted.is_empty());
+        assert!(!committed);
+        assert_eq!(metadata.read().unwrap().schema, before);
+    }
+
+    #[test]
+    fn skip_warnings_include_source_identity_and_tenant() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let mut records = vec![
+            record("not json"),
+            record(r#"[{"region":"west"}]"#),
+            record(r#"{"n":1}"#),
+            record(r#"{"region":"west","p_timestamp":"reserved"}"#),
+            record(r#"{"region":"west","x":1}"#),
+            record(r#"{"region":"east","x":"text"}"#),
+            record("null"),
+            record(""),
+        ];
+        records.last_mut().unwrap().payload = None;
+        for (offset, record) in records.iter_mut().enumerate() {
+            record.partition = 7;
+            record.offset = offset as i64 + 100;
+            record.tenant_id = Some("test-tenant".to_owned());
+        }
+        #[derive(Clone)]
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = LogWriter(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let check = || {
+            let meta = stream_meta(Some("region"));
+            let events = build_events(&records, "test", &None, &meta).unwrap();
+            let metadata = RwLock::new(LogStreamMetadata::default());
+            let (accepted, _) = commit_compatible_events("test", &metadata, events).unwrap();
+            assert_eq!(accepted.len(), 1);
+        };
+        tracing::subscriber::with_default(subscriber, check);
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let warnings: Vec<_> = output.lines().collect();
+        assert_eq!(warnings.len(), 7, "{output}");
+        for (warning, offset) in warnings.iter().zip([100, 101, 102, 103, 106, 107, 105]) {
+            for field in [
+                "topic=test".to_owned(),
+                "partition=7".to_owned(),
+                format!("offset={offset}"),
+                "tenant=\"test-tenant\"".to_owned(),
+                "Skipping Kafka record".to_owned(),
+            ] {
+                assert!(warning.contains(&field), "missing {field} in {warning}");
+            }
+        }
+        assert!(output.contains("conflicting schema"), "{output}");
+    }
+
+    #[test]
     fn custom_partition_builds_one_event_per_valid_record() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let records = vec![
             record(r#" {"region": "west", "status": 200} "#),
             record(r#"{"message": "missing region", "status": 200}"#),
@@ -410,24 +614,26 @@ mod tests {
             (&events[1], 3, "east", "500"),
         ] {
             assert_eq!(
-                event.custom_partition_values,
+                event.event.custom_partition_values,
                 HashMap::from([
                     ("region".to_owned(), region.to_owned()),
                     ("status".to_owned(), status.to_owned()),
                 ])
             );
-            assert_eq!(event.rb.num_rows(), 1);
+            assert!(std::ptr::eq(event.record, &records[record_index]));
+            assert_eq!(event.event.rb.num_rows(), 1);
             assert_eq!(
-                event.origin_size,
+                event.event.origin_size,
                 records[record_index].payload.as_ref().unwrap().len() as u64
             );
-            assert_eq!(event.stream_name, "test");
-            assert_eq!(event.tenant_id, tenant_id);
+            assert_eq!(event.event.stream_name, "test");
+            assert_eq!(event.event.tenant_id, tenant_id);
         }
     }
 
     #[test]
     fn custom_partition_skips_records_that_fail_conversion() {
+        let _guard = TEST_LOCK.lock().unwrap();
         // `p_timestamp` is reserved, so converting that record fails; the
         // valid records around it must still become events.
         let records = vec![
@@ -439,17 +645,18 @@ mod tests {
 
         let regions: Vec<_> = events
             .iter()
-            .map(|event| event.custom_partition_values["region"].as_str())
+            .map(|event| event.event.custom_partition_values["region"].as_str())
             .collect();
         assert_eq!(regions, ["west", "north"]);
         for event in &events {
-            assert_eq!(event.rb.num_rows(), 1);
-            assert!(event.rb.schema().field_with_name("n").is_ok());
+            assert_eq!(event.event.rb.num_rows(), 1);
+            assert!(event.event.rb.schema().field_with_name("n").is_ok());
         }
     }
 
     #[test]
     fn custom_partition_skips_invalid_values_and_non_objects() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let records = vec![
             record(r#"{"region": null}"#),
             record(r#"{"region": ""}"#),
@@ -467,13 +674,14 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(
-            events[0].custom_partition_values,
+            events[0].event.custom_partition_values,
             HashMap::from([("region".to_owned(), "false".to_owned())])
         );
     }
 
     #[test]
     fn non_partitioned_chunk_builds_single_event() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let records = vec![
             record(r#"{"region": "west", "message": "first"}"#),
             record("not json"),
@@ -482,10 +690,10 @@ mod tests {
         let events = build_events(&records, "test", &None, &stream_meta(None)).unwrap();
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].rb.num_rows(), 2);
-        assert!(events[0].custom_partition_values.is_empty());
+        assert_eq!(events[0].event.rb.num_rows(), 2);
+        assert!(events[0].event.custom_partition_values.is_empty());
         assert_eq!(
-            events[0].origin_size,
+            events[0].event.origin_size,
             records
                 .iter()
                 .map(|record| record.payload.as_ref().unwrap().len() as u64)
@@ -495,6 +703,7 @@ mod tests {
 
     #[test]
     fn empty_or_invalid_chunks_build_no_events() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let mut missing_payload = record("");
         missing_payload.payload = None;
         let invalid_records = vec![record("not json"), missing_payload];
