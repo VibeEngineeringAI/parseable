@@ -19,11 +19,12 @@
 use crate::{
     connectors::common::processor::Processor,
     event::{
-        USER_AGENT_KEY, commit_ingested_schemas,
+        Event, USER_AGENT_KEY, commit_ingested_schemas,
+        error::EventError,
         format::{EventFormat, LogSourceEntry, json},
     },
     handlers::TelemetryType,
-    metadata::SchemaVersion,
+    metadata::{LogStreamMetadata, SchemaVersion},
     parseable::PARSEABLE,
     storage::StreamType,
     utils::json::flatten::validate_custom_partition,
@@ -35,7 +36,7 @@ use futures_util::StreamExt;
 use rdkafka::consumer::{CommitMode, Consumer};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
@@ -110,12 +111,7 @@ fn build_and_process_event(
         // conflict between records rejects the chunk instead of staging only
         // the events processed before it.
         let stream = PARSEABLE.get_stream(&stream_name, &tenant_id)?;
-        let schemas: Vec<_> = events
-            .iter()
-            .map(|event| (event.rb.schema(), event.is_first_event))
-            .collect();
-        let committed =
-            commit_ingested_schemas(&stream_name, &stream.metadata, &schemas, usize::MAX)?;
+        let committed = commit_chunk_schemas(&stream_name, &stream.metadata, &events)?;
         if committed && !stream.get_static_schema_flag() {
             stream.stage_schema_file(stream.get_schema().as_ref().clone())?;
         }
@@ -125,6 +121,19 @@ fn build_and_process_event(
     }
 
     Ok(())
+}
+
+/// Commits a chunk's schemas together so a conflict leaves stream metadata unchanged.
+fn commit_chunk_schemas(
+    stream_name: &str,
+    metadata: &RwLock<LogStreamMetadata>,
+    events: &[Event],
+) -> Result<bool, EventError> {
+    let schemas: Vec<_> = events
+        .iter()
+        .map(|event| (event.rb.schema(), event.is_first_event))
+        .collect();
+    commit_ingested_schemas(stream_name, metadata, &schemas, usize::MAX)
 }
 
 /// Builds events without accessing stream state, keeping partition values and
@@ -300,6 +309,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::DataType;
 
     fn stream_meta(custom_partition: Option<&str>) -> StreamMeta {
         StreamMeta {
@@ -322,6 +332,59 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn commit_chunk_schemas_commits_compatible_new_fields() {
+        let records = vec![
+            record(r#"{"region":"south","n":3,"x":1}"#),
+            record(r#"{"region":"south","n":4,"y":"text"}"#),
+        ];
+        let meta = stream_meta(Some("region"));
+        let metadata = RwLock::new(LogStreamMetadata {
+            schema: meta.schema.clone(),
+            ..Default::default()
+        });
+        let events = build_events(&records, "test", &None, &meta).unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(commit_chunk_schemas("test", &metadata, &events).unwrap());
+        let stored = metadata.read().unwrap();
+        assert_eq!(stored.schema["x"].data_type(), &DataType::Float64);
+        assert_eq!(stored.schema["y"].data_type(), &DataType::Utf8);
+        for event in &events {
+            for field in event.rb.schema().fields() {
+                assert_eq!(stored.schema.get(field.name()), Some(field));
+            }
+        }
+    }
+
+    #[test]
+    fn commit_chunk_schemas_rejects_type_conflict_atomically() {
+        let records = vec![
+            record(r#"{"region":"south","n":3,"x":1}"#),
+            record(r#"{"region":"south","n":4,"x":"text"}"#),
+        ];
+        let mut meta = stream_meta(Some("region"));
+        for field in [
+            Field::new("region", DataType::Utf8, true),
+            Field::new("n", DataType::Float64, true),
+        ] {
+            meta.schema.insert(field.name().clone(), Arc::new(field));
+        }
+        let metadata = RwLock::new(LogStreamMetadata {
+            schema: meta.schema.clone(),
+            ..Default::default()
+        });
+        let before = metadata.read().unwrap().schema.clone();
+        let events = build_events(&records, "test", &None, &meta).unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.is_first_event));
+        let result = commit_chunk_schemas("test", &metadata, &events);
+
+        assert!(matches!(result, Err(EventError::Staging(_))), "{result:?}");
+        assert_eq!(metadata.read().unwrap().schema, before);
     }
 
     #[test]
