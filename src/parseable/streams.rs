@@ -1642,6 +1642,23 @@ impl Stream {
         // Files sealed after this snapshot are safely deferred to the next cycle.
         let mut root_arrows = Vec::new();
         let recovery = self.resolve_conversion_journals_with_root(tenant_id, &mut root_arrows);
+        self.convert_after_journal_resolution(
+            init_signal,
+            shutdown_signal,
+            tenant_id,
+            Some(root_arrows),
+            recovery,
+        )
+    }
+
+    fn convert_after_journal_resolution(
+        &self,
+        init_signal: bool,
+        shutdown_signal: bool,
+        tenant_id: &Option<String>,
+        root_arrows: Option<Vec<PathBuf>>,
+        recovery: Result<(), StagingError>,
+    ) -> Result<(), StagingError> {
         let time_partition = self.get_time_partition();
         let custom_partition = self.get_custom_partition();
 
@@ -1653,7 +1670,7 @@ impl Stream {
             init_signal,
             shutdown_signal,
             tenant_id,
-            Some(root_arrows),
+            root_arrows,
         )?;
         self.finish_arrow_file_conversion(outcome)?;
         recovery
@@ -3682,12 +3699,16 @@ impl Stream {
         shutdown_signal: bool,
         tenant_id: &Option<String>,
     ) -> Result<(), StagingError> {
-        // On init, recover any orphaned .part files from previous interrupted runs
-        if init_signal {
+        // Init must resolve journals before orphan cleanup. Reuse that result
+        // for conversion below instead of inventorying the root a second time.
+        let recovery = if init_signal {
             self.defer_unowned_inprocess_dirs();
-            let _ = self.resolve_conversion_journals(tenant_id);
+            let recovery = self.resolve_conversion_journals(tenant_id);
             self.recover_orphan_part_files();
-        }
+            Some(recovery)
+        } else {
+            None
+        };
 
         let start_flush = Instant::now();
         // Force flush for init or shutdown signals to convert all .part files to .arrows
@@ -3704,7 +3725,17 @@ impl Stream {
 
         let start_convert = Instant::now();
 
-        self.prepare_parquet(init_signal, shutdown_signal, tenant_id)?;
+        if let Some(recovery) = recovery {
+            self.convert_after_journal_resolution(
+                init_signal,
+                shutdown_signal,
+                tenant_id,
+                None,
+                recovery,
+            )?;
+        } else {
+            self.prepare_parquet(init_signal, shutdown_signal, tenant_id)?;
+        }
         if self.get_stream_type().eq(&StreamType::UserDefined) {
             info!(
                 "Converting arrows to parquet on stream ({}) took: {}s",

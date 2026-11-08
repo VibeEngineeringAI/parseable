@@ -1021,7 +1021,20 @@ fn init_flush_resolves_journal_before_orphan_part_cleanup() {
     let options = Arc::clone(&stream.options);
     drop(stream);
     let restarted = fresh(options);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let scans = Arc::new(AtomicUsize::new(0));
+    let scans_hook = Arc::clone(&scans);
+    *restarted.conversion_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, ConversionPhase::InventoryScan) {
+            scans_hook.fetch_add(1, Ordering::Relaxed);
+        }
+    }));
     restarted.flush_and_convert(true, false, &None).unwrap();
+    assert_eq!(
+        scans.load(Ordering::Relaxed),
+        1,
+        "init must reuse its recovery inventory"
+    );
     assert_eq!(listed_parquet(&restarted.data_path), vec![output]);
     assert_eq!(
         read_all(&restarted.parquet_files()).pairs,
