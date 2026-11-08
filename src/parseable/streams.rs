@@ -99,7 +99,7 @@ use super::{
 };
 
 mod conversion_journal;
-use conversion_journal::{ConversionJournal, has_journal, has_journal_for_part, sync_directory};
+use conversion_journal::{ConversionJournal, has_journal, has_journal_for_part};
 
 static HOSTNAME: OnceCell<String> = OnceCell::new();
 static METRIC_PARQUET_THREADPOOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
@@ -1731,7 +1731,9 @@ impl Stream {
         }
         fs::rename(tmp_path, path)?;
         if durable {
-            sync_directory(&self.data_path)?;
+            // No directory sync here: the staged schema lives in the stream
+            // root, and every journal install syncs that same directory before
+            // any source can be unlinked, which also persists this rename.
             *staged = Some(schema);
             self.conversion_phase(ConversionPhase::SchemaStaged);
         }
