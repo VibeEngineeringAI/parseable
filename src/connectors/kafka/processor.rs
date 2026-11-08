@@ -19,7 +19,7 @@
 use crate::{
     connectors::common::processor::Processor,
     event::{
-        USER_AGENT_KEY,
+        USER_AGENT_KEY, commit_ingested_schemas,
         format::{EventFormat, LogSourceEntry, json},
     },
     handlers::TelemetryType,
@@ -102,7 +102,25 @@ fn build_and_process_event(
     // Offsets are committed whether or not the chunk is ingested and the
     // producer gets no rejection signal, so the dataset field limit is not
     // enforced here: rejecting would silently drop the whole chunk.
-    for event in build_events(&records, &stream_name, &tenant_id, &meta)? {
+    let events = build_events(&records, &stream_name, &tenant_id, &meta)?;
+    if meta.custom_partition.is_some() && !events.is_empty() {
+        // Custom-partitioned chunks yield one event per record, all built
+        // against the same schema snapshot. As in the HTTP per-record path,
+        // commit the union of their schemas before staging any of them, so a
+        // conflict between records rejects the chunk instead of staging only
+        // the events processed before it.
+        let stream = PARSEABLE.get_stream(&stream_name, &tenant_id)?;
+        let schemas: Vec<_> = events
+            .iter()
+            .map(|event| (event.rb.schema(), event.is_first_event))
+            .collect();
+        let committed =
+            commit_ingested_schemas(&stream_name, &stream.metadata, &schemas, usize::MAX)?;
+        if committed && !stream.get_static_schema_flag() {
+            stream.stage_schema_file(stream.get_schema().as_ref().clone())?;
+        }
+    }
+    for event in events {
         event.process_without_field_limit()?;
     }
 
@@ -163,7 +181,14 @@ fn build_events(
                 warn!(error = %err, "Skipping Kafka record with invalid custom partition");
                 continue;
             }
-            events.push(into_event(value, record.len() as u64)?);
+            // Records are validated and converted individually here, so skip a
+            // record that fails conversion instead of dropping the whole chunk.
+            match into_event(value, record.len() as u64) {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    warn!(error = %err, "Skipping Kafka record that failed event conversion");
+                }
+            }
         } else {
             json_vec.push(value);
         }
@@ -335,6 +360,28 @@ mod tests {
             );
             assert_eq!(event.stream_name, "test");
             assert_eq!(event.tenant_id, tenant_id);
+        }
+    }
+
+    #[test]
+    fn custom_partition_skips_records_that_fail_conversion() {
+        // `p_timestamp` is reserved, so converting that record fails; the
+        // valid records around it must still become events.
+        let records = vec![
+            record(r#"{"region": "west", "n": 1}"#),
+            record(r#"{"region": "east", "p_timestamp": "reserved"}"#),
+            record(r#"{"region": "north", "n": 2}"#),
+        ];
+        let events = build_events(&records, "test", &None, &stream_meta(Some("region"))).unwrap();
+
+        let regions: Vec<_> = events
+            .iter()
+            .map(|event| event.custom_partition_values["region"].as_str())
+            .collect();
+        assert_eq!(regions, ["west", "north"]);
+        for event in &events {
+            assert_eq!(event.rb.num_rows(), 1);
+            assert!(event.rb.schema().field_with_name("n").is_ok());
         }
     }
 

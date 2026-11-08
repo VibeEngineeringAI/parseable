@@ -672,16 +672,35 @@ mod tests {
     #[test]
     fn custom_partition_array_returns_error() {
         let value = json!([{"region": "west"}]);
-        assert!(extract_custom_partition_values(&value, &["region"]).is_err());
-        assert!(custom_partition_event(value).is_err());
+        let err = extract_custom_partition_values(&value, &["region"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Expected a JSON object for custom partition fields"
+        );
+        let err = custom_partition_event(value)
+            .err()
+            .expect("conversion must fail");
+        assert_eq!(
+            err.to_string(),
+            "Expected a JSON object for custom partition fields"
+        );
     }
 
     #[test]
     fn custom_partition_missing_field_returns_error() {
         let value = json!({"message": "missing region"});
         let err = extract_custom_partition_values(&value, &["region"]).unwrap_err();
-        assert!(err.to_string().contains("region"));
-        assert!(custom_partition_event(value).is_err());
+        assert_eq!(
+            err.to_string(),
+            "Missing field for custom partition in json: region"
+        );
+        let err = custom_partition_event(value)
+            .err()
+            .expect("conversion must fail");
+        assert_eq!(
+            err.to_string(),
+            "Missing field for custom partition in json: region"
+        );
     }
 
     #[test]
