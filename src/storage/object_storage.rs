@@ -1658,16 +1658,23 @@ pub async fn commit_schema_to_storage(
 }
 
 /// Update memory only after a successful upload, including schemas recovered
-/// from staging after a crash. A failed merge leaves the staged file retryable.
+/// from staging after a crash. A failed upload leaves the staged file
+/// retryable. A failed memory merge does not: the schema is already stored,
+/// and a conflict would fail identically on every retry, so it is logged like
+/// the per-query merge this replaces.
 async fn persist_schema_and_update_memory(
     stream: Option<&Stream>,
     schema: &Schema,
     persist: impl std::future::Future<Output = Result<(), ObjectStorageError>>,
 ) -> Result<(), ObjectStorageError> {
     persist.await?;
-    if let Some(stream) = stream {
-        crate::event::commit_schema_to_metadata(&stream.metadata, schema)
-            .map_err(|e| ObjectStorageError::Custom(e.to_string()))?;
+    if let Some(stream) = stream
+        && let Err(e) = crate::event::commit_schema_to_metadata(&stream.metadata, schema)
+    {
+        warn!(
+            stream = stream.stream_name,
+            "Stored staged schema but could not merge it into memory: {e}"
+        );
     }
     Ok(())
 }
@@ -2259,6 +2266,49 @@ mod query_reload_tests {
             serde_json::from_slice::<Schema>(&storage.get_object(&path, &None).await.unwrap())
                 .unwrap(),
             schema
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_memory_merge_after_upload_does_not_wedge_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            local_staging_path: dir.path().to_owned(),
+            ..Options::default()
+        };
+        let stream = Stream::new(
+            Arc::new(options),
+            "logs",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        let in_memory = Schema::new(vec![Field::new("value", DataType::Boolean, true)]);
+        crate::event::commit_schema_to_metadata(&stream.metadata, &in_memory).unwrap();
+        stream
+            .stage_schema_file(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                true,
+            )]))
+            .unwrap();
+        process_schema_files_with(&stream, |schema| {
+            let stream = &stream;
+            async move {
+                persist_schema_and_update_memory(Some(stream), &schema, async { Ok(()) }).await
+            }
+        })
+        .await
+        .unwrap();
+        // Stored successfully: the staged file is consumed, not retried forever.
+        assert!(stream.schema_files().is_empty());
+        assert_eq!(
+            stream
+                .get_schema()
+                .field_with_name("value")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
         );
     }
 

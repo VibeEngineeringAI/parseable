@@ -782,9 +782,7 @@ mod tests {
         // and must not grow.
         assert!(!commit_ingested_schema(STREAM, &stream, &schema, 2, true).unwrap());
         assert!(!commit_ingested_schema(STREAM, &stream, &schema, 2, false).unwrap());
-        assert!(
-            !commit_ingested_schemas(STREAM, &stream, &[(Arc::new(schema), true)], 2).unwrap()
-        );
+        assert!(!commit_ingested_schemas(STREAM, &stream, &[(Arc::new(schema), true)], 2).unwrap());
         assert_eq!(field_names(&stream).len(), 2);
     }
 
@@ -853,8 +851,13 @@ mod tests {
         // The union fits: everything is committed at once, so processing the
         // events afterwards adds nothing and cannot hit the limit
         assert!(
-            commit_ingested_schemas(STREAM, &stream, &[(a.clone(), true), (b.clone(), false)], 13)
-                .unwrap()
+            commit_ingested_schemas(
+                STREAM,
+                &stream,
+                &[(a.clone(), true), (b.clone(), false)],
+                13
+            )
+            .unwrap()
         );
         assert_eq!(field_names(&stream).len(), 13);
         assert!(!commit_ingested_schema(STREAM, &stream, &b, 13, false).unwrap());
@@ -864,13 +867,9 @@ mod tests {
         // A type conflict in any event leaves the schema untouched
         let before = field_names(&stream);
         let c: SchemaRef = Arc::new(Schema::new(utf8_fields("c", 1)));
-        let conflict: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "a0",
-            DataType::Int64,
-            true,
-        )]));
-        let result =
-            commit_ingested_schemas(STREAM, &stream, &[(c, true), (conflict, true)], 100);
+        let conflict: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a0", DataType::Int64, true)]));
+        let result = commit_ingested_schemas(STREAM, &stream, &[(c, true), (conflict, true)], 100);
         assert!(matches!(result, Err(EventError::Staging(_))), "{result:?}");
         assert_eq!(field_names(&stream), before);
     }
