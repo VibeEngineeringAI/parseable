@@ -112,9 +112,25 @@ schema with default 262,144-row groups, three rotated blocks per arm:
 | RSS rise during conversion above RSS at acknowledgement | 0 MiB | 810 MiB | 143 MiB |
 | Peak RSS after acknowledgement | 2,127 MiB | 2,919 MiB | 2,424 MiB |
 
-Process CPU varied by up to 40% between runs of the same binary in this matrix,
-so it did not resolve the CPU cost of either implementation. The same
-fixtures, read by the baseline binary with 25 ms of added storage round-trip
+Process CPU varied by up to 40% between whole-server runs of the same binary,
+so writer CPU was measured separately: the same 1,048,576-row, 101-column
+input with production writer settings (LZ4_RAW, 262,144-row groups), each
+variant in its own process, median of five. The default writer receives
+staged batches as they were ingested (2,048 rows here).
+
+| Writer | CPU | Peak memory rise |
+| --- | ---: | ---: |
+| Default, 2,048-row staged batches | 5.58 s | 152 MiB |
+| Default, coalesced to 8,192-row batches | 4.02 s | 244 MiB |
+| Clustered, current (8,192-row gathers) | 4.54 s | 182 MiB |
+| Clustered, first implementation (one batch per group) | 3.09 s | 483 MiB |
+
+Clustering's own ordering and gathering cost about 13% more CPU than a
+default writer given the same batch size, but the clustered writer hands
+the Parquet encoder larger batches than staging does. Against today's
+default path, its writer CPU was therefore lower in this measurement.
+
+The 1.5-million-row fixtures, read by the baseline binary with 25 ms of added storage round-trip
 latency (`tc netem`, 24-hour window), returned identical oracle-checked results:
 
 | Query | Concurrency | Unclustered QPS / p50 | Clustered QPS / p50 | Logical MiB per query |
@@ -129,6 +145,25 @@ Most of the roughly one-second latency at this window was per-query object
 listing and metadata requests, which clustering does not change. Stored bytes
 were 0.3–1.1% larger. These are emulated-latency results on a single node, not
 real-cloud or blog-scale measurements.
+
+A second fixture of 6 million rows of the same schema, under the same 25 ms
+latency, added narrow time windows without a severity filter (medians of three
+blocks; every result checked):
+
+| Query | Concurrency | Unclustered QPS | Clustered QPS | Logical MiB per query |
+| --- | ---: | ---: | ---: | ---: |
+| `ERROR` groups, 24 hours | 8 | 4.02 | 4.21 | 19.5 → 11.0 |
+| `COUNT(*)` by severity, 24 hours | 8 | 4.69 | 5.08 | 1.87 → 0.09 |
+| 100 most recent rows, 1 s window | 8 | 1.74 | 1.74 | 53.9 → 107.1 |
+| `COUNT(*)`, 1 s window | 8 | 18.84 | 21.99 | 0.92 → 1.60 |
+| 100 most recent rows, 10 s window | 8 | 1.29 | 1.52 | 418.9 → 289.1 |
+| `ERROR` groups, 10 s window | 1 | 2.45 | 2.16 | 6.88 → 3.30 |
+| `ERROR` groups, 10 s window | 8 | 16.83 | 15.60 | 6.88 → 3.30 |
+
+A 1 s window without a severity filter read up to twice as many bytes, with
+no latency regression measured. The one consistent regression was a
+severity filter combined with a narrow time window: 7–12% lower throughput
+despite reading half the bytes. Its cause has not been identified.
 
 ## Tests
 
