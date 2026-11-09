@@ -1340,6 +1340,48 @@ impl Metastore for ObjectStoreMetastore {
             .collect())
     }
 
+    async fn refresh_schema(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+        schema_file: &str,
+    ) -> Result<Schema, MetastoreError> {
+        let objects = self.storage.schema_objects(stream_name, tenant_id).await?;
+        let mut schemas = Vec::with_capacity(objects.len());
+        let mut canonical = None;
+        for (name, bytes) in objects {
+            let schema: Schema = serde_json::from_slice(&bytes)
+                .map_err(|e| ObjectStorageError::Custom(e.to_string()))?;
+            if name == schema_file {
+                canonical = Some(schema.clone());
+            }
+            schemas.push(schema);
+        }
+        let merged =
+            Schema::try_merge(schemas).map_err(|e| ObjectStorageError::Custom(e.to_string()))?;
+        // Field order is immaterial, but nested types, nullability and field
+        // metadata all matter. Normalize only the top-level ordering.
+        let normalize = |schema: &Schema| {
+            let mut schema = schema.clone();
+            let mut fields = schema.fields.to_vec();
+            fields.sort_by(|a, b| a.name().cmp(b.name()));
+            schema.fields = fields.into();
+            schema
+        };
+        if canonical.as_ref().map(normalize) != Some(normalize(&merged)) {
+            let path = RelativePathBuf::from_iter([
+                tenant_id.as_deref().unwrap_or(""),
+                stream_name,
+                STREAM_ROOT_DIRECTORY,
+                schema_file,
+            ]);
+            self.storage
+                .put_object(&path, to_bytes(&merged), tenant_id)
+                .await?;
+        }
+        Ok(merged)
+    }
+
     async fn get_schema(
         &self,
         stream_name: &str,
@@ -1558,6 +1600,142 @@ impl Metastore for ObjectStoreMetastore {
 mod tests {
     use super::*;
     use crate::storage::LocalFS;
+
+    #[tokio::test]
+    async fn remote_schema_refresh_publishes_only_changes() {
+        use crate::{event::commit_schema_to_metadata, metadata::LogStreamMetadata};
+        use arrow_schema::{DataType, Field};
+        for tenant in [None, Some("tenant".to_owned())] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(LocalFS::new(dir.path().to_owned()));
+            let store = ObjectStoreMetastore {
+                storage: storage.clone(),
+            };
+            let prefix = RelativePathBuf::from_iter([
+                tenant.as_deref().unwrap_or(""),
+                "logs",
+                STREAM_ROOT_DIRECTORY,
+            ]);
+            let canonical_path = prefix.join(".schema");
+            let node_path = prefix.join(".ingestor.node.schema");
+            let original = Schema::new(vec![Field::new("local", DataType::Null, true)]);
+            storage
+                .put_object(&canonical_path, to_bytes(&original), &tenant)
+                .await
+                .unwrap();
+            let remote = Schema::new(vec![
+                Field::new("remote", DataType::Utf8, true),
+                Field::new("local", DataType::Int64, true),
+            ]);
+            storage
+                .put_object(&node_path, to_bytes(&remote), &tenant)
+                .await
+                .unwrap();
+            let memory = std::sync::RwLock::new(LogStreamMetadata::default());
+            let refreshed = store
+                .refresh_schema("logs", &tenant, ".schema")
+                .await
+                .unwrap();
+            commit_schema_to_metadata(&memory, &refreshed).unwrap();
+            assert_eq!(
+                memory.read().unwrap().schema["local"].data_type(),
+                &DataType::Int64
+            );
+            assert!(memory.read().unwrap().schema.contains_key("remote"));
+            let published: Schema = serde_json::from_slice(
+                &storage.get_object(&canonical_path, &tenant).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(published, refreshed);
+
+            // A refresh of the same union must not write, even when the files
+            // present their fields in a different order.
+            let file = std::fs::File::open(canonical_path.to_path(dir.path())).unwrap();
+            file.set_modified(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+            store
+                .refresh_schema("logs", &tenant, ".schema")
+                .await
+                .unwrap();
+            assert_eq!(
+                file.metadata().unwrap().modified().unwrap(),
+                std::time::SystemTime::UNIX_EPOCH
+            );
+            assert_eq!(
+                std::fs::metadata(canonical_path.to_path(dir.path()))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                std::time::SystemTime::UNIX_EPOCH
+            );
+
+            let remote = Schema::try_merge([
+                remote,
+                Schema::new(vec![Field::new(
+                    "new_on_other_node",
+                    DataType::Boolean,
+                    true,
+                )]),
+            ])
+            .unwrap();
+            storage
+                .put_object(&node_path, to_bytes(&remote), &tenant)
+                .await
+                .unwrap();
+            let refreshed = store
+                .refresh_schema("logs", &tenant, ".schema")
+                .await
+                .unwrap();
+            commit_schema_to_metadata(&memory, &refreshed).unwrap();
+            assert!(
+                memory
+                    .read()
+                    .unwrap()
+                    .schema
+                    .contains_key("new_on_other_node")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ingestor_refresh_preserves_its_schema_destination() {
+        use arrow_schema::{DataType, Field};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(dir.path().to_owned()));
+        let store = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        let global = RelativePathBuf::from("logs/.stream/.schema");
+        let own = RelativePathBuf::from("logs/.stream/.ingestor.own.schema");
+        let remote = RelativePathBuf::from("logs/.stream/.ingestor.other.schema");
+        storage
+            .put_object(&global, to_bytes(&Schema::empty()), &None)
+            .await
+            .unwrap();
+        storage
+            .put_object(&own, to_bytes(&Schema::empty()), &None)
+            .await
+            .unwrap();
+        let added = Schema::new(vec![Field::new("remote", DataType::Utf8, true)]);
+        storage
+            .put_object(&remote, to_bytes(&added), &None)
+            .await
+            .unwrap();
+        store
+            .refresh_schema("logs", &None, ".ingestor.own.schema")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Schema>(&storage.get_object(&own, &None).await.unwrap())
+                .unwrap(),
+            added
+        );
+        assert_eq!(
+            serde_json::from_slice::<Schema>(&storage.get_object(&global, &None).await.unwrap())
+                .unwrap(),
+            Schema::empty()
+        );
+    }
 
     #[derive(serde::Serialize)]
     struct TestMetastoreObject {

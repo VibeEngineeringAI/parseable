@@ -380,6 +380,7 @@ fn minute_from_system_time(time: SystemTime) -> u128 {
 pub struct Stream {
     pub stream_name: String,
     pub metadata: RwLock<LogStreamMetadata>,
+    pub(super) schema_refresh: super::schema_refresh::SchemaRefresh,
     pub data_path: PathBuf,
     pub options: Arc<Options>,
     /// Staging writers, also accessible directly to library consumers.
@@ -944,6 +945,7 @@ impl Stream {
         Arc::new(Self {
             stream_name: stream_name.clone(),
             metadata: RwLock::new(metadata),
+            schema_refresh: Default::default(),
             data_path,
             options,
             writer: Mutex::new(Writer::default()),

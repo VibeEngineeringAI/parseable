@@ -43,6 +43,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::{DashSet, mapref::entry::Entry};
 use datafusion::{datasource::listing::ListingTableUrl, execution::runtime_env::RuntimeEnvBuilder};
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ListResult;
 use object_store::ObjectMeta;
@@ -521,6 +522,45 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
         filter_fun: Box<dyn Fn(String) -> bool + Send>,
         tenant_id: &Option<String>,
     ) -> Result<Vec<Bytes>, ObjectStorageError>;
+    /// List only this stream's metadata, accepting ingestor-only streams too.
+    async fn stream_exists(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<bool, ObjectStorageError> {
+        let prefix = stream_metadata_prefix(stream_name, tenant_id);
+        let listing = self.list_with_delimiter(Some(prefix)).await?;
+        Ok(has_stream_metadata(&listing.objects))
+    }
+
+    /// Read each schema once, retaining filenames to compare the published
+    /// schema with the union without another GET of the canonical object.
+    async fn schema_objects(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<Vec<(String, Bytes)>, ObjectStorageError> {
+        let listing = self
+            .list_with_delimiter(Some(stream_metadata_prefix(stream_name, tenant_id)))
+            .await?;
+        let requests = listing.objects.into_iter().filter_map(|object| {
+            let name = object.location.filename()?.to_owned();
+            if !name.contains(".schema") {
+                return None;
+            }
+            Some(async move {
+                let path = RelativePathBuf::from(object.location.as_ref());
+                self.get_object(&path, tenant_id)
+                    .await
+                    .map(|bytes| (name, bytes))
+            })
+        });
+        futures::stream::iter(requests)
+            .buffered(super::GET_OBJECTS_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
     async fn upload_multipart(
         &self,
         key: &RelativePath,
@@ -1499,10 +1539,24 @@ async fn process_schema_files(
     stream_name: &str,
     tenant_id: &Option<String>,
 ) -> Result<(), ObjectStorageError> {
-    for path in upload_context.stream.schema_files() {
+    process_schema_files_with(&upload_context.stream, |schema| {
+        commit_schema_to_storage(stream_name, schema, tenant_id)
+    })
+    .await
+}
+
+async fn process_schema_files_with<F, Fut>(
+    stream: &Stream,
+    commit: F,
+) -> Result<(), ObjectStorageError>
+where
+    F: Fn(Schema) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ObjectStorageError>>,
+{
+    for path in stream.schema_files() {
         let file = File::open(&path)?;
         let schema: Schema = serde_json::from_reader(file)?;
-        commit_schema_to_storage(stream_name, schema, tenant_id).await?;
+        commit(schema).await?;
 
         if let Err(e) = remove_file(path) {
             warn!("Failed to remove staged file: {e}");
@@ -1592,11 +1646,30 @@ pub async fn commit_schema_to_storage(
     ])
     .map_err(|e| ObjectStorageError::Custom(e.to_string()))?;
 
-    PARSEABLE
-        .metastore
-        .put_schema(new_schema, stream_name, tenant_id)
-        .await
-        .map_err(|e| ObjectStorageError::MetastoreError(Box::new(e.to_detail())))
+    let stream = PARSEABLE.get_stream(stream_name, tenant_id).ok();
+    persist_schema_and_update_memory(stream.as_deref(), &new_schema, async {
+        PARSEABLE
+            .metastore
+            .put_schema(new_schema.clone(), stream_name, tenant_id)
+            .await
+            .map_err(|e| ObjectStorageError::MetastoreError(Box::new(e.to_detail())))
+    })
+    .await
+}
+
+/// Update memory only after a successful upload, including schemas recovered
+/// from staging after a crash. A failed merge leaves the staged file retryable.
+async fn persist_schema_and_update_memory(
+    stream: Option<&Stream>,
+    schema: &Schema,
+    persist: impl std::future::Future<Output = Result<(), ObjectStorageError>>,
+) -> Result<(), ObjectStorageError> {
+    persist.await?;
+    if let Some(stream) = stream {
+        crate::event::commit_schema_to_metadata(&stream.metadata, schema)
+            .map_err(|e| ObjectStorageError::Custom(e.to_string()))?;
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -1604,6 +1677,26 @@ pub fn to_bytes(any: &(impl ?Sized + serde::Serialize)) -> Bytes {
     serde_json::to_vec(any)
         .map(|any| any.into())
         .expect("serialize cannot fail")
+}
+
+fn has_stream_metadata(objects: &[ObjectMeta]) -> bool {
+    objects.iter().any(|object| {
+        object
+            .location
+            .filename()
+            .is_some_and(|name| name.ends_with("stream.json"))
+    })
+}
+
+fn stream_metadata_prefix(
+    stream_name: &str,
+    tenant_id: &Option<String>,
+) -> object_store::path::Path {
+    object_store::path::Path::from_iter([
+        tenant_id.as_deref().unwrap_or(""),
+        stream_name,
+        STREAM_ROOT_DIRECTORY,
+    ])
 }
 
 pub fn schema_path(stream_name: &str, tenant_id: &Option<String>) -> RelativePathBuf {
@@ -2056,5 +2149,154 @@ mod conditional_cloud_metadata_tests {
             .await,
             Err(ConditionalMetadataError::Unsupported(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod query_reload_tests {
+    use super::*;
+    use crate::{cli::Options, metadata::LogStreamMetadata, storage::LocalFS};
+    use arrow_schema::{DataType, Field};
+    use object_store::{ObjectStore, ObjectStoreExt};
+
+    #[tokio::test]
+    async fn cold_lookup_accepts_ingestor_only_metadata_and_is_tenant_scoped() {
+        let store = object_store::memory::InMemory::new();
+        let path = object_store::path::Path::from("tenant/logs/.stream/.ingestor.node.stream.json");
+        store
+            .put(&path, Bytes::from_static(b"{}").into())
+            .await
+            .unwrap();
+        store
+            .put(
+                &object_store::path::Path::from("tenant/other/.stream/.stream.json"),
+                Bytes::from_static(b"{}").into(),
+            )
+            .await
+            .unwrap();
+        let prefix = stream_metadata_prefix("logs", &Some("tenant".to_owned()));
+        assert_eq!(prefix.as_ref(), "tenant/logs/.stream");
+        let listing = store.list_with_delimiter(Some(&prefix)).await.unwrap();
+        assert_eq!(listing.objects.len(), 1);
+        assert!(has_stream_metadata(&listing.objects));
+        let prefix = stream_metadata_prefix("logs", &Some("other-tenant".to_owned()));
+        assert!(!has_stream_metadata(
+            &store
+                .list_with_delimiter(Some(&prefix))
+                .await
+                .unwrap()
+                .objects
+        ));
+        assert_eq!(
+            stream_metadata_prefix("logs", &None).as_ref(),
+            "logs/.stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn localfs_cold_lookup_keeps_global_metadata_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalFS::new(dir.path().to_owned());
+        assert!(!storage.stream_exists("logs", &None).await.unwrap());
+        storage
+            .put_object(
+                &RelativePathBuf::from("logs/.stream/.ingestor.node.stream.json"),
+                Bytes::from_static(b"{}"),
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(!storage.stream_exists("logs", &None).await.unwrap());
+        storage
+            .put_object(
+                &RelativePathBuf::from("logs/.stream/.stream.json"),
+                Bytes::from_static(b"{}"),
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(storage.stream_exists("logs", &None).await.unwrap());
+        assert!(storage.list_streams().await.unwrap().contains("logs"));
+    }
+
+    #[tokio::test]
+    async fn staged_schema_upload_updates_memory_without_a_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalFS::new(dir.path().join("remote"));
+        let options = Options {
+            local_staging_path: dir.path().join("staging"),
+            ..Options::default()
+        };
+        let stream = Stream::new(
+            Arc::new(options),
+            "logs",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        let schema = Schema::new(vec![Field::new("recovered", DataType::Utf8, true)]);
+        stream.stage_schema_file(schema.clone()).unwrap();
+        assert!(stream.get_schema().fields().is_empty());
+        let path = RelativePathBuf::from("logs/.stream/.schema");
+        process_schema_files_with(&stream, |schema| {
+            let storage = &storage;
+            let stream = &stream;
+            let path = &path;
+            async move {
+                persist_schema_and_update_memory(
+                    Some(stream),
+                    &schema,
+                    storage.put_object(path, to_bytes(&schema), &None),
+                )
+                .await
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(stream.get_schema().as_ref(), &schema);
+        assert!(stream.schema_files().is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Schema>(&storage.get_object(&path, &None).await.unwrap())
+                .unwrap(),
+            schema
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_schema_upload_leaves_staging_and_memory_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            local_staging_path: dir.path().to_owned(),
+            ..Options::default()
+        };
+        let stream = Stream::new(
+            Arc::new(options),
+            "logs",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        stream
+            .stage_schema_file(Schema::new(vec![Field::new(
+                "recovered",
+                DataType::Utf8,
+                true,
+            )]))
+            .unwrap();
+        assert!(
+            process_schema_files_with(&stream, |schema| {
+                let stream = &stream;
+                async move {
+                    persist_schema_and_update_memory(Some(stream), &schema, async {
+                        Err(ObjectStorageError::Custom("upload failed".to_owned()))
+                    })
+                    .await
+                }
+            })
+            .await
+            .is_err()
+        );
+        assert!(stream.get_schema().fields().is_empty());
+        assert_eq!(stream.schema_files().len(), 1);
     }
 }
