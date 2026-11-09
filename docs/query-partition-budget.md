@@ -107,3 +107,30 @@ spilling and memory-admission capacity remain unqualified.
 
 This change is independent of severity clustering and the Flight metrics fix.
 It includes no benchmark output or storage-layout changes.
+
+## Prometheus metrics
+
+The custom registry exposes two process-wide metrics with no labels, matching
+this budget's scope across all tenants and streams:
+
+- `parseable_query_partition_budget_active_queries` (gauge): queries currently
+  holding a budget lease. Shared lease owners count once; the final owner releases
+  the gauge on completion, error, timeout, abort or early drop.
+- `parseable_query_partition_budget_target_partitions` (histogram): one observation
+  of the chosen target for each budgeted query. Finite buckets are powers of two
+  from 1 through 1024; the `+Inf` bucket includes larger explicit targets.
+
+Both metrics are registered even when the budget is unset, providing a stable
+scrape schema and explicit zero values. The unset path performs no metric updates.
+The histogram describes planning decisions, not actual worker utilization; old
+queries keep their targets when concurrency changes. The gauge can include
+outstanding streaming workers and buffered results until their last lease drops.
+
+Use the gauge to track active budgeted queries. For the mean chosen target over
+five minutes, use
+`rate(parseable_query_partition_budget_target_partitions_sum[5m]) / rate(parseable_query_partition_budget_target_partitions_count[5m])`.
+Use `histogram_quantile(0.5, rate(parseable_query_partition_budget_target_partitions_bucket[5m]))`
+for an approximate median. Rising activity with targets moving toward the floor
+shows the budget reducing per-query parallelism. A zero observation rate means
+no budgeted queries entered during that interval; a disabled budget and an idle
+enabled budget both expose zero activity, so check configuration to distinguish them.

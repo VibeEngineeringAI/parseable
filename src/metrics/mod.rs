@@ -29,7 +29,8 @@ use actix_web_prometheus::{PrometheusMetrics, PrometheusMetricsBuilder};
 use error::MetricsError;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+    Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry,
     core::{Atomic, AtomicF64},
 };
 
@@ -360,6 +361,51 @@ mod process_metrics_tests {
         assert_eq!(accumulator.record(20.0, 300), (10.8, 116.0));
     }
 }
+
+/// Process-wide budget metrics deliberately have no tenant or stream labels.
+#[derive(Clone)]
+pub(crate) struct PartitionBudgetMetrics {
+    pub(crate) active: IntGauge,
+    pub(crate) target: Histogram,
+}
+
+impl PartitionBudgetMetrics {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: IntGauge::with_opts(
+                Opts::new(
+                    "query_partition_budget_active_queries",
+                    "Currently active budgeted queries",
+                )
+                .namespace(METRICS_NAMESPACE),
+            )
+            .expect("metric can be created"),
+            target: Histogram::with_opts(
+                HistogramOpts::new(
+                    "query_partition_budget_target_partitions",
+                    "Chosen target partitions per budgeted query",
+                )
+                .namespace(METRICS_NAMESPACE)
+                .buckets(vec![
+                    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+                ]),
+            )
+            .expect("metric can be created"),
+        }
+    }
+
+    fn register(&self, registry: &Registry) {
+        registry
+            .register(Box::new(self.active.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(self.target.clone()))
+            .expect("metric can be registered");
+    }
+}
+
+pub(crate) static PARTITION_BUDGET_METRICS: Lazy<PartitionBudgetMetrics> =
+    Lazy::new(PartitionBudgetMetrics::new);
 
 pub static QUERY_EXECUTE_TIME: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(
@@ -850,6 +896,7 @@ pub static TOTAL_TRACES_COLLECTED_SIZE_BY_DATE: Lazy<IntCounterVec> = Lazy::new(
 });
 
 fn custom_metrics(registry: &Registry) {
+    PARTITION_BUDGET_METRICS.register(registry);
     registry
         .register(Box::new(EVENTS_INGESTED.clone()))
         .expect("metric can be registered");
@@ -1320,5 +1367,47 @@ pub mod error {
                 .insert_header(ContentType::plaintext())
                 .body(self.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod partition_budget_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn partition_budget_metrics_registration_and_buckets() {
+        let registry = Registry::new();
+        let metrics = PartitionBudgetMetrics::new();
+        metrics.register(&registry);
+        let initial = registry.gather();
+        assert_eq!(initial.len(), 2);
+        assert!(
+            initial
+                .iter()
+                .all(|family| family.get_metric()[0].get_label().is_empty())
+        );
+        metrics.target.observe(3.0);
+        metrics.target.observe(32.0);
+        let families = registry.gather();
+        let target = families
+            .iter()
+            .find(|family| {
+                family.get_name() == "parseable_query_partition_budget_target_partitions"
+            })
+            .unwrap();
+        let histogram = target.get_metric()[0].get_histogram();
+        assert_eq!(histogram.get_sample_count(), 2);
+        assert_eq!(histogram.get_sample_sum(), 35.0);
+        let bucket = |bound| {
+            histogram
+                .get_bucket()
+                .iter()
+                .find(|bucket| bucket.get_upper_bound() == bound)
+                .unwrap()
+                .get_cumulative_count()
+        };
+        assert_eq!(bucket(2.0), 0);
+        assert_eq!(bucket(4.0), 1);
+        assert_eq!(bucket(32.0), 2);
     }
 }
