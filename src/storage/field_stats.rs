@@ -238,29 +238,64 @@ async fn calculate_field_stats_inner(
         .get_stream(DATASET_STATS_STREAM_NAME, tenant_id)?
         .get_schema_raw();
     let max_row_bytes = FlattenLimits::from_config().max_bytes_per_request;
-    for_each_stats_row(&stats, max_row_bytes, |json, origin_size| {
-        json::Event {
-            json,
-            p_timestamp: parquet_ts,
-        }
-        .into_event(
-            DATASET_STATS_STREAM_NAME.to_string(),
-            origin_size,
-            &schema,
-            false,
-            Some(&DATASET_STATS_CUSTOM_PARTITION.to_string()),
-            None,
-            SchemaVersion::V1,
-            StreamType::Internal,
-            &p_custom_fields,
-            TelemetryType::Logs,
-            tenant_id,
-            false,
-        )?
-        .process()?;
+    if let Some(event) = stats_event(
+        &stats,
+        max_row_bytes,
+        parquet_ts,
+        &schema,
+        &p_custom_fields,
+        tenant_id,
+    )? {
+        event.process()?;
+    }
+    Ok(stats_calculated)
+}
+
+/// All rows of a file have one dataset partition and one timestamp. Convert them together:
+/// in particular, infer/commit a newly encountered schema only once per file.
+fn stats_event(
+    stats: &DatasetStats,
+    max_row_bytes: usize,
+    parquet_ts: DateTime<Utc>,
+    schema: &HashMap<String, std::sync::Arc<arrow_schema::Field>>,
+    custom_fields: &HashMap<String, String>,
+    tenant_id: &Option<String>,
+) -> Result<Option<crate::event::Event>, PostError> {
+    let mut rows = Vec::new();
+    let mut origin_size = 0;
+    for_each_stats_row(stats, max_row_bytes, |row, size| {
+        rows.push(row);
+        origin_size += size;
         Ok(())
     })?;
-    Ok(stats_calculated)
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    // into_event's generic partition extraction accepts only individual objects.
+    // Every row was validated above and has stats.dataset_name as its partition.
+    let mut event = json::Event {
+        json: serde_json::Value::Array(rows),
+        p_timestamp: parquet_ts,
+    }
+    .into_event(
+        DATASET_STATS_STREAM_NAME.to_string(),
+        origin_size,
+        schema,
+        false,
+        None,
+        None,
+        SchemaVersion::V1,
+        StreamType::Internal,
+        custom_fields,
+        TelemetryType::Logs,
+        tenant_id,
+        false,
+    )?;
+    event.custom_partition_values.insert(
+        DATASET_STATS_CUSTOM_PARTITION.to_string(),
+        stats.dataset_name.clone(),
+    );
+    Ok(Some(event))
 }
 
 /// Hands the rows of the stats dataset for `stats` (see `DatasetStats::rows`) to `process`
@@ -371,11 +406,31 @@ async fn collect_all_field_stats_from_parquet(
     .map_err(|e| PostError::Invalid(anyhow::anyhow!("Field stats task failed: {}", e)))?
 }
 
+// 32K amortizes scheduling without retaining the whole file. At 120 fixed-width
+// columns this is ~30 MiB of decoded values; counting/cache state stays bounded.
+const FIELD_STATS_BATCH_ROWS: usize = 32 * 1024;
+
 fn collect_all_field_stats_from_parquet_blocking(
     stream_name: &str,
     parquet_path: &Path,
     schema: &Schema,
     max_field_statistics: usize,
+) -> Result<Vec<FieldStat>, PostError> {
+    collect_field_stats_with_batch_size(
+        stream_name,
+        parquet_path,
+        schema,
+        max_field_statistics,
+        FIELD_STATS_BATCH_ROWS,
+    )
+}
+
+fn collect_field_stats_with_batch_size(
+    stream_name: &str,
+    parquet_path: &Path,
+    schema: &Schema,
+    max_field_statistics: usize,
+    batch_rows: usize,
 ) -> Result<Vec<FieldStat>, PostError> {
     let file = File::open(parquet_path).map_err(|e| {
         PostError::Invalid(anyhow::anyhow!(
@@ -385,6 +440,7 @@ fn collect_all_field_stats_from_parquet_blocking(
     })?;
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| PostError::Invalid(anyhow::anyhow!(e)))?
+        .with_batch_size(batch_rows)
         .build()
         .map_err(|e| PostError::Invalid(anyhow::anyhow!(e)))?;
     let field_names: Vec<String> = schema
@@ -392,16 +448,12 @@ fn collect_all_field_stats_from_parquet_blocking(
         .iter()
         .map(|field| field.name().clone())
         .collect();
-    let mut field_counts: HashMap<String, FieldCountState> = field_names
+    let mut field_counts: Vec<_> = field_names
         .iter()
-        .map(|field_name| {
+        .map(|name| {
             (
-                field_name.clone(),
-                FieldCountState::new(
-                    stream_name.to_string(),
-                    field_name.clone(),
-                    max_field_statistics,
-                ),
+                name.clone(),
+                FieldCountState::new(stream_name.to_string(), name.clone(), max_field_statistics),
             )
         })
         .collect();
@@ -419,26 +471,34 @@ fn collect_all_field_stats_from_parquet_blocking(
             }
         };
 
-        let batch_field_counts = collect_batch_field_counts_parallel(
-            stream_name,
-            &batch,
-            &field_names,
-            max_field_statistics,
-        );
-
-        for (field_name, batch_field_count) in batch_field_counts {
-            merge_field_counts(&mut field_counts, &field_name, batch_field_count);
-        }
+        FIELD_STATS_RAYON_POOL.install(|| {
+            field_counts.par_iter_mut().for_each(|(name, total)| {
+                if let Some(array) = batch.column_by_name(name) {
+                    // Retain the old candidate-merge boundaries. Larger candidate states
+                    // lose repeated tail values before they can be merged into the total.
+                    // Decode and schedule in large batches, but merge in the same order as
+                    // the former 1024-row Parquet reader, including across row groups.
+                    for offset in (0..array.len()).step_by(1024) {
+                        let chunk = array.slice(offset, (array.len() - offset).min(1024));
+                        let state = collect_array_field_counts(
+                            stream_name,
+                            chunk.as_ref(),
+                            name,
+                            max_field_statistics,
+                        );
+                        total.merge_state(state);
+                    }
+                }
+            });
+        });
     }
 
-    Ok(field_names
+    Ok(field_counts
         .into_iter()
-        .filter_map(|field_name| {
-            let state = field_counts.remove(&field_name)?;
+        .filter_map(|(field_name, state)| {
             if state.total_count == 0 {
                 return None;
             }
-
             Some(FieldStat {
                 field_name,
                 count: state.total_count,
@@ -449,22 +509,7 @@ fn collect_all_field_stats_from_parquet_blocking(
         .collect())
 }
 
-fn collect_batch_field_counts_parallel(
-    stream_name: &str,
-    batch: &arrow_array::RecordBatch,
-    field_names: &[String],
-    max_field_statistics: usize,
-) -> Vec<(String, FieldCountState)> {
-    FIELD_STATS_RAYON_POOL.install(|| {
-        field_names
-            .par_iter()
-            .filter_map(|field_name| {
-                collect_field_counts(stream_name, batch, field_name, max_field_statistics)
-            })
-            .collect()
-    })
-}
-
+#[cfg(test)]
 fn collect_field_counts(
     stream_name: &str,
     batch: &arrow_array::RecordBatch,
@@ -472,11 +517,87 @@ fn collect_field_counts(
     max_field_statistics: usize,
 ) -> Option<(String, FieldCountState)> {
     let array = batch.column_by_name(field_name)?;
+    Some((
+        field_name.to_string(),
+        collect_array_field_counts(
+            stream_name,
+            array.as_ref(),
+            field_name,
+            max_field_statistics,
+        ),
+    ))
+}
+
+fn collect_array_field_counts(
+    stream_name: &str,
+    array: &dyn Array,
+    field_name: &str,
+    max_field_statistics: usize,
+) -> FieldCountState {
     let mut field_count = FieldCountState::new_for_batch(
         stream_name.to_string(),
         field_name.to_string(),
         max_field_statistics,
     );
+
+    // Count by native bits, never float equality (NaNs and signed zero matter).
+    // Hash the same formatted bytes as before, preserving every HLL register.
+    // Native counting is bounded to one logical chunk, including for wide files.
+    macro_rules! native_counts {
+        ($ty:ty, $key:expr) => {
+            if let Some(arr) = array.as_any().downcast_ref::<$ty>() {
+                if arr.len() <= MIN_TRACKED_DISTINCT_VALUES_PER_FIELD {
+                    // A logical batch fits entirely below the cap. Count native values,
+                    // then format/hash each distinct value once, in first-seen order so
+                    // the resulting string map has the legacy insertion/merge order.
+                    let mut positions: FxHashMap<Option<u64>, usize> = FxHashMap::default();
+                    let mut values: Vec<(usize, i64)> = Vec::new();
+                    let mut aggregate = true;
+                    for i in 0..arr.len() {
+                        // Unique numeric columns cannot amortize formatting. Probe only
+                        // a short prefix, then use the original single-map path.
+                        if i == 32 && values.len() >= 30 {
+                            aggregate = false;
+                            break;
+                        }
+                        let key = (!arr.is_null(i)).then(|| ($key)(arr.value(i)));
+                        if let Some(&position) = positions.get(&key) {
+                            values[position].1 += 1;
+                        } else {
+                            positions.insert(key, values.len());
+                            values.push((i, 1));
+                        }
+                    }
+                    if aggregate {
+                        for (i, count) in values {
+                            let text = format_arrow_value(array, i);
+                            field_count.hll.add(&text);
+                            field_count.total_count += count;
+                            field_count.track_value(Cow::Owned(text), count);
+                        }
+                        return field_count;
+                    }
+                }
+                for i in 0..arr.len() {
+                    field_count.record_value(Cow::Owned(format_arrow_value(array, i)));
+                }
+                return field_count;
+            }
+        };
+    }
+    native_counts!(TimestampMillisecondArray, |v: i64| v as u64);
+    native_counts!(Int64Array, |v: i64| v as u64);
+    native_counts!(arrow_array::Int32Array, |v: i32| v as u64);
+    native_counts!(arrow_array::Int16Array, |v: i16| v as u64);
+    native_counts!(arrow_array::Int8Array, |v: i8| v as u64);
+    native_counts!(arrow_array::UInt64Array, |v: u64| v);
+    native_counts!(arrow_array::UInt32Array, |v: u32| v as u64);
+    native_counts!(arrow_array::UInt16Array, |v: u16| v as u64);
+    native_counts!(arrow_array::UInt8Array, |v: u8| v as u64);
+    native_counts!(Float64Array, |v: f64| v.to_bits());
+    native_counts!(arrow_array::Float32Array, |v: f32| v.to_bits() as u64);
+    native_counts!(Date32Array, |v: i32| v as u64);
+    native_counts!(BooleanArray, |v: bool| v as u64);
 
     // Fast paths for the string-like types that dominate log payloads. These read the value as a
     // borrowed `&str` straight out of the Arrow buffer, so a `String` is only allocated when the
@@ -491,7 +612,7 @@ fn collect_field_counts(
                         field_count.record_value(Cow::Borrowed(arr.value(row_index)));
                     }
                 }
-                return Some((field_name.to_string(), field_count));
+                return field_count;
             }
         }
         DataType::Utf8View => {
@@ -503,20 +624,21 @@ fn collect_field_counts(
                         field_count.record_value(Cow::Borrowed(arr.value(row_index)));
                     }
                 }
-                return Some((field_name.to_string(), field_count));
+                return field_count;
             }
         }
         _ => {}
     }
 
     for row_index in 0..array.len() {
-        let value = format_arrow_value(array.as_ref(), row_index);
+        let value = format_arrow_value(array, row_index);
         field_count.record_value(Cow::Owned(value));
     }
 
-    Some((field_name.to_string(), field_count))
+    field_count
 }
 
+#[cfg(test)]
 fn merge_field_counts(
     field_counts: &mut HashMap<String, FieldCountState>,
     field_name: &str,
@@ -702,7 +824,10 @@ impl HyperLogLog {
     }
 
     fn add(&mut self, value: &str) {
-        let hash = hash_field_value(value);
+        self.add_hash(hash_field_value(value));
+    }
+
+    fn add_hash(&mut self, hash: u64) {
         let register_index = (hash >> (u64::BITS - HLL_PRECISION_BITS)) as usize;
         let rank = ((hash << HLL_PRECISION_BITS).leading_zeros() + 1)
             .min(u64::BITS - HLL_PRECISION_BITS + 1) as u8;
@@ -1233,6 +1358,300 @@ mod tests {
     use crate::utils::json::apply_generic_flattening_for_partition;
     use crate::utils::json::flatten::{FlattenBudget, FlattenLimits, GENEROUS_LIMITS, legacy};
 
+    #[test]
+    fn differential_all_types_and_batches() {
+        use super::*;
+        use arrow_array::*;
+        let n = FIELD_STATS_BATCH_ROWS * 2 + 137;
+        let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+        macro_rules! primitive {
+            ($ty:ty, $value:expr) => {
+                columns.push(Arc::new(<$ty>::from_iter(
+                    (0..n).map(|i| if i % 31 == 0 { None } else { Some(($value)(i)) }),
+                )));
+            };
+        }
+        primitive!(Int8Array, |i| (i % 17) as i8 - 8);
+        primitive!(Int16Array, |i| (i % 17) as i16 - 8);
+        primitive!(Int32Array, |i| (i % 17) as i32 - 8);
+        primitive!(Int64Array, |i| (i % 17) as i64 - 8);
+        primitive!(UInt8Array, |i| (i % 17) as u8);
+        primitive!(UInt16Array, |i| (i % 17) as u16);
+        primitive!(UInt32Array, |i| (i % 17) as u32);
+        primitive!(UInt64Array, |i| (i % 17) as u64);
+        primitive!(Float64Array, |i| [
+            0.,
+            -0.,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.234
+        ][i % 6]);
+        primitive!(Float32Array, |i| [
+            0.,
+            -0.,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.234
+        ][i % 6]);
+        primitive!(TimestampMillisecondArray, |i| [
+            i64::MIN,
+            -1,
+            0,
+            1730000000123,
+            i64::MAX
+        ][i % 5]);
+        primitive!(Date32Array, |i| (i % 17) as i32 - 8);
+        primitive!(BooleanArray, |i| i % 2 == 0);
+        let strings: Vec<_> = (0..n)
+            .map(|i| [Some("NULL"), None, Some(""), Some("é\n")][i % 4])
+            .collect();
+        columns.push(Arc::new(StringArray::from(strings.clone())));
+        columns.push(Arc::new(StringViewArray::from(strings)));
+        let bytes: Vec<_> = (0..n)
+            .map(|i| {
+                [
+                    Some(&b"abc"[..]),
+                    None,
+                    Some(&b"\xff"[..]),
+                    Some(&b"\xfe"[..]),
+                ][i % 4]
+            })
+            .collect();
+        columns.push(Arc::new(BinaryArray::from(bytes.clone())));
+        columns.push(Arc::new(BinaryViewArray::from(bytes)));
+        columns.push(Arc::new(NullArray::new(n)));
+        columns.push(Arc::new(ListArray::from_iter_primitive::<
+            arrow_array::types::Int64Type,
+            _,
+            _,
+        >((0..n).map(|i| {
+            if i % 3 == 0 {
+                None
+            } else {
+                Some(vec![Some((i % 7) as i64), None])
+            }
+        }))));
+        // Above the cap: repeated high-cardinality app-like fields with known truth.
+        primitive!(Int64Array, |i| (i % 3000) as i64);
+        primitive!(Float64Array, |i| (i % 3000) as f64 / 7.);
+        columns.push(Arc::new(StringArray::from_iter_values(
+            (0..n).map(|i| format!("trace-{:08}", i % 3000)),
+        )));
+        let fields: Vec<_> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, a)| Field::new(format!("f{i}"), a.data_type().clone(), true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        // Memoization alone must preserve counts, candidate eviction and every HLL register.
+        for field in schema.fields() {
+            let (_, old) = legacy_collect_field_counts("test", &batch, field.name(), 50).unwrap();
+            let (_, new) = collect_field_counts("test", &batch, field.name(), 50).unwrap();
+            assert_eq!(old.counts, new.counts);
+            assert_eq!(old.hll.registers, new.hll.registers);
+        }
+        for offset in (0..n).step_by(1024) {
+            let chunk = batch.slice(offset, (n - offset).min(1024));
+            for field in schema.fields() {
+                let (_, old) =
+                    legacy_collect_field_counts("test", &chunk, field.name(), 50).unwrap();
+                let (_, new) = collect_field_counts("test", &chunk, field.name(), 50).unwrap();
+                assert_eq!(old.counts, new.counts);
+                assert_eq!(old.hll.registers, new.hll.registers);
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("types.parquet");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(19000))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            schema.clone(),
+            Some(props),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let old = legacy_collect_all_field_stats_from_parquet_blocking("test", &path, &schema, 50)
+            .unwrap();
+        let new =
+            collect_all_field_stats_from_parquet_blocking("test", &path, &schema, 50).unwrap();
+        for (index, (a, b)) in old.iter().zip(&new).enumerate() {
+            assert_eq!(a.count, b.count);
+            assert_eq!(a.distinct_count, b.distinct_count, "HLL {index}");
+            assert_eq!(
+                serde_json::to_value(a).unwrap(),
+                serde_json::to_value(b).unwrap(),
+                "field {index}"
+            );
+            if index >= 19 {
+                let mut errors = Vec::new();
+                for stats in [a, b] {
+                    let mut error = 0;
+                    for value in &stats.distinct_stats {
+                        let truth = (0..n)
+                            .filter(|&i| {
+                                format_arrow_value(batch.column(index).as_ref(), i)
+                                    == value.distinct_value
+                            })
+                            .count() as i64;
+                        assert!(value.count <= truth);
+                        error += truth - value.count;
+                    }
+                    errors.push(error);
+                }
+                // Keeping the original merge boundaries preserves the same approximation.
+                assert_eq!(errors[0], errors[1]);
+                println!(
+                    "APPROX field={index} old/new retained undercount={errors:?}, distinct={}",
+                    b.distinct_count
+                );
+            }
+        }
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            legacy_collect_all_field_stats_from_parquet_blocking("t", &missing, &schema, 50)
+                .unwrap_err()
+                .to_string(),
+            collect_all_field_stats_from_parquet_blocking("t", &missing, &schema, 50)
+                .unwrap_err()
+                .to_string()
+        );
+    }
+
+    /// Strict differential harness for the very Parquet files used by the server benchmark.
+    #[test]
+    #[ignore]
+    fn differential_benchmark_parquet() {
+        use super::*;
+        let path = std::env::var("FIELD_STATS_PARQUET").expect("FIELD_STATS_PARQUET path");
+        let path = Path::new(&path);
+        let schema = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .schema()
+            .clone();
+        let old =
+            legacy_collect_all_field_stats_from_parquet_blocking("benchlogs", path, &schema, 50)
+                .unwrap();
+        let new =
+            collect_all_field_stats_from_parquet_blocking("benchlogs", path, &schema, 50).unwrap();
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::to_value(&new).unwrap()
+        );
+        // Ground truth for the reported top values, computed without cardinality caps.
+        let mut truth: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .with_batch_size(32768)
+            .build()
+            .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
+                let counts = truth.entry(field.name().clone()).or_default();
+                for i in 0..array.len() {
+                    *counts
+                        .entry(format_arrow_value(array.as_ref(), i))
+                        .or_default() += 1;
+                }
+            }
+        }
+        for field in &new {
+            let counts = &truth[&field.field_name];
+            let error: i64 = field
+                .distinct_stats
+                .iter()
+                .map(|v| counts[&v.distinct_value] - v.count)
+                .sum();
+            assert!(
+                field
+                    .distinct_stats
+                    .iter()
+                    .all(|v| counts[&v.distinct_value] >= v.count)
+            );
+            println!(
+                "GROUND_TRUTH field={} distinct_estimate={} truth={} reported_count_underestimate={error}",
+                field.field_name,
+                field.distinct_count,
+                counts.len()
+            );
+        }
+    }
+
+    #[test]
+    fn batched_event_matches_per_row_events() {
+        use super::*;
+        let ts = DateTime::from_timestamp_millis(1730000000000).unwrap();
+        for stats in [uniform_stats(&[4, 2, 3]), uniform_stats(&[0, 2, 0])] {
+            let custom = HashMap::from([(USER_AGENT_KEY.to_string(), "parseable".to_string())]);
+            let event = stats_event(&stats, usize::MAX, ts, &HashMap::new(), &custom, &None)
+                .unwrap()
+                .unwrap();
+            assert!(event.is_first_event); // one process call => at most one schema write
+            let mut total = 0;
+            for_each_stats_row(&stats, usize::MAX, |row, size| {
+                let old = json::Event {
+                    json: row,
+                    p_timestamp: ts,
+                }
+                .into_event(
+                    DATASET_STATS_STREAM_NAME.to_string(),
+                    size,
+                    &HashMap::new(),
+                    false,
+                    Some(&DATASET_STATS_CUSTOM_PARTITION.to_string()),
+                    None,
+                    SchemaVersion::V1,
+                    StreamType::Internal,
+                    &custom,
+                    TelemetryType::Logs,
+                    &None,
+                    false,
+                )?;
+                // Union schema: absent null-only columns are equivalent to nulls in the batch.
+                for (i, field) in old.rb.schema().fields().iter().enumerate() {
+                    let new = event
+                        .rb
+                        .column_by_name(field.name())
+                        .unwrap()
+                        .slice(total, 1);
+                    if old.rb.column(i).data_type() == &DataType::Null {
+                        assert!(new.is_null(0));
+                    } else {
+                        assert_eq!(old.rb.column(i).to_data(), new.to_data());
+                    }
+                }
+                assert_eq!(old.custom_partition_values, event.custom_partition_values);
+                assert_eq!(old.parsed_timestamp, event.parsed_timestamp);
+                total += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(total, event.rb.num_rows());
+            let schema = event
+                .rb
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), f.clone()))
+                .collect();
+            let known = stats_event(&stats, usize::MAX, ts, &schema, &custom, &None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(known.rb, event.rb);
+            assert!(
+                stats_event(&stats, 1, ts, &schema, &custom, &None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     async fn create_test_parquet_with_data() -> (TempDir, std::path::PathBuf) {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_data.parquet");
@@ -1594,22 +2013,30 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        // warmup
-        let _ = collect_all_field_stats_from_parquet_blocking("bench", &path, &schema, 50).unwrap();
-
-        let started = Instant::now();
-        let runs = 3;
-        for _ in 0..runs {
-            let stats =
-                collect_all_field_stats_from_parquet_blocking("bench", &path, &schema, 50).unwrap();
-            assert_eq!(stats.len(), HIGH_CARD_FIELDS + LOW_CARD_FIELDS);
+        for rows in [1024, 8192, 32768, 65536] {
+            let started = Instant::now();
+            for _ in 0..3 {
+                let stats =
+                    super::collect_field_stats_with_batch_size("bench", &path, &schema, 50, rows)
+                        .unwrap();
+                assert_eq!(stats.len(), HIGH_CARD_FIELDS + LOW_CARD_FIELDS);
+            }
+            println!(
+                "BATCH_BENCH rows={ROWS} fields={} batch={rows} mean_ms={:.3}",
+                HIGH_CARD_FIELDS + LOW_CARD_FIELDS,
+                started.elapsed().as_secs_f64() * 1000. / 3.
+            );
         }
-        let per_run = started.elapsed() / runs;
+        let started = Instant::now();
+        for _ in 0..3 {
+            super::legacy_collect_all_field_stats_from_parquet_blocking(
+                "bench", &path, &schema, 50,
+            )
+            .unwrap();
+        }
         println!(
-            "BENCH rows={ROWS} fields={} per_run={:?} rows_per_sec={:.0}",
-            HIGH_CARD_FIELDS + LOW_CARD_FIELDS,
-            per_run,
-            ROWS as f64 / per_run.as_secs_f64()
+            "BATCH_BENCH legacy_mean_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000. / 3.
         );
     }
 
@@ -1918,4 +2345,153 @@ mod forwarding_header_tests {
         let status = actix_web::ResponseError::status_code(&QueryError::from(err));
         assert_eq!(status, actix_web::http::StatusCode::BAD_REQUEST);
     }
+}
+
+#[cfg(test)]
+fn legacy_collect_all_field_stats_from_parquet_blocking(
+    stream_name: &str,
+    parquet_path: &Path,
+    schema: &Schema,
+    max_field_statistics: usize,
+) -> Result<Vec<FieldStat>, PostError> {
+    let file = File::open(parquet_path).map_err(|e| {
+        PostError::Invalid(anyhow::anyhow!(
+            "Failed to open parquet file for field stats: {}",
+            e
+        ))
+    })?;
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| PostError::Invalid(anyhow::anyhow!(e)))?
+        .build()
+        .map_err(|e| PostError::Invalid(anyhow::anyhow!(e)))?;
+    let field_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    let mut field_counts: HashMap<String, FieldCountState> = field_names
+        .iter()
+        .map(|field_name| {
+            (
+                field_name.clone(),
+                FieldCountState::new(
+                    stream_name.to_string(),
+                    field_name.clone(),
+                    max_field_statistics,
+                ),
+            )
+        })
+        .collect();
+
+    for batch in &mut reader {
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(e) => {
+                warn!(
+                    "Skipping undecodable parquet batch while calculating field stats for {}: {}",
+                    parquet_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        let batch_field_counts = legacy_collect_batch_field_counts_parallel(
+            stream_name,
+            &batch,
+            &field_names,
+            max_field_statistics,
+        );
+
+        for (field_name, batch_field_count) in batch_field_counts {
+            merge_field_counts(&mut field_counts, &field_name, batch_field_count);
+        }
+    }
+
+    Ok(field_names
+        .into_iter()
+        .filter_map(|field_name| {
+            let state = field_counts.remove(&field_name)?;
+            if state.total_count == 0 {
+                return None;
+            }
+
+            Some(FieldStat {
+                field_name,
+                count: state.total_count,
+                distinct_count: state.distinct_count(),
+                distinct_stats: state.into_distinct_stats(max_field_statistics),
+            })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+fn legacy_collect_batch_field_counts_parallel(
+    stream_name: &str,
+    batch: &arrow_array::RecordBatch,
+    field_names: &[String],
+    max_field_statistics: usize,
+) -> Vec<(String, FieldCountState)> {
+    FIELD_STATS_RAYON_POOL.install(|| {
+        field_names
+            .par_iter()
+            .filter_map(|field_name| {
+                legacy_collect_field_counts(stream_name, batch, field_name, max_field_statistics)
+            })
+            .collect()
+    })
+}
+
+#[cfg(test)]
+fn legacy_collect_field_counts(
+    stream_name: &str,
+    batch: &arrow_array::RecordBatch,
+    field_name: &str,
+    max_field_statistics: usize,
+) -> Option<(String, FieldCountState)> {
+    let array = batch.column_by_name(field_name)?;
+    let mut field_count = FieldCountState::new_for_batch(
+        stream_name.to_string(),
+        field_name.to_string(),
+        max_field_statistics,
+    );
+
+    // Fast paths for the string-like types that dominate log payloads. These read the value as a
+    // borrowed `&str` straight out of the Arrow buffer, so a `String` is only allocated when the
+    // value is actually inserted into the tracked-values map.
+    match array.data_type() {
+        DataType::Utf8 => {
+            if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                for row_index in 0..arr.len() {
+                    if arr.is_null(row_index) {
+                        field_count.record_value(Cow::Borrowed(NULL_VALUE));
+                    } else {
+                        field_count.record_value(Cow::Borrowed(arr.value(row_index)));
+                    }
+                }
+                return Some((field_name.to_string(), field_count));
+            }
+        }
+        DataType::Utf8View => {
+            if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
+                for row_index in 0..arr.len() {
+                    if arr.is_null(row_index) {
+                        field_count.record_value(Cow::Borrowed(NULL_VALUE));
+                    } else {
+                        field_count.record_value(Cow::Borrowed(arr.value(row_index)));
+                    }
+                }
+                return Some((field_name.to_string(), field_count));
+            }
+        }
+        _ => {}
+    }
+
+    for row_index in 0..array.len() {
+        let value = format_arrow_value(array.as_ref(), row_index);
+        field_count.record_value(Cow::Owned(value));
+    }
+
+    Some((field_name.to_string(), field_count))
 }
