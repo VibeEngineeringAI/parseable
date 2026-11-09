@@ -566,6 +566,26 @@ fn resolve_cluster_key_cases() {
             })
         );
     }
+    // Candidate order, rather than schema order, decides the selected key.
+    for (candidates, index) in [
+        ("number,severity_text", 4),
+        ("severity_text,number", 1),
+        ("missing,number", 4),
+        ("float,flag,missing,number", 4),
+    ] {
+        assert_eq!(
+            resolve_cluster_key(Some(candidates), true, &schema, None),
+            Ok(LogClusterKey {
+                cluster_idx: index,
+                time_idx: Some(0)
+            }),
+            "{candidates}"
+        );
+    }
+    assert_eq!(
+        resolve_cluster_key(Some("missing,float,absent"), true, &schema, None),
+        Err(LogClusterSkip::UnsupportedType(DataType::Float64))
+    );
     // A custom time partition supplies the secondary key...
     assert_eq!(
         resolve_cluster_key(Some(SEVERITY), true, &schema, Some("event_time")),
@@ -640,6 +660,29 @@ fn file_bytes(files: &[PathBuf]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+#[test]
+fn candidate_fallback_matches_single_column_output() {
+    let schema = log_schema();
+    let batches = requests(&schema, 50)
+        .into_iter()
+        .map(|batch| ("logs", batch))
+        .collect_vec();
+    let metadata = LogStreamMetadata::default;
+    let (_, single_files, _a, _b) = write_pair(metadata, SEVERITY, &batches);
+    for candidates in [
+        "severity_text,missing",
+        "missing,severity_text",
+        "p_timestamp,missing,severity_text",
+    ] {
+        let (_, files, _c, _d) = write_pair(metadata, candidates, &batches);
+        assert_eq!(
+            file_bytes(&single_files),
+            file_bytes(&files),
+            "{candidates}"
+        );
+    }
+}
+
 /// With the column configured, non-applicable streams and unusable columns
 /// write byte-identical files to the default writer.
 #[test]
@@ -691,6 +734,16 @@ fn skipped_outputs_are_byte_identical_to_default() {
             "missing column",
             Box::new(LogStreamMetadata::default),
             "level",
+        ),
+        (
+            "all candidates missing",
+            Box::new(LogStreamMetadata::default),
+            "level,severity",
+        ),
+        (
+            "unsupported then missing",
+            Box::new(LogStreamMetadata::default),
+            "p_timestamp,level",
         ),
         (
             "unsupported timestamp column",
@@ -967,7 +1020,19 @@ fn cluster_column_option_parses_and_defaults_off() {
     use crate::option::validation::cluster_column;
     assert_eq!(cluster_column(" severity_text ").unwrap(), SEVERITY);
     assert!(cluster_column("  ").is_err());
-    assert!(cluster_column("a,b").is_err());
+    assert_eq!(
+        cluster_column(" severity_text , level , severity ").unwrap(),
+        "severity_text,level,severity"
+    );
+    for invalid in ["", ",a", "a,", "a,,b", "a,  ,b", "a,a", "a, a"] {
+        assert!(cluster_column(invalid).is_err(), "{invalid:?}");
+    }
+    let limit = (0..16)
+        .map(|i| format!("col{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(cluster_column(&limit).unwrap(), limit);
+    assert!(cluster_column(&format!("{limit},extra")).is_err());
 
     let parsed = Options::try_parse_from(["parseable"]).unwrap();
     assert_eq!(parsed.log_severity_cluster_column, None);
@@ -980,6 +1045,20 @@ fn cluster_column_option_parses_and_defaults_off() {
     assert_eq!(
         parsed.log_severity_cluster_column.as_deref(),
         Some("severity_number")
+    );
+    let parsed = Options::try_parse_from([
+        "parseable",
+        "--log-severity-cluster-column",
+        "severity_text, level",
+    ])
+    .unwrap();
+    assert_eq!(
+        parsed.log_severity_cluster_column.as_deref(),
+        Some("severity_text,level")
+    );
+    assert!(
+        Options::try_parse_from(["parseable", "--log-severity-cluster-column", "level,level"])
+            .is_err()
     );
 }
 

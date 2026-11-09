@@ -512,7 +512,7 @@ pub struct Options {
         long,
         env = "P_LOG_SEVERITY_CLUSTER_COLUMN",
         value_parser = validation::cluster_column,
-        help = "Top-level log column (for example severity_text) used to cluster rows inside each Parquet row group; unset disables clustering"
+        help = "Ordered comma-separated top-level log columns (maximum 16); first present supported column clusters each Parquet row group; unset disables clustering"
     )]
     pub log_severity_cluster_column: Option<String>,
 

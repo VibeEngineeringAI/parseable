@@ -114,7 +114,8 @@ fn is_supported_cluster_type(data_type: &DataType) -> bool {
     }
 }
 
-/// Resolves the clustering key for one output file's merged schema.
+/// Selects the first present, supported candidate in one output's merged schema.
+/// Startup validation supplies a normalized comma-separated list.
 pub(super) fn resolve_cluster_key(
     configured_column: Option<&str>,
     applicable: bool,
@@ -127,13 +128,26 @@ pub(super) fn resolve_cluster_key(
     if !applicable {
         return Err(LogClusterSkip::NotApplicable);
     }
-    let Ok(cluster_idx) = merged_schema.index_of(column) else {
-        return Err(LogClusterSkip::MissingColumn);
-    };
-    let data_type = merged_schema.field(cluster_idx).data_type();
-    if !is_supported_cluster_type(data_type) {
-        return Err(LogClusterSkip::UnsupportedType(data_type.clone()));
+    let mut skipped = LogClusterSkip::MissingColumn;
+    let mut selected = None;
+    for candidate in column.split(',') {
+        let Ok(index) = merged_schema.index_of(candidate) else {
+            continue;
+        };
+        let data_type = merged_schema.field(index).data_type();
+        if !is_supported_cluster_type(data_type) {
+            tracing::warn!(
+                column = candidate,
+                %data_type,
+                "Log severity clustering candidate skipped: unsupported column type"
+            );
+            skipped = LogClusterSkip::UnsupportedType(data_type.clone());
+            continue;
+        }
+        selected = Some(index);
+        break;
     }
+    let cluster_idx = selected.ok_or(skipped)?;
     let time_field = time_partition.unwrap_or(DEFAULT_TIMESTAMP_KEY);
     let time_idx = merged_schema
         .index_of(time_field)

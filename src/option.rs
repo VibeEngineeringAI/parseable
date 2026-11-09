@@ -165,17 +165,26 @@ pub mod validation {
     }
 
     pub fn cluster_column(s: &str) -> Result<String, String> {
-        let column = s.trim();
-        if column.is_empty() {
-            return Err(
-                "P_LOG_SEVERITY_CLUSTER_COLUMN must name a column; unset it to disable clustering"
-                    .to_string(),
-            );
+        // Bound startup configuration and per-output schema lookups.
+        const MAX_CANDIDATES: usize = 16;
+        let mut columns = Vec::new();
+        for column in s.split(',').map(str::trim) {
+            if column.is_empty() {
+                return Err("P_LOG_SEVERITY_CLUSTER_COLUMN cannot contain empty entries; unset it to disable clustering".to_string());
+            }
+            if columns.contains(&column) {
+                return Err(format!(
+                    "P_LOG_SEVERITY_CLUSTER_COLUMN contains duplicate column: {column}"
+                ));
+            }
+            if columns.len() == MAX_CANDIDATES {
+                return Err(format!(
+                    "P_LOG_SEVERITY_CLUSTER_COLUMN accepts at most {MAX_CANDIDATES} candidates"
+                ));
+            }
+            columns.push(column);
         }
-        if column.contains(',') {
-            return Err("P_LOG_SEVERITY_CLUSTER_COLUMN accepts exactly one column".to_string());
-        }
-        Ok(column.to_string())
+        Ok(columns.join(","))
     }
 
     pub fn compression(s: &str) -> Result<Compression, String> {

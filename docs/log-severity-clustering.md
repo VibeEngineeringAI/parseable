@@ -9,10 +9,17 @@ qualification is required before rollout.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `P_LOG_SEVERITY_CLUSTER_COLUMN` / `--log-severity-cluster-column` | unset (disabled) | Name of one top-level column to cluster by, for example `severity_text` (OTel logs) or `level` for JSON logs. |
+| `P_LOG_SEVERITY_CLUSTER_COLUMN` / `--log-severity-cluster-column` | unset (disabled) | Ordered comma-separated top-level candidate columns, for example `severity_text,level,log.level,severity`. The first present column with a supported type wins for each conversion output. |
 
 When unset, the writer is unchanged: the same code path, row order and footer
-metadata as before. Blank values and comma lists are rejected at startup.
+metadata as before. A single name retains its existing behavior. Whitespace around
+entries is trimmed; empty entries, duplicate names (case-sensitive), and lists
+longer than 16 entries are rejected at startup. Dots are literal parts of a
+top-level column name, not nested-field traversal. Missing candidates are skipped
+silently. Present candidates with unsupported types emit a warning with the
+stream, candidate and type, then resolution tries the next candidate. Selection
+uses each output's merged schema, so different streams or outputs can select
+different columns; this is fallback selection, not a multi-column sort.
 
 ## What changes when enabled
 
@@ -48,9 +55,10 @@ holds:
 - The stream is not a user-defined `logs` stream: internal streams, metrics,
   traces and events are never clustered. Neither is a stream whose log
   sources include OTel metrics, OTel traces or `pmeta`.
-- The column is missing from every source of that file.
-- The column is not a string (`Utf8`, `LargeUtf8`, `Utf8View`, or a dictionary
-  of those) or integer type. A warning names the stream and type.
+- No candidate is present with a supported type in the merged output schema.
+  Supported columns are strings (`Utf8`, `LargeUtf8`, `Utf8View`, or a dictionary
+  of those) or integer types. If no candidate qualifies, the output remains byte-identical
+  to the default writer.
 
 A source that predates the column is read with NULLs, which cluster last. The
 time key is omitted when the time column is missing or not a timestamp.

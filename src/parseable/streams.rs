@@ -101,7 +101,7 @@ use super::{
 mod conversion_journal;
 use conversion_journal::{ConversionJournal, has_journal, has_journal_for_part};
 mod log_clustering;
-use log_clustering::{LogClusterKey, LogClusterSkip};
+use log_clustering::LogClusterKey;
 
 static HOSTNAME: OnceCell<String> = OnceCell::new();
 static METRIC_PARQUET_THREADPOOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
@@ -2059,6 +2059,8 @@ impl Stream {
                     .map(|entry| entry.log_source_format.clone()),
             )
         };
+        let _span =
+            tracing::warn_span!("log_cluster_key", stream_name = %self.stream_name).entered();
         match log_clustering::resolve_cluster_key(
             configured,
             applicable,
@@ -2066,15 +2068,6 @@ impl Stream {
             time_partition.map(String::as_str),
         ) {
             Ok(key) => Some(key),
-            Err(LogClusterSkip::UnsupportedType(data_type)) => {
-                warn!(
-                    stream_name = %self.stream_name,
-                    column = configured.unwrap_or_default(),
-                    %data_type,
-                    "Log severity clustering skipped: unsupported column type"
-                );
-                None
-            }
             Err(skip) => {
                 debug!(
                     stream_name = %self.stream_name,
