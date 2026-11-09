@@ -37,6 +37,9 @@ struct Case {
     crash_again: bool,
     mixed: bool,
     boundary: Boundary,
+    /// Convert with opt-in clustering on `id`, which reverses the reverse
+    /// reader's physical order, so every boundary also covers that writer.
+    clustered: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -100,6 +103,7 @@ fn fixture_named(dir: &TempDir, case: Case, name: &str) -> StreamRef {
         Arc::new(Options {
             local_staging_path: dir.path().to_path_buf(),
             row_group_size: 1048576,
+            log_severity_cluster_column: case.clustered.then(|| "id".to_owned()),
             ..Default::default()
         }),
         name,
@@ -214,11 +218,14 @@ fn listed_parquet(directory: &Path) -> Vec<PathBuf> {
 struct Snapshot {
     pairs: Vec<Pair>,
     parquet_sha256: BTreeMap<PathBuf, String>,
+    /// Physical `id` order of each file, in path order.
+    physical_ids: Vec<Vec<i32>>,
 }
 
 fn read_all(paths: &[PathBuf]) -> Snapshot {
     let mut pairs = Vec::new();
     let mut parquet_sha256 = BTreeMap::new();
+    let mut physical = BTreeMap::new();
     for path in paths {
         let file = File::open(path)
             .unwrap_or_else(|error| panic!("oracle: cannot open {path:?}: {error}"));
@@ -233,7 +240,12 @@ fn read_all(paths: &[PathBuf]) -> Snapshot {
             let batch =
                 batch.unwrap_or_else(|error| panic!("oracle: cannot decode {path:?}: {error}"));
             actual_rows += batch.num_rows();
-            pairs.extend(batch_pairs(&batch));
+            let batch_pairs = batch_pairs(&batch);
+            physical
+                .entry(path.clone())
+                .or_insert_with(Vec::new)
+                .extend(batch_pairs.iter().map(|(id, _)| *id));
+            pairs.extend(batch_pairs);
         }
         assert_eq!(
             actual_rows, expected_rows,
@@ -252,6 +264,7 @@ fn read_all(paths: &[PathBuf]) -> Snapshot {
     Snapshot {
         pairs,
         parquet_sha256,
+        physical_ids: physical.into_values().collect(),
     }
 }
 
@@ -464,7 +477,16 @@ fn observe(case: Case, control: bool) -> Snapshot {
 
 #[track_caller]
 fn exactly_once(case: Case) {
-    let actual = observe(case, false).pairs;
+    let snapshot = observe(case, false);
+    if case.clustered {
+        for ids in &snapshot.physical_ids {
+            assert!(
+                ids.windows(2).all(|pair| pair[0] < pair[1]),
+                "clustered output must be physically ordered by id: {ids:?} ({case:?})"
+            );
+        }
+    }
+    let actual = snapshot.pairs;
     if case.mixed {
         assert_eq!(
             actual,
@@ -481,6 +503,61 @@ fn exactly_once(case: Case) {
             .collect::<Vec<_>>();
         assert_eq!(actual_ids, IDS, "exactly-once IDs: {case:?}");
     }
+}
+
+#[test]
+fn clustered_conversion_is_exactly_once_at_every_boundary() {
+    for boundary in [
+        Boundary::PartSynced,
+        Boundary::JournalInstalled,
+        Boundary::AfterPublish,
+        Boundary::SourcesRetired,
+    ] {
+        for (mixed, crash_again, uploaded) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            // The fixture uploads the published output, which only exists
+            // from AfterPublish on.
+            if uploaded && matches!(boundary, Boundary::PartSynced | Boundary::JournalInstalled) {
+                continue;
+            }
+            exactly_once(Case {
+                clustered: true,
+                boundary,
+                mixed,
+                crash_again,
+                uploaded,
+                ..Case::default()
+            });
+        }
+    }
+    exactly_once(Case {
+        clustered: true,
+        removed_source: Some(0),
+        multiple_dirs: true,
+        ..Case::default()
+    });
+}
+
+#[test]
+fn clustered_cleanup_control_orders_physically() {
+    let snapshot = observe(
+        Case {
+            clustered: true,
+            ..Case::default()
+        },
+        true,
+    );
+    assert_eq!(snapshot.pairs, expected_pairs(false));
+    assert_eq!(snapshot.physical_ids, vec![IDS.to_vec()]);
+    // The default control writes the reverse reader's order, so clustering
+    // really changed the physical layout.
+    let control = observe(Case::default(), true);
+    assert_eq!(control.physical_ids.len(), 1);
+    assert_ne!(control.physical_ids, vec![IDS.to_vec()]);
 }
 
 #[test]

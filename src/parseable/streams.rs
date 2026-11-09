@@ -61,7 +61,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::task::JoinSet;
-use tracing::{error, info, info_span, instrument, trace, warn};
+use tracing::{debug, error, info, info_span, instrument, trace, warn};
 use ulid::Ulid;
 
 use crate::{
@@ -100,6 +100,8 @@ use super::{
 
 mod conversion_journal;
 use conversion_journal::{ConversionJournal, has_journal, has_journal_for_part};
+mod log_clustering;
+use log_clustering::LogClusterKey;
 
 static HOSTNAME: OnceCell<String> = OnceCell::new();
 static METRIC_PARQUET_THREADPOOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
@@ -1957,6 +1959,7 @@ impl Stream {
         merged_schema: &Schema,
         time_partition: Option<&String>,
         custom_partition: Option<&String>,
+        clustered: bool,
     ) -> WriterProperties {
         // Determine time partition field
         let time_partition_field = time_partition.map_or(DEFAULT_TIMESTAMP_KEY, |tp| tp.as_str());
@@ -2025,8 +2028,55 @@ impl Stream {
             }
         }
 
+        // A clustered log file is ordered by the cluster column inside each
+        // row group, not by time across the file. Declare no order at all
+        // rather than an unverified or file-level-misleading claim.
+        if clustered {
+            return props.set_sorting_columns(None).build();
+        }
+
         // Set sorting columns
         props.set_sorting_columns(Some(sorting_column_vec)).build()
+    }
+
+    /// Chooses the opt-in severity clustering key for one log conversion
+    /// output, or `None` to keep the existing writer behaviour.
+    fn log_cluster_key(
+        &self,
+        merged_schema: &Schema,
+        time_partition: Option<&String>,
+    ) -> Option<LogClusterKey> {
+        let configured = self.options.log_severity_cluster_column.as_deref();
+        configured?;
+        let applicable = {
+            let metadata = self.metadata.read().expect(LOCK_EXPECT);
+            log_clustering::stream_is_applicable(
+                metadata.stream_type,
+                metadata.telemetry_type,
+                metadata
+                    .log_source
+                    .iter()
+                    .map(|entry| entry.log_source_format.clone()),
+            )
+        };
+        let _span =
+            tracing::warn_span!("log_cluster_key", stream_name = %self.stream_name).entered();
+        match log_clustering::resolve_cluster_key(
+            configured,
+            applicable,
+            merged_schema,
+            time_partition.map(String::as_str),
+        ) {
+            Ok(key) => Some(key),
+            Err(skip) => {
+                debug!(
+                    stream_name = %self.stream_name,
+                    ?skip,
+                    "Log severity clustering not applied"
+                );
+                None
+            }
+        }
     }
 
     /// True if this stream's log_source carries the OTel-metrics
@@ -2695,7 +2745,17 @@ impl Stream {
         });
 
         let merged_schema = record_reader.merged_schema();
-        let props = self.parquet_writer_props(&merged_schema, time_partition, custom_partition);
+        let cluster_key = if self.is_otel_metrics() {
+            None
+        } else {
+            self.log_cluster_key(&merged_schema, time_partition)
+        };
+        let props = self.parquet_writer_props(
+            &merged_schema,
+            time_partition,
+            custom_partition,
+            cluster_key.is_some(),
+        );
         let schema = Arc::new(merged_schema.clone());
         let part_path = parquet_part_path(&parquet_path);
 
@@ -2705,6 +2765,7 @@ impl Stream {
             &schema,
             &props,
             time_partition,
+            cluster_key,
         );
         match write_result {
             Ok(true) => {
@@ -2787,6 +2848,7 @@ impl Stream {
         schema: &Arc<Schema>,
         props: &WriterProperties,
         time_partition: Option<&String>,
+        cluster_key: Option<LogClusterKey>,
     ) -> Result<bool, StagingError> {
         let _span = info_span!(
             "write_parquet_part_file",
@@ -2810,6 +2872,23 @@ impl Stream {
                 props,
                 time_partition,
             )?;
+        } else if let Some(key) = cluster_key {
+            let stats = log_clustering::write_clustered_log_parquet(
+                &mut part_file,
+                record_reader.merged_iter(schema.clone(), time_partition.cloned()),
+                schema,
+                props,
+                self.options.row_group_size,
+                key,
+            )?;
+            debug!(
+                stream_name = %self.stream_name,
+                parquet_path = %part_path.display(),
+                rows = stats.rows,
+                row_groups = stats.row_groups,
+                cluster_ms = stats.cluster_duration.as_secs_f64() * 1000.0,
+                "Clustered log Arrow-to-Parquet conversion"
+            );
         } else {
             let mut writer =
                 ArrowWriter::try_new(&mut part_file, schema.clone(), Some(props.clone()))?;
@@ -3955,6 +4034,9 @@ fn lexsort_to_indices_rows(
 mod crash_recovery_tests;
 
 #[cfg(test)]
+mod log_clustering_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{io::Write, sync::Barrier, thread::spawn, time::Duration};
 
@@ -4871,6 +4953,7 @@ mod tests {
                     record_reader,
                     &merged_schema,
                     &props,
+                    None,
                     None,
                 )
                 .unwrap()
