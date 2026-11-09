@@ -982,3 +982,158 @@ fn cluster_column_option_parses_and_defaults_off() {
         Some("severity_number")
     );
 }
+
+/// Independent reference order: a stable `std` sort with explicit
+/// `(severity ASC NULLS LAST, time DESC NULLS LAST)` comparisons.
+fn reference_order(batch: &RecordBatch, severity_idx: usize, time_idx: usize) -> Vec<u32> {
+    let severity = batch
+        .column(severity_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let time = batch
+        .column(time_idx)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+    let key = |row: usize| {
+        (
+            severity.is_null(row),
+            severity.is_valid(row).then(|| severity.value(row)),
+            time.is_null(row),
+            std::cmp::Reverse(time.is_valid(row).then(|| time.value(row))),
+        )
+    };
+    let mut order = (0..batch.num_rows()).collect_vec();
+    order.sort_by_key(|row| key(*row));
+    order.into_iter().map(|row| row as u32).collect()
+}
+
+fn reference_cluster(schema: &Arc<Schema>, slices: &[RecordBatch]) -> RecordBatch {
+    let combined = arrow::compute::concat_batches(schema, slices).unwrap();
+    let indices = arrow_array::UInt32Array::from(reference_order(&combined, 2, 0));
+    let columns = combined
+        .columns()
+        .iter()
+        .map(|column| arrow::compute::take(column.as_ref(), &indices, None).unwrap())
+        .collect_vec();
+    RecordBatch::try_new(schema.clone(), columns).unwrap()
+}
+
+#[test]
+fn interleaved_batches_match_reference_order() {
+    let schema = log_schema();
+    let key = LogClusterKey {
+        cluster_idx: 2,
+        time_idx: Some(0),
+    };
+    // Uneven slices, as the row-group buffer receives them from requests.
+    let slices = requests(&schema, 37);
+    let expected = reference_cluster(&schema, &slices);
+    for output_rows in [1, 3, 64, 999, 1000, 8192] {
+        let mut out = Vec::new();
+        log_clustering::cluster_row_group_into(slices.clone(), key, output_rows, |batch| {
+            out.push(batch);
+            Ok(())
+        })
+        .unwrap();
+        assert!(out.iter().all(|b| b.num_rows() <= output_rows));
+        assert_eq!(out.iter().map(RecordBatch::num_rows).sum::<usize>(), ROWS);
+        let actual = arrow::compute::concat_batches(&schema, &out).unwrap();
+        assert_eq!(actual, expected, "output_rows={output_rows}");
+    }
+
+    // Already ordered input is emitted as the original slices, uncopied.
+    let ordered = expected.clone();
+    let ordered_slices = vec![ordered.slice(0, 400), ordered.slice(400, 600)];
+    let mut out = Vec::new();
+    log_clustering::cluster_row_group_into(ordered_slices.clone(), key, 64, |batch| {
+        out.push(batch);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(out, ordered_slices);
+}
+
+/// Chunked output must be byte-identical to writing each reordered row group
+/// as one batch (the previous concat-and-take implementation).
+#[test]
+fn chunked_writer_matches_single_batch_write_bytes() {
+    const BIG_ROWS: usize = 20_000;
+    const TARGET: usize = 16_384;
+    let schema = log_schema();
+    let batches = (0..BIG_ROWS)
+        .collect_vec()
+        .chunks(613)
+        .map(|ids| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(TimestampMillisecondArray::from(
+                        ids.iter()
+                            .map(|id| {
+                                (id % 89 != 0).then_some(1_760_000_000_000 + (*id as i64 / 5))
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.iter().map(|id| *id as i64),
+                    )),
+                    Arc::new(StringArray::from(
+                        ids.iter().map(|id| severity(*id)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        ids.iter()
+                            .map(|id| (id % 13 != 0).then(|| format!("message {}", id % 401)))
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        })
+        .collect_vec();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(TARGET))
+        .build();
+    let key = LogClusterKey {
+        cluster_idx: 2,
+        time_idx: Some(0),
+    };
+    let dir = TempDir::new().unwrap();
+    let actual_path = dir.path().join("chunked.parquet");
+    let stats = log_clustering::write_clustered_log_parquet(
+        &mut File::create(&actual_path).unwrap(),
+        batches.clone().into_iter().map(Ok),
+        &schema,
+        &props,
+        TARGET,
+        key,
+    )
+    .unwrap();
+    assert_eq!((stats.rows, stats.row_groups), (BIG_ROWS, 2));
+
+    let combined = arrow::compute::concat_batches(&schema, &batches).unwrap();
+    let expected_path = dir.path().join("single.parquet");
+    let mut writer = ArrowWriter::try_new(
+        File::create(&expected_path).unwrap(),
+        schema.clone(),
+        Some(props.clone()),
+    )
+    .unwrap();
+    for (offset, len) in [(0, TARGET), (TARGET, BIG_ROWS - TARGET)] {
+        writer
+            .write(&reference_cluster(&schema, &[combined.slice(offset, len)]))
+            .unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+
+    assert_eq!(
+        std::fs::read(&actual_path).unwrap(),
+        std::fs::read(&expected_path).unwrap()
+    );
+    assert_eq!(
+        row_groups(&actual_path).iter().map(Vec::len).collect_vec(),
+        vec![TARGET, BIG_ROWS - TARGET]
+    );
+}

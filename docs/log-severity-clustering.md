@@ -33,9 +33,12 @@ keys. The final row group of a file may be partial and is clustered the same way
   manifest `sort_order_id` is empty. They contain no file-level timestamp order,
   and the query engine does not trust footer order claims for any file. Without
   clustering, the existing `p_timestamp DESC` claim is still written.
-- **Memory:** clustering holds up to one row group of decoded Arrow rows plus
-  a reordered copy per file being converted. The existing writer holds one
-  row group of encoded column data. At most two conversions run per stream.
+- **Memory:** clustering holds up to one row group of decoded Arrow rows per
+  file being converted, plus one reordered batch of 8,192 rows at a time.
+  Rows are gathered from the buffered input in order; neither a concatenated
+  copy of the row group nor a full reordered copy is built. The existing
+  writer holds one row group of encoded column data. At most two conversions
+  run per stream.
 
 ## When clustering is skipped
 
@@ -96,6 +99,36 @@ by fixed costs, so they show no reliable difference and are not reported as a
 gain. Narrow time windows without a severity predicate read more, because each
 row group's rows are no longer in time order across severities. This is a small
 synthetic matrix, not a capacity or remote-latency qualification.
+
+The table above measured the first implementation, which concatenated each
+row group and then built a full reordered copy. The writer now gathers rows
+from the buffered input in 8,192-row batches. A follow-up run (one boat.dev
+`large` VM, 2026-11-09, the same toolchain and lockfile for all binaries, server
+pinned to four CPUs, MinIO) ingested 1.5 million rows of a 101-column JSON log
+schema with default 262,144-row groups, three rotated blocks per arm:
+
+| Measure (median of three) | Baseline | First implementation | Current |
+| --- | ---: | ---: | ---: |
+| RSS rise during conversion above RSS at acknowledgement | 0 MiB | 810 MiB | 143 MiB |
+| Peak RSS after acknowledgement | 2,127 MiB | 2,919 MiB | 2,424 MiB |
+
+Process CPU varied by up to 40% between runs of the same binary in this matrix,
+so it did not resolve the CPU cost of either implementation. The same
+fixtures, read by the baseline binary with 25 ms of added storage round-trip
+latency (`tc netem`, 24-hour window), returned identical oracle-checked results:
+
+| Query | Concurrency | Unclustered QPS / p50 | Clustered QPS / p50 | Logical MiB per query |
+| --- | ---: | ---: | ---: | ---: |
+| `ERROR` groups by `body_message` | 1 | 0.95 / 1,055 ms | 0.95 / 1,069 ms | 3.61 → 1.70 |
+| `ERROR` groups by `body_message` | 8 | 6.97 / 1,101 ms | 7.29 / 1,056 ms | 3.61 → 1.70 |
+| `COUNT(*)` by severity | 1 | 1.04 / 965 ms | 1.09 / 917 ms | 0.48 → 0.03 |
+| `COUNT(*)` by severity | 8 | 7.88 / 993 ms | 8.55 / 913 ms | 0.48 → 0.03 |
+| 100 most recent rows, all columns | 8 | 1.15 / 6,742 ms | 1.25 / 6,274 ms | 470.6 → 472.1 |
+
+Most of the roughly one-second latency at this window was per-query object
+listing and metadata requests, which clustering does not change. Stored bytes
+were 0.3–1.1% larger. These are emulated-latency results on a single node, not
+real-cloud or blog-scale measurements.
 
 ## Tests
 
