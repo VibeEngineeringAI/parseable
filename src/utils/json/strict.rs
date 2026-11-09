@@ -23,8 +23,14 @@ use serde::{
 
 // A shared deferred error keeps serde_json's syntax errors and their locations
 // identical to the former parse-then-convert implementation.
+#[derive(Default)]
+struct Scratch {
+    objects: Vec<Vec<(String, serde_json::Value)>>,
+}
+
 struct ValueSeed<'a> {
     error: &'a mut Option<&'static str>,
+    scratch: &'a mut Scratch,
 }
 
 impl<'de> serde::de::DeserializeSeed<'de> for ValueSeed<'_> {
@@ -134,11 +140,13 @@ impl<'de> Visitor<'de> for ValueSeed<'_> {
         A: serde::de::SeqAccess<'de>,
     {
         let mut arr = Vec::new();
-
-        while let Some(v) = seq.next_element_seed(ValueSeed { error: self.error })? {
+        while let Some(v) = seq.next_element_seed(ValueSeed {
+            error: self.error,
+            scratch: self.scratch,
+        })? {
             arr.push(v);
         }
-
+        arr.shrink_to_fit();
         Ok(serde_json::Value::Array(arr))
     }
 
@@ -146,20 +154,42 @@ impl<'de> Visitor<'de> for ValueSeed<'_> {
     where
         A: serde::de::MapAccess<'de>,
     {
-        let mut obj = serde_json::Map::new();
+        // Most log objects fit on the stack. Larger objects reuse a spill
+        // buffer, keeping heap scratch bounded by concurrent nesting.
+        let mut inline = [const { None }; 16];
+        let mut len = 0;
+        let mut entries = self.scratch.objects.pop().unwrap_or_default();
         while let Some(key) = map.next_key::<String>()? {
-            // Keep consuming even after a duplicate: syntax errors must take
-            // precedence, and only the outer Deserialize adds custom errors.
-            let entry = obj.entry(key);
-            if matches!(entry, serde_json::map::Entry::Occupied(_)) {
-                self.error.get_or_insert("duplicate key in JSON");
+            let value = map.next_value_seed(ValueSeed {
+                error: self.error,
+                scratch: self.scratch,
+            })?;
+            if len < inline.len() {
+                inline[len] = Some((key, value));
+            } else {
+                entries.push((key, value));
             }
-            let value = map.next_value_seed(ValueSeed { error: self.error })?;
-            if let serde_json::map::Entry::Vacant(entry) = entry {
-                entry.insert(value);
+            len += 1;
+        }
+        let mut obj = serde_json::Map::with_capacity(len);
+        for (key, value) in inline
+            .iter_mut()
+            .filter_map(Option::take)
+            .chain(entries.drain(..))
+        {
+            match obj.entry(key) {
+                serde_json::map::Entry::Occupied(_) => {
+                    // Finish parsing before exposing this error: syntax wins.
+                    self.error.get_or_insert("duplicate key in JSON");
+                }
+                serde_json::map::Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
             }
         }
-
+        if entries.capacity() != 0 {
+            self.scratch.objects.push(entries);
+        }
         Ok(serde_json::Value::Object(obj))
     }
 }
@@ -375,7 +405,11 @@ impl<'de> Deserialize<'de> for StrictValue {
         D: serde::Deserializer<'de>,
     {
         let mut error = None;
-        let inner = ValueSeed { error: &mut error }.deserialize(deserializer)?;
+        let inner = ValueSeed {
+            error: &mut error,
+            scratch: &mut Scratch::default(),
+        }
+        .deserialize(deserializer)?;
         if let Some(error) = error {
             return Err(D::Error::custom(error));
         }
@@ -387,6 +421,103 @@ impl<'de> Deserialize<'de> for StrictValue {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // serde_json::Map hides IndexMap's capacity. Compare retained allocation
+    // bytes with the oracle as well as inspecting Vec capacities directly.
+    mod allocations {
+        use std::{
+            alloc::{GlobalAlloc, Layout, System},
+            cell::Cell,
+        };
+        std::thread_local! {
+            static LIVE: Cell<Option<isize>> = const { Cell::new(None) };
+        }
+        struct Tracking;
+        fn add(bytes: isize) {
+            let _ = LIVE.try_with(|live| {
+                if let Some(n) = live.get() {
+                    live.set(Some(n + bytes));
+                }
+            });
+        }
+        unsafe impl GlobalAlloc for Tracking {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc(layout) };
+                if !ptr.is_null() {
+                    add(layout.size() as isize);
+                }
+                ptr
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                add(-(layout.size() as isize));
+                unsafe { System.dealloc(ptr, layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                let result = unsafe { System.realloc(ptr, layout, size) };
+                if !result.is_null() {
+                    add(size as isize - layout.size() as isize);
+                }
+                result
+            }
+        }
+        #[global_allocator]
+        static ALLOCATOR: Tracking = Tracking;
+        pub fn retained<T>(f: impl FnOnce() -> T) -> (T, isize) {
+            LIVE.with(|n| n.set(Some(0)));
+            let value = f();
+            let bytes = LIVE.with(|n| n.replace(None).unwrap());
+            (value, bytes)
+        }
+    }
+
+    #[test]
+    fn final_container_capacities_match_oracle() {
+        fn tight_arrays(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Array(a) => {
+                    assert_eq!(a.capacity(), a.len());
+                    a.iter().for_each(tight_arrays);
+                }
+                serde_json::Value::Object(m) => m.values().for_each(tight_arrays),
+                _ => {}
+            }
+        }
+        for width in [0, 1, 3, 22, 32, 33, 120] {
+            let flat = format!(
+                "{{{}}}",
+                (0..width)
+                    .map(|i| format!("\"k{i}\":{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let (_, new_bytes) = allocations::retained(|| {
+                serde_json::from_str::<StrictValue>(&flat)
+                    .unwrap()
+                    .into_inner()
+            });
+            let (_, old_bytes) =
+                allocations::retained(|| serde_json::from_str::<Oracle>(&flat).unwrap().0);
+            assert_eq!(new_bytes, old_bytes, "map width {width}");
+            let object = (0..width)
+                .map(|i| format!("\"k{i}\":[1,2,3]"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let raw = format!("[{{{object}}},{{\"nested\":[{{{object}}},[],[1,2,3,4,5]]}}]");
+            let (new, new_bytes) = allocations::retained(|| {
+                serde_json::from_str::<StrictValue>(&raw)
+                    .unwrap()
+                    .into_inner()
+            });
+            let (old, old_bytes) =
+                allocations::retained(|| serde_json::from_str::<Oracle>(&raw).unwrap().0);
+            assert_eq!(new, old);
+            tight_arrays(&new);
+            assert!(
+                new_bytes <= old_bytes,
+                "width {width}: {new_bytes} > {old_bytes}"
+            );
+        }
+    }
 
     #[test]
     fn test_deserialize_string() {
