@@ -896,7 +896,15 @@ pub static TOTAL_TRACES_COLLECTED_SIZE_BY_DATE: Lazy<IntCounterVec> = Lazy::new(
 });
 
 fn custom_metrics(registry: &Registry) {
-    PARTITION_BUDGET_METRICS.register(registry);
+    // Register only when the opt-in budget is configured, so the default
+    // scrape output is unchanged.
+    if crate::parseable::PARSEABLE
+        .options
+        .query_partition_budget
+        .is_some()
+    {
+        PARTITION_BUDGET_METRICS.register(registry);
+    }
     registry
         .register(Box::new(EVENTS_INGESTED.clone()))
         .expect("metric can be registered");

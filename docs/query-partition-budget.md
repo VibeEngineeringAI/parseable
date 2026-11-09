@@ -120,8 +120,9 @@ this budget's scope across all tenants and streams:
   of the chosen target for each budgeted query. Finite buckets are powers of two
   from 1 through 1024; the `+Inf` bucket includes larger explicit targets.
 
-Both metrics are registered even when the budget is unset, providing a stable
-scrape schema and explicit zero values. The unset path performs no metric updates.
+Both metrics are registered only when `P_DATAFUSION_QUERY_PARTITION_BUDGET` is
+set, so the default scrape output is unchanged. The unset path performs no metric
+updates.
 The histogram describes planning decisions, not actual worker utilization; old
 queries keep their targets when concurrency changes. The gauge can include
 outstanding streaming workers and buffered results until their last lease drops.
