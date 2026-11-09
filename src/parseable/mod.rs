@@ -79,6 +79,7 @@ use crate::{
     validator,
 };
 
+mod schema_refresh;
 mod staging;
 mod streams;
 
@@ -464,23 +465,43 @@ impl Parseable {
         }
     }
 
-    /// list all streams from storage
-    /// if stream exists in storage, create stream and schema from storage
-    /// and add it to the memory map
+    /// Refresh a resident stream's schema, or load a cold stream from storage.
     pub async fn create_stream_and_schema_from_storage(
         &self,
         stream_name: &str,
         tenant_id: &Option<String>,
     ) -> Result<bool, StreamError> {
-        // Proceed to create log stream if it doesn't exist
+        if let Ok(stream) = self.get_stream(stream_name, tenant_id) {
+            stream
+                .schema_refresh
+                .run(self.options.mode, || async {
+                    let schema_file = if self.options.mode == Mode::Ingest {
+                        crate::storage::object_storage::schema_path(stream_name, tenant_id)
+                            .file_name()
+                            .expect("schema filename")
+                            .to_owned()
+                    } else {
+                        crate::storage::SCHEMA_FILE_NAME.to_owned()
+                    };
+                    let schema = self
+                        .metastore
+                        .refresh_schema(stream_name, tenant_id, &schema_file)
+                        .await?;
+                    crate::event::commit_schema_to_metadata(&stream.metadata, &schema)?;
+                    Ok(())
+                })
+                .await
+                .map_err(StreamError::Anyhow)?;
+            return Ok(true);
+        }
+
         let storage = self.storage.get_object_store();
         // A deletion in progress (or left unfinished by a crashed node) must
         // never be resurrected by a concurrent lazy reload.
         if is_tombstoned(storage.as_ref(), stream_name, tenant_id).await? {
             return Ok(false);
         }
-        let streams = PARSEABLE.metastore.list_streams(tenant_id).await?;
-        if !streams.contains(stream_name) {
+        if !storage.stream_exists(stream_name, tenant_id).await? {
             return Ok(false);
         }
         let (stream_metadata_bytes, schema_bytes) = try_join!(
@@ -1356,6 +1377,95 @@ pub fn validate_custom_partition(custom_partition: &str) -> Result<(), CreateStr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resident_all_reload_never_touches_storage() {
+        use crate::storage::{FSConfig, LocalFS};
+        let dir = tempfile::tempdir().unwrap();
+        // Any metadata request would fail: the backing directory is absent.
+        let root = dir.path().join("absent-storage");
+        let storage = Arc::new(LocalFS::new(root.clone()));
+        let server = Parseable::new(
+            Options::default(),
+            #[cfg(feature = "kafka")]
+            KafkaConfig::parse_from(["test"]),
+            Arc::new(FSConfig { root: root.clone() }),
+            Arc::new(ObjectStoreMetastore {
+                storage: storage.clone(),
+            }),
+            storage,
+        );
+        let stream = server.get_or_create_stream("logs", &None);
+        assert!(
+            server
+                .create_stream_and_schema_from_storage("logs", &None)
+                .await
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            &stream,
+            &server.get_stream("logs", &None).unwrap()
+        ));
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn resident_query_reload_learns_remote_fields() {
+        use crate::storage::{FSConfig, LocalFS};
+        use arrow_schema::DataType;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(dir.path().to_owned()));
+        let options = Options {
+            mode: Mode::Query,
+            ..Options::default()
+        };
+        let server = Parseable::new(
+            options,
+            #[cfg(feature = "kafka")]
+            KafkaConfig::parse_from(["test"]),
+            Arc::new(FSConfig {
+                root: dir.path().to_owned(),
+            }),
+            Arc::new(ObjectStoreMetastore {
+                storage: storage.clone(),
+            }),
+            storage.clone(),
+        );
+        let stream = server.get_or_create_stream("logs", &None);
+        let remote_path = RelativePathBuf::from("logs/.stream/.ingestor.other.schema");
+        storage
+            .put_object(
+                &remote_path,
+                crate::storage::object_storage::to_bytes(&Schema::empty()),
+                &None,
+            )
+            .await
+            .unwrap();
+        server
+            .create_stream_and_schema_from_storage("logs", &None)
+            .await
+            .unwrap();
+        let remote = Schema::new(vec![Field::new(
+            "added_on_other_node",
+            DataType::Utf8,
+            true,
+        )]);
+        storage
+            .put_object(
+                &remote_path,
+                crate::storage::object_storage::to_bytes(&remote),
+                &None,
+            )
+            .await
+            .unwrap();
+        server
+            .create_stream_and_schema_from_storage("logs", &None)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_schema().as_ref(), &remote);
+        // No stream metadata file was needed for either resident refresh.
+        assert!(!storage.stream_exists("logs", &None).await.unwrap());
+    }
 
     #[test]
     fn telemetry_type_inferred_for_otel_metrics_when_unset() {

@@ -336,6 +336,13 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         stream_name: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<Schema>, MetastoreError>;
+    /// Fetch the schema union and publish it only if the canonical schema lags.
+    async fn refresh_schema(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+        schema_file: &str,
+    ) -> Result<Schema, MetastoreError>;
     async fn get_schema(
         &self,
         stream_name: &str,

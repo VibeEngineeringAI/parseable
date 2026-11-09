@@ -195,19 +195,42 @@ pub fn commit_schema(
     tenant_id: &Option<String>,
 ) -> Result<(), StagingError> {
     let _span = info_span!("commit_schema", stream_name).entered();
-    let mut stream_metadata = PARSEABLE.streams.write().expect("lock poisoned");
-    let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
-    let map = &mut stream_metadata
-        .get_mut(tenant_id)
-        .ok_or_else(|| TenantNotFound(tenant_id.to_owned()))?
-        .get_mut(stream_name)
-        .ok_or_else(|| StreamNotFound(stream_name.to_string()))?
-        .metadata
-        .write()
-        .expect(LOCK_EXPECT)
-        .schema;
-    merge_into_schema(map, &schema)?;
+    let stream = {
+        let streams = PARSEABLE.streams.read().expect(LOCK_EXPECT);
+        let tenant_id = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+        streams
+            .get(tenant_id)
+            .ok_or_else(|| TenantNotFound(tenant_id.to_owned()))?
+            .get(stream_name)
+            .ok_or_else(|| StreamNotFound(stream_name.to_owned()))?
+            .clone()
+    };
+    commit_schema_to_metadata(&stream.metadata, &schema)?;
     Ok(())
+}
+
+/// Merge storage/recovery schemas without taking a write lock for an unchanged
+/// schema. Recheck under the write lock so concurrent ingestion cannot be lost.
+pub(crate) fn commit_schema_to_metadata(
+    metadata: &RwLock<LogStreamMetadata>,
+    schema: &Schema,
+) -> Result<bool, StagingError> {
+    let merge = |current: &HashMap<String, Arc<Field>>| {
+        let mut merged = current.clone();
+        merge_into_schema(&mut merged, schema)?;
+        Ok::<_, ArrowError>(merged)
+    };
+    {
+        let current = metadata.read().expect(LOCK_EXPECT);
+        if merge(&current.schema)? == current.schema {
+            return Ok(false);
+        }
+    }
+    let mut current = metadata.write().expect(LOCK_EXPECT);
+    let merged = merge(&current.schema)?;
+    let changed = merged != current.schema;
+    current.schema = merged;
+    Ok(changed)
 }
 
 /// Checks an ingested event against the stream's field limit and commits its
@@ -461,6 +484,29 @@ mod tests {
     };
 
     const STREAM: &str = "logs";
+
+    #[test]
+    fn storage_schema_merge_skips_writes_and_preserves_widening() {
+        let metadata = metadata(vec![Field::new("value", DataType::Null, true)]);
+        let original = Schema::new(vec![Field::new("value", DataType::Null, true)]);
+        // Holding a read lock makes an accidental write lock deadlock.
+        let guard = metadata.read().unwrap();
+        assert!(!super::commit_schema_to_metadata(&metadata, &original).unwrap());
+        drop(guard);
+        let added = Schema::new(vec![
+            Field::new("value", DataType::Utf8, true),
+            Field::new("remote", DataType::Int64, true),
+        ]);
+        assert!(super::commit_schema_to_metadata(&metadata, &added).unwrap());
+        assert_eq!(
+            metadata.read().unwrap().schema["value"].data_type(),
+            &DataType::Utf8
+        );
+        assert!(!super::commit_schema_to_metadata(&metadata, &added).unwrap());
+        let conflict = Schema::new(vec![Field::new("remote", DataType::Boolean, true)]);
+        assert!(super::commit_schema_to_metadata(&metadata, &conflict).is_err());
+        assert_eq!(field_names(&metadata), vec!["remote", "value"]);
+    }
 
     fn p_timestamp() -> Field {
         Field::new(
@@ -736,9 +782,7 @@ mod tests {
         // and must not grow.
         assert!(!commit_ingested_schema(STREAM, &stream, &schema, 2, true).unwrap());
         assert!(!commit_ingested_schema(STREAM, &stream, &schema, 2, false).unwrap());
-        assert!(
-            !commit_ingested_schemas(STREAM, &stream, &[(Arc::new(schema), true)], 2).unwrap()
-        );
+        assert!(!commit_ingested_schemas(STREAM, &stream, &[(Arc::new(schema), true)], 2).unwrap());
         assert_eq!(field_names(&stream).len(), 2);
     }
 
@@ -807,8 +851,13 @@ mod tests {
         // The union fits: everything is committed at once, so processing the
         // events afterwards adds nothing and cannot hit the limit
         assert!(
-            commit_ingested_schemas(STREAM, &stream, &[(a.clone(), true), (b.clone(), false)], 13)
-                .unwrap()
+            commit_ingested_schemas(
+                STREAM,
+                &stream,
+                &[(a.clone(), true), (b.clone(), false)],
+                13
+            )
+            .unwrap()
         );
         assert_eq!(field_names(&stream).len(), 13);
         assert!(!commit_ingested_schema(STREAM, &stream, &b, 13, false).unwrap());
@@ -818,13 +867,9 @@ mod tests {
         // A type conflict in any event leaves the schema untouched
         let before = field_names(&stream);
         let c: SchemaRef = Arc::new(Schema::new(utf8_fields("c", 1)));
-        let conflict: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "a0",
-            DataType::Int64,
-            true,
-        )]));
-        let result =
-            commit_ingested_schemas(STREAM, &stream, &[(c, true), (conflict, true)], 100);
+        let conflict: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a0", DataType::Int64, true)]));
+        let result = commit_ingested_schemas(STREAM, &stream, &[(c, true), (conflict, true)], 100);
         assert!(matches!(result, Err(EventError::Staging(_))), "{result:?}");
         assert_eq!(field_names(&stream), before);
     }

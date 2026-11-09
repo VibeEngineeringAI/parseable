@@ -516,6 +516,47 @@ impl ObjectStorage for LocalFS {
         Ok(path_arr)
     }
 
+    async fn stream_exists(
+        &self,
+        stream_name: &str,
+        _tenant_id: &Option<String>,
+    ) -> Result<bool, ObjectStorageError> {
+        // LocalFS has no tenants and list_streams accepts only the global
+        // metadata file; avoid its unsupported list_with_delimiter operation.
+        Ok(fs::try_exists(
+            self.root
+                .join(stream_name)
+                .join(STREAM_ROOT_DIRECTORY)
+                .join(STREAM_METADATA_FILE_NAME),
+        )
+        .await?)
+    }
+
+    async fn schema_objects(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<Vec<(String, Bytes)>, ObjectStorageError> {
+        let prefix = RelativePathBuf::from_iter([
+            tenant_id.as_deref().unwrap_or(""),
+            stream_name,
+            STREAM_ROOT_DIRECTORY,
+        ]);
+        let mut entries = fs::read_dir(prefix.to_path(&self.root)).await?;
+        let mut schemas = Vec::new();
+        let mut files_scanned = 0;
+        while let Some(entry) = entries.next_entry().await? {
+            files_scanned += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_upload_temp(&entry.path()) && name.contains(".schema") {
+                let bytes = self.get_object(&prefix.join(&name), tenant_id).await?;
+                schemas.push((name, bytes));
+            }
+        }
+        super::object_storage::record_metadata_listing(files_scanned, tenant_id);
+        Ok(schemas)
+    }
+
     /// currently it is not using the starts_with_pattern
     async fn get_objects(
         &self,
