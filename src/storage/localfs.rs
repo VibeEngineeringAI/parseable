@@ -544,13 +544,16 @@ impl ObjectStorage for LocalFS {
         ]);
         let mut entries = fs::read_dir(prefix.to_path(&self.root)).await?;
         let mut schemas = Vec::new();
+        let mut files_scanned = 0;
         while let Some(entry) = entries.next_entry().await? {
+            files_scanned += 1;
             let name = entry.file_name().to_string_lossy().into_owned();
             if !is_upload_temp(&entry.path()) && name.contains(".schema") {
                 let bytes = self.get_object(&prefix.join(&name), tenant_id).await?;
                 schemas.push((name, bytes));
             }
         }
+        super::object_storage::record_metadata_listing(files_scanned, tenant_id);
         Ok(schemas)
     }
 

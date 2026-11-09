@@ -530,6 +530,7 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
     ) -> Result<bool, ObjectStorageError> {
         let prefix = stream_metadata_prefix(stream_name, tenant_id);
         let listing = self.list_with_delimiter(Some(prefix)).await?;
+        record_metadata_listing(listing.objects.len(), tenant_id);
         Ok(has_stream_metadata(&listing.objects))
     }
 
@@ -543,6 +544,7 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
         let listing = self
             .list_with_delimiter(Some(stream_metadata_prefix(stream_name, tenant_id)))
             .await?;
+        record_metadata_listing(listing.objects.len(), tenant_id);
         let requests = listing.objects.into_iter().filter_map(|object| {
             let name = object.location.filename()?.to_owned();
             if !name.contains(".schema") {
@@ -1693,6 +1695,20 @@ fn has_stream_metadata(objects: &[ObjectMeta]) -> bool {
             .filename()
             .is_some_and(|name| name.ends_with("stream.json"))
     })
+}
+
+/// Count a stream-metadata listing in the per-tenant usage counters, as the
+/// `get_objects` listing it replaces on the query path did.
+pub(crate) fn record_metadata_listing(files_scanned: usize, tenant_id: &Option<String>) {
+    let date = Utc::now().date_naive().to_string();
+    let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+    crate::metrics::increment_files_scanned_in_object_store_calls_by_date(
+        "LIST",
+        files_scanned as u64,
+        &date,
+        tenant,
+    );
+    crate::metrics::increment_object_store_calls_by_date("LIST", &date, tenant);
 }
 
 fn stream_metadata_prefix(
