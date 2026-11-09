@@ -18,9 +18,153 @@
 
 use serde::{
     Deserialize, Serialize,
-    de::{Error as _, Visitor},
+    de::{DeserializeSeed, Error as _, Visitor},
 };
 
+// A shared deferred error keeps serde_json's syntax errors and their locations
+// identical to the former parse-then-convert implementation.
+struct ValueSeed<'a> {
+    error: &'a mut Option<&'static str>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::Bool(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    fn visit_i128<E>(self, v: i128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::Number(
+            serde_json::Number::from_i128(v).unwrap_or_else(|| (v as i64).into()),
+        ))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    fn visit_u128<E>(self, v: u128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::Number(
+            serde_json::Number::from_u128(v).unwrap_or_else(|| (v as u64).into()),
+        ))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match serde_json::Number::from_f64(v) {
+            Some(number) => Ok(serde_json::Value::Number(number)),
+            None => {
+                self.error.get_or_insert("not a valid JSON number");
+                Ok(serde_json::Value::Null)
+            }
+        }
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::String(v))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.deserialize(deserializer)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut arr = Vec::new();
+
+        while let Some(v) = seq.next_element_seed(ValueSeed { error: self.error })? {
+            arr.push(v);
+        }
+
+        Ok(serde_json::Value::Array(arr))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut obj = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            // Keep consuming even after a duplicate: syntax errors must take
+            // precedence, and only the outer Deserialize adds custom errors.
+            let entry = obj.entry(key);
+            if matches!(entry, serde_json::map::Entry::Occupied(_)) {
+                self.error.get_or_insert("duplicate key in JSON");
+            }
+            let value = map.next_value_seed(ValueSeed { error: self.error })?;
+            if let serde_json::map::Entry::Vacant(entry) = entry {
+                entry.insert(value);
+            }
+        }
+
+        Ok(serde_json::Value::Object(obj))
+    }
+}
+
+#[cfg(test)]
 enum InterimValue {
     Null,
     Bool(bool),
@@ -34,6 +178,7 @@ enum InterimValue {
     Object(Vec<(String, InterimValue)>),
 }
 
+#[cfg(test)]
 impl TryFrom<InterimValue> for serde_json::Value {
     type Error = &'static str;
 
@@ -84,6 +229,7 @@ impl TryFrom<InterimValue> for serde_json::Value {
     }
 }
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for InterimValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -228,10 +374,12 @@ impl<'de> Deserialize<'de> for StrictValue {
     where
         D: serde::Deserializer<'de>,
     {
-        let interim: InterimValue = Deserialize::deserialize(deserializer)?;
-        Ok(Self {
-            inner: interim.try_into().map_err(D::Error::custom)?,
-        })
+        let mut error = None;
+        let inner = ValueSeed { error: &mut error }.deserialize(deserializer)?;
+        if let Some(error) = error {
+            return Err(D::Error::custom(error));
+        }
+        Ok(Self { inner })
     }
 }
 
@@ -412,6 +560,155 @@ mod tests {
                 .unwrap()
                 .into_inner();
             assert_eq!(serde_json::to_string(&result).unwrap(), raw);
+        }
+    }
+
+    #[derive(Debug)]
+    struct Oracle(serde_json::Value);
+
+    impl<'de> Deserialize<'de> for Oracle {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let interim = InterimValue::deserialize(d)?;
+            Ok(Self(interim.try_into().map_err(D::Error::custom)?))
+        }
+    }
+
+    fn corpus() -> Vec<Vec<u8>> {
+        let mut cases: Vec<Vec<u8>> = [
+            r#""hello""#, "123", "true", "false", "null", "{}", "[]",
+            r#"{"key":"value"}"#, "[1,2,3]", "[[1,2],[3,4,[5,6]],[]]",
+            r#"{"user":{"id":1,"info":{"name":"Alice","emails":["a","b"]}}}"#,
+            r#"{"status":"ok","data":[{"id":1,"value":null},{"id":2,"value":[true,false]},{"id":3,"value":{"nested":"yes"}}]}"#,
+            r#"{"a":{"b":{"c":{"d":[1,{"e":"f"}]}}}}"#,
+            r#"{"x":1,"x":2}"#, r#"{"x":1,"\u0078":2}"#,
+            r#"[{"outer":{"x":1,"x":2}}]"#, r#"{"x":null,"x":{"nested":true}}"#,
+            r#"{"x":1,"x":2,"y":3,"y":4}"#,
+            r#"{"x":1,"x":2,"later":[}"#, r#"{"bad":],"x":1,"x":2}"#,
+            r#"{"x":1,"x":2} trailing"#, "true false", "{}[]", "", "[", "{",
+            r#""\u0000""#, r#""\uD834\uDD1E""#, r#""\uD800""#, r#""\uDC00""#,
+            r#""\x""#, r#""\uZZZZ""#, r#"{"z":1,"a":2,"m":3}"#,
+            "-9223372036854775809", "-9223372036854775808", "9223372036854775807",
+            "9223372036854775808", "18446744073709551615", "18446744073709551616",
+            "340282366920938463463374607431768211455", "-0", "-0.0", "0", "0.0",
+            "1e400", "1e-400", "1e999999999999999999", "-1e400", "1e+", "01", "1.",
+            "1.23456789012345678901234567890123456789", "2.2250738585072014e-308",
+            "1.7976931348623157e308", "1.7976931348623159e308",
+        ].into_iter().map(|s| s.as_bytes().to_vec()).collect();
+        cases.push(vec![b'"', 0xff, b'"']);
+        cases.push(b"\"raw\x00control\"".to_vec());
+        for depth in [126, 127, 128, 129, 256] {
+            cases.push(format!("{}0{}", "[".repeat(depth), "]".repeat(depth)).into_bytes());
+            cases.push(format!("{}0{}", "{\"a\":".repeat(depth), "}".repeat(depth)).into_bytes());
+        }
+        // Fixed-seed generated batches, with varying widths, order, numbers and nesting.
+        let mut seed = 7_u64;
+        for batch in 0..40 {
+            let mut rows = Vec::new();
+            for row in 0..(batch * 7 + 1) {
+                let mut obj = serde_json::Map::new();
+                for field in (0..(batch % 20 + 1)).rev() {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    obj.insert(
+                        format!("field_{field}"),
+                        json!([seed, row, -0.0, {"s":"a\0𝄞"}]),
+                    );
+                }
+                rows.push(obj);
+            }
+            cases.push(serde_json::to_vec(&rows).unwrap());
+        }
+        // Every truncation of a mixed document, including a deferred duplicate.
+        for raw in [
+            r#"{"a":[true,null,"\uD834\uDD1E",-2.34e+56],"b":{}}"#,
+            r#"{"a":1,"a":2,"b":["later",{"c":false}]}"#,
+        ] {
+            for n in 0..raw.len() {
+                cases.push(raw.as_bytes()[..n].to_vec());
+            }
+        }
+        cases
+    }
+
+    fn fingerprint(value: serde_json::Value) -> String {
+        // Debug exposes Number's integer/float representation, serialization exposes order.
+        format!("{value:?}|{}", serde_json::to_string(&value).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn differential_corpus() {
+        use actix_web::{
+            FromRequest,
+            test::TestRequest,
+            web::{Json, JsonConfig},
+        };
+        for raw in corpus() {
+            let old = serde_json::from_slice::<Oracle>(&raw)
+                .map(|v| fingerprint(v.0))
+                .map_err(|e| e.to_string());
+            let new = serde_json::from_slice::<StrictValue>(&raw)
+                .map(|v| fingerprint(v.inner))
+                .map_err(|e| e.to_string());
+            assert_eq!(new, old, "slice: {:?}", String::from_utf8_lossy(&raw));
+            if let Ok(raw) = std::str::from_utf8(&raw) {
+                let old = serde_json::from_str::<Oracle>(raw)
+                    .map(|v| fingerprint(v.0))
+                    .map_err(|e| e.to_string());
+                let new = serde_json::from_str::<StrictValue>(raw)
+                    .map(|v| fingerprint(v.inner))
+                    .map_err(|e| e.to_string());
+                assert_eq!(new, old, "str: {raw}");
+            }
+            let (req, mut payload) = TestRequest::post()
+                .insert_header(("content-type", "application/json"))
+                .app_data(JsonConfig::default().limit(16 * 1024 * 1024))
+                .set_payload(raw.clone())
+                .to_http_parts();
+            let old = Json::<Oracle>::from_request(&req, &mut payload)
+                .await
+                .map(|v| fingerprint(v.0.0))
+                .map_err(|e| e.to_string());
+            let (req, mut payload) = TestRequest::post()
+                .insert_header(("content-type", "application/json"))
+                .app_data(JsonConfig::default().limit(16 * 1024 * 1024))
+                .set_payload(raw)
+                .to_http_parts();
+            let new = Json::<StrictValue>::from_request(&req, &mut payload)
+                .await
+                .map(|v| fingerprint(v.into_inner().inner))
+                .map_err(|e| e.to_string());
+            assert_eq!(new, old, "extractor");
+        }
+    }
+    #[test]
+    fn non_json_numeric_visitors_match_oracle() {
+        use serde::de::value::{Error, F64Deserializer, I128Deserializer, U128Deserializer};
+        macro_rules! compare {
+            ($deserializer:expr) => {
+                assert_eq!(
+                    StrictValue::deserialize($deserializer)
+                        .map(|v| fingerprint(v.inner))
+                        .map_err(|e| e.to_string()),
+                    Oracle::deserialize($deserializer)
+                        .map(|v| fingerprint(v.0))
+                        .map_err(|e| e.to_string()),
+                );
+            };
+        }
+        for v in [i128::MIN, i64::MIN as i128, 0, i64::MAX as i128, i128::MAX] {
+            compare!(I128Deserializer::<Error>::new(v));
+        }
+        for v in [0, u64::MAX as u128, u64::MAX as u128 + 1, u128::MAX] {
+            compare!(U128Deserializer::<Error>::new(v));
+        }
+        for v in [
+            -0.0,
+            f64::MIN,
+            f64::MAX,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            compare!(F64Deserializer::<Error>::new(v));
         }
     }
 }
