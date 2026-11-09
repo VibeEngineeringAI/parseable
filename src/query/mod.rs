@@ -527,6 +527,9 @@ impl Query {
         Ok((results, fields))
     }
 
+    /// Build a lazy DataFrame; this does not execute a scan or acquire a budget lease.
+    /// Callers that execute it must retain a query lease through collection/streaming;
+    /// prefer `execute`, which owns that lifetime. Currently there are no callers.
     pub async fn get_dataframe(
         &self,
         tenant_id: &Option<String>,

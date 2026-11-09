@@ -56,6 +56,38 @@ construct their own execution contexts need separate qualification. This checkou
 exposes an Arrow Flight service on `P_FLIGHT_PORT`; `P_QUERY_GRPC_PORT` is metadata
 and configuration here, with no separately registered query service found.
 
+## Execution entry-point audit
+
+Audit of this checkout (base `c48c2f7a`): the separate session states below
+are not separate scan executors. No additional production DataFusion scan entry
+point was found outside `Query::execute`. Counting planning twice would lower
+parallelism unnecessarily during dashboard and alert fan-out.
+
+| Entry point | Through `query::execute`? | Work and budget participation | Invocation pattern |
+| --- | --- | --- | --- |
+| `Query::execute` | Yes | Physical planning and `collect_partitioned` or `execute_stream_partitioned`; one lease through collection or stream/workers | Every SQL execution, including concurrent dashboard panels |
+| HTTP `get_records_and_fields`, authorized variant, `query_internal` | Yes, except metadata count shortcut | Their own session states parse SQL and set tenant schema; scan execution acquires the lease later | Each query request; structured APIs can fan out into several SQL queries |
+| Dashboard runtime, PromQL, traces, query-context APIs and tool SQL | Yes via HTTP query helpers | Generated SQL scans use the same executor; each generated SQL execution receives its own lease | Dashboard refreshes and interactive API/tool requests; a request can fan out |
+| HTTP `counts` with conditions (`get_df_sql`) | Yes via `get_records_and_fields` | Histogram SQL scans and aggregates under the budget | Each filtered histogram refresh |
+| `CountsRequest::get_bin_density`, HTTP unfiltered counts and plain count shortcut | No | Reads manifest metadata and sums row counts; no DataFusion scan, partitions or lease | Each unfiltered histogram/count refresh; may overlap query panels |
+| `Query::get_dataframe` | No | Returns a lazy DataFrame without physical execution; no lease | No callers found in this checkout |
+| `alerts_utils::execute_local_query` | Yes | Local alert scans collect under the budget; initial session state only parses SQL | Each configured alert evaluation (`evalFrequency`) |
+| `alerts_utils::execute_remote_query` | On receiving server | Local logical planning and HTTP dispatch; receiving query server budgets its execution | Each Prism alert evaluation |
+| Alert `get_number_of_agg_exprs`, `get_aggregate_projection` | No | Logical-plan validation/introspection only; no lease | Alert configuration/validation paths |
+| Flight `do_get` | Yes | Initial context parses SQL; local collection is budgeted before Flight encoding; ingester RPCs execute on their own servers | Each Flight ticket, possibly with ingester fan-out |
+| Flight schema endpoints | No | Schema lookup/IPC encoding only | Client schema discovery |
+| `stream_schema_provider` / `listing_table_builder` | Inside executor | Build storage scan plans using the executor's session; not independent scan entry points | During physical planning of queries |
+| DataFusion fixtures in test modules | No | Isolated test contexts and scans; no production load | Tests only |
+
+Keep the current boundary rather than adding leases to planning or metadata
+operations. Manifest reads and SQL planning can still compete for CPU, memory
+and storage I/O; this partition budget does not account for those costs. It is
+not a dashboard request concurrency limit. A future caller that collects or
+streams `get_dataframe` must use `query_context` and retain its `QueryLease`
+through collection, or transfer it into `LeasedQueryStream` (and any detached
+workers). Prefer the existing executor. Plugins and enterprise code outside
+this checkout can introduce independent executors and remain a known limit.
+
 ## Qualification and rollout
 
 This is an experimental tuning surface. The setting remains unset by default.

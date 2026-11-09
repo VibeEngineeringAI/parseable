@@ -274,3 +274,70 @@ async fn isolated_config_keeps_runtime_catalogs_udfs_hooks_and_tenant_values() {
     futures::future::join_all(work).await;
     assert_eq!(budget.active.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test]
+async fn execution_context_counts_collection_and_planning_errors() {
+    let shared = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(32));
+    let budget = PartitionBudget::new(Some(16), 1);
+    let (ctx, lease) = query_context(shared.clone(), &budget);
+    assert_eq!(budget.active.load(Ordering::Relaxed), 1);
+    assert_eq!(ctx.state().config().target_partitions(), 16);
+    let batches = ctx
+        .sql("SELECT 42 AS answer")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches[0].num_rows(), 1);
+    // Collection is complete, but the owning execution scope still holds its lease.
+    assert_eq!(budget.active.load(Ordering::Relaxed), 1);
+    drop(lease);
+    assert_eq!(budget.active.load(Ordering::Relaxed), 0);
+
+    let failed: datafusion::error::Result<()> = async {
+        let (ctx, _lease) = query_context(shared, &budget);
+        assert_eq!(budget.active.load(Ordering::Relaxed), 1);
+        ctx.sql("SELECT * FROM missing_budget_test_table").await?;
+        Ok(())
+    }
+    .await;
+    assert!(failed.is_err());
+    assert_eq!(budget.active.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn unset_context_is_shared_and_lazy_planning_does_not_enter_budget() {
+    let shared = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(37));
+    let off = PartitionBudget::new(None, 1);
+    let (ctx, lease) = query_context(shared.clone(), &off);
+    assert!(lease.is_none());
+    assert_eq!(ctx.state().config().target_partitions(), 37);
+    // Register after obtaining the context: a cloned SessionState would not see
+    // this new UDF. The unset path must return the original shared session.
+    shared.register_udf(create_udf(
+        "registered_after_context",
+        vec![DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(|args| Ok(args[0].clone())),
+    ));
+    let frame = ctx
+        .sql("SELECT registered_after_context(42)")
+        .await
+        .unwrap();
+    assert_eq!(off.active.load(Ordering::Relaxed), 0);
+    assert_eq!(frame.collect().await.unwrap()[0].num_rows(), 1);
+    assert_eq!(off.active.load(Ordering::Relaxed), 0);
+
+    let enabled = PartitionBudget::new(Some(16), 1);
+    // Mirrors the HTTP/alert/Flight logical-planning contexts: no execution
+    // context, no lease, and no change to the shared target.
+    shared
+        .state()
+        .create_logical_plan("SELECT 1")
+        .await
+        .unwrap();
+    assert_eq!(enabled.active.load(Ordering::Relaxed), 0);
+    assert_eq!(shared.state().config().target_partitions(), 37);
+}
