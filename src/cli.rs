@@ -506,6 +506,24 @@ pub struct Options {
     )]
     pub row_group_size: usize,
 
+    /// Top-level columns only; absent columns and metrics streams are ignored.
+    #[arg(
+        long,
+        env = "P_PARQUET_BLOOM_FILTER_COLUMNS",
+        value_delimiter = ',',
+        help = "Opt-in Parquet bloom filters for comma-separated top-level log/trace columns; unset disables (1% target false positives)"
+    )]
+    pub parquet_bloom_filter_columns: Vec<String>,
+
+    #[arg(
+        long,
+        env = "P_PARQUET_BLOOM_FILTER_POSITION",
+        default_value = "end",
+        value_parser = ["end", "after-row-group"],
+        help = "Position of opt-in log/trace bloom filters; does not affect metrics filters"
+    )]
+    pub parquet_bloom_filter_position: String,
+
     // Opt-in physical clustering of log rows inside each Parquet row group.
     // Unset (the default) keeps the existing writer behaviour.
     #[arg(
