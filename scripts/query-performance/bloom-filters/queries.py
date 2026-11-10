@@ -1,4 +1,6 @@
-"""HTTP evidence with per-query CPU, metrics and EXPLAIN ANALYZE. Server must be idle.
+"""HTTP evidence with per-query CPU, logical storage calls and EXPLAIN ANALYZE.
+Storage counters exclude individual HTTP requests inside GET_RANGES and retries;
+use a server-side request trace to evaluate S3 request costs. Server must be idle.
 usage: queries.py PORT PID PRESENT_ID OUTPUT START END
 Set PRESENT_TIME to the matching record timestamp; local credentials default to admin:admin.
 """
