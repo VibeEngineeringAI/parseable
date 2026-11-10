@@ -1,0 +1,5 @@
+{
+  "summary.json": true,
+  "fixtures.json": true,
+  "wire.jsonl": "exact parsed trace equality; 35 attempts"
+}

@@ -1,0 +1,291 @@
+{
+  "arms": {
+    "dictionary": {
+      "app/lz4_raw": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 33977942,
+        "footer_bytes": 1973,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 520,
+        "selected_time_encodings": [
+          [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 55.42900000000009,
+          "write_wall_ms": 55.683841,
+          "read_cpu_ms": 19.267999999999915,
+          "read_wall_ms": 19.552183,
+          "project_cpu_ms": 0.8830000000000382
+        }
+      },
+      "app/zstd": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 17152334,
+        "footer_bytes": 1972,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 483,
+        "selected_time_encodings": [
+          [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 93.17699999999991,
+          "write_wall_ms": 93.566757,
+          "read_cpu_ms": 28.857999999999947,
+          "read_wall_ms": 28.971871999999998,
+          "project_cpu_ms": 0.9499999999999318
+        }
+      },
+      "wide/lz4_raw": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 42850469,
+        "footer_bytes": 14621,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 275,
+        "selected_time_encodings": [
+          [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 186.47400000000016,
+          "write_wall_ms": 188.67409600000002,
+          "read_cpu_ms": 41.2829999999999,
+          "read_wall_ms": 41.440258,
+          "project_cpu_ms": 0.9890000000004875
+        }
+      },
+      "wide/zstd": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 21406812,
+        "footer_bytes": 14620,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 310,
+        "selected_time_encodings": [
+          [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 233.88700000000017,
+          "write_wall_ms": 235.01709000000002,
+          "read_cpu_ms": 64.51400000000012,
+          "read_wall_ms": 64.899286,
+          "project_cpu_ms": 1.0329999999999018
+        }
+      },
+      "otel/lz4_raw": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 40583413,
+        "footer_bytes": 3962,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "event_time",
+        "selected_time_bytes": 604284,
+        "selected_time_encodings": [
+          [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 92.02499999999964,
+          "write_wall_ms": 92.687289,
+          "read_cpu_ms": 25.625,
+          "read_wall_ms": 25.709953000000002,
+          "project_cpu_ms": 0.9119999999993524
+        }
+      },
+      "otel/zstd": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 20702905,
+        "footer_bytes": 3959,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "event_time",
+        "selected_time_bytes": 298588,
+        "selected_time_encodings": [
+          [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 137.10499999999956,
+          "write_wall_ms": 137.673168,
+          "read_cpu_ms": 41.037999999999556,
+          "read_wall_ms": 41.307992,
+          "project_cpu_ms": 0.9769999999998618
+        }
+      }
+    },
+    "delta": {
+      "app/lz4_raw": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 33977962,
+        "footer_bytes": 1962,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 552,
+        "selected_time_encodings": [
+          [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 137.14599999999996,
+          "write_wall_ms": 137.867135,
+          "read_cpu_ms": 17.590999999999894,
+          "read_wall_ms": 17.713274000000002,
+          "project_cpu_ms": 0.8870000000000573
+        }
+      },
+      "app/zstd": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 17152296,
+        "footer_bytes": 1961,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 457,
+        "selected_time_encodings": [
+          [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 112.048,
+          "write_wall_ms": 112.65810900000001,
+          "read_cpu_ms": 28.86500000000001,
+          "read_wall_ms": 28.993403,
+          "project_cpu_ms": 1.0
+        }
+      },
+      "wide/lz4_raw": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 42850555,
+        "footer_bytes": 14610,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 369,
+        "selected_time_encodings": [
+          [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 181.6819999999998,
+          "write_wall_ms": 182.533683,
+          "read_cpu_ms": 41.818999999999505,
+          "read_wall_ms": 42.158252,
+          "project_cpu_ms": 0.9720000000002074
+        }
+      },
+      "wide/zstd": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 21406866,
+        "footer_bytes": 14609,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "p_timestamp",
+        "selected_time_bytes": 372,
+        "selected_time_encodings": [
+          [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 235.36299999999983,
+          "write_wall_ms": 236.55305099999998,
+          "read_cpu_ms": 64.68600000000015,
+          "read_wall_ms": 65.037812,
+          "project_cpu_ms": 1.0540000000000873
+        }
+      },
+      "otel/lz4_raw": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 39983132,
+        "footer_bytes": 3948,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "event_time",
+        "selected_time_bytes": 4021,
+        "selected_time_encodings": [
+          [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 118.3140000000003,
+          "write_wall_ms": 119.455819,
+          "read_cpu_ms": 25.692000000000007,
+          "read_wall_ms": 25.840934,
+          "project_cpu_ms": 0.9520000000002256
+        }
+      },
+      "otel/zstd": {
+        "conservative_string_bound_chunks": 1,
+        "file_bytes": 20405724,
+        "footer_bytes": 3945,
+        "row_groups": 1,
+        "rows": 100000,
+        "selected_time": "event_time",
+        "selected_time_bytes": 1425,
+        "selected_time_encodings": [
+          [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ]
+        ],
+        "median": {
+          "write_cpu_ms": 135.89699999999993,
+          "write_wall_ms": 136.551385,
+          "read_cpu_ms": 39.597999999999956,
+          "read_wall_ms": 39.988074,
+          "project_cpu_ms": 0.9949999999998909
+        }
+      }
+    }
+  },
+  "same_inputs": {
+    "app": "9ef19d5df9fce109179f4c39d3599f380c48b2d791fb2e28fab927e9cb86bd42",
+    "wide": "270e09bf57978ad89a77a7a7e949a47666ab51d44a241af59007441ff8dd7680",
+    "otel": "4c2e8ed41e158343ac330764cd1e89ebee81338a7c6a09e589c3d8b645023481"
+  },
+  "semantic_comparison": {
+    "app/lz4_raw": "schema, values, nulls, timestamps, row-group statistics: PASS",
+    "app/zstd": "schema, values, nulls, timestamps, row-group statistics: PASS",
+    "wide/lz4_raw": "schema, values, nulls, timestamps, row-group statistics: PASS",
+    "wide/zstd": "schema, values, nulls, timestamps, row-group statistics: PASS",
+    "otel/lz4_raw": "schema, values, nulls, timestamps, row-group statistics: PASS",
+    "otel/zstd": "schema, values, nulls, timestamps, row-group statistics: PASS"
+  }
+}
