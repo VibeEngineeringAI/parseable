@@ -42,5 +42,5 @@ if len(sys.argv) == 3:
     p{color:var(--muted-foreground,#aaa);font-size:12px}
     @media(max-width:450px){.panels{grid-template-columns:1fr}}
     </style><div class="panels">''' + ''.join(panels) + '''</div>
-    <p>LZ4_RAW = 100 within each fixture. 270,000 synthetic rows; five-round medians.
+    <p>LZ4_RAW = 100 within each fixture. Synthetic log fixtures; medians exclude warmup.
     Arrow/Parquet Rust 59.2.0. Lower is better. Local warm-cache experiment.</p>''')
