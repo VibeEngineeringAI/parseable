@@ -87,23 +87,23 @@ impl PartitionedEvents {
         mut stage: impl FnMut(&super::Event) -> Result<(), E>,
         mut observe: impl FnMut(&super::Event, usize, u64, NaiveDateTime),
     ) -> Result<(), E> {
-        let mut staged = vec![false; self.events.len()];
-        let mut next = 0;
-        for (index, event) in self.events.iter().enumerate() {
-            stage(event)?;
-            staged[index] = true;
-            // A completed group can contain later input rows. Only release the
-            // contiguous input prefix whose staging writes have all succeeded.
-            while let Some(&(group, offset, size, timestamp)) = self.rows.get(next) {
-                if !staged[group] {
-                    break;
-                }
-                let event = &self.events[group];
-                observe(event, offset, size, timestamp);
-                next += 1;
+        let mut completed = 0;
+        let mut result = Ok(());
+        for event in &self.events {
+            if let Err(error) = stage(event) {
+                result = Err(error);
+                break;
+            }
+            completed += 1;
+        }
+        // Account every completed group, including rows beyond a failed group
+        // in input order. Never retry staging after an error.
+        for &(group, offset, size, timestamp) in &self.rows {
+            if group < completed {
+                observe(&self.events[group], offset, size, timestamp);
             }
         }
-        Ok(())
+        result
     }
 }
 
@@ -1900,8 +1900,8 @@ mod partition_batching_tests {
             ),
             Err(())
         );
-        // Group a (rows 1,3) is staged; only row 1 is a contiguous prefix.
-        assert_eq!(delivered, vec![old[0].rb.clone()]);
+        // Group a (rows 1,3) is staged; both rows must be accounted.
+        assert_eq!(delivered, vec![old[0].rb.clone(), old[2].rb.clone()]);
     }
 
     #[test]
