@@ -23,7 +23,7 @@ use chrono::Utc;
 use opentelemetry_proto::tonic::{
     logs::v1::LogsData, metrics::v1::MetricsData, trace::v1::TracesData,
 };
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
@@ -355,6 +355,14 @@ pub fn push_logs(
     tenant_id: &Option<String>,
     budget: &mut FlattenBudget,
 ) -> Result<(), PostError> {
+    // Snapshot at request entry. A subscriber attaching later receives ordered
+    // single-row slices from the grouped path.
+    let grouped = use_partitioned_ingest_batching(
+        PARSEABLE.options.partitioned_ingest_batching,
+        PARSEABLE.options.mode,
+        &crate::livetail::LIVETAIL,
+        stream_name,
+    );
     let stream = PARSEABLE.get_stream(stream_name, tenant_id)?;
     let time_partition_limit = stream.get_time_partition_limit();
     let static_schema_flag = stream.get_static_schema_flag();
@@ -416,7 +424,7 @@ pub fn push_logs(
             tenant_id: tenant_id.to_owned(),
         };
         event.process()?;
-    } else {
+    } else if !grouped {
         // Per-record path for custom-partitioned streams
         let events: Result<Vec<_>, _> = data
             .into_par_iter()
@@ -462,8 +470,64 @@ pub fn push_logs(
         for event in events {
             event.process_without_field_limit()?;
         }
+    } else {
+        let records = data
+            .into_iter()
+            .map(|json| {
+                let size = json_byte_size(&json);
+                (json, size)
+            })
+            .collect();
+        let events = json::Event::partitioned_events(
+            records,
+            p_timestamp,
+            stream_name,
+            &schema,
+            static_schema_flag,
+            custom_partition.as_ref(),
+            time_partition.as_ref(),
+            schema_version,
+            p_custom_fields,
+            telemetry_type,
+            tenant_id,
+            infer_timestamp,
+            // Query-mode user ingestion has a single, unsegmented memory
+            // buffer, whose global input order must also remain unchanged.
+            PARSEABLE.options.mode != crate::option::Mode::Query,
+        )
+        .map_err(PostError::Invalid)?;
+        // Check the union of all events' fields against the limit and commit
+        // it under one write lock before processing any event. The fields are
+        // then reserved, so processing cannot fail on the limit partway through
+        // (leaving earlier events staged) even if concurrent requests add
+        // fields meanwhile.
+        let schemas: Vec<_> = events
+            .iter()
+            .map(|event| (event.rb.schema(), event.is_first_event))
+            .collect();
+        let committed = commit_ingested_schemas(
+            stream_name,
+            &stream.metadata,
+            &schemas,
+            PARSEABLE.options.dataset_fields_allowed_limit,
+        )?;
+        if committed && !stream.get_static_schema_flag() {
+            stream
+                .stage_schema_file(stream.get_schema().as_ref().clone())
+                .map_err(EventError::from)?;
+        }
+        events.process()?;
     }
     Ok(())
+}
+
+fn use_partitioned_ingest_batching(
+    enabled: bool,
+    mode: crate::option::Mode,
+    tail: &crate::livetail::LiveTail,
+    stream_name: &str,
+) -> bool {
+    enabled && mode != crate::option::Mode::Query && !tail.has_subscribers(stream_name)
 }
 
 /// Zero-allocation JSON byte size counter.
@@ -638,6 +702,62 @@ pub fn validate_stream_for_ingestion(
 mod tests {
     use super::*;
     use actix_web::test::TestRequest;
+
+    #[test]
+    fn partitioned_batching_defaults_to_per_record_and_falls_back_for_subscribers() {
+        use crate::{
+            cli::{Cli, StorageOptions},
+            option::Mode,
+        };
+        use clap::Parser;
+        let StorageOptions::Local(args) = Cli::try_parse_from(["parseable", "local-store", "/tmp"])
+            .unwrap()
+            .storage
+        else {
+            panic!("expected local store")
+        };
+        let tail = crate::livetail::LiveTail::default();
+        assert!(!args.options.partitioned_ingest_batching);
+        assert!(!use_partitioned_ingest_batching(
+            args.options.partitioned_ingest_batching,
+            Mode::All,
+            &tail,
+            "test"
+        ));
+        assert!(use_partitioned_ingest_batching(
+            true,
+            Mode::All,
+            &tail,
+            "test"
+        ));
+        assert!(!use_partitioned_ingest_batching(
+            true,
+            Mode::Query,
+            &tail,
+            "test"
+        ));
+        let receiver = tail.new_pipe("subscriber".into(), "test".into());
+        assert!(!use_partitioned_ingest_batching(
+            true,
+            Mode::All,
+            &tail,
+            "test"
+        ));
+        // Registry keys are stream names, not tenant-prefixed names.
+        assert!(use_partitioned_ingest_batching(
+            true,
+            Mode::All,
+            &tail,
+            "other"
+        ));
+        drop(receiver);
+        assert!(use_partitioned_ingest_batching(
+            true,
+            Mode::All,
+            &tail,
+            "test"
+        ));
+    }
 
     #[test]
     fn test_get_custom_fields_from_header_with_custom_fields() {

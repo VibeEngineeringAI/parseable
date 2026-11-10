@@ -718,6 +718,14 @@ pub struct Options {
     )]
     pub normalise_otel_payload: bool,
 
+    #[arg(
+        long,
+        env = "P_PARTITIONED_INGEST_BATCHING",
+        default_value = "false",
+        help = "Batch staging for partitioned ingest requests without live-tail subscribers"
+    )]
+    pub partitioned_ingest_batching: bool,
+
     // the duration during which local sync should be completed
     #[arg(
         long,

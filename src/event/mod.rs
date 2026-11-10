@@ -67,7 +67,7 @@ impl Event {
     /// dataset field limit.
     pub fn process(self) -> Result<(), EventError> {
         let limit = PARSEABLE.options.dataset_fields_allowed_limit;
-        self.process_with_field_limit(limit)
+        self.process_with_field_limit(limit, true)
     }
 
     /// Processes the event without enforcing the dataset field limit.
@@ -80,7 +80,11 @@ impl Event {
     /// together with `commit_ingested_schemas`, so that a request yielding
     /// several events cannot fail on the limit after some were staged.
     pub fn process_without_field_limit(self) -> Result<(), EventError> {
-        self.process_with_field_limit(usize::MAX)
+        self.process_with_field_limit(usize::MAX, true)
+    }
+
+    pub(crate) fn stage_without_observers(self) -> Result<(), EventError> {
+        self.process_with_field_limit(usize::MAX, false)
     }
 
     #[instrument(
@@ -94,7 +98,11 @@ impl Event {
         )
     )]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    fn process_with_field_limit(self, field_limit: usize) -> Result<(), EventError> {
+    fn process_with_field_limit(
+        self,
+        field_limit: usize,
+        observers: bool,
+    ) -> Result<(), EventError> {
         let mut key = get_schema_key(&self.rb.schema().fields);
         if self.time_partition.is_some() {
             let parsed_timestamp_to_min = self.parsed_timestamp.format("%Y%m%dT%H%M").to_string();
@@ -137,29 +145,28 @@ impl Event {
             self.stream_type,
         )?;
 
+        if observers {
+            self.observe(self.origin_size, self.rb.num_rows(), self.parsed_timestamp);
+            crate::livetail::LIVETAIL.process(&self.stream_name, &self.rb);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe(&self, size: u64, num_rows: usize, timestamp: NaiveDateTime) {
         let tenant = self.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
         update_stats(
             &self.stream_name,
             self.origin_format,
-            self.origin_size,
-            self.rb.num_rows(),
-            self.parsed_timestamp.date(),
+            size,
+            num_rows,
+            timestamp.date(),
             tenant,
         );
 
         // Track billing metrics for event ingestion
-        let date_string = self.parsed_timestamp.date().to_string();
-        increment_events_ingested_by_date(self.rb.num_rows() as u64, &date_string, tenant);
-        increment_events_ingested_size_by_date(
-            self.origin_size,
-            &date_string,
-            self.telemetry_type,
-            tenant,
-        );
-
-        crate::livetail::LIVETAIL.process(&self.stream_name, &self.rb);
-
-        Ok(())
+        let date_string = timestamp.date().to_string();
+        increment_events_ingested_by_date(num_rows as u64, &date_string, tenant);
+        increment_events_ingested_size_by_date(size, &date_string, self.telemetry_type, tenant);
     }
 
     pub fn process_unchecked(&self) -> Result<(), EventError> {
