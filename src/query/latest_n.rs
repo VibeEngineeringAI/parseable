@@ -102,10 +102,21 @@ fn repeatable(predicate: &Expr) -> bool {
                 Expr::ScalarFunction(function) => {
                     function.func.signature().volatility != Volatility::Immutable
                 }
+                // Subqueries are not walked into, so none is accepted
                 Expr::ScalarSubquery(_)
                 | Expr::Exists(_)
                 | Expr::InSubquery(_)
-                | Expr::Placeholder(_) => true,
+                | Expr::SetComparison(_)
+                | Expr::OuterReferenceColumn(..)
+                // Values or functions this check cannot vouch for
+                | Expr::ScalarVariable(..)
+                | Expr::Placeholder(_)
+                | Expr::HigherOrderFunction(_)
+                | Expr::Lambda(_)
+                | Expr::LambdaVariable(_)
+                | Expr::Unnest(_)
+                | Expr::AggregateFunction(_)
+                | Expr::WindowFunction(_) => true,
                 _ => false,
             })
         })
@@ -604,6 +615,14 @@ mod tests {
             ),
             (
                 "SELECT * FROM logs WHERE EXISTS (SELECT 1 FROM logs) ORDER BY p_timestamp DESC LIMIT 10",
+                false,
+            ),
+            (
+                "SELECT * FROM logs WHERE v0 < ANY (SELECT v0 FROM logs) ORDER BY p_timestamp DESC LIMIT 10",
+                false,
+            ),
+            (
+                "SELECT * FROM logs WHERE level = 'ERROR' OR 1 < ALL (SELECT CASE WHEN now() < p_timestamp THEN 2 ELSE 0 END FROM logs) ORDER BY p_timestamp DESC LIMIT 10",
                 false,
             ),
             (

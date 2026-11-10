@@ -15,8 +15,9 @@ The optimization requires a single stream scan, plain column projections, at
 least eight output columns, and one descending sort on the stream's timestamp
 column followed by a literal nonzero LIMIT. LIMIT plus OFFSET must be at most
 1,000. Joins, aggregates, expressions in the projection or sort, and distributed
-query modes bypass it. So does a predicate that contains a subquery or a
-function whose result depends on when it runs, such as `now()` or `random()`:
+query modes bypass it. So does a predicate that contains a subquery of any
+form (`IN`, `EXISTS`, `ANY`, `ALL` or scalar) or a function whose result depends
+on when it runs, such as `now()` or `random()`:
 the probes and the final query run separately and must agree on which rows
 match. Nullable timestamps with NULLS FIRST require a predicate
 that excludes null timestamps.
