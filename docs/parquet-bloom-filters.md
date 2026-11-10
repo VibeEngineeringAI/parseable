@@ -76,14 +76,22 @@ dataset, not production capacity.
 | `!=` on the ID column | object storage | 835 ms | 1,042 ms |
 | No predicate on the ID column | object storage | 443 ms | 447 ms |
 
-The two slower rows are the cost described above. A full-range lookup issued
-50 object-store GETs without filters and 138 with them, because each row
-group's filter is a separate read. With `after-row-group` the same lookups
-issued 146 GETs and timings were within a few percent (355 ms against 346 ms
+The two slower rows are the cost described above. A full-range lookup recorded
+50 logical object-store `GET` calls without filters and 138 with them, because
+each row group's filter is a separate read. With `after-row-group` the same lookups
+recorded 146 `GET` calls and timings were within a few percent (355 ms against 346 ms
 for the absent-ID lookup on object storage). With a
 narrow time range, min/max statistics already leave little to skip, so the
 filter reads are overhead (6 GETs became 10). A `!=` predicate still fetches
 the filters but cannot use them.
+
+These counts are the `GET` metric from Parseable's storage wrapper, not the
+total number of HTTP requests or billed S3 GETs. A separate `GET_RANGES` call
+can issue multiple HTTP range requests after the storage library coalesces
+nearby ranges. Those requests and the library's retries are not individually
+visible to the wrapper. Use an isolated MinIO server-side trace or S3 request
+logs to measure physical requests before estimating request charges. Faster
+query times alone do not establish lower S3 costs.
 
 Writing filters added 2.3% to conversion CPU instructions for one column and
 4.8% for two. Files grew 6.6% and 13.2%; the test data compresses unusually

@@ -1,0 +1,118 @@
+{
+  "harness_revision": "28ce491ba0ff85ffc1c450ba8b280f9ac8b50b0a",
+  "timestamp_fixture": "non-null and constant within each 8192-row IPC batch",
+  "command": "compression-bench OUTPUT_DIR 270000 3 262144",
+  "arms": {
+    "dictionary": {
+      "patch": "timestamp-batch-dictionary.patch",
+      "source_sha256": "7ac5ff3b3f49c19e1c04d81569f0bc97c322f36faad65121798a2fa3097f3524",
+      "files": {
+        "app-lz4_raw.parquet": {
+          "bytes": 5958647,
+          "sha256": "985f371e6bdab4658f368f3f44c36a2eed08974fc587474e0f0048bad43051ef"
+        },
+        "app-statistics.json": {
+          "bytes": 24704,
+          "sha256": "ebb2b62d6a6fac443ec92047f84aadee60bc2f0a23e05f72c9ea9319b776a431"
+        },
+        "app-zstd.parquet": {
+          "bytes": 2753730,
+          "sha256": "f47eaccb31f4ffb68f9228ad20bdf4939ed3b5ad60ba9d7aa5067e5f7d445889"
+        },
+        "app.arrow": {
+          "bytes": 28097682,
+          "sha256": "e7552323d904862a22c73c412005b56cfd9515fe02f6ff57b367b755d34686db"
+        },
+        "otel-lz4_raw.parquet": {
+          "bytes": 10565978,
+          "sha256": "7a8fffd67a924df12ef05259775ce6e85105ff693c45db56d5fc5373cae2e108"
+        },
+        "otel-statistics.json": {
+          "bytes": 58954,
+          "sha256": "fcbce4258cc78f861e1ebb39f9baa214ff4d64bee79cf21251aa580fef5b1bdf"
+        },
+        "otel-zstd.parquet": {
+          "bytes": 4317498,
+          "sha256": "d8259baf37d115c1a8c50480c1b4bdedcfc0ba71690caf881877afb294696619"
+        },
+        "otel.arrow": {
+          "bytes": 80984754,
+          "sha256": "5019bb5a686899114468136d49fabbc9560706fbd69cc8d023f77957bcae3619"
+        },
+        "wide-lz4_raw.parquet": {
+          "bytes": 29526926,
+          "sha256": "26282db472a515a087e0639965a174f39ea416d1f744083d49f20e0ce6d05962"
+        },
+        "wide-statistics.json": {
+          "bytes": 242982,
+          "sha256": "c1648c6125a2f962fd98d8363af212dccaa69982a8026c835027d71fb6e4d8f7"
+        },
+        "wide-zstd.parquet": {
+          "bytes": 13724621,
+          "sha256": "c839ce3f294dd416f6af4e499395645ac2bb73f53edb0022c948e8d619fdf64a"
+        },
+        "wide.arrow": {
+          "bytes": 132711890,
+          "sha256": "23237f3db9e8f8b7980934a0594c886c996c167fe72702d50b0b19ef764da0fc"
+        }
+      },
+      "patch_sha256": "429801fa67179443ce9c3fce6bb632d94a7bae1cc1c120f9a3f5b107766f602e"
+    },
+    "delta": {
+      "patch": "timestamp-batch-delta.patch",
+      "source_sha256": "ff3240cdda4289eb9d10fe369c2d3f6933cea4abd7e0562ee6abb42cf49206d9",
+      "files": {
+        "app-lz4_raw.parquet": {
+          "bytes": 5958887,
+          "sha256": "769c25a72436e5e8bef19829c0ff21dbc68d63cc36b6888c0f7f885674097632"
+        },
+        "app-statistics.json": {
+          "bytes": 24700,
+          "sha256": "bef0cf8115e2f37e8a3a38d01549415638206bf8c0f23a212cf0dd55635e90cd"
+        },
+        "app-zstd.parquet": {
+          "bytes": 2753905,
+          "sha256": "b53fcff9885733049fb863c10154a5404c7b60729f84bf4527e05c1c6e76bf9b"
+        },
+        "app.arrow": {
+          "bytes": 28097682,
+          "sha256": "e7552323d904862a22c73c412005b56cfd9515fe02f6ff57b367b755d34686db"
+        },
+        "otel-lz4_raw.parquet": {
+          "bytes": 10566218,
+          "sha256": "e83147ea228f7ddf884af63f3e58345b29fb20a8f8b11a8f8b3187896691d0a7"
+        },
+        "otel-statistics.json": {
+          "bytes": 58950,
+          "sha256": "50438776be46ae61d22c3fe1ac64accf9922820096105b66f22541910854b04d"
+        },
+        "otel-zstd.parquet": {
+          "bytes": 4317673,
+          "sha256": "f57661d1a6d764f29400adaee280965fc9a74ad4b1c549ab7494d078cec8e590"
+        },
+        "otel.arrow": {
+          "bytes": 80984754,
+          "sha256": "5019bb5a686899114468136d49fabbc9560706fbd69cc8d023f77957bcae3619"
+        },
+        "wide-lz4_raw.parquet": {
+          "bytes": 29527166,
+          "sha256": "4579dfddbe65d472240ed1be1a8610dbcae7316ba3a53d76150ec634db85dc4a"
+        },
+        "wide-statistics.json": {
+          "bytes": 242978,
+          "sha256": "70e77e53325e380bb05b301606c4792c7c2db9cb7f056de8b54e3b59a525b67c"
+        },
+        "wide-zstd.parquet": {
+          "bytes": 13724796,
+          "sha256": "af06339cd5c7b9068893d1aa6c9912cf6bfa9220d9e3657e9bac9c6c941a9929"
+        },
+        "wide.arrow": {
+          "bytes": 132711890,
+          "sha256": "23237f3db9e8f8b7980934a0594c886c996c167fe72702d50b0b19ef764da0fc"
+        }
+      },
+      "patch_sha256": "58b3d9d4468e2aa555dc399ff0ae9ee564ca778d36d584b2cda97e6ad3c60dae"
+    }
+  },
+  "column_inspector_sha256": "9c952347a7a7f211c5efc8221579778a3d3c7f0d20d02f2804e4f8b9d881c298"
+}

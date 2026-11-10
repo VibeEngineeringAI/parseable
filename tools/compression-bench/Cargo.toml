@@ -1,0 +1,21 @@
+[package]
+name = "compression-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+arrow-array = "=59.2.0"
+arrow-schema = "=59.2.0"
+arrow-ipc = "=59.2.0"
+parquet = "=59.2.0"
+# Match codec feature unification from the server's direct zstd dependency.
+zstd = "=0.13.3"
+libc = "0.2"
+serde_json = "1"
+
+[profile.release]
+debug = 0
+strip = true

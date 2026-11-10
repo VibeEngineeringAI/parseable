@@ -1,0 +1,59 @@
+{
+  "harness_revision": "28ce491ba0ff85ffc1c450ba8b280f9ac8b50b0a",
+  "patch": "timestamp-dictionary-disabled.patch",
+  "patch_sha256": "9fa5f4209882d382d66b92132b87e78e62751adc55d4183d50eea09cac114ece",
+  "source_sha256": "2401ad2d034a2edd3a77429161b4e0335f9b1afab178931e13f369da5fd629c6",
+  "command": "compression-bench OUTPUT_DIR 270000 5 262144",
+  "scope": "standalone synthetic dense timestamp fixture only; no production writer changes",
+  "files": {
+    "app-lz4_raw.parquet": {
+      "bytes": 5959311,
+      "sha256": "62ecf1f5c547fe0bb1ff47c5d30825e641707ac05d77529e0b568975cfe96fc2"
+    },
+    "app-statistics.json": {
+      "bytes": 24709,
+      "sha256": "283487c465b9e73d989f20633fb5b3ac076b21c580819ec872217e58b23f1dea"
+    },
+    "app-zstd.parquet": {
+      "bytes": 2754023,
+      "sha256": "5bc77c6291668765598d859a39ca59184001367c95d44d01e37f3ffd249b5db8"
+    },
+    "app.arrow": {
+      "bytes": 28097682,
+      "sha256": "c1f5889240acc37a1a11341df96c41ac28ee2401e96221ec186e9aa380aa8dbf"
+    },
+    "otel-lz4_raw.parquet": {
+      "bytes": 10566642,
+      "sha256": "81e76867d7246b7bf9309c18c3a7cb998914f78d943dcc29a33249ec34c431df"
+    },
+    "otel-statistics.json": {
+      "bytes": 58959,
+      "sha256": "b8a0b546c8f48269742a0344da9601aad00e8b4a23c975b9a04bfdf917acc4bc"
+    },
+    "otel-zstd.parquet": {
+      "bytes": 4317791,
+      "sha256": "add5f18e69bd681c0469025a9b31171ec97ef6ea2f3c09b5d8e662110d5d6d85"
+    },
+    "otel.arrow": {
+      "bytes": 80984754,
+      "sha256": "111c6787ae57fc003bc9d91e28a06c91f2024b59b94c6d143517c51d082fb9e0"
+    },
+    "wide-lz4_raw.parquet": {
+      "bytes": 29527590,
+      "sha256": "a9a8f95f59ad81cb8429a165c7c6abbf06f2d9e9222fb3601b6f0b6777566d7c"
+    },
+    "wide-statistics.json": {
+      "bytes": 242987,
+      "sha256": "6be15841b57a7eaf6072c40e906ab8896cfa5fb8a7a16e8076f1c6ccbf4b9aea"
+    },
+    "wide-zstd.parquet": {
+      "bytes": 13724914,
+      "sha256": "f10f1a9074584d5f01948c5c9ae0d6e88dbc626d9613bf84c1058bf1c52eaaa4"
+    },
+    "wide.arrow": {
+      "bytes": 132711890,
+      "sha256": "5c9ff00ed59f45258f3ace014c6eb14be4aeda55a50fbf52a20124126adcb4bd"
+    }
+  },
+  "column_inspector_sha256": "9c952347a7a7f211c5efc8221579778a3d3c7f0d20d02f2804e4f8b9d881c298"
+}

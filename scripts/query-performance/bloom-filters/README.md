@@ -14,7 +14,7 @@ comparing arms; repeat with separate server lifetimes and alternate arm order.
   directories must come from identical conversion input and settings apart from
   the candidate's unset bloom option.
 - `queries.py PORT PID PRESENT_ID OUTPUT START END`: measures query latency,
-  Linux process CPU and storage request counts, retaining responses and EXPLAIN
+  Linux process CPU and logical storage call counts, retaining responses and EXPLAIN
   ANALYZE. Requires the `applogs` stream, `trace_id`, `service`, `level`, and
   `p_timestamp`, with a known present ID. Set `PRESENT_TIME` to its SQL timestamp.
   Choose an absent ID absent from your fixture (the script uses a fixed value).
@@ -40,3 +40,19 @@ Query outputs are descriptive measurements, not correctness oracles. The stored
 response excerpt may be truncated. Check complete results separately before
 claiming compatibility. Changing filter position does not merge object-store
 filter reads. See `docs/parquet-bloom-filters.md` for costs and measured results.
+
+The existing output keys `GETs` and `GET_RANGES` count calls observed by
+Parseable's storage wrapper; they are retained for compatibility with previous
+outputs and `summarize.py`. They do not count every HTTP request. One
+`GET_RANGES` call can produce multiple HTTP GETs after range coalescing, and
+retries occur below the wrapper. Do not multiply either counter, or their sum,
+by an S3 request price to estimate a bill. Capture server-side requests for an
+isolated benchmark, including retries, and distinguish data requests from
+metadata reads and concurrent background activity.
+
+Before adding a cache or changing range reads, compare cold and warm metadata
+cache runs with bloom filtering enabled and disabled on the same files. Record
+HTTP Range headers and response sizes as well as these application metrics.
+For cold runs, check which subsequent reads overlap the footer tail; for warm
+runs, check whether the same proposed savings remain. Include memory usage,
+complete result comparisons, and read-failure behavior in the evaluation.

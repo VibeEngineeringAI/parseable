@@ -1,0 +1,68 @@
+{
+  "target": "x86_64-unknown-linux-gnu",
+  "scope": "default normal/build dependencies; development dependencies excluded",
+  "commands": [
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path Cargo.toml -e normal,build,features -i lz4_flex",
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path tools/compression-bench/Cargo.toml -e normal,build,features -i lz4_flex",
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path Cargo.toml -e normal,build,features -i zstd",
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path tools/compression-bench/Cargo.toml -e normal,build,features -i zstd",
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path Cargo.toml -e normal,build,features -i zstd-safe",
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path tools/compression-bench/Cargo.toml -e normal,build,features -i zstd-safe",
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path Cargo.toml -e normal,build,features -i zstd-sys",
+    "cargo tree --offline --locked --target x86_64-unknown-linux-gnu --manifest-path tools/compression-bench/Cargo.toml -e normal,build,features -i zstd-sys"
+  ],
+  "crates": {
+    "lz4_flex": {
+      "root": [
+        "alloc",
+        "frame",
+        "std"
+      ],
+      "benchmark": [
+        "alloc",
+        "frame",
+        "std"
+      ]
+    },
+    "zstd": {
+      "root": [
+        "arrays",
+        "default",
+        "legacy",
+        "zdict_builder"
+      ],
+      "benchmark": [
+        "arrays",
+        "default",
+        "legacy",
+        "zdict_builder"
+      ]
+    },
+    "zstd-safe": {
+      "root": [
+        "arrays",
+        "legacy",
+        "std",
+        "zdict_builder"
+      ],
+      "benchmark": [
+        "arrays",
+        "legacy",
+        "std",
+        "zdict_builder"
+      ]
+    },
+    "zstd-sys": {
+      "root": [
+        "legacy",
+        "std",
+        "zdict_builder"
+      ],
+      "benchmark": [
+        "legacy",
+        "std",
+        "zdict_builder"
+      ]
+    }
+  }
+}
