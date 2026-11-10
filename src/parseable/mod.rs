@@ -867,7 +867,7 @@ impl Parseable {
     ) -> Result<(), CreateStreamError> {
         // fail to proceed if invalid stream name
         if stream_type != StreamType::Internal {
-            validator::stream_name(&stream_name, stream_type)?;
+            validator::new_stream_name(&stream_name, stream_type)?;
         }
         // Proceed to create log stream if it doesn't exist
         let storage = self.storage.get_object_store();
