@@ -26,9 +26,11 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use datafusion::arrow::util::bit_util::round_upto_multiple_of_64;
 use itertools::Itertools;
+use rayon::prelude::*;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
 };
 use tracing::{error, info_span};
@@ -47,6 +49,209 @@ pub struct Event {
 impl Event {
     pub fn new(json: Value, p_timestamp: DateTime<Utc>) -> Self {
         Self { json, p_timestamp }
+    }
+    /// Batch only records whose per-record inference is determined by the same
+    /// known scalar fields. Full-inference records are barriers: typed sibling
+    /// renaming can otherwise make two different key sets share a staging file.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn partitioned_events(
+        records: Vec<(Value, u64)>,
+        p_timestamp: DateTime<Utc>,
+        stream_name: &str,
+        storage_schema: &HashMap<String, Arc<Field>>,
+        static_schema_flag: bool,
+        custom_partitions: Option<&String>,
+        time_partition: Option<&String>,
+        schema_version: SchemaVersion,
+        p_custom_fields: &HashMap<String, String>,
+        telemetry_type: TelemetryType,
+        tenant_id: &Option<String>,
+        infer_timestamp: bool,
+        batch: bool,
+    ) -> Result<Vec<super::Event>, anyhow::Error> {
+        let convert = |json, origin_size| {
+            Self::new(json, p_timestamp).into_event(
+                stream_name.to_owned(),
+                origin_size,
+                storage_schema,
+                static_schema_flag,
+                custom_partitions,
+                time_partition,
+                schema_version,
+                StreamType::UserDefined,
+                p_custom_fields,
+                telemetry_type,
+                tenant_id,
+                infer_timestamp,
+            )
+        };
+        // Nested values require full inference. Keep these requests in one
+        // parallel pass, as in the per-record path: splitting mixed requests
+        // into short fallback runs adds scheduling and grouping work without
+        // amortizing decoding. Ordered collection keeps the first input error.
+        if batch
+            && records.iter().any(|(json, _)| {
+                json.as_object().is_some_and(|row| {
+                    row.values()
+                        .any(|value| matches!(value, Value::Array(_) | Value::Object(_)))
+                })
+            })
+        {
+            let converted: Vec<_> = records
+                .into_par_iter()
+                .map(|(json, size)| convert(json, size))
+                .collect();
+            return converted.into_iter().collect();
+        }
+        // Partition names are fixed for the request. Hash values in this order
+        // without constructing a second owned copy of the partition map.
+        let partition_fields = custom_partitions
+            .map(|fields| fields.split(',').collect_vec())
+            .unwrap_or_default();
+        let hash_fields = partition_fields
+            .iter()
+            .map(|field| field.trim())
+            .sorted()
+            .dedup()
+            .collect_vec();
+        let mut active_keys: Vec<String> = Vec::new();
+        struct Group {
+            rows: Vec<Value>,
+            origin_size: u64,
+            parsed_timestamp: NaiveDateTime,
+            custom_partition_values: HashMap<String, String>,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        let mut indices: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut events = Vec::new();
+        let flush = |groups: &mut Vec<Group>,
+                     events: &mut Vec<super::Event>|
+         -> Result<(), anyhow::Error> {
+            for group in groups.drain(..) {
+                let (rb, is_first_event) = Self::new(Value::Array(group.rows), p_timestamp)
+                    .into_recordbatch(
+                        storage_schema,
+                        static_schema_flag,
+                        time_partition,
+                        schema_version,
+                        p_custom_fields,
+                        infer_timestamp,
+                    )?;
+                debug_assert!(!is_first_event);
+                events.push(super::Event {
+                    rb,
+                    is_first_event,
+                    stream_name: stream_name.to_owned(),
+                    origin_format: "json",
+                    origin_size: group.origin_size,
+                    parsed_timestamp: group.parsed_timestamp,
+                    time_partition: None,
+                    custom_partition_values: group.custom_partition_values,
+                    stream_type: StreamType::UserDefined,
+                    telemetry_type,
+                    tenant_id: tenant_id.to_owned(),
+                });
+            }
+            Ok(())
+        };
+        let mut fallback = Vec::new();
+        let flush_fallback = |fallback: &mut Vec<(Value, u64)>,
+                              events: &mut Vec<super::Event>|
+         -> Result<(), anyhow::Error> {
+            if fallback.is_empty() {
+                return Ok(());
+            }
+            // Indexed collection preserves input order. Collect each Result
+            // before propagating errors so Rayon cannot select a later error.
+            let converted: Vec<_> = std::mem::take(fallback)
+                .into_par_iter()
+                .map(|(json, size)| convert(json, size))
+                .collect();
+            for event in converted {
+                events.push(event?);
+            }
+            Ok(())
+        };
+        for (json, origin_size) in records {
+            let known = batch
+                // Header fields fill absent payload fields during augmentation. Keep
+                // such records as barriers so distinct input key sets cannot
+                // reorder rows that end up with the same staging schema key.
+                && json.as_object().is_some_and(|row| !row.contains_key(crate::event::DEFAULT_TIMESTAMP_KEY)
+                    && !p_custom_fields.keys().any(|key| row.contains_key(key)))
+                && known_scalar_schema(
+                    std::slice::from_ref(&json),
+                    storage_schema,
+                    schema_version,
+                    static_schema_flag,
+                )
+                .is_some();
+            if !known {
+                flush(&mut groups, &mut events)?;
+                indices.clear();
+                if batch {
+                    fallback.push((json, origin_size));
+                } else {
+                    // Keep an independent sequential reference for tests.
+                    events.push(convert(json, origin_size)?);
+                }
+                continue;
+            }
+            flush_fallback(&mut fallback, &mut events)?;
+            // Use exactly the extraction routines of into_event, before decoding.
+            let partitions = match custom_partitions {
+                Some(_) => extract_custom_partition_values(&json, &partition_fields)?,
+                None => HashMap::new(),
+            };
+            let timestamp = match time_partition {
+                Some(field) => extract_and_parse_time(&json, field)?,
+                None => p_timestamp.naive_utc(),
+            };
+            let row = json.as_object().unwrap();
+            // Usually the keys have the same iteration order. The membership
+            // check also handles maps preserving a different insertion order.
+            let same_keys = row.len() == active_keys.len()
+                && (row.keys().eq(active_keys.iter())
+                    || active_keys.iter().all(|key| row.contains_key(key)));
+            // get_schema_key concatenates names without separators, so even
+            // colliding key sets must retain the existing flush boundary.
+            if !same_keys {
+                flush(&mut groups, &mut events)?;
+                indices.clear();
+                active_keys = row.keys().cloned().collect();
+            }
+            let minute = timestamp.and_utc().timestamp().div_euclid(60);
+            let mut hasher = DefaultHasher::new();
+            minute.hash(&mut hasher);
+            for field in &hash_fields {
+                partitions.get(*field).hash(&mut hasher);
+            }
+            let key = hasher.finish();
+            // Compare full values as well: hash collisions must never combine
+            // different partitions or minutes.
+            let index = indices.get(&key).and_then(|candidates| {
+                candidates.iter().copied().find(|&index| {
+                    let group = &groups[index];
+                    group.custom_partition_values == partitions
+                        && group.parsed_timestamp.and_utc().timestamp().div_euclid(60) == minute
+                })
+            });
+            if let Some(index) = index {
+                groups[index].origin_size += origin_size;
+                groups[index].rows.push(json);
+            } else {
+                indices.entry(key).or_default().push(groups.len());
+                groups.push(Group {
+                    rows: vec![json],
+                    origin_size,
+                    parsed_timestamp: timestamp,
+                    custom_partition_values: partitions,
+                });
+            }
+        }
+        flush_fallback(&mut fallback, &mut events)?;
+        flush(&mut groups, &mut events)?;
+        Ok(events)
     }
 }
 
@@ -1504,6 +1709,237 @@ mod tests {
                     );
                 }
                 schema.extend(fields.into_iter().map(|f| (f.name().to_owned(), f)));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod partition_batching_tests {
+    use super::*;
+    use crate::{
+        event::{commit_ingested_schemas, get_schema_key},
+        metadata::LogStreamMetadata,
+    };
+    use serde_json::json;
+    use std::sync::RwLock;
+
+    type Observation = (
+        std::collections::BTreeMap<String, Vec<RecordBatch>>,
+        std::collections::BTreeMap<String, (u64, usize)>,
+    );
+
+    fn observe(events: &[crate::event::Event]) -> Observation {
+        let mut files = std::collections::BTreeMap::<String, Vec<RecordBatch>>::new();
+        let mut stats = std::collections::BTreeMap::<String, (u64, usize)>::new();
+        for event in events {
+            let key = format!(
+                "{}:{}:{:?}",
+                get_schema_key(&event.rb.schema().fields),
+                event.parsed_timestamp.format("%Y%m%d%H%M"),
+                event.custom_partition_values.iter().sorted().collect_vec()
+            );
+            for row in 0..event.rb.num_rows() {
+                files
+                    .entry(key.clone())
+                    .or_default()
+                    .push(event.rb.slice(row, 1));
+            }
+            let total = stats
+                .entry(format!(
+                    "{}:{}:{}",
+                    event.parsed_timestamp.date(),
+                    event.origin_format,
+                    event.telemetry_type
+                ))
+                .or_default();
+            total.0 += event.origin_size;
+            total.1 += event.rb.num_rows();
+        }
+        (files, stats)
+    }
+
+    #[test]
+    fn partition_batching_matches_per_record_conversion_and_commits() {
+        let now = DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let headers = HashMap::from([("env".to_owned(), "test".to_owned())]);
+        let mut corpus = Vec::new();
+        for i in 0..96 {
+            let mut row = json!({"service": format!("svc-{}", i % 3), "count": i,
+                "timestamp": format!("2026-11-{:02}T23:{:02}:00Z", 8 + i % 2, i % 4), "message": "hello"});
+            if i % 7 == 0 {
+                row["message"] = Value::Null;
+            }
+            if i % 9 == 0 {
+                row.as_object_mut().unwrap().remove("message");
+            }
+            corpus.push(row);
+        }
+        let base = corpus.clone();
+        // Payload/header overlap can collapse otherwise different input key sets.
+        corpus[15]["env"] = json!("payload");
+        corpus[16]["p_timestamp"] = json!("reserved");
+        let mut fallback = corpus.clone();
+        fallback.insert(20, json!({"service":"svc-0", "count":"conflict", "new_field":true, "timestamp":"2026-11-09T23:00:00Z"}));
+        fallback.insert(
+            40,
+            json!({"service":"svc-0", "count":[1,2], "timestamp":"2026-11-09T23:00:00Z"}),
+        );
+        let mut collision = base.clone();
+        for (i, row) in collision.iter_mut().enumerate() {
+            let object = row.as_object_mut().unwrap();
+            if i % 2 == 0 {
+                object.insert("a".to_owned(), json!(i));
+                object.insert("bc".to_owned(), json!(i));
+            } else {
+                object.insert("ab".to_owned(), json!(i));
+                object.insert("c".to_owned(), json!(i));
+            }
+        }
+        let collision_runs = collision
+            .iter()
+            .flat_map(|row| [row.clone(), row.clone()])
+            .collect::<Vec<_>>();
+        let reordered = base
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                if i % 2 == 0 {
+                    return row.clone();
+                }
+                let reversed = row
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                Value::Object(reversed)
+            })
+            .collect::<Vec<_>>();
+        let long_fallback = (0..192)
+            .map(|i| {
+                json!({
+                    "service": "svc-0", "count": [i, i + 1],
+                    "timestamp": "2026-11-09T23:00:00Z"
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut invalid_fallback = long_fallback.clone();
+        // Two distinct errors in a run: parallel conversion must select the
+        // earlier record's error, just like the sequential reference.
+        invalid_fallback[80] = json!({"count": [1], "timestamp": "bad timestamp"});
+        invalid_fallback[120] = json!({"service": "svc-0", "count": [1], "timestamp": 42});
+        let mut invalid = base.clone();
+        invalid[30] = json!({"count":1,"timestamp":"bad timestamp"});
+        let mixed_runs = [1, 2, 3, 4, 31, 32, 33]
+            .into_iter()
+            .map(|run| {
+                let mut records = base.clone();
+                for (i, record) in records.iter_mut().enumerate() {
+                    if i % (run + 1) == run {
+                        record["count"] = json!([i, i + 1]);
+                    }
+                }
+                records
+            })
+            .collect_vec();
+        for version in [SchemaVersion::V0, SchemaVersion::V1] {
+            for static_schema in [false, true] {
+                for empty in [false, true] {
+                    let schema = if empty {
+                        HashMap::new()
+                    } else {
+                        let (rb, _) = Event::new(Value::Array(base.clone()), now)
+                            .into_recordbatch(
+                                &HashMap::new(),
+                                false,
+                                None,
+                                version,
+                                &HashMap::new(),
+                                false,
+                            )
+                            .unwrap();
+                        rb.schema()
+                            .fields()
+                            .iter()
+                            .map(|f| (f.name().clone(), f.clone()))
+                            .collect()
+                    };
+                    let mut schema = schema;
+                    if !empty {
+                        for name in ["a", "ab", "bc", "c"] {
+                            schema.insert(
+                                name.to_owned(),
+                                Arc::new(Field::new(name, DataType::Float64, true)),
+                            );
+                        }
+                    }
+                    for custom in [None, Some("service".to_owned())] {
+                        for time in [None, Some("timestamp".to_owned())] {
+                            for records in [
+                                &base,
+                                &fallback,
+                                &invalid,
+                                &corpus,
+                                &collision,
+                                &collision_runs,
+                                &reordered,
+                                &long_fallback,
+                                &invalid_fallback,
+                            ]
+                            .into_iter()
+                            .chain(mixed_runs.iter())
+                            {
+                                let run = |batch| {
+                                    Event::partitioned_events(records.iter().map(|v| (v.clone(), crate::handlers::http::modal::utils::ingest_utils::json_byte_size(v))).collect(), now, "test", &schema, static_schema, custom.as_ref(), time.as_ref(), version, &headers, TelemetryType::Logs, &None, false, batch)
+                                };
+                                let old = run(false);
+                                let new = run(true);
+                                match (old, new) {
+                                    (Ok(old), Ok(new)) => {
+                                        assert_eq!(observe(&old), observe(&new));
+                                        for limit in [1, 6, 1000] {
+                                            let commit = |events: &[crate::event::Event]| {
+                                                let metadata = RwLock::new(LogStreamMetadata {
+                                                    schema: schema.clone(),
+                                                    static_schema_flag: static_schema,
+                                                    ..Default::default()
+                                                });
+                                                let schemas = events
+                                                    .iter()
+                                                    .map(|e| (e.rb.schema(), e.is_first_event))
+                                                    .collect_vec();
+                                                let result = commit_ingested_schemas(
+                                                    "test", &metadata, &schemas, limit,
+                                                )
+                                                .map_err(|e| e.to_string());
+                                                let fields =
+                                                    metadata.read().unwrap().schema.clone();
+                                                (result, fields)
+                                            };
+                                            assert_eq!(commit(&old), commit(&new));
+                                        }
+                                        if !empty
+                                            && !static_schema
+                                            && custom.is_some()
+                                            && time.is_none()
+                                            && std::ptr::eq(records, &base)
+                                        {
+                                            assert!(new.len() < old.len());
+                                        }
+                                    }
+                                    (Err(old), Err(new)) => {
+                                        assert_eq!(old.to_string(), new.to_string())
+                                    }
+                                    _ => panic!("conversion outcomes differ"),
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

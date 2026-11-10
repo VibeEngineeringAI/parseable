@@ -23,7 +23,6 @@ use chrono::Utc;
 use opentelemetry_proto::tonic::{
     logs::v1::LogsData, metrics::v1::MetricsData, trace::v1::TracesData,
 };
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
@@ -417,28 +416,29 @@ pub fn push_logs(
         };
         event.process()?;
     } else {
-        // Per-record path for custom-partitioned streams
-        let events: Result<Vec<_>, _> = data
-            .into_par_iter()
+        let records = data
+            .into_iter()
             .map(|json| {
-                let origin_size = json_byte_size(&json);
-                (json::Event { json, p_timestamp }).into_event(
-                    stream_name.to_owned(),
-                    origin_size,
-                    &schema,
-                    static_schema_flag,
-                    custom_partition.as_ref(),
-                    time_partition.as_ref(),
-                    schema_version,
-                    StreamType::UserDefined,
-                    p_custom_fields,
-                    telemetry_type,
-                    tenant_id,
-                    infer_timestamp,
-                )
+                let size = json_byte_size(&json);
+                (json, size)
             })
             .collect();
-        let events = events.map_err(PostError::Invalid)?;
+        let events = json::Event::partitioned_events(
+            records,
+            p_timestamp,
+            stream_name,
+            &schema,
+            static_schema_flag,
+            custom_partition.as_ref(),
+            time_partition.as_ref(),
+            schema_version,
+            p_custom_fields,
+            telemetry_type,
+            tenant_id,
+            infer_timestamp,
+            true,
+        )
+        .map_err(PostError::Invalid)?;
         // Check the union of all events' fields against the limit and commit
         // it under one write lock before processing any event. The fields are
         // then reserved, so processing cannot fail on the limit partway through
