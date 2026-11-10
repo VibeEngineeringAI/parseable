@@ -29,6 +29,11 @@ does not report how many rows it persisted. Accounting covers all successfully
 completed staging calls, including completed groups beyond the failed input row.
 No rows are retried. The request returns the staging error.
 
+Batching also fixes which error a request with several invalid records returns.
+With the option on it is always the error of the first invalid record in the
+request. Without it, records are converted in parallel and the error can be
+that of any invalid record.
+
 Grouping retains a row-position map for ordered accounting, and changes disk IPC
 batch boundaries. Staging files remain readable by existing readers. Choose this
 option when ingestion work and staging overhead matter and these partial-failure
