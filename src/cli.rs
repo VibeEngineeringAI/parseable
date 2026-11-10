@@ -525,6 +525,15 @@ pub struct Options {
     pub execution_batch_size: usize,
 
     #[arg(
+        long,
+        env = "P_LATEST_N_PREFILTER",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        help = "Preflight wide descending time-column LIMIT queries in standalone mode"
+    )]
+    pub latest_n_prefilter: bool,
+
+    #[arg(
         long = "compression-algo",
         env = "P_PARQUET_COMPRESSION_ALGO",
         default_value = "lz4_raw",

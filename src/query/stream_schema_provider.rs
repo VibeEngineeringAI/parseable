@@ -29,7 +29,7 @@ use datafusion::{
     common::{
         Constraints, ToDFSchema,
         stats::Precision,
-        tree_node::{TreeNode, TreeNodeRecursion},
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     datasource::{
         DefaultTableSource, MemTable, TableProvider,
@@ -105,6 +105,7 @@ impl SchemaProvider for GlobalSchemaProvider {
                 tenant_id: self.tenant_id.clone(),
                 time_partition: stream.get_time_partition(),
                 hot_tier_guarded: false,
+                planning_cache: None,
             })))
         } else {
             Ok(None)
@@ -116,7 +117,7 @@ impl SchemaProvider for GlobalSchemaProvider {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StandardTableProvider {
     schema: SchemaRef,
     // prefix under which to find snapshot
@@ -125,6 +126,36 @@ struct StandardTableProvider {
     // Column the stream's data files are partitioned by; `p_timestamp` when `None`.
     time_partition: Option<String>,
     hot_tier_guarded: bool,
+    planning_cache: Option<Arc<PlanningCache>>,
+}
+
+// Installed on a cloned table source for one opted-in request only. Historical
+// scans can share a metadata view; staging scans retain the publication capture
+// and refresh sequence below and deliberately bypass this cache.
+#[derive(Debug, Default)]
+struct PlanningCache {
+    format: tokio::sync::OnceCell<ObjectStoreFormat>,
+    manifests: tokio::sync::Mutex<HashMap<String, Option<crate::catalog::manifest::Manifest>>>,
+}
+
+pub(super) fn with_planning_cache(
+    plan: datafusion::logical_expr::LogicalPlan,
+) -> DataFusionResult<datafusion::logical_expr::LogicalPlan> {
+    plan.transform_up(|node| {
+        if let datafusion::logical_expr::LogicalPlan::TableScan(mut scan) = node {
+            if let Some(provider) = standard_table_provider(&scan.source) {
+                let mut provider = provider.clone();
+                provider.planning_cache = Some(Arc::new(PlanningCache::default()));
+                scan.source = provider_as_source(Arc::new(provider));
+            }
+            Ok(Transformed::yes(
+                datafusion::logical_expr::LogicalPlan::TableScan(scan),
+            ))
+        } else {
+            Ok(Transformed::no(node))
+        }
+    })
+    .map(|t| t.data)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -157,6 +188,7 @@ pub(super) fn guarded_hot_tier_table_source(
         tenant_id: provider.tenant_id.clone(),
         time_partition: provider.time_partition.clone(),
         hot_tier_guarded: true,
+        planning_cache: provider.planning_cache.clone(),
     })))
 }
 
@@ -365,6 +397,12 @@ async fn parquet_scan_plan(
 }
 
 impl StandardTableProvider {
+    fn cache_for_filters(&self, filters: &[Expr]) -> Option<&PlanningCache> {
+        self.planning_cache.as_deref().filter(|_| {
+            !is_within_staging_window(&extract_primary_filter(filters, &self.time_partition))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_parquet_physical_plan(
         &self,
@@ -689,6 +727,27 @@ pub async fn collect_from_snapshot(
     stream_name: &str,
     tenant_id: &Option<String>,
 ) -> Result<Vec<File>, DataFusionError> {
+    collect_from_snapshot_cached(
+        snapshot,
+        time_filters,
+        filters,
+        limit,
+        stream_name,
+        tenant_id,
+        None,
+    )
+    .await
+}
+
+async fn collect_from_snapshot_cached(
+    snapshot: &Snapshot,
+    time_filters: &[PartialTimeFilter],
+    filters: &[Expr],
+    limit: Option<usize>,
+    stream_name: &str,
+    tenant_id: &Option<String>,
+    cache: Option<&PlanningCache>,
+) -> Result<Vec<File>, DataFusionError> {
     // Manifest fetches are one object store GET each and are pure round trip
     // latency, so run them concurrently instead of serially. `buffered` keeps
     // the snapshot ordering, which the `rev()` below depends on.
@@ -701,13 +760,19 @@ pub async fn collect_from_snapshot(
                 ..
             } = manifest_item;
             async move {
+                if let Some(cache) = cache
+                    && let Some(manifest) =
+                        cache.manifests.lock().await.get(&manifest_path).cloned()
+                {
+                    return Ok(manifest);
+                }
                 let manifest_opt = PARSEABLE
                     .metastore
                     .get_manifest(
                         stream_name,
                         time_lower_bound,
                         time_upper_bound,
-                        Some(manifest_path),
+                        Some(manifest_path.clone()),
                         tenant_id,
                     )
                     .await
@@ -719,6 +784,13 @@ pub async fn collect_from_snapshot(
                         time_lower_bound,
                         time_upper_bound
                     );
+                }
+                if let Some(cache) = cache {
+                    cache
+                        .manifests
+                        .lock()
+                        .await
+                        .insert(manifest_path, manifest_opt.clone());
                 }
                 Ok::<_, DataFusionError>(manifest_opt)
             }
@@ -798,14 +870,23 @@ impl TableProvider for StandardTableProvider {
         let mut execution_plans = vec![];
         let glob_storage = PARSEABLE.storage.get_object_store();
 
-        let object_store_format: ObjectStoreFormat = serde_json::from_slice(
-            &PARSEABLE
-                .metastore
-                .get_stream_json(&self.stream, false, &self.tenant_id, false)
-                .await
-                .map_err(|e| DataFusionError::Plan(e.to_string()))?,
-        )
-        .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+        let cache = self.cache_for_filters(filters);
+        let load_format = || async {
+            serde_json::from_slice::<ObjectStoreFormat>(
+                &PARSEABLE
+                    .metastore
+                    .get_stream_json(&self.stream, false, &self.tenant_id, false)
+                    .await
+                    .map_err(|e| DataFusionError::Plan(e.to_string()))?,
+            )
+            .map_err(|e| DataFusionError::Plan(e.to_string()))
+        };
+
+        let object_store_format = if let Some(cache) = cache {
+            cache.format.get_or_try_init(load_format).await?.clone()
+        } else {
+            load_format().await?
+        };
 
         let time_partition = object_store_format.time_partition;
         let mut time_filters = extract_primary_filter(filters, &time_partition);
@@ -881,13 +962,14 @@ impl TableProvider for StandardTableProvider {
             }
         }
 
-        let mut manifest_files = collect_from_snapshot(
+        let mut manifest_files = collect_from_snapshot_cached(
             &merged_snapshot,
             &time_filters,
             filters,
             limit,
             &self.stream,
             &self.tenant_id,
+            cache,
         )
         .await?;
 
@@ -1439,6 +1521,66 @@ mod tests {
     };
 
     #[test]
+    fn prefilter_cache_is_request_scoped_and_bypasses_staging() {
+        use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+        use datafusion::prelude::{col, lit};
+        let source = provider_as_source(Arc::new(StandardTableProvider {
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "p_timestamp",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                false,
+            )])),
+            stream: "logs".to_owned(),
+            tenant_id: Some("tenant".to_owned()),
+            time_partition: None,
+            hot_tier_guarded: true,
+            planning_cache: None,
+        }));
+        let original = LogicalPlanBuilder::scan("logs", source.clone(), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let first = super::with_planning_cache(original.clone()).unwrap();
+        let second = super::with_planning_cache(original).unwrap();
+        let provider = |plan: LogicalPlan| {
+            let LogicalPlan::TableScan(scan) = plan else {
+                panic!("expected scan")
+            };
+            standard_table_provider(&scan.source).unwrap().clone()
+        };
+        let a = provider(first.clone());
+        let clone = provider(first);
+        let b = provider(second);
+        assert!(
+            standard_table_provider(&source)
+                .unwrap()
+                .planning_cache
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(
+            a.planning_cache.as_ref().unwrap(),
+            clone.planning_cache.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            a.planning_cache.as_ref().unwrap(),
+            b.planning_cache.as_ref().unwrap()
+        ));
+        assert_eq!(a.tenant_id.as_deref(), Some("tenant"));
+        assert!(a.hot_tier_guarded);
+        let bounds = |end| {
+            vec![
+                col("p_timestamp").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(0), None))),
+                col("p_timestamp").lt_eq(lit(ScalarValue::TimestampMillisecond(Some(end), None))),
+            ]
+        };
+        assert!(a.cache_for_filters(&bounds(60_000)).is_some());
+        assert!(
+            a.cache_for_filters(&bounds(Utc::now().timestamp_millis()))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn guarded_hot_tier_source_preserves_provider_identity() {
         let source = provider_as_source(Arc::new(StandardTableProvider {
             schema: Arc::new(Schema::empty()),
@@ -1446,6 +1588,7 @@ mod tests {
             tenant_id: Some("other-tenant".to_owned()),
             time_partition: Some("event_time".to_owned()),
             hot_tier_guarded: false,
+            planning_cache: None,
         }));
 
         assert_eq!(
