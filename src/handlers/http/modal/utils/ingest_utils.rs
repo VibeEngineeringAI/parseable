@@ -436,7 +436,9 @@ pub fn push_logs(
             telemetry_type,
             tenant_id,
             infer_timestamp,
-            true,
+            // Query-mode user ingestion has a single, unsegmented memory
+            // buffer, whose global input order must also remain unchanged.
+            PARSEABLE.options.mode != crate::option::Mode::Query,
         )
         .map_err(PostError::Invalid)?;
         // Check the union of all events' fields against the limit and commit
@@ -459,9 +461,7 @@ pub fn push_logs(
                 .stage_schema_file(stream.get_schema().as_ref().clone())
                 .map_err(EventError::from)?;
         }
-        for event in events {
-            event.process_without_field_limit()?;
-        }
+        events.process()?;
     }
     Ok(())
 }

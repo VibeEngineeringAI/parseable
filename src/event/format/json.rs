@@ -46,13 +46,90 @@ pub struct Event {
     pub p_timestamp: DateTime<Utc>,
 }
 
+/// Staging batches plus input-order row references for event observers.
+pub(crate) struct PartitionedEvents {
+    pub(crate) events: Vec<super::Event>,
+    // (staging event, row offset, original JSON size, original timestamp)
+    rows: Vec<(usize, usize, u64, NaiveDateTime)>,
+}
+
+impl std::ops::Deref for PartitionedEvents {
+    type Target = [super::Event];
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl PartitionedEvents {
+    #[cfg(test)]
+    pub(crate) fn ordered_rows(&self) -> impl Iterator<Item = super::Event> + '_ {
+        self.rows.iter().map(|&(index, offset, size, timestamp)| {
+            let mut event = self.events[index].clone();
+            event.rb = event.rb.slice(offset, 1);
+            event.origin_size = size;
+            event.parsed_timestamp = timestamp;
+            event
+        })
+    }
+
+    pub(crate) fn process(self) -> Result<(), crate::event::error::EventError> {
+        self.process_with(
+            |event| event.clone().stage_without_observers(),
+            |event, offset, size, timestamp| {
+                event.observe(size, 1, timestamp);
+                crate::livetail::LIVETAIL.process_row(&event.stream_name, &event.rb, offset);
+            },
+        )
+    }
+
+    fn process_with<E>(
+        &self,
+        mut stage: impl FnMut(&super::Event) -> Result<(), E>,
+        mut observe: impl FnMut(&super::Event, usize, u64, NaiveDateTime),
+    ) -> Result<(), E> {
+        let mut staged = vec![false; self.events.len()];
+        let mut next = 0;
+        for (index, event) in self.events.iter().enumerate() {
+            stage(event)?;
+            staged[index] = true;
+            // A completed group can contain later input rows. Only release the
+            // contiguous input prefix whose staging writes have all succeeded.
+            while let Some(&(group, offset, size, timestamp)) = self.rows.get(next) {
+                if !staged[group] {
+                    break;
+                }
+                let event = &self.events[group];
+                observe(event, offset, size, timestamp);
+                next += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decode_rows(data: &[impl serde::Serialize], schema: Arc<Schema>) -> anyhow::Result<RecordBatch> {
+    let _span = info_span!("json_to_recordbatch", record_count = data.len()).entered();
+    if data.is_empty() {
+        return Err(anyhow!("JSON batch must contain at least one event"));
+    }
+    let mut reader = ReaderBuilder::new(schema)
+        .with_batch_size(round_upto_multiple_of_64(data.len()))
+        .with_coerce_primitive(false)
+        .build_decoder()?;
+    reader.serialize(data)?;
+    match reader.flush() {
+        Ok(Some(rb)) => Ok(rb),
+        Err(err) => Err(anyhow!("Failed to create recordbatch due to {:?}", err)),
+        Ok(None) => Err(anyhow!("JSON decoder produced no record batch")),
+    }
+}
+
 impl Event {
     pub fn new(json: Value, p_timestamp: DateTime<Utc>) -> Self {
         Self { json, p_timestamp }
     }
-    /// Batch only records whose per-record inference is determined by the same
-    /// known scalar fields. Full-inference records are barriers: typed sibling
-    /// renaming can otherwise make two different key sets share a staging file.
+    /// Build staging groups without consuming the input. Failed conversion is
+    /// replayed sequentially against the same schema, before any side effects.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn partitioned_events(
         records: Vec<(Value, u64)>,
@@ -68,7 +145,7 @@ impl Event {
         tenant_id: &Option<String>,
         infer_timestamp: bool,
         batch: bool,
-    ) -> Result<Vec<super::Event>, anyhow::Error> {
+    ) -> Result<PartitionedEvents, anyhow::Error> {
         let convert = |json, origin_size| {
             Self::new(json, p_timestamp).into_event(
                 stream_name.to_owned(),
@@ -85,173 +162,174 @@ impl Event {
                 infer_timestamp,
             )
         };
-        // Nested values require full inference. Keep these requests in one
-        // parallel pass, as in the per-record path: splitting mixed requests
-        // into short fallback runs adds scheduling and grouping work without
-        // amortizing decoding. Ordered collection keeps the first input error.
-        if batch
-            && records.iter().any(|(json, _)| {
+        let per_record = |records: Vec<(Value, u64)>, parallel: bool| {
+            let converted: Vec<_> = if parallel {
+                records
+                    .into_par_iter()
+                    .map(|(json, size)| convert(json, size))
+                    .collect()
+            } else {
+                records
+                    .into_iter()
+                    .map(|(json, size)| convert(json, size))
+                    .collect()
+            };
+            let events = converted.into_iter().collect::<Result<Vec<_>, _>>()?;
+            let rows = events
+                .iter()
+                .enumerate()
+                .map(|(index, e)| (index, 0, e.origin_size, e.parsed_timestamp))
+                .collect();
+            Ok(PartitionedEvents { events, rows })
+        };
+        if !batch
+            || records.iter().any(|(json, _)| {
                 json.as_object().is_some_and(|row| {
                     row.values()
-                        .any(|value| matches!(value, Value::Array(_) | Value::Object(_)))
+                        .any(|v| matches!(v, Value::Array(_) | Value::Object(_)))
                 })
             })
         {
-            let converted: Vec<_> = records
-                .into_par_iter()
-                .map(|(json, size)| convert(json, size))
-                .collect();
-            return converted.into_iter().collect();
+            return per_record(records, batch);
         }
-        // Partition names are fixed for the request. Hash values in this order
-        // without constructing a second owned copy of the partition map.
-        let partition_fields = custom_partitions
-            .map(|fields| fields.split(',').collect_vec())
-            .unwrap_or_default();
-        let hash_fields = partition_fields
-            .iter()
-            .map(|field| field.trim())
-            .sorted()
-            .dedup()
-            .collect_vec();
-        let mut active_keys: Vec<String> = Vec::new();
-        struct Group {
-            rows: Vec<Value>,
-            origin_size: u64,
-            parsed_timestamp: NaiveDateTime,
-            custom_partition_values: HashMap<String, String>,
-        }
-        let mut groups: Vec<Group> = Vec::new();
-        let mut indices: HashMap<u64, Vec<usize>> = HashMap::new();
-        let mut events = Vec::new();
-        let flush = |groups: &mut Vec<Group>,
-                     events: &mut Vec<super::Event>|
-         -> Result<(), anyhow::Error> {
-            for group in groups.drain(..) {
-                let (rb, is_first_event) = Self::new(Value::Array(group.rows), p_timestamp)
-                    .into_recordbatch(
-                        storage_schema,
-                        static_schema_flag,
-                        time_partition,
-                        schema_version,
-                        p_custom_fields,
-                        infer_timestamp,
-                    )?;
-                debug_assert!(!is_first_event);
-                events.push(super::Event {
-                    rb,
-                    is_first_event,
-                    stream_name: stream_name.to_owned(),
-                    origin_format: "json",
-                    origin_size: group.origin_size,
-                    parsed_timestamp: group.parsed_timestamp,
-                    time_partition: None,
-                    custom_partition_values: group.custom_partition_values,
-                    stream_type: StreamType::UserDefined,
-                    telemetry_type,
-                    tenant_id: tenant_id.to_owned(),
-                });
+        let attempt = || -> anyhow::Result<PartitionedEvents> {
+            let partition_fields = custom_partitions
+                .map(|s| s.split(',').collect_vec())
+                .unwrap_or_default();
+            struct Group {
+                positions: Vec<usize>,
+                partitions: HashMap<String, String>,
+                timestamp: NaiveDateTime,
+                known: bool,
             }
-            Ok(())
-        };
-        let mut fallback = Vec::new();
-        let flush_fallback = |fallback: &mut Vec<(Value, u64)>,
-                              events: &mut Vec<super::Event>|
-         -> Result<(), anyhow::Error> {
-            if fallback.is_empty() {
-                return Ok(());
-            }
-            // Indexed collection preserves input order. Collect each Result
-            // before propagating errors so Rayon cannot select a later error.
-            let converted: Vec<_> = std::mem::take(fallback)
-                .into_par_iter()
-                .map(|(json, size)| convert(json, size))
-                .collect();
-            for event in converted {
-                events.push(event?);
-            }
-            Ok(())
-        };
-        for (json, origin_size) in records {
-            let known = batch
-                // Header fields fill absent payload fields during augmentation. Keep
-                // such records as barriers so distinct input key sets cannot
-                // reorder rows that end up with the same staging schema key.
-                && json.as_object().is_some_and(|row| !row.contains_key(crate::event::DEFAULT_TIMESTAMP_KEY)
-                    && !p_custom_fields.keys().any(|key| row.contains_key(key)))
-                && known_scalar_schema(
-                    std::slice::from_ref(&json),
+            let mut groups: Vec<Group> = Vec::new();
+            let mut indices: HashMap<u64, Vec<usize>> = HashMap::new();
+            let mut active_keys: Vec<String> = Vec::new();
+            for (position, (json, _)) in records.iter().enumerate() {
+                let known = json.as_object().is_some_and(|row| {
+                    !row.contains_key(crate::event::DEFAULT_TIMESTAMP_KEY)
+                        && !p_custom_fields.keys().any(|key| row.contains_key(key))
+                }) && known_scalar_schema(
+                    std::slice::from_ref(json),
                     storage_schema,
                     schema_version,
                     static_schema_flag,
                 )
                 .is_some();
-            if !known {
-                flush(&mut groups, &mut events)?;
-                indices.clear();
-                if batch {
-                    fallback.push((json, origin_size));
+                let partitions = if custom_partitions.is_some() {
+                    extract_custom_partition_values(json, &partition_fields)?
                 } else {
-                    // Keep an independent sequential reference for tests.
-                    events.push(convert(json, origin_size)?);
+                    HashMap::new()
+                };
+                let timestamp = match time_partition {
+                    Some(field) => extract_and_parse_time(json, field)?,
+                    None => p_timestamp.naive_utc(),
+                };
+                if !known {
+                    indices.clear();
+                    active_keys.clear();
+                    groups.push(Group {
+                        positions: vec![position],
+                        partitions,
+                        timestamp,
+                        known,
+                    });
+                    continue;
                 }
-                continue;
-            }
-            flush_fallback(&mut fallback, &mut events)?;
-            // Use exactly the extraction routines of into_event, before decoding.
-            let partitions = match custom_partitions {
-                Some(_) => extract_custom_partition_values(&json, &partition_fields)?,
-                None => HashMap::new(),
-            };
-            let timestamp = match time_partition {
-                Some(field) => extract_and_parse_time(&json, field)?,
-                None => p_timestamp.naive_utc(),
-            };
-            let row = json.as_object().unwrap();
-            // Usually the keys have the same iteration order. The membership
-            // check also handles maps preserving a different insertion order.
-            let same_keys = row.len() == active_keys.len()
-                && (row.keys().eq(active_keys.iter())
-                    || active_keys.iter().all(|key| row.contains_key(key)));
-            // get_schema_key concatenates names without separators, so even
-            // colliding key sets must retain the existing flush boundary.
-            if !same_keys {
-                flush(&mut groups, &mut events)?;
-                indices.clear();
-                active_keys = row.keys().cloned().collect();
-            }
-            let minute = timestamp.and_utc().timestamp().div_euclid(60);
-            let mut hasher = DefaultHasher::new();
-            minute.hash(&mut hasher);
-            for field in &hash_fields {
-                partitions.get(*field).hash(&mut hasher);
-            }
-            let key = hasher.finish();
-            // Compare full values as well: hash collisions must never combine
-            // different partitions or minutes.
-            let index = indices.get(&key).and_then(|candidates| {
-                candidates.iter().copied().find(|&index| {
-                    let group = &groups[index];
-                    group.custom_partition_values == partitions
-                        && group.parsed_timestamp.and_utc().timestamp().div_euclid(60) == minute
-                })
-            });
-            if let Some(index) = index {
-                groups[index].origin_size += origin_size;
-                groups[index].rows.push(json);
-            } else {
-                indices.entry(key).or_default().push(groups.len());
-                groups.push(Group {
-                    rows: vec![json],
-                    origin_size,
-                    parsed_timestamp: timestamp,
-                    custom_partition_values: partitions,
+                let row = json.as_object().unwrap();
+                if row.len() != active_keys.len()
+                    || !active_keys.iter().all(|k| row.contains_key(k))
+                {
+                    indices.clear();
+                    active_keys = row.keys().cloned().collect();
+                }
+                let minute = timestamp.and_utc().timestamp().div_euclid(60);
+                let mut hasher = DefaultHasher::new();
+                minute.hash(&mut hasher);
+                for (key, value) in partitions.iter().sorted_by_key(|(k, _)| *k) {
+                    key.hash(&mut hasher);
+                    value.hash(&mut hasher);
+                }
+                let key = hasher.finish();
+                let index = indices.get(&key).and_then(|candidates| {
+                    candidates.iter().copied().find(|&i| {
+                        groups[i].partitions == partitions
+                            && groups[i].timestamp.and_utc().timestamp().div_euclid(60) == minute
+                    })
                 });
+                if let Some(index) = index {
+                    groups[index].positions.push(position);
+                } else {
+                    indices.entry(key).or_default().push(groups.len());
+                    groups.push(Group {
+                        positions: vec![position],
+                        partitions,
+                        timestamp,
+                        known,
+                    });
+                }
             }
+            let mut events = Vec::with_capacity(groups.len());
+            let mut rows = vec![(0, 0, 0, p_timestamp.naive_utc()); records.len()];
+            // Insertion order is the order of each group's first input record.
+            for group in groups {
+                let event = if group.known {
+                    let data = group.positions.iter().map(|&p| &records[p].0).collect_vec();
+                    let schema = known_scalar_schema(
+                        std::slice::from_ref(data[0]),
+                        storage_schema,
+                        schema_version,
+                        static_schema_flag,
+                    )
+                    .unwrap();
+                    let schema = super::update_field_type_in_schema(
+                        Arc::new(Schema::new(schema)),
+                        None,
+                        time_partition,
+                        None,
+                        schema_version,
+                        infer_timestamp,
+                    );
+                    let rb = decode_rows(&data, schema)?;
+                    let rb = crate::utils::arrow::add_parseable_fields(
+                        rb,
+                        p_timestamp,
+                        p_custom_fields,
+                    )?;
+                    super::Event {
+                        rb,
+                        is_first_event: false,
+                        stream_name: stream_name.to_owned(),
+                        origin_format: "json",
+                        origin_size: group.positions.iter().map(|&p| records[p].1).sum(),
+                        parsed_timestamp: group.timestamp,
+                        time_partition: None,
+                        custom_partition_values: group.partitions,
+                        stream_type: StreamType::UserDefined,
+                        telemetry_type,
+                        tenant_id: tenant_id.clone(),
+                    }
+                } else {
+                    let (json, size) = &records[group.positions[0]];
+                    convert(json.clone(), *size)?
+                };
+                for (offset, &position) in group.positions.iter().enumerate() {
+                    let timestamp = match time_partition {
+                        Some(field) => extract_and_parse_time(&records[position].0, field)?,
+                        None => p_timestamp.naive_utc(),
+                    };
+                    rows[position] = (events.len(), offset, records[position].1, timestamp);
+                }
+                events.push(event);
+            }
+            Ok(PartitionedEvents { events, rows })
+        };
+        match attempt() {
+            Ok(events) => Ok(events),
+            // The attempt only builds batches; it cannot change schema, staging,
+            // counters or subscribers. Replay also handles group-only failures.
+            Err(_) => per_record(records, false),
         }
-        flush_fallback(&mut fallback, &mut events)?;
-        flush(&mut groups, &mut events)?;
-        Ok(events)
     }
 }
 
@@ -309,22 +387,7 @@ impl EventFormat for Event {
 
     // Convert the Data type (defined above) to arrow record batch
     fn decode(data: Self::Data, schema: Arc<Schema>) -> Result<RecordBatch, anyhow::Error> {
-        let _span = info_span!("json_to_recordbatch", record_count = data.len()).entered();
-        if data.is_empty() {
-            return Err(anyhow!("JSON batch must contain at least one event"));
-        }
-        let array_capacity = round_upto_multiple_of_64(data.len());
-        let mut reader = ReaderBuilder::new(schema)
-            .with_batch_size(array_capacity)
-            .with_coerce_primitive(false)
-            .build_decoder()?;
-
-        reader.serialize(&data)?;
-        match reader.flush() {
-            Ok(Some(recordbatch)) => Ok(recordbatch),
-            Err(err) => Err(anyhow!("Failed to create recordbatch due to {:?}", err)),
-            Ok(None) => Err(anyhow!("JSON decoder produced no record batch")),
-        }
+        decode_rows(&data, schema)
     }
 
     /// Converts a JSON event into a Parseable Event
@@ -1724,15 +1787,12 @@ mod partition_batching_tests {
     use serde_json::json;
     use std::sync::RwLock;
 
-    type Observation = (
-        std::collections::BTreeMap<String, Vec<RecordBatch>>,
-        std::collections::BTreeMap<String, (u64, usize)>,
-    );
+    type Observation = (Vec<(String, RecordBatch)>, Vec<(String, u64, usize)>);
 
-    fn observe(events: &[crate::event::Event]) -> Observation {
-        let mut files = std::collections::BTreeMap::<String, Vec<RecordBatch>>::new();
-        let mut stats = std::collections::BTreeMap::<String, (u64, usize)>::new();
-        for event in events {
+    fn observe(events: &PartitionedEvents) -> Observation {
+        let mut files = Vec::new();
+        let mut stats = Vec::new();
+        for event in events.ordered_rows() {
             let key = format!(
                 "{}:{}:{:?}",
                 get_schema_key(&event.rb.schema().fields),
@@ -1740,23 +1800,124 @@ mod partition_batching_tests {
                 event.custom_partition_values.iter().sorted().collect_vec()
             );
             for row in 0..event.rb.num_rows() {
-                files
-                    .entry(key.clone())
-                    .or_default()
-                    .push(event.rb.slice(row, 1));
+                files.push((key.clone(), event.rb.slice(row, 1)));
             }
-            let total = stats
-                .entry(format!(
+            stats.push((
+                format!(
                     "{}:{}:{}",
                     event.parsed_timestamp.date(),
                     event.origin_format,
                     event.telemetry_type
-                ))
-                .or_default();
-            total.0 += event.origin_size;
-            total.1 += event.rb.num_rows();
+                ),
+                event.origin_size,
+                event.rb.num_rows(),
+            ));
         }
         (files, stats)
+    }
+
+    fn regression(records: Vec<Value>, batch: bool) -> anyhow::Result<PartitionedEvents> {
+        let schema = [
+            Field::new("service", DataType::Utf8, true),
+            Field::new("id", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                true,
+            ),
+        ]
+        .into_iter()
+        .map(|f| (f.name().clone(), Arc::new(f)))
+        .collect();
+        Event::partitioned_events(
+            records
+                .into_iter()
+                .map(|v| {
+                    let size =
+                        crate::handlers::http::modal::utils::ingest_utils::json_byte_size(&v);
+                    (v, size)
+                })
+                .collect(),
+            DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            "partition_order_regression",
+            &schema,
+            true,
+            Some(&"service".to_owned()),
+            None,
+            SchemaVersion::V1,
+            &HashMap::new(),
+            TelemetryType::Logs,
+            &None,
+            false,
+            batch,
+        )
+    }
+
+    #[tokio::test]
+    async fn interleaved_partitions_keep_live_tail_batches_and_accounting_in_input_order() {
+        use futures_util::StreamExt;
+        let records = vec![
+            json!({"service":"a", "id":1}),
+            json!({"service":"b", "id":2}),
+            json!({"service":"a", "id":3}),
+        ];
+        let old = regression(records.clone(), false).unwrap();
+        let new = regression(records, true).unwrap();
+        assert_eq!(new.len(), 2);
+        assert_eq!(observe(&old), observe(&new));
+        let tail = crate::livetail::LiveTail::default();
+        let mut receiver = tail.new_pipe("test".into(), "partition_order_regression".into());
+        let mut accounting = Vec::new();
+        new.process_with(
+            |_| Ok::<_, ()>(()),
+            |event, offset, size, timestamp| {
+                accounting.push((size, timestamp));
+                tail.process_row(&event.stream_name, &event.rb, offset);
+            },
+        )
+        .unwrap();
+        for (index, expected) in old.iter().enumerate() {
+            assert_eq!(
+                receiver.next().await,
+                Some(crate::livetail::Message::Record(expected.rb.clone()))
+            );
+            assert_eq!(
+                accounting[index],
+                (expected.origin_size, expected.parsed_timestamp)
+            );
+        }
+        let mut stages = 0;
+        let mut delivered = Vec::new();
+        assert_eq!(
+            new.process_with(
+                |_| {
+                    stages += 1;
+                    if stages == 2 { Err(()) } else { Ok(()) }
+                },
+                |event, offset, _, _| delivered.push(event.rb.slice(offset, 1))
+            ),
+            Err(())
+        );
+        // Group a (rows 1,3) is staged; only row 1 is a contiguous prefix.
+        assert_eq!(delivered, vec![old[0].rb.clone()]);
+    }
+
+    #[test]
+    fn multiple_invalid_timestamps_return_first_input_error() {
+        let records = vec![
+            json!({"service":"a", "ts":"2026-11-10T12:00:00Z"}),
+            json!({"service":"b", "ts":"bad-first"}),
+            json!({"service":"a", "ts":"bad-second"}),
+        ];
+        let old = regression(records.clone(), false)
+            .err()
+            .unwrap()
+            .to_string();
+        let new = regression(records, true).err().unwrap().to_string();
+        assert!(old.contains("bad-first"), "{old}");
+        assert_eq!(old, new);
     }
 
     #[test]
@@ -1834,6 +1995,11 @@ mod partition_batching_tests {
         invalid_fallback[120] = json!({"service": "svc-0", "count": [1], "timestamp": 42});
         let mut invalid = base.clone();
         invalid[30] = json!({"count":1,"timestamp":"bad timestamp"});
+        let multi_invalid = vec![
+            json!({"service":"a", "timestamp":"2026-11-10T12:00:00Z"}),
+            json!({"service":"b", "timestamp":"bad-first"}),
+            json!({"service":"a", "timestamp":"bad-second"}),
+        ];
         let mixed_runs = [1, 2, 3, 4, 31, 32, 33]
             .into_iter()
             .map(|run| {
@@ -1846,95 +2012,106 @@ mod partition_batching_tests {
                 records
             })
             .collect_vec();
-        for version in [SchemaVersion::V0, SchemaVersion::V1] {
-            for static_schema in [false, true] {
-                for empty in [false, true] {
-                    let schema = if empty {
-                        HashMap::new()
-                    } else {
-                        let (rb, _) = Event::new(Value::Array(base.clone()), now)
-                            .into_recordbatch(
-                                &HashMap::new(),
-                                false,
-                                None,
-                                version,
-                                &HashMap::new(),
-                                false,
-                            )
-                            .unwrap();
-                        rb.schema()
-                            .fields()
-                            .iter()
-                            .map(|f| (f.name().clone(), f.clone()))
-                            .collect()
-                    };
-                    let mut schema = schema;
-                    if !empty {
-                        for name in ["a", "ab", "bc", "c"] {
+        for infer_timestamp in [false, true] {
+            for version in [SchemaVersion::V0, SchemaVersion::V1] {
+                for static_schema in [false, true] {
+                    for empty in [false, true] {
+                        let schema = if empty {
+                            HashMap::new()
+                        } else {
+                            let (rb, _) = Event::new(Value::Array(base.clone()), now)
+                                .into_recordbatch(
+                                    &HashMap::new(),
+                                    false,
+                                    None,
+                                    version,
+                                    &HashMap::new(),
+                                    false,
+                                )
+                                .unwrap();
+                            rb.schema()
+                                .fields()
+                                .iter()
+                                .map(|f| (f.name().clone(), f.clone()))
+                                .collect()
+                        };
+                        let mut schema = schema;
+                        if !empty {
                             schema.insert(
-                                name.to_owned(),
-                                Arc::new(Field::new(name, DataType::Float64, true)),
+                                "timestamp".to_owned(),
+                                Arc::new(Field::new(
+                                    "timestamp",
+                                    DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                                    true,
+                                )),
                             );
+                            for name in ["a", "ab", "bc", "c"] {
+                                schema.insert(
+                                    name.to_owned(),
+                                    Arc::new(Field::new(name, DataType::Float64, true)),
+                                );
+                            }
                         }
-                    }
-                    for custom in [None, Some("service".to_owned())] {
-                        for time in [None, Some("timestamp".to_owned())] {
-                            for records in [
-                                &base,
-                                &fallback,
-                                &invalid,
-                                &corpus,
-                                &collision,
-                                &collision_runs,
-                                &reordered,
-                                &long_fallback,
-                                &invalid_fallback,
-                            ]
-                            .into_iter()
-                            .chain(mixed_runs.iter())
-                            {
-                                let run = |batch| {
-                                    Event::partitioned_events(records.iter().map(|v| (v.clone(), crate::handlers::http::modal::utils::ingest_utils::json_byte_size(v))).collect(), now, "test", &schema, static_schema, custom.as_ref(), time.as_ref(), version, &headers, TelemetryType::Logs, &None, false, batch)
-                                };
-                                let old = run(false);
-                                let new = run(true);
-                                match (old, new) {
-                                    (Ok(old), Ok(new)) => {
-                                        assert_eq!(observe(&old), observe(&new));
-                                        for limit in [1, 6, 1000] {
-                                            let commit = |events: &[crate::event::Event]| {
-                                                let metadata = RwLock::new(LogStreamMetadata {
-                                                    schema: schema.clone(),
-                                                    static_schema_flag: static_schema,
-                                                    ..Default::default()
-                                                });
-                                                let schemas = events
-                                                    .iter()
-                                                    .map(|e| (e.rb.schema(), e.is_first_event))
-                                                    .collect_vec();
-                                                let result = commit_ingested_schemas(
-                                                    "test", &metadata, &schemas, limit,
-                                                )
-                                                .map_err(|e| e.to_string());
-                                                let fields =
-                                                    metadata.read().unwrap().schema.clone();
-                                                (result, fields)
-                                            };
-                                            assert_eq!(commit(&old), commit(&new));
+                        for custom in [None, Some("service".to_owned())] {
+                            for time in [None, Some("timestamp".to_owned())] {
+                                for records in [
+                                    &base,
+                                    &multi_invalid,
+                                    &fallback,
+                                    &invalid,
+                                    &corpus,
+                                    &collision,
+                                    &collision_runs,
+                                    &reordered,
+                                    &long_fallback,
+                                    &invalid_fallback,
+                                ]
+                                .into_iter()
+                                .chain(mixed_runs.iter())
+                                {
+                                    let run = |batch| {
+                                        Event::partitioned_events(records.iter().map(|v| (v.clone(), crate::handlers::http::modal::utils::ingest_utils::json_byte_size(v))).collect(), now, "test", &schema, static_schema, custom.as_ref(), time.as_ref(), version, &headers, TelemetryType::Logs, &None, infer_timestamp, batch)
+                                    };
+                                    let old = run(false);
+                                    let new = run(true);
+                                    match (old, new) {
+                                        (Ok(old), Ok(new)) => {
+                                            assert_eq!(observe(&old), observe(&new));
+                                            for limit in [1, 6, 1000] {
+                                                let commit = |events: &[crate::event::Event]| {
+                                                    let metadata = RwLock::new(LogStreamMetadata {
+                                                        schema: schema.clone(),
+                                                        static_schema_flag: static_schema,
+                                                        ..Default::default()
+                                                    });
+                                                    let schemas = events
+                                                        .iter()
+                                                        .map(|e| (e.rb.schema(), e.is_first_event))
+                                                        .collect_vec();
+                                                    let result = commit_ingested_schemas(
+                                                        "test", &metadata, &schemas, limit,
+                                                    )
+                                                    .map_err(|e| e.to_string());
+                                                    let fields =
+                                                        metadata.read().unwrap().schema.clone();
+                                                    (result, fields)
+                                                };
+                                                assert_eq!(commit(&old), commit(&new));
+                                            }
+                                            if !empty
+                                                && !static_schema
+                                                && custom.is_some()
+                                                && time.is_none()
+                                                && std::ptr::eq(records, &base)
+                                            {
+                                                assert!(new.len() < old.len());
+                                            }
                                         }
-                                        if !empty
-                                            && !static_schema
-                                            && custom.is_some()
-                                            && time.is_none()
-                                            && std::ptr::eq(records, &base)
-                                        {
-                                            assert!(new.len() < old.len());
+                                        (Err(old), Err(new)) => {
+                                            assert_eq!(old.to_string(), new.to_string())
                                         }
+                                        _ => panic!("conversion outcomes differ"),
                                     }
-                                    (Err(old), Err(new)) => {
-                                        assert_eq!(old.to_string(), new.to_string())
-                                    }
-                                    _ => panic!("conversion outcomes differ"),
                                 }
                             }
                         }

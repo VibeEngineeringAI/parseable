@@ -50,6 +50,15 @@ impl LiveTail {
         revc
     }
 
+    pub(crate) fn process_row(&self, stream_name: &str, rb: &RecordBatch, offset: usize) {
+        let read = self.pipes.read().unwrap();
+        if let Some(pipes) = read.get(stream_name) {
+            for pipe in pipes {
+                pipe.send(rb.slice(offset, 1));
+            }
+        }
+    }
+
     pub fn process(&self, stream_name: &str, rb: &RecordBatch) {
         let read = self.pipes.read().unwrap();
         let Some(pipes) = read.get(stream_name) else {
