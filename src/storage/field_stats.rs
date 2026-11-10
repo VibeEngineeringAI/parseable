@@ -234,45 +234,85 @@ async fn calculate_field_stats_inner(
     ensure_dataset_stats_stream(tenant_id).await?;
     let mut p_custom_fields = HashMap::new();
     p_custom_fields.insert(USER_AGENT_KEY.to_string(), "parseable".to_string());
-    let schema = PARSEABLE
-        .get_stream(DATASET_STATS_STREAM_NAME, tenant_id)?
-        .get_schema_raw();
+    let stats_stream = PARSEABLE.get_stream(DATASET_STATS_STREAM_NAME, tenant_id)?;
     let max_row_bytes = FlattenLimits::from_config().max_bytes_per_request;
-    if let Some(event) = stats_event(
+    for_each_stats_event(
         &stats,
         max_row_bytes,
+        MAX_STATS_EVENT_BYTES,
         parquet_ts,
-        &schema,
+        || stats_stream.get_schema_raw(),
         &p_custom_fields,
         tenant_id,
-    )? {
-        event.process()?;
-    }
+        |event| {
+            event.process()?;
+            Ok(())
+        },
+    )?;
     Ok(stats_calculated)
 }
 
-/// All rows of a file have one dataset partition and one timestamp. Convert them together:
-/// in particular, infer/commit a newly encountered schema only once per file.
-fn stats_event(
+/// The rows of one file staged as one event hold at most this much compact JSON. Most files
+/// fit in one event. A file whose statistics carry many large distinct values is staged as
+/// several, so the memory held and the size of one Arrow batch stay bounded.
+const MAX_STATS_EVENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// All rows of a file have one dataset partition and one timestamp. Convert them together,
+/// so that a newly encountered schema is inferred and committed once and not for every row.
+/// Rows are grouped, in order, into events of at most `max_event_bytes` of compact JSON; a
+/// single row over that is an event of its own. `schema` is read again for each event, as
+/// processing the one before it may have committed new fields.
+#[allow(clippy::too_many_arguments)]
+fn for_each_stats_event(
     stats: &DatasetStats,
     max_row_bytes: usize,
+    max_event_bytes: u64,
     parquet_ts: DateTime<Utc>,
-    schema: &HashMap<String, std::sync::Arc<arrow_schema::Field>>,
+    schema: impl Fn() -> HashMap<String, std::sync::Arc<arrow_schema::Field>>,
     custom_fields: &HashMap<String, String>,
     tenant_id: &Option<String>,
-) -> Result<Option<crate::event::Event>, PostError> {
+    mut process: impl FnMut(crate::event::Event) -> Result<(), PostError>,
+) -> Result<(), PostError> {
     let mut rows = Vec::new();
-    let mut origin_size = 0;
+    let mut origin_size = 0u64;
+    let mut flush =
+        |rows: &mut Vec<serde_json::Value>, origin_size: &mut u64| -> Result<(), PostError> {
+            if rows.is_empty() {
+                return Ok(());
+            }
+            process(stats_event(
+                std::mem::take(rows),
+                std::mem::take(origin_size),
+                &stats.dataset_name,
+                parquet_ts,
+                &schema(),
+                custom_fields,
+                tenant_id,
+            )?)
+        };
     for_each_stats_row(stats, max_row_bytes, |row, size| {
+        if origin_size.saturating_add(size) > max_event_bytes {
+            flush(&mut rows, &mut origin_size)?;
+        }
         rows.push(row);
         origin_size += size;
         Ok(())
     })?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
+    flush(&mut rows, &mut origin_size)
+}
+
+/// One event for `rows`, which are rows of the stats dataset for `dataset_name`.
+fn stats_event(
+    rows: Vec<serde_json::Value>,
+    origin_size: u64,
+    dataset_name: &str,
+    parquet_ts: DateTime<Utc>,
+    schema: &HashMap<String, std::sync::Arc<arrow_schema::Field>>,
+    custom_fields: &HashMap<String, String>,
+    tenant_id: &Option<String>,
+) -> Result<crate::event::Event, PostError> {
     // into_event's generic partition extraction accepts only individual objects.
-    // Every row was validated above and has stats.dataset_name as its partition.
+    // Every row was validated by for_each_stats_row and has dataset_name as its partition.
     let mut event = json::Event {
         json: serde_json::Value::Array(rows),
         p_timestamp: parquet_ts,
@@ -293,15 +333,15 @@ fn stats_event(
     )?;
     event.custom_partition_values.insert(
         DATASET_STATS_CUSTOM_PARTITION.to_string(),
-        stats.dataset_name.clone(),
+        dataset_name.to_owned(),
     );
-    Ok(Some(event))
+    Ok(event)
 }
 
 /// Hands the rows of the stats dataset for `stats` (see `DatasetStats::rows`) to `process`
 /// one at a time, each with its size as compact JSON. A row is measured before it is built,
-/// and only built when it is at most `max_row_bytes`, so one row of at most that size is all
-/// that is held at a time, however many fields and distinct values the stats have. A row over
+/// and only built when it is at most `max_row_bytes`, so this holds one row of at most that
+/// size at a time, however many fields and distinct values the stats have. A row over
 /// it, which takes a distinct value or a field name of about that size, is skipped with a
 /// warning, and the rows after it are still processed. Returns the number of rows skipped.
 fn for_each_stats_row(
@@ -1589,9 +1629,33 @@ mod tests {
         let ts = DateTime::from_timestamp_millis(1730000000000).unwrap();
         for stats in [uniform_stats(&[4, 2, 3]), uniform_stats(&[0, 2, 0])] {
             let custom = HashMap::from([(USER_AGENT_KEY.to_string(), "parseable".to_string())]);
-            let event = stats_event(&stats, usize::MAX, ts, &HashMap::new(), &custom, &None)
-                .unwrap()
+            // The events for `stats`, grouping rows up to `max_event_bytes`, and how many
+            // times the schema was read for them
+            let events = |max_row_bytes, max_event_bytes, schema: &HashMap<_, _>| {
+                let mut events = Vec::new();
+                let reads = std::cell::Cell::new(0);
+                for_each_stats_event(
+                    &stats,
+                    max_row_bytes,
+                    max_event_bytes,
+                    ts,
+                    || {
+                        reads.set(reads.get() + 1);
+                        schema.clone()
+                    },
+                    &custom,
+                    &None,
+                    |event| {
+                        events.push(event);
+                        Ok(())
+                    },
+                )
                 .unwrap();
+                (events, reads.get())
+            };
+            let (mut whole, reads) = events(usize::MAX, u64::MAX, &HashMap::new());
+            assert_eq!((whole.len(), reads), (1, 1));
+            let event = whole.pop().unwrap();
             assert!(event.is_first_event); // one process call => at most one schema write
             let mut total = 0;
             for_each_stats_row(&stats, usize::MAX, |row, size| {
@@ -1640,15 +1704,53 @@ mod tests {
                 .iter()
                 .map(|f| (f.name().clone(), f.clone()))
                 .collect();
-            let known = stats_event(&stats, usize::MAX, ts, &schema, &custom, &None)
-                .unwrap()
-                .unwrap();
+            let known = events(usize::MAX, u64::MAX, &schema).0.pop().unwrap();
             assert_eq!(known.rb, event.rb);
-            assert!(
-                stats_event(&stats, 1, ts, &schema, &custom, &None)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(events(1, u64::MAX, &schema).0.is_empty());
+
+            // A byte bound splits the rows into several events, in order and without loss,
+            // and the schema is read again for each of them.
+            let mut sizes = Vec::new();
+            for_each_stats_row(&stats, usize::MAX, |_, size| {
+                sizes.push(size);
+                Ok(())
+            })
+            .unwrap();
+            assert!(total >= 3, "{total}");
+            for (bound, single_rows) in [(1, true), (sizes[0] + sizes[1], false)] {
+                let (parts, reads) = events(usize::MAX, bound, &schema);
+                assert_eq!(reads, parts.len());
+                if single_rows {
+                    assert_eq!(parts.len(), total);
+                } else {
+                    assert_eq!(parts[0].rb.num_rows(), 2);
+                    assert!(parts.len() > 1 && parts.len() < total, "{}", parts.len());
+                }
+                let mut offset = 0;
+                for part in &parts {
+                    let rows = part.rb.num_rows();
+                    for (i, field) in part.rb.schema().fields().iter().enumerate() {
+                        let expected = known
+                            .rb
+                            .column_by_name(field.name())
+                            .unwrap()
+                            .slice(offset, rows);
+                        if part.rb.column(i).data_type() == &DataType::Null {
+                            assert_eq!(expected.logical_null_count(), rows);
+                        } else {
+                            assert_eq!(part.rb.column(i).to_data(), expected.to_data());
+                        }
+                    }
+                    assert_eq!(part.custom_partition_values, known.custom_partition_values);
+                    assert_eq!(part.parsed_timestamp, known.parsed_timestamp);
+                    assert_eq!(
+                        part.origin_size,
+                        sizes[offset..offset + rows].iter().sum::<u64>()
+                    );
+                    offset += rows;
+                }
+                assert_eq!(offset, total);
+            }
         }
     }
 
