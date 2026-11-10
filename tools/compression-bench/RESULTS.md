@@ -37,7 +37,7 @@ beyond this run. Every measured round produced the same closed file length.
 The [chart](evidence/comparison.html) can be regenerated with:
 
 ```sh
-python tools/compression-bench/summarize.py \
+python3 tools/compression-bench/summarize.py \
   tools/compression-bench/evidence/codec.jsonl \
   tools/compression-bench/evidence/comparison.html
 ```
@@ -63,7 +63,9 @@ Exact readers tested:
   and behavior; these numbers do not constitute an A/B of reader versions.
 
 A separate 100-row smoke run with a 37-row group limit passed both readers,
-covering three groups and tiny partial batches. The main run crosses Arrow input
+covering three groups and tiny partial batches; see the committed
+[Rust output](evidence/smoke-codec.jsonl) and
+[older-reader output](evidence/smoke-reader.jsonl). The main run crosses Arrow input
 batch, data page and row-group boundaries. The all-null column and timestamp
 null tail are checked in both runs. Exact IPC/Parquet/statistics artifact sizes
 and SHA-256 hashes are recorded in [manifest.json](evidence/manifest.json).
@@ -96,26 +98,12 @@ estimate also needs workload volume, retention, request patterns, CPU and storag
 pricing. **Smaller new files do not shrink already retained objects.** There is
 no rewrite, compaction, catalog, lifecycle or infrastructure change in this work.
 
+Timed writes include creating or truncating the previous round's output file.
+The standalone release profile and system allocator differ from production's
+`release-lto` profile and jemalloc. Absolute timings may not carry over to the
+service; see [Method](README.md#method).
+
 Builds used two jobs and a ten-minute timeout; the measured run used a three-minute
 timeout and completed normally. Build target was about 315 MiB; generated main
-fixtures and files about 299 MiB. All experiment artifacts reside under the home
-cache. An initial C build hit the host's `/tmp` quota; retrying with a dedicated
-home-cache TMPDIR succeeded. No unrelated files were removed.
-
-## Candidate PR text
-
-Title: Add bounded standard Parquet compression benchmark and compatibility evidence
-
-Description: Add a standalone codec A/B harness using the server's pinned
-Arrow/Parquet dependencies. It compares existing LZ4_RAW and default-level ZSTD
-on identical app, sparse wide and flattened OTel-like log rows, recording closed
-file bytes, conversion wall/CPU time and full/projected read time. Preserve all
-production defaults and public behavior.
-
-Validation: Five measured rounds after warmup on 270,000 rows per fixture;
-current Rust reader checks exact schema/values/nulls/timestamps and matching
-row-group/page statistics. Older Arrow C++ 18.1.0 independently checks saved
-input rows and footer min/max/null counts. Include raw results, hashes,
-reproduction steps and explicit service/downgrade and synthetic-workload limits.
-
-No PR created, pushed, merged or deployed as part of this experiment.
+fixtures and files about 299 MiB. Generated fixtures and build artifacts are
+kept outside the repository.

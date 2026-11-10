@@ -233,7 +233,7 @@ fn read(path: &Path, projection: bool) -> Result<Vec<RecordBatch>> {
         .build()?
         .collect::<std::result::Result<Vec<_>, _>>()?)
 }
-fn verify(path: &Path, expected: &RecordBatch) -> Result<Value> {
+fn verify(path: &Path, expected: &RecordBatch, codec: Compression) -> Result<Value> {
     for projected in [false, true] {
         let expected = if projected {
             expected.project(&[0, 1, 5])?
@@ -260,6 +260,11 @@ fn verify(path: &Path, expected: &RecordBatch) -> Result<Value> {
         meta.file_metadata().num_rows() as usize,
         expected.num_rows()
     );
+    for group in meta.row_groups() {
+        for column in group.columns() {
+            assert_eq!(column.compression(), codec, "unexpected column codec");
+        }
+    }
     // Deliberately omit codec, offsets and compressed sizes; compare semantic statistics.
     let groups: Vec<_> = meta.row_groups().iter().map(|rg| json!({
         "rows": rg.num_rows(), "sorting": format!("{:?}", rg.sorting_columns()),
@@ -310,7 +315,7 @@ fn main() -> Result<()> {
                 let (name, codec) = codecs[if round % 2 == 0 { k } else { 1 - k }];
                 let path = out.join(format!("{kind}-{name}.parquet"));
                 let (_, write_wall, write_cpu) = measure(|| convert(&ipc, &path, codec, rg))?;
-                let stats = verify(&path, &batch)?;
+                let stats = verify(&path, &batch, codec)?;
                 if let Some(ref expected) = baseline {
                     assert_eq!(&stats, expected, "codec statistics differ");
                 } else {

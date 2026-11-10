@@ -22,7 +22,7 @@ CARGO_BUILD_JOBS=2 timeout 600 cargo build --release --locked \
 OUT="$HOME/.cache/parseable-codec-measurement-1"
 timeout 180 "$CARGO_TARGET_DIR/release/compression-bench" \
   "$OUT" 270000 5 262144 > "$OUT.jsonl"
-python tools/compression-bench/summarize.py "$OUT.jsonl"
+python3 tools/compression-bench/summarize.py "$OUT.jsonl"
 # Optional independent older reader, isolated from system Python:
 UV_CACHE_DIR="$HOME/.cache/parseable-compression-uv" uv venv --python 3.12 \
   "$HOME/.cache/parseable-compression-reader"
@@ -71,9 +71,15 @@ uploads. Full and three-column projected read timings cover open, metadata and
 complete decoding/materialization; result drops and value checks are outside
 the timed read. Correctness verification precedes timed reads, so reads are warm.
 These timings do not measure SQL pruning, DataFusion scheduling or S3 latency.
+The timed write includes creating or truncating the previous round's output
+file. The standalone `release` profile uses the system allocator, whereas the
+Linux production build uses `release-lto` with fat LTO, one codegen unit and
+jemalloc; absolute timings may differ from the service.
 
 For every file on every round, the Rust reader checks exact Arrow schema and
-all rows/values/nulls/timestamps, both full and projected. It compares Parquet
+all rows/values/nulls/timestamps, both full and projected. It also checks every
+column chunk's codec against the requested codec, separately from semantic
+comparisons. It compares Parquet
 schema, row-group counts/row counts, sorting metadata, encodings, row-group
 statistics and page column-index statistics across codecs. Byte offsets and
 compressed sizes are intentionally excluded from semantic comparisons. The
