@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><style>body{font:14px var(--font-sans);color:var(--foreground)} .row{display:grid;grid-template-columns:130px 1fr 130px;gap:10px;align-items:center;margin:8px 0}.track{height:22px;background:var(--secondary)}.bar{height:22px;background:var(--chart-1)}small{color:var(--muted-foreground)}@media(max-width:500px){.row{grid-template-columns:85px 1fr 85px;font-size:11px}}</style><p><b>Cold metadata: measured GET payload bytes</b></p><small>DataFusion 55 fetch loop · local S3 protocol server · one setup HEAD per case</small>
+<p>1.6 KB footer</p>
+<div class="row"><span>64 KiB hint</span><div class="track"><div class="bar" style="width:0.87%"></div></div><span>0.062 MiB · 1 GET</span></div>
+<div class="row"><span>512 KiB hint</span><div class="track"><div class="bar" style="width:6.99%"></div></div><span>0.500 MiB · 1 GET</span></div>
+<div class="row"><span>2048 KiB hint</span><div class="track"><div class="bar" style="width:27.96%"></div></div><span>2.000 MiB · 1 GET</span></div>
+<p>1.1 MB footer</p>
+<div class="row"><span>64 KiB hint</span><div class="track"><div class="bar" style="width:23.21%"></div></div><span>1.660 MiB · 3 GET</span></div>
+<div class="row"><span>512 KiB hint</span><div class="track"><div class="bar" style="width:29.33%"></div></div><span>2.098 MiB · 3 GET</span></div>
+<div class="row"><span>2048 KiB hint</span><div class="track"><div class="bar" style="width:27.96%"></div></div><span>2.000 MiB · 1 GET</span></div>
+<p>3.3 MB footer</p>
+<div class="row"><span>64 KiB hint</span><div class="track"><div class="bar" style="width:67.65%"></div></div><span>4.839 MiB · 3 GET</span></div>
+<div class="row"><span>512 KiB hint</span><div class="track"><div class="bar" style="width:73.77%"></div></div><span>5.276 MiB · 3 GET</span></div>
+<div class="row"><span>2048 KiB hint</span><div class="track"><div class="bar" style="width:94.74%"></div></div><span>6.776 MiB · 3 GET</span></div>
+<p><small>Includes page-index fetches. Physical payload bytes are not a cloud bill. A 512 KiB hint increases both GETs and bytes on the middle fixture. Warm Arc reuse is a separate zero-I/O control, not a measured service cache-hit rate.</small></p>

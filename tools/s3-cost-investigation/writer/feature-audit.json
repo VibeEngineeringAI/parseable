@@ -1,0 +1,32 @@
+{
+  "lz4_flex": {
+    "root": "lz4_flex v0.14.0 alloc,frame,std",
+    "probe": "lz4_flex v0.14.0 alloc,frame,std",
+    "match": true
+  },
+  "zstd": {
+    "root": "zstd v0.13.3 arrays,default,legacy,zdict_builder",
+    "probe": "zstd v0.13.3 arrays,default,legacy,zdict_builder",
+    "match": true
+  },
+  "zstd-safe": {
+    "root": "zstd-safe v7.2.4 arrays,legacy,std,zdict_builder",
+    "probe": "zstd-safe v7.2.4 arrays,legacy,std,zdict_builder",
+    "match": true
+  },
+  "zstd-sys": {
+    "root": "zstd-sys v2.0.16+zstd.1.5.7 legacy,std,zdict_builder",
+    "probe": "zstd-sys v2.0.16+zstd.1.5.7 legacy,std,zdict_builder",
+    "match": true
+  },
+  "tikv-jemallocator": {
+    "root": "tikv-jemallocator v0.7.0 background_threads,background_threads_runtime_support,default,profiling,stats",
+    "probe": "tikv-jemallocator v0.7.0 background_threads,background_threads_runtime_support,default,profiling,stats",
+    "match": true
+  },
+  "tikv-jemalloc-sys": {
+    "root": "tikv-jemalloc-sys v0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8 background_threads,background_threads_runtime_support,default,profiling,stats",
+    "probe": "tikv-jemalloc-sys v0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8 background_threads,background_threads_runtime_support,default,profiling,stats",
+    "match": true
+  }
+}

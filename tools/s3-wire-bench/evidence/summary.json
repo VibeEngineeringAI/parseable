@@ -1,0 +1,165 @@
+[
+  {
+    "key": "LIST",
+    "attempts": {
+      "GET": 1
+    },
+    "statuses": {
+      "200": 1
+    },
+    "response_body_bytes": 2318,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "large-2097152.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 1
+    },
+    "statuses": {
+      "200": 1,
+      "206": 1
+    },
+    "response_body_bytes": 2097152,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "large-524288.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 3
+    },
+    "statuses": {
+      "200": 1,
+      "206": 3
+    },
+    "response_body_bytes": 2199579,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "large-65536.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 3
+    },
+    "statuses": {
+      "200": 1,
+      "206": 3
+    },
+    "response_body_bytes": 1740827,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "ranges.parquet",
+    "attempts": {
+      "GET": 2
+    },
+    "statuses": {
+      "206": 2
+    },
+    "response_body_bytes": 6144,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "retry.parquet",
+    "attempts": {
+      "GET": 2
+    },
+    "statuses": {
+      "503": 1,
+      "206": 1
+    },
+    "response_body_bytes": 1093,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "small-2097152.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 1
+    },
+    "statuses": {
+      "200": 1,
+      "206": 1
+    },
+    "response_body_bytes": 2097152,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "small-524288.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 1
+    },
+    "statuses": {
+      "200": 1,
+      "206": 1
+    },
+    "response_body_bytes": 524288,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "small-65536.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 1
+    },
+    "statuses": {
+      "200": 1,
+      "206": 1
+    },
+    "response_body_bytes": 65536,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "upload.parquet",
+    "attempts": {
+      "PUT": 1,
+      "HEAD": 1
+    },
+    "statuses": {
+      "200": 2
+    },
+    "response_body_bytes": 0,
+    "request_body_bytes": 4096
+  },
+  {
+    "key": "xlarge-2097152.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 3
+    },
+    "statuses": {
+      "200": 1,
+      "206": 3
+    },
+    "response_body_bytes": 7105244,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "xlarge-524288.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 3
+    },
+    "statuses": {
+      "200": 1,
+      "206": 3
+    },
+    "response_body_bytes": 5532380,
+    "request_body_bytes": 0
+  },
+  {
+    "key": "xlarge-65536.parquet",
+    "attempts": {
+      "HEAD": 1,
+      "GET": 3
+    },
+    "statuses": {
+      "200": 1,
+      "206": 3
+    },
+    "response_body_bytes": 5073628,
+    "request_body_bytes": 0
+  }
+]

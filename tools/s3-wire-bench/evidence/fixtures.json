@@ -1,0 +1,26 @@
+[
+  {
+    "case": "small",
+    "object_bytes": 4298602,
+    "footer_bytes": 1603,
+    "sha256": "3c8e2c681a80ed48ef9fd2d3f1da3112f00e1e9cce313ed9fe3e2dac5bf4453b",
+    "pyarrow": "18.1.0",
+    "rows": 8192
+  },
+  {
+    "case": "large",
+    "object_bytes": 17380903,
+    "footer_bytes": 1100162,
+    "sha256": "4c0e7d00f7fd796f92a5a1ebc7822de81f8bef7e07fd7ffdec727f484e2cdb98",
+    "pyarrow": "18.1.0",
+    "rows": 10000
+  },
+  {
+    "case": "xlarge",
+    "object_bytes": 52124904,
+    "footer_bytes": 3280963,
+    "sha256": "34009708eeca151893c048eb29a609fd988e27fd8597bc1f2240fb34438413cb",
+    "pyarrow": "18.1.0",
+    "rows": 30000
+  }
+]

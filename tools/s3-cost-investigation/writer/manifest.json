@@ -1,0 +1,195 @@
+{
+  "base_revision": "24c4acca5d1bac4518f6019d21f823d1bc2ce196",
+  "platform": "Linux-7.2.5-3-omarchy-x86_64-with-glibc2.44",
+  "cpu": "13th Gen Intel(R) Core(TM) i9-13900HK",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "compiler": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "profile": "release-lto: opt-level3, fat LTO, codegen-units1; jemalloc exact codec/allocator feature audit",
+  "files": {
+    "/home/ajs/.t3/worktrees/parseable/t3-3732c9d9-2d5394c49f48c120/tools/compression-bench/src/main.rs": {
+      "bytes": 14456,
+      "sha256": "63be76562c94fcef655206c8f1de30e668576767448c4d738e5a7df59b2a192b"
+    },
+    "/home/ajs/.t3/worktrees/parseable/t3-3732c9d9-2d5394c49f48c120/tools/s3-cost-investigation/writer/prepare.py": {
+      "bytes": 5246,
+      "sha256": "e0a019798dd4a6a89762f43bdd80fcce6540d1cc901bd54e71dd4466e45a3229"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/probe/harness/src/main.rs": {
+      "bytes": 16106,
+      "sha256": "e31a01b6c130fcf1747ff5328d20fa7a51bc476d2dff640c9218f90dbb9bd381"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/probe/harness/Cargo.toml": {
+      "bytes": 612,
+      "sha256": "9b0e4fabc73a68f25e36e236dc34b9a9a01b1cf6bf16955b925f22b3fb394156"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/probe/harness/Cargo.lock": {
+      "bytes": 22304,
+      "sha256": "eb8f13fcf92057900e3f22aaacc911d275b2da8ccbc2b16687fedfd01ce6861b"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/app-lz4_raw.parquet": {
+      "bytes": 33977942,
+      "sha256": "41f41d4acf9c1651b44b3365fa48c60001100545dd3a904053fc749726093516"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/app-statistics.json": {
+      "bytes": 29546,
+      "sha256": "d68a56cc5f13606f751055e2b2797caf38702f93ac69ef286b9a253926b380cc"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/app-zstd.parquet": {
+      "bytes": 17152334,
+      "sha256": "bc77dbed2952289b2f29ca08714f406282ccb377dc49460c1198e06201398864"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/app.arrow": {
+      "bytes": 41922938,
+      "sha256": "9ef19d5df9fce109179f4c39d3599f380c48b2d791fb2e28fab927e9cb86bd42"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/otel-lz4_raw.parquet": {
+      "bytes": 40583413,
+      "sha256": "78e83c605a8de218fec694e3851ebd69be7cc393d7d0a8e164c77987463ed962"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/otel-statistics.json": {
+      "bytes": 45394,
+      "sha256": "4eab8e6c231d0de91f7c6d78973e761b2462d8024227bea010ea2e2497c6c1ac"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/otel-zstd.parquet": {
+      "bytes": 20702905,
+      "sha256": "af83f6a3d687a7660eb9ec6379810df4562af15595ccfe7d6ab00ce6cf52a81c"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/otel.arrow": {
+      "bytes": 62273434,
+      "sha256": "4c2e8ed41e158343ac330764cd1e89ebee81338a7c6a09e589c3d8b645023481"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/wide-lz4_raw.parquet": {
+      "bytes": 42850469,
+      "sha256": "828378aa425bff4a7b7cabd723ec5d110d0f9df15ead1b16c384f1723da9265f"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/wide-statistics.json": {
+      "bytes": 125445,
+      "sha256": "0d1964c894674457e3aedc41af4b59071a502fd51d59d85ff9e4d6e05c439b88"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/wide-zstd.parquet": {
+      "bytes": 21406812,
+      "sha256": "ceef797deec3104610c31151884da3f24e74fd2bba97fa1923be21d2604f2bc4"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/dictionary/wide.arrow": {
+      "bytes": 80625202,
+      "sha256": "270e09bf57978ad89a77a7a7e949a47666ab51d44a241af59007441ff8dd7680"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/app-lz4_raw.parquet": {
+      "bytes": 33977962,
+      "sha256": "c33116dd52c04c831bab4ac76775637131083cb47f1416e2c0e85b8a1f8b4288"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/app-statistics.json": {
+      "bytes": 29544,
+      "sha256": "07869e406866b4ac4aeccd62c1215288303490445cc4361d5fc4b8be7eb8049c"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/app-zstd.parquet": {
+      "bytes": 17152296,
+      "sha256": "c0934b5d4656a6cfff4a3904ec50f0816c0ab2eaa6047bd383b3252adc1be813"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/app.arrow": {
+      "bytes": 41922938,
+      "sha256": "9ef19d5df9fce109179f4c39d3599f380c48b2d791fb2e28fab927e9cb86bd42"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/otel-lz4_raw.parquet": {
+      "bytes": 39983132,
+      "sha256": "5a88a4661dd002ed61eb1a6419f1713794c69228cdd61cd0b286d5e253ba86cb"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/otel-statistics.json": {
+      "bytes": 45392,
+      "sha256": "8dfa0e2a6a1188391758cf16d19b0aa84b1e1f497d43367326319e8c7f0e3173"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/otel-zstd.parquet": {
+      "bytes": 20405724,
+      "sha256": "2d2ee6e44c3f052bdd297d584f55bb213d89140cc4368875ea242907d626ad91"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/otel.arrow": {
+      "bytes": 62273434,
+      "sha256": "4c2e8ed41e158343ac330764cd1e89ebee81338a7c6a09e589c3d8b645023481"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/wide-lz4_raw.parquet": {
+      "bytes": 42850555,
+      "sha256": "88f04e55c97b6c30d53a2c9ecca0a423ab7d76b63b5a13f4f8ca57520c7df852"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/wide-statistics.json": {
+      "bytes": 125443,
+      "sha256": "fac838ccdc2d0106affe79b0a77c9c33bb1374ff56a89ed4b9020925ab6edf24"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/wide-zstd.parquet": {
+      "bytes": 21406866,
+      "sha256": "b0cf2fb4fcf5209717eea1968ca78a025ae92f82a472c8248ec7940175083c35"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/delta/wide.arrow": {
+      "bytes": 80625202,
+      "sha256": "270e09bf57978ad89a77a7a7e949a47666ab51d44a241af59007441ff8dd7680"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/app-lz4_raw.parquet": {
+      "bytes": 352923,
+      "sha256": "2fd79fa2c122001ce06e8e2a216adce8656b4eb9a0c371d1844a7c31188f9558"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/app-statistics.json": {
+      "bytes": 53784,
+      "sha256": "4a9b0406e007645608652def34c8673d4595eff3b6f85211ac69b1859edc60f2"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/app-zstd.parquet": {
+      "bytes": 193440,
+      "sha256": "1601cfa1ee24341c733d6295ba68ed5aad1f0e4a6cf9b066062abc0ed0025c0b"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/app.arrow": {
+      "bytes": 423770,
+      "sha256": "255d9f6fdf119af6d3e4c01f4e2237eb366c62e3f37635255e2d0a72a2698055"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/otel-lz4_raw.parquet": {
+      "bytes": 444466,
+      "sha256": "51e68cdcfbc7cc0c8b674a51887908cfaafbeca915c87f5bfe37caa3328e114d"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/otel-statistics.json": {
+      "bytes": 108793,
+      "sha256": "d8dca32784018e59d65a5de9aebe6473256b946aa6ac4282d03b2be461099c1d"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/otel-zstd.parquet": {
+      "bytes": 250159,
+      "sha256": "b7f2da881c07ce6a080cd1e05a27a73852943dc399d2fe6865601863e052095a"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/otel.arrow": {
+      "bytes": 632058,
+      "sha256": "b2f0b973549dacd30dc7e8e76d3786cec917be5cdb0372bfda5928e57bce9bb3"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/wide-lz4_raw.parquet": {
+      "bytes": 563813,
+      "sha256": "441a905c0916c0c1b17c6b85e6dc7a6cc44be01cd718998c904b5e6bb9bd06d7"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/wide-statistics.json": {
+      "bytes": 418705,
+      "sha256": "68c35dede20b66fef182aa0a7ad572b553e09a6a2381d10c9bafde93a9042637"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/wide-zstd.parquet": {
+      "bytes": 377884,
+      "sha256": "a5dcf21df5a8d7717b71b78318a6f47aefb81771861446ac020092260fada607"
+    },
+    "/home/ajs/.cache/parseable-s3-writer-20261110/smoke/wide.arrow": {
+      "bytes": 817490,
+      "sha256": "c94c754ac62fecca80704096d3d280973a4a7fe65e383d0fd0228155c6036ad6"
+    }
+  }
+}
