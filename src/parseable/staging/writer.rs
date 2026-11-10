@@ -28,7 +28,10 @@ use std::{
 use arrow_array::RecordBatch;
 use arrow_ipc::{
     CompressionType,
-    writer::{IpcWriteOptions, StreamWriter},
+    writer::{
+        DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions, StreamWriter,
+        write_message,
+    },
 };
 use arrow_schema::Schema;
 use arrow_select::concat::concat_batches;
@@ -45,6 +48,18 @@ use crate::{
 };
 
 use super::StagingError;
+
+// The app-log sweep at 1/10/100/1000 rows shows substantial space savings
+// starting at 100 rows. Below that, frame setup dominates encoding CPU while
+// IPC metadata/alignment dominate bytes. Keep this row cutoff cheap to evaluate.
+const MIN_COMPRESSED_BATCH_ROWS: usize = 100;
+
+// A few rows can still carry a lot of data (stack traces, payload dumps).
+// Above this in-memory size the frame setup cost no longer matters and LZ4
+// pays for itself, so such batches keep the compressed path whatever their
+// row count. Wide schemas stay under it: 120 eight-byte columns padded to 128
+// rows are about 123 KiB.
+const MAX_UNCOMPRESSED_BATCH_BYTES: usize = 256 * 1024;
 
 const ENABLE_MEMORY_STAGING_VAR: &str = "ENABLE_MEMORY_STAGING";
 pub static ENABLE_MEMORY_STAGING: Lazy<bool> = Lazy::new(|| {
@@ -215,10 +230,66 @@ pub(crate) struct SealedPart {
 
 pub struct DiskWriter {
     inner: StreamWriter<BufWriter<File>>,
+    // StreamWriter owns schema validation, the compressed path and EOS/flush.
+    // Only dictionary-free small messages bypass its fixed write options.
+    small: Option<SmallBatchEncoder>,
     path: PathBuf,
     range: TimeRange,
     // Set once `seal` has taken over finishing and renaming from Drop.
     sealed: bool,
+}
+
+/// Keep dictionary schemas on the original path: reverse staging readers reorder
+/// dictionary messages as well as batches. Do not introduce new dictionary state
+/// transitions while changing compression. `flattened_fields` includes nested fields.
+struct SmallBatchEncoder {
+    dictionaries: DictionaryTracker,
+    context: IpcWriteContext,
+    options: IpcWriteOptions,
+}
+
+impl SmallBatchEncoder {
+    // Keep IPC encoding machinery out of the large-batch append path.
+    #[inline(never)]
+    fn write(
+        &mut self,
+        rb: &RecordBatch,
+        sink: &mut BufWriter<File>,
+    ) -> Result<(), arrow_schema::ArrowError> {
+        let (dictionaries, message) = IpcDataGenerator::default().encode(
+            rb,
+            &mut self.dictionaries,
+            &self.options,
+            &mut self.context,
+        )?;
+        for dictionary in dictionaries {
+            write_message(&mut *sink, dictionary, &self.options)?;
+        }
+        write_message(sink, message, &self.options)?;
+        Ok(())
+    }
+
+    fn for_schema(schema: &Schema) -> Option<Self> {
+        if schema
+            .flattened_fields()
+            .iter()
+            .any(|field| matches!(field.data_type(), arrow_schema::DataType::Dictionary(_, _)))
+        {
+            return None;
+        }
+        let options = IpcWriteOptions::default();
+        let mut dictionaries = DictionaryTracker::new(false);
+        IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+            schema,
+            &mut dictionaries,
+            &options,
+        );
+        Some(Self {
+            dictionaries,
+            context: IpcWriteContext::default(),
+            options,
+        })
+    }
 }
 
 impl DiskWriter {
@@ -241,6 +312,7 @@ impl DiskWriter {
 
         Ok(Self {
             inner,
+            small: SmallBatchEncoder::for_schema(schema),
             path,
             range,
             sealed: false,
@@ -306,7 +378,14 @@ impl DiskWriter {
     /// Write a single recordbatch into file
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn write(&mut self, rb: &RecordBatch) -> Result<(), StagingError> {
-        self.inner.write(rb).map_err(StagingError::Arrow)?;
+        if let Some(small) = self.small.as_mut().filter(|_| {
+            rb.num_rows() < MIN_COMPRESSED_BATCH_ROWS
+                && rb.get_array_memory_size() < MAX_UNCOMPRESSED_BATCH_BYTES
+        }) {
+            small.write(rb, self.inner.get_mut())?;
+        } else {
+            self.inner.write(rb).map_err(StagingError::Arrow)?;
+        }
         // A process crash does not run Drop, so do not leave the tail of an
         // acknowledged record batch only in BufWriter's userspace buffer.
         // The EOS marker can be recovered, but missing batch bytes cannot.
@@ -601,6 +680,306 @@ mod tests {
     };
 
     use super::{DiskWriter, MemWriter, MutableBuffer, Writer};
+
+    fn legacy_bytes(schema: &Schema, batches: &[RecordBatch], compressed: bool) -> Vec<u8> {
+        let options = arrow_ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(compressed.then_some(arrow_ipc::CompressionType::LZ4_FRAME))
+            .unwrap();
+        let mut writer =
+            arrow_ipc::writer::StreamWriter::try_new_with_options(Vec::new(), schema, options)
+                .unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.into_inner().unwrap()
+    }
+
+    #[test]
+    fn adaptive_staging_reader_compatibility() {
+        use crate::parseable::staging::reader::{
+            MergedForwardRecordReader, get_forward_reader, get_reverse_reader,
+        };
+        use std::io::Cursor;
+        for sizes in [
+            vec![],
+            vec![0],
+            vec![1],
+            vec![1, 10],
+            vec![100, 1000],
+            vec![1, 1000, 10, 100, 1],
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("mixed.data.arrows");
+            let schema = id_schema();
+            let mut start = 0;
+            let batches = sizes
+                .iter()
+                .map(|n| {
+                    let rb = ids_batch(&schema, start..start + n);
+                    start += n;
+                    rb
+                })
+                .collect::<Vec<_>>();
+            let range = TimeRange::granularity_range(Utc::now(), OBJECT_STORE_DATA_GRANULARITY);
+            let mut writer = DiskWriter::try_new(&path, &schema, range).unwrap();
+            for batch in &batches {
+                writer.write(batch).unwrap();
+                // Acknowledged bytes must already be visible without Drop or seal.
+                let visible = StreamReader::try_new(File::open(writer.path()).unwrap(), None)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(visible.last(), Some(batch));
+            }
+            let sealed = writer.seal().unwrap_or_else(|(_, e)| panic!("{e}"));
+            std::fs::rename(sealed.part, &path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                StreamReader::try_new(Cursor::new(&bytes), None)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                batches
+            );
+            let legacy = legacy_bytes(&schema, &batches, true);
+            assert_eq!(
+                StreamReader::try_new(Cursor::new(legacy.clone()), None)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                batches
+            );
+            if sizes.iter().all(|n| *n >= 100) {
+                assert_eq!(bytes, legacy);
+            }
+            if batches.is_empty() {
+                assert!(get_forward_reader(Cursor::new(&bytes)).is_err());
+                assert!(get_reverse_reader(Cursor::new(&bytes)).is_err());
+                continue;
+            }
+            assert_eq!(
+                get_forward_reader(Cursor::new(&bytes))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                batches
+            );
+            let mut reversed = batches.clone();
+            reversed.reverse();
+            assert_eq!(
+                get_reverse_reader(Cursor::new(&bytes))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                reversed
+            );
+            let plan = MergedForwardRecordReader::try_new(std::slice::from_ref(&path))
+                .into_file_plans()
+                .next()
+                .unwrap();
+            assert_eq!(
+                plan.open_lanes(1)
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+                    .reader
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                batches
+            );
+            // Cuts at the message boundary, in metadata and in the body recover the same prefix.
+            let before_last = if batches.len() > 1 {
+                // Locate batch boundaries with a plain reader's underlying cursor.
+                let mut cursor = Cursor::new(&bytes);
+                {
+                    let mut reader = StreamReader::try_new(&mut cursor, None).unwrap();
+                    for _ in 0..batches.len() - 1 {
+                        reader.next().unwrap().unwrap();
+                    }
+                }
+                cursor.position() as usize
+            } else {
+                continue;
+            };
+            for cut in [before_last, before_last + 4, bytes.len() - 9] {
+                let truncated = &bytes[..cut];
+                assert_eq!(
+                    get_forward_reader(Cursor::new(truncated))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                    batches[..batches.len() - 1]
+                );
+                let mut expected = batches[..batches.len() - 1].to_vec();
+                expected.reverse();
+                assert_eq!(
+                    get_reverse_reader(Cursor::new(truncated))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_staging_retains_legacy_bytes() {
+        use arrow_array::{DictionaryArray, types::Int32Type};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dictionary.data.arrows");
+        let batches = [1, 1000, 10]
+            .into_iter()
+            .map(|n| {
+                RecordBatch::try_from_iter([(
+                    "dict",
+                    Arc::new(DictionaryArray::<Int32Type>::from_iter(
+                        (0..n).map(|_| "same"),
+                    )) as Arc<dyn Array>,
+                )])
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let schema = batches[0].schema();
+        let range = TimeRange::granularity_range(Utc::now(), OBJECT_STORE_DATA_GRANULARITY);
+        let mut writer = DiskWriter::try_new(&path, &schema, range).unwrap();
+        assert!(writer.small.is_none());
+        for batch in &batches {
+            writer.write(batch).unwrap();
+        }
+        drop(writer);
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes, legacy_bytes(&schema, &batches, true));
+        assert_eq!(
+            StreamReader::try_new(std::io::Cursor::new(bytes), None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            batches
+        );
+    }
+
+    #[test]
+    fn adaptive_staging_varied_sliced_nullable_batches() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nullable.data.arrows");
+        let strings = (0..1100)
+            .map(|i| (i % 3 != 0).then(|| format!("value {i}")))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter([
+            (
+                "text",
+                Arc::new(StringArray::from(strings)) as Arc<dyn Array>,
+            ),
+            (
+                "id",
+                Arc::new(Int32Array::from_iter(
+                    (0..1100).map(|i| (i % 7 != 0).then_some(i)),
+                )) as Arc<dyn Array>,
+            ),
+        ])
+        .unwrap();
+        let batches = [
+            batch.slice(1, 1),
+            batch.slice(3, 1000),
+            batch.slice(7, 10),
+            batch.slice(9, 100),
+        ];
+        let range = TimeRange::granularity_range(Utc::now(), OBJECT_STORE_DATA_GRANULARITY);
+        let mut writer = DiskWriter::try_new(&path, &batch.schema(), range).unwrap();
+        for rb in &batches {
+            writer.write(rb).unwrap();
+        }
+        drop(writer);
+        let actual = StreamReader::try_new(File::open(path).unwrap(), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let expected = StreamReader::try_new(
+            std::io::Cursor::new(legacy_bytes(&batch.schema(), &batches, true)),
+            None,
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, batches);
+    }
+
+    #[test]
+    fn adaptive_staging_flush_errors_match_legacy() {
+        use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
+        use std::io::BufWriter;
+        for n in [1, 1000] {
+            let dir = TempDir::new().unwrap();
+            let schema = id_schema();
+            let batch = ids_batch(&schema, 0..n);
+            let range = TimeRange::granularity_range(Utc::now(), OBJECT_STORE_DATA_GRANULARITY);
+            let mut writer =
+                DiskWriter::try_new(dir.path().join("full.data.arrows"), &schema, range).unwrap();
+            // Both paths must report a failed flush instead of acknowledging rows.
+            *writer.inner.get_mut().get_mut() = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            let actual = writer.write(&batch).unwrap_err();
+            let options = IpcWriteOptions::default()
+                .try_with_compression(Some(arrow_ipc::CompressionType::LZ4_FRAME))
+                .unwrap();
+            let mut legacy = StreamWriter::try_new_with_options(
+                BufWriter::new(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/dev/full")
+                        .unwrap(),
+                ),
+                &schema,
+                options,
+            )
+            .unwrap();
+            let expected = legacy
+                .write(&batch)
+                .and_then(|_| legacy.flush())
+                .unwrap_err();
+            assert_eq!(
+                actual.to_string(),
+                super::StagingError::Arrow(expected).to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn small_batches_with_large_values_stay_compressed() {
+        let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+        // Five rows of 100 KiB each: far below the row cutoff, far above the size cutoff.
+        let big = "stack frame line\n".repeat(100 * 1024 / 17);
+        let batches = (0..3)
+            .map(|_| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(StringArray::from(vec![big.as_str(); 5]))],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(batches[0].num_rows() < super::MIN_COMPRESSED_BATCH_ROWS);
+        assert!(batches[0].get_array_memory_size() >= super::MAX_UNCOMPRESSED_BATCH_BYTES);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large-values.data.arrows");
+        let range = TimeRange::granularity_range(Utc::now(), OBJECT_STORE_DATA_GRANULARITY);
+        let mut writer = DiskWriter::try_new(&path, &schema, range).unwrap();
+        for batch in &batches {
+            writer.write(batch).unwrap();
+        }
+        let sealed = writer.seal().unwrap_or_else(|(_, e)| panic!("{e}"));
+        let bytes = std::fs::read(&sealed.part).unwrap();
+
+        // Byte-identical to the always-compressed writer, and much smaller than raw.
+        assert_eq!(bytes, legacy_bytes(&schema, &batches, true));
+        assert!(bytes.len() < legacy_bytes(&schema, &batches, false).len() / 4);
+    }
 
     fn id_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
