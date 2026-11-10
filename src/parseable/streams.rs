@@ -1998,7 +1998,7 @@ impl Stream {
             // queried name still gets read. The bloom answers membership exactly,
             // so a row group that never saw the metric is rejected outright.
             let column_path = ColumnPath::new(vec!["metric_name".to_string()]);
-            let bloom_filter_position = if PARSEABLE.options.bloom_filter_default_position {
+            let bloom_filter_position = if self.options.bloom_filter_default_position {
                 BloomFilterPosition::AfterRowGroup
             } else {
                 BloomFilterPosition::End
@@ -2007,6 +2007,35 @@ impl Stream {
                 .set_column_bloom_filter_enabled(column_path.clone(), true)
                 .set_column_bloom_filter_max_ndv(column_path, METRIC_NAME_BLOOM_FILTER_NDV)
                 .set_bloom_filter_position(bloom_filter_position);
+        }
+        // Keep metrics' existing filters and position independent of this opt-in.
+        // Parquet 59 folds each filter at close, reducing short/low-NDV groups.
+        if !is_otel_metrics && !self.options.parquet_bloom_filter_columns.is_empty() {
+            for name in &self.options.parquet_bloom_filter_columns {
+                // "a, b" is a natural way to write the list
+                let name = name.trim();
+                if merged_schema.index_of(name).is_ok() {
+                    let path = ColumnPath::new(vec![name.to_owned()]);
+                    props = props
+                        .set_column_bloom_filter_enabled(path.clone(), true)
+                        .set_column_bloom_filter_max_ndv(
+                            path.clone(),
+                            self.options.row_group_size as u64,
+                        )
+                        .set_column_bloom_filter_fpp(path, 0.01);
+                }
+            }
+            // A filter is allocated at its full size for every selected column of
+            // every row group, and with `End` the writer keeps all of them until
+            // the file is closed. Writing them after each row group releases them
+            // as it goes, so that is the default.
+            props = props.set_bloom_filter_position(
+                if self.options.parquet_bloom_filter_position == "end" {
+                    BloomFilterPosition::End
+                } else {
+                    BloomFilterPosition::AfterRowGroup
+                },
+            );
         }
         sorting_column_vec.push(SortingColumn {
             column_idx: time_partition_idx as i32,
@@ -4051,6 +4080,267 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
+
+    #[test]
+    fn bloom_filter_conversion_round_trip() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        // Exercise the regular, custom partition (delta encoding), and clustered
+        // conversion paths, including a final short row group.
+        for (enabled, clustered, partitioned) in [
+            (false, false, false),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let staging = Stream::new(
+                Arc::new(Options {
+                    local_staging_path: dir.path().to_path_buf(),
+                    row_group_size: 4,
+                    parquet_bloom_filter_columns: if enabled {
+                        vec!["value".into(), "missing".into()]
+                    } else {
+                        vec![]
+                    },
+                    log_severity_cluster_column: clustered.then(|| "value".into()),
+                    ..Default::default()
+                }),
+                "bloom-roundtrip",
+                LogStreamMetadata::default(),
+                None,
+                &None,
+            );
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(
+                    DEFAULT_TIMESTAMP_KEY,
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    false,
+                ),
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(TimestampMillisecondArray::from_iter_values(0..11)),
+                    Arc::new(Int32Array::from_iter_values(0..11)),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..11).map(|i| if i % 2 == 0 { "a" } else { "z" }),
+                    )),
+                ],
+            )
+            .unwrap();
+            staging
+                .push(
+                    "abc",
+                    &batch,
+                    (Utc::now() - TimeDelta::minutes(2)).naive_utc(),
+                    &HashMap::new(),
+                    StreamType::UserDefined,
+                )
+                .unwrap();
+            staging.flush(true).unwrap();
+            let partition = partitioned.then(|| "value".to_string());
+            staging
+                .convert_disk_files_to_parquet(None, partition.as_ref(), false, true, &None)
+                .unwrap();
+            let paths = staging.parquet_files();
+            assert_eq!(paths.len(), 1);
+            let read_options = parquet::file::serialized_reader::ReadOptionsBuilder::new()
+                .with_reader_properties(
+                    parquet::file::properties::ReaderProperties::builder()
+                        .set_read_bloom_filter(true)
+                        .build(),
+                )
+                .build();
+            let reader = SerializedFileReader::new_with_options(
+                File::open(&paths[0]).unwrap(),
+                read_options,
+            )
+            .unwrap();
+            assert_eq!(reader.num_row_groups(), 3);
+            for i in 0..3 {
+                let rg = reader.get_row_group(i).unwrap();
+                assert_eq!(rg.metadata().num_rows(), if i == 2 { 3 } else { 4 });
+                for col in 0..3 {
+                    assert_eq!(
+                        rg.metadata().column(col).bloom_filter_offset().is_some(),
+                        enabled && col == 2
+                    );
+                }
+                assert_eq!(rg.metadata().sorting_columns().is_none(), clustered);
+                if enabled {
+                    let filter = rg.get_column_bloom_filter(2).unwrap();
+                    assert!(filter.check(&"a"));
+                    assert!(filter.check(&"z"));
+                    assert!(!filter.check(&"m")); // absent, inside every group's min/max
+                }
+            }
+            let batches = ParquetRecordBatchReaderBuilder::try_new(File::open(&paths[0]).unwrap())
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(batches.map(|b| b.unwrap().num_rows()).sum::<usize>(), 11);
+        }
+    }
+
+    #[test]
+    fn bloom_filter_folds_short_and_low_cardinality_groups() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let dir = TempDir::new().unwrap();
+        let staging = Stream::new(
+            Arc::new(Options {
+                row_group_size: 4096,
+                // Names are trimmed, as in "id, level"
+                parquet_bloom_filter_columns: vec!["id".into(), " level ".into()],
+                ..Default::default()
+            }),
+            "bloom-folding",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("level", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..4099).map(|i| format!("{i:032x}")),
+                )),
+                Arc::new(StringArray::from(vec!["INFO"; 4099])),
+            ],
+        )
+        .unwrap();
+        let props = staging.parquet_writer_props(&schema, None, None, true);
+        // Unless `end` is asked for, filters are written, and released, per row group
+        assert_eq!(
+            props.bloom_filter_position(),
+            BloomFilterPosition::AfterRowGroup
+        );
+        for name in ["id", "level"] {
+            assert!(
+                props
+                    .bloom_filter_properties(&ColumnPath::new(vec![name.into()]))
+                    .is_some(),
+                "{name}"
+            );
+        }
+        let path = dir.path().join("folded.parquet");
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            schema.clone(),
+            Some(staging.parquet_writer_props(&schema, None, None, true)),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+        let large = reader
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .bloom_filter_length()
+            .unwrap();
+        let short = reader
+            .metadata()
+            .row_group(1)
+            .column(0)
+            .bloom_filter_length()
+            .unwrap();
+        let low_ndv = reader
+            .metadata()
+            .row_group(0)
+            .column(1)
+            .bloom_filter_length()
+            .unwrap();
+        assert!(large > short);
+        assert_eq!(short, low_ndv);
+        assert!(short < 100); // minimum 32-byte bitset plus compact Thrift header
+    }
+
+    #[test]
+    fn bloom_filter_metrics_properties_unchanged() {
+        let metadata = LogStreamMetadata {
+            log_source: vec![LogSourceEntry::new(LogSource::OtelMetrics, HashSet::new())],
+            ..Default::default()
+        };
+        let schema = Schema::new(vec![
+            Field::new(
+                DEFAULT_TIMESTAMP_KEY,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("trace_id", DataType::Utf8, false),
+        ]);
+        let original = Stream::new(
+            Arc::new(Options {
+                row_group_size: 4,
+                bloom_filter_default_position: true,
+                ..Default::default()
+            }),
+            "metrics-before",
+            metadata.clone(),
+            None,
+            &None,
+        );
+        let configured = Stream::new(
+            Arc::new(Options {
+                row_group_size: 4,
+                bloom_filter_default_position: true,
+                parquet_bloom_filter_columns: vec!["trace_id".into(), "metric_name".into()],
+                parquet_bloom_filter_position: "end".into(),
+                ..Default::default()
+            }),
+            "metrics-after",
+            metadata,
+            None,
+            &None,
+        );
+        let before = original.parquet_writer_props(&schema, None, None, false);
+        let after = configured.parquet_writer_props(&schema, None, None, false);
+        assert_eq!(
+            after.bloom_filter_position(),
+            BloomFilterPosition::AfterRowGroup
+        );
+        assert_eq!(
+            before.max_row_group_row_count(),
+            after.max_row_group_row_count()
+        );
+        assert_eq!(before.sorting_columns(), after.sorting_columns());
+        assert_eq!(
+            before.bloom_filter_position(),
+            after.bloom_filter_position()
+        );
+        for field in schema.fields() {
+            let path = ColumnPath::new(vec![field.name().clone()]);
+            assert_eq!(
+                before.bloom_filter_properties(&path),
+                after.bloom_filter_properties(&path)
+            );
+            assert_eq!(before.encoding(&path), after.encoding(&path));
+            assert_eq!(before.compression(&path), after.compression(&path));
+            assert_eq!(
+                before.dictionary_enabled(&path),
+                after.dictionary_enabled(&path)
+            );
+        }
+        assert!(
+            after
+                .bloom_filter_properties(&ColumnPath::from("trace_id"))
+                .is_none()
+        );
+        assert_eq!(
+            after
+                .bloom_filter_properties(&ColumnPath::from("metric_name"))
+                .unwrap()
+                .ndv(),
+            METRIC_NAME_BLOOM_FILTER_NDV
+        );
+    }
 
     #[test]
     fn current_minute_query_visibility_query_mode_flushes_ownerless_memory() {
