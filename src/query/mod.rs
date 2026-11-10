@@ -17,6 +17,7 @@
  */
 
 mod filter_optimizer;
+mod latest_n;
 mod listing_table_builder;
 pub mod stream_schema_provider;
 
@@ -441,6 +442,26 @@ impl Query {
             hot_tier_query_guards(&logical_plan, &self.time_range).await?;
         if !guarded_hot_tier_streams.is_empty() {
             logical_plan = enable_hot_tier_reads(logical_plan, &guarded_hot_tier_streams)?;
+        }
+        if PARSEABLE.options.latest_n_prefilter && PARSEABLE.options.mode == Mode::All {
+            let time = first_table_name(&logical_plan)
+                .and_then(|name| PARSEABLE.get_stream(&name, tenant_id).ok())
+                .and_then(|stream| stream.get_time_partition())
+                .unwrap_or_else(|| DEFAULT_TIMESTAMP_KEY.to_owned());
+            if latest_n::candidate(&logical_plan, &time).is_some() {
+                logical_plan = stream_schema_provider::with_planning_cache(logical_plan)?;
+                let candidate = latest_n::candidate(&logical_plan, &time)
+                    .expect("cloning the table source preserves candidate eligibility");
+                logical_plan = latest_n::prefilter_range(
+                    &ctx,
+                    logical_plan,
+                    candidate,
+                    tenant_id,
+                    self.time_range.start.timestamp_millis(),
+                    self.time_range.end.timestamp_millis(),
+                )
+                .await?;
+            }
         }
         let df = ctx.execute_logical_plan(logical_plan).await?;
         let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
@@ -1033,6 +1054,16 @@ pub async fn get_manifest_list(
     }
 
     Ok(all_manifest_files)
+}
+
+fn first_table_name(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::TableScan(scan) => Some(scan.table_name.to_string()),
+        _ => plan
+            .inputs()
+            .first()
+            .and_then(|input| first_table_name(input)),
+    }
 }
 
 fn transform(
