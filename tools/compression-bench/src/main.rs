@@ -285,7 +285,7 @@ fn verify(path: &Path, expected: &RecordBatch, codec: Compression) -> Result<Val
     );
     for group in meta.row_groups() {
         assert_eq!(
-            group.sorting_columns(),
+            group.sorting_columns().map(|columns| columns.as_slice()),
             Some(
                 [SortingColumn {
                     column_idx: 0,
