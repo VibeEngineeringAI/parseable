@@ -5,6 +5,15 @@
   "affinity": "0-19 (unpinned)",
   "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
   "command": "timeout 180 compression-bench OUTPUT_DIR 270000 5 262144",
+  "harness_revision": "28ce491ba0ff85ffc1c450ba8b280f9ac8b50b0a",
+  "write_output_reuse": "unlink_before_timing",
+  "source_sha256": {
+    "src/main.rs": "63be76562c94fcef655206c8f1de30e668576767448c4d738e5a7df59b2a192b",
+    "Cargo.toml": "7981a96ea23b276bf5bae7f4d64b0467a8430c0369511c3b113b800d8c3b9e7c",
+    "Cargo.lock": "68fe86eb69370764b839234aa84b320869d7f87d9566f088df7c940ecee205fc",
+    "verify_reader.py": "dbbf4a7f54ee786cf2f1217b65506b3d3390c33cde6b1b89d79c1b9a2b1a1865",
+    "summarize.py": "3c8c3026a8ce38ad175a53e16c1ec46948fc2784855bb1b78dab4903577b73b7"
+  },
   "files": {
     "app-lz4_raw.parquet": {
       "bytes": 6757933,
@@ -54,5 +63,6 @@
       "bytes": 132711890,
       "sha256": "5c9ff00ed59f45258f3ace014c6eb14be4aeda55a50fbf52a20124126adcb4bd"
     }
-  }
+  },
+  "column_inspector_sha256": "9c952347a7a7f211c5efc8221579778a3d3c7f0d20d02f2804e4f8b9d881c298"
 }

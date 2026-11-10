@@ -1,0 +1,262 @@
+{
+  "pyarrow": "18.1.0",
+  "cpp": "18.1.0",
+  "files": {
+    "app-lz4_raw.parquet": {
+      "file_bytes": 5959311,
+      "rows": 270000,
+      "row_groups": 2,
+      "footer_metadata_bytes": 2887,
+      "all_column_compressed_bytes": 5951450,
+      "columns": {
+        "p_timestamp": {
+          "compressed_bytes": 1333,
+          "uncompressed_bytes": 39133,
+          "encodings": [
+            "DELTA_BINARY_PACKED",
+            "RLE"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 0.0224
+        },
+        "request_id": {
+          "compressed_bytes": 5025330,
+          "uncompressed_bytes": 5515120,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 84.3274
+        }
+      }
+    },
+    "app-zstd.parquet": {
+      "file_bytes": 2754023,
+      "rows": 270000,
+      "row_groups": 2,
+      "footer_metadata_bytes": 2885,
+      "all_column_compressed_bytes": 2746171,
+      "columns": {
+        "p_timestamp": {
+          "compressed_bytes": 1035,
+          "uncompressed_bytes": 39133,
+          "encodings": [
+            "DELTA_BINARY_PACKED",
+            "RLE"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 0.0376
+        },
+        "request_id": {
+          "compressed_bytes": 2042931,
+          "uncompressed_bytes": 5515120,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 74.1799
+        }
+      }
+    },
+    "otel-lz4_raw.parquet": {
+      "file_bytes": 10566642,
+      "rows": 270000,
+      "row_groups": 2,
+      "footer_metadata_bytes": 5670,
+      "all_column_compressed_bytes": 10548680,
+      "columns": {
+        "p_timestamp": {
+          "compressed_bytes": 1333,
+          "uncompressed_bytes": 39133,
+          "encodings": [
+            "DELTA_BINARY_PACKED",
+            "RLE"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 0.0126
+        },
+        "request_id": {
+          "compressed_bytes": 5025330,
+          "uncompressed_bytes": 5515120,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 47.5584
+        },
+        "trace_id": {
+          "compressed_bytes": 1430758,
+          "uncompressed_bytes": 7755836,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 13.5403
+        },
+        "span_id": {
+          "compressed_bytes": 1437500,
+          "uncompressed_bytes": 7494697,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 13.6041
+        }
+      }
+    },
+    "otel-zstd.parquet": {
+      "file_bytes": 4317791,
+      "rows": 270000,
+      "row_groups": 2,
+      "footer_metadata_bytes": 5665,
+      "all_column_compressed_bytes": 4299841,
+      "columns": {
+        "p_timestamp": {
+          "compressed_bytes": 1035,
+          "uncompressed_bytes": 39133,
+          "encodings": [
+            "DELTA_BINARY_PACKED",
+            "RLE"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 0.024
+        },
+        "request_id": {
+          "compressed_bytes": 2042931,
+          "uncompressed_bytes": 5515120,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 47.3143
+        },
+        "trace_id": {
+          "compressed_bytes": 268259,
+          "uncompressed_bytes": 7755835,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 6.2129
+        },
+        "span_id": {
+          "compressed_bytes": 282925,
+          "uncompressed_bytes": 7494696,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 6.5525
+        }
+      }
+    },
+    "wide-lz4_raw.parquet": {
+      "file_bytes": 29527590,
+      "rows": 270000,
+      "row_groups": 2,
+      "footer_metadata_bytes": 22974,
+      "all_column_compressed_bytes": 29454429,
+      "columns": {
+        "p_timestamp": {
+          "compressed_bytes": 1333,
+          "uncompressed_bytes": 39133,
+          "encodings": [
+            "DELTA_BINARY_PACKED",
+            "RLE"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 0.0045
+        },
+        "request_id": {
+          "compressed_bytes": 5025330,
+          "uncompressed_bytes": 5515120,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "LZ4"
+          ],
+          "file_share_percent": 17.0191
+        }
+      }
+    },
+    "wide-zstd.parquet": {
+      "file_bytes": 13724914,
+      "rows": 270000,
+      "row_groups": 2,
+      "footer_metadata_bytes": 22924,
+      "all_column_compressed_bytes": 13651906,
+      "columns": {
+        "p_timestamp": {
+          "compressed_bytes": 1035,
+          "uncompressed_bytes": 39133,
+          "encodings": [
+            "DELTA_BINARY_PACKED",
+            "RLE"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 0.0075
+        },
+        "request_id": {
+          "compressed_bytes": 2042931,
+          "uncompressed_bytes": 5515120,
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "codecs": [
+            "ZSTD"
+          ],
+          "file_share_percent": 14.8848
+        }
+      }
+    }
+  }
+}

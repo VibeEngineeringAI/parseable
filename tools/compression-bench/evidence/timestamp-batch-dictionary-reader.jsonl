@@ -1,0 +1,67 @@
+{"type": "reader", "pyarrow": "18.1.0", "cpp": "18.1.0", "python": "3.12.16"}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": false, "trial": 0, "wall_ms": 26.03717, "cpu_ms": 27.069092}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": true, "trial": 0, "wall_ms": 4.4148, "cpu_ms": 4.726493}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": true, "trial": 1, "wall_ms": 3.780914, "cpu_ms": 4.09725}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": false, "trial": 1, "wall_ms": 25.110632, "cpu_ms": 26.12629}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": false, "trial": 2, "wall_ms": 29.601793, "cpu_ms": 30.206308}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": true, "trial": 2, "wall_ms": 3.998934, "cpu_ms": 4.175237}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": true, "trial": 3, "wall_ms": 3.686964, "cpu_ms": 3.886987}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": false, "trial": 3, "wall_ms": 21.231519, "cpu_ms": 21.966324}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": false, "trial": 4, "wall_ms": 22.562312, "cpu_ms": 23.338004}
+{"type": "read_sample", "dataset": "app", "codec": "lz4_raw", "projection": true, "trial": 4, "wall_ms": 4.114977, "cpu_ms": 4.507323}
+{"type": "verified", "dataset": "app", "codec": "lz4_raw", "rows": 270000, "row_groups": 2, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": false, "trial": 0, "wall_ms": 22.447928, "cpu_ms": 23.554265}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": true, "trial": 0, "wall_ms": 4.238496, "cpu_ms": 4.624522}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": true, "trial": 1, "wall_ms": 3.854556, "cpu_ms": 4.099137}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": false, "trial": 1, "wall_ms": 20.768219, "cpu_ms": 21.868956}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": false, "trial": 2, "wall_ms": 27.108843, "cpu_ms": 28.318473}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": true, "trial": 2, "wall_ms": 4.164553, "cpu_ms": 4.379124}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": true, "trial": 3, "wall_ms": 4.794802, "cpu_ms": 5.035455}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": false, "trial": 3, "wall_ms": 21.020567, "cpu_ms": 22.005237}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": false, "trial": 4, "wall_ms": 20.082024, "cpu_ms": 21.26637}
+{"type": "read_sample", "dataset": "app", "codec": "zstd", "projection": true, "trial": 4, "wall_ms": 3.947963, "cpu_ms": 4.17706}
+{"type": "verified", "dataset": "app", "codec": "zstd", "rows": 270000, "row_groups": 2, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": false, "trial": 0, "wall_ms": 146.997924, "cpu_ms": 151.094088}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": true, "trial": 0, "wall_ms": 4.569138, "cpu_ms": 5.011462}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": true, "trial": 1, "wall_ms": 4.152059, "cpu_ms": 4.307464}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": false, "trial": 1, "wall_ms": 165.555723, "cpu_ms": 169.192333}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": false, "trial": 2, "wall_ms": 141.84513, "cpu_ms": 145.732344}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": true, "trial": 2, "wall_ms": 5.245168, "cpu_ms": 5.519147}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": true, "trial": 3, "wall_ms": 4.777727, "cpu_ms": 5.038623}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": false, "trial": 3, "wall_ms": 141.601775, "cpu_ms": 145.333664}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": false, "trial": 4, "wall_ms": 130.608399, "cpu_ms": 137.700886}
+{"type": "read_sample", "dataset": "wide", "codec": "lz4_raw", "projection": true, "trial": 4, "wall_ms": 7.756508, "cpu_ms": 8.158941}
+{"type": "verified", "dataset": "wide", "codec": "lz4_raw", "rows": 270000, "row_groups": 2, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": false, "trial": 0, "wall_ms": 156.328113, "cpu_ms": 160.669019}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": true, "trial": 0, "wall_ms": 6.192829, "cpu_ms": 6.558679}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": true, "trial": 1, "wall_ms": 4.851466, "cpu_ms": 5.0744}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": false, "trial": 1, "wall_ms": 154.988329, "cpu_ms": 159.41311}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": false, "trial": 2, "wall_ms": 150.369187, "cpu_ms": 155.082579}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": true, "trial": 2, "wall_ms": 5.30638, "cpu_ms": 5.625388}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": true, "trial": 3, "wall_ms": 4.652594, "cpu_ms": 4.844427}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": false, "trial": 3, "wall_ms": 145.005423, "cpu_ms": 149.398233}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": false, "trial": 4, "wall_ms": 149.282543, "cpu_ms": 154.192783}
+{"type": "read_sample", "dataset": "wide", "codec": "zstd", "projection": true, "trial": 4, "wall_ms": 4.924109, "cpu_ms": 5.417736}
+{"type": "verified", "dataset": "wide", "codec": "zstd", "rows": 270000, "row_groups": 2, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": false, "trial": 0, "wall_ms": 39.359014, "cpu_ms": 40.939237}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": true, "trial": 0, "wall_ms": 4.108518, "cpu_ms": 4.484563}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": true, "trial": 1, "wall_ms": 3.983797, "cpu_ms": 4.034796}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": false, "trial": 1, "wall_ms": 40.40907, "cpu_ms": 41.768148}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": false, "trial": 2, "wall_ms": 40.422466, "cpu_ms": 41.791156}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": true, "trial": 2, "wall_ms": 4.313778, "cpu_ms": 4.693158}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": true, "trial": 3, "wall_ms": 3.897464, "cpu_ms": 4.299071}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": false, "trial": 3, "wall_ms": 39.70875, "cpu_ms": 41.034521}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": false, "trial": 4, "wall_ms": 38.436724, "cpu_ms": 39.868732}
+{"type": "read_sample", "dataset": "otel", "codec": "lz4_raw", "projection": true, "trial": 4, "wall_ms": 4.323271, "cpu_ms": 4.375474}
+{"type": "verified", "dataset": "otel", "codec": "lz4_raw", "rows": 270000, "row_groups": 2, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": false, "trial": 0, "wall_ms": 53.073976, "cpu_ms": 54.933597}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": true, "trial": 0, "wall_ms": 4.889825, "cpu_ms": 5.343951}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": true, "trial": 1, "wall_ms": 5.671697, "cpu_ms": 5.859744}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": false, "trial": 1, "wall_ms": 46.19893, "cpu_ms": 48.721897}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": false, "trial": 2, "wall_ms": 44.822307, "cpu_ms": 46.826014}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": true, "trial": 2, "wall_ms": 4.516395, "cpu_ms": 4.797838}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": true, "trial": 3, "wall_ms": 4.364963, "cpu_ms": 4.532897}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": false, "trial": 3, "wall_ms": 45.799978, "cpu_ms": 47.474741}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": false, "trial": 4, "wall_ms": 46.142782, "cpu_ms": 48.078349}
+{"type": "read_sample", "dataset": "otel", "codec": "zstd", "projection": true, "trial": 4, "wall_ms": 5.71243, "cpu_ms": 5.952446}
+{"type": "verified", "dataset": "otel", "codec": "zstd", "rows": 270000, "row_groups": 2, "schema_values_nulls_timestamps_statistics": "pass"}

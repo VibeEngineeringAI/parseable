@@ -33,6 +33,8 @@ UV_CACHE_DIR="$HOME/.cache/parseable-compression-uv" uv pip install \
   --python "$HOME/.cache/parseable-compression-reader/bin/python" pyarrow==18.1.0
 "$HOME/.cache/parseable-compression-reader/bin/python" \
   tools/compression-bench/verify_reader.py "$OUT" > "$OUT-reader.jsonl"
+"$HOME/.cache/parseable-compression-reader/bin/python" \
+  tools/compression-bench/inspect_columns.py "$OUT" > "$OUT-columns.json"
 ```
 
 Use a quiet host and record `rustc -Vv`, `uname -a`, CPU model, affinity and load.
@@ -43,6 +45,8 @@ Recheck that alignment when production dependencies change.
 The direct `zstd` dependency matches the server's codec feature unification;
 version equality alone is insufficient. The checked Linux feature sets and
 commands are recorded in `evidence/codec-features.json`.
+The evidence manifest records the producing harness revision and source hashes;
+the Python reader record includes its Python version.
 
 ## Method
 
@@ -108,3 +112,47 @@ The older independent reader compares full schema (including metadata) and all
 values to the input IPC, and validates every row group's min/max and null counts
 against the input via Arrow compute. Its warm read samples are supplemental;
 reader implementations and versions must not be compared as a controlled A/B.
+
+`inspect_columns.py` records file/footer sizes, actual encodings and compressed
+bytes for selected columns; `--columns` selects a different list. The footer
+metadata size excludes the trailing eight-byte Parquet footer length/magic and
+does not include bloom filters or column/page indexes. It is not a measurement
+of bytes fetched by a query.
+
+The summarizer requires the declared number of measured rounds and one warmup
+per codec/shape, rejecting missing or duplicate samples before reporting medians.
+
+## Timestamp encoding probes
+
+The main harness retains the production dictionary setting. Separate probe
+patches under `evidence/` modify only copies of the standalone harness. Their
+base revision and source hashes are recorded in
+`timestamp-dictionary-disabled-manifest.json` and `timestamp-batch-manifest.json`.
+The dense probe keeps the main fixture and disables the timestamp dictionary.
+The batch controls instead make `p_timestamp` non-null and constant within each
+IPC batch, testing both dictionary and delta encoding. Results and limitations
+are in [RESULTS](RESULTS.md#additional-finding-timestamp-dictionary-selection).
+
+To reproduce the dense probe, run from the repository root with the reader
+environment prepared above:
+
+```sh
+PROBE_PARENT=$(mktemp -d "$HOME/.cache/parseable-time-probe.XXXXXX")
+git archive 28ce491b tools/compression-bench | tar -x -C "$PROBE_PARENT"
+patch -d "$PROBE_PARENT/tools/compression-bench" -p1 \
+  < tools/compression-bench/evidence/timestamp-dictionary-disabled.patch
+CARGO_TARGET_DIR="$PROBE_PARENT/target" TMPDIR="$PROBE_PARENT" \
+  CARGO_BUILD_JOBS=2 timeout 600 cargo build --release --locked \
+  --manifest-path "$PROBE_PARENT/tools/compression-bench/Cargo.toml"
+timeout 180 "$PROBE_PARENT/target/release/compression-bench" \
+  "$PROBE_PARENT/data" 270000 5 262144 > "$PROBE_PARENT/codec.jsonl"
+"$HOME/.cache/parseable-compression-reader/bin/python" \
+  tools/compression-bench/verify_reader.py "$PROBE_PARENT/data"
+"$HOME/.cache/parseable-compression-reader/bin/python" \
+  tools/compression-bench/inspect_columns.py "$PROBE_PARENT/data"
+```
+
+For each batch control use a fresh copy of the same base revision, apply
+`timestamp-batch-dictionary.patch` or `timestamp-batch-delta.patch`, and use
+three measured rounds. Keep output directories separate. All probe variants
+retain the same pinned codec versions/features and local buffered timing method.

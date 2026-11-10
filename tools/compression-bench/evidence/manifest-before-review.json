@@ -1,0 +1,58 @@
+{
+  "base_commit": "36c3978acf3aa559a7e8ea7032fdc0abb6ea6f2a",
+  "platform": "Linux-7.2.5-3-omarchy-x86_64-with-glibc2.44",
+  "cpu": "Intel Core i9-13900HK",
+  "affinity": "0-19 (unpinned)",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "command": "timeout 180 compression-bench OUTPUT_DIR 270000 5 262144",
+  "files": {
+    "app-lz4_raw.parquet": {
+      "bytes": 6757933,
+      "sha256": "045e0c5b241517ef51fa578c0ae826b5ad01025e6634600cdcb6dc8d741d9e76"
+    },
+    "app-statistics.json": {
+      "bytes": 24713,
+      "sha256": "84dc3934c6e2de375333f6067784289cb73c9dcde508144345d733cd827a3ec2"
+    },
+    "app-zstd.parquet": {
+      "bytes": 3336017,
+      "sha256": "d9aaaa9697d6ebcf6c8695ed20ce57a3efb2097708d02e86223dc8b992f81798"
+    },
+    "app.arrow": {
+      "bytes": 28097682,
+      "sha256": "c1f5889240acc37a1a11341df96c41ac28ee2401e96221ec186e9aa380aa8dbf"
+    },
+    "otel-lz4_raw.parquet": {
+      "bytes": 11365264,
+      "sha256": "c273e09597d159d93913ee9508fee7c2c88c70275f3043fcafe3348de757c831"
+    },
+    "otel-statistics.json": {
+      "bytes": 58963,
+      "sha256": "ed78684932453d944a257886d0ed7306f0a63b6e5317abf8cd7e05c95b555f4b"
+    },
+    "otel-zstd.parquet": {
+      "bytes": 4899785,
+      "sha256": "bfbd360c27fcd8466a0898df88a392d00a26675c6e740a054cf7305432e88631"
+    },
+    "otel.arrow": {
+      "bytes": 80984754,
+      "sha256": "111c6787ae57fc003bc9d91e28a06c91f2024b59b94c6d143517c51d082fb9e0"
+    },
+    "wide-lz4_raw.parquet": {
+      "bytes": 30326212,
+      "sha256": "8d20421676a48253ca50f5b49502599b8b74753f5a98aecbd07c60ab9259dabe"
+    },
+    "wide-statistics.json": {
+      "bytes": 242991,
+      "sha256": "8b29d4bcdaec4548a5b1d5ecbdf4ecbef85e519498ca7c0fa0a614f172abab1a"
+    },
+    "wide-zstd.parquet": {
+      "bytes": 14306908,
+      "sha256": "9faf9510dced54dacb40f600e71af97e6878c3e8be719a5d3844ec16342f3221"
+    },
+    "wide.arrow": {
+      "bytes": 132711890,
+      "sha256": "5c9ff00ed59f45258f3ace014c6eb14be4aeda55a50fbf52a20124126adcb4bd"
+    }
+  }
+}

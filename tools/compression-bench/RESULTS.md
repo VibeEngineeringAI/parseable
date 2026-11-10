@@ -14,24 +14,26 @@ shared host; initial load average is recorded in the raw output. No S3 access.
 One warmup plus five alternating AB/BA measured rounds per shape, 270,000 rows,
 262,144-row group limit (two groups, including a 7,856-row final group). Both
 codecs consume identical IPC bytes. See [README.md](README.md) for exact settings,
-commands, fixture definitions and timing boundaries.
+commands, fixture definitions and timing boundaries. The exact harness revision
+and source hashes are in [manifest.json](evidence/manifest.json). Codec feature
+sets match the default Linux root build; see [the feature audit](evidence/codec-features.json).
 
 Actual file lengths and medians in milliseconds (wall / process CPU):
 
 | Dataset | Codec | File bytes | Write wall / CPU ms | Full read wall / CPU ms | Project read wall / CPU ms |
 |---|---|---:|---:|---:|---:|
-| app | lz4_raw | 6,757,933 | 53.05 / 49.30 | 12.06 / 12.01 | 3.09 / 3.03 |
-| app | zstd | 3,336,017 | 54.39 / 54.12 | 14.45 / 14.38 | 3.63 / 3.61 |
-| wide | lz4_raw | 30,326,212 | 353.71 / 341.62 | 64.09 / 63.84 | 3.22 / 3.19 |
-| wide | zstd | 14,306,908 | 385.80 / 384.30 | 93.66 / 93.25 | 3.70 / 3.69 |
-| otel | lz4_raw | 11,365,264 | 105.60 / 98.64 | 26.86 / 26.71 | 3.11 / 3.11 |
-| otel | zstd | 4,899,785 | 110.39 / 110.00 | 32.26 / 32.10 | 3.69 / 3.68 |
+| app | lz4_raw | 6,757,933 | 48.60 / 48.39 | 12.18 / 12.15 | 3.05 / 3.03 |
+| app | zstd | 3,336,017 | 53.69 / 53.51 | 14.35 / 14.31 | 3.50 / 3.49 |
+| wide | lz4_raw | 30,326,212 | 357.98 / 349.79 | 66.75 / 66.45 | 3.20 / 3.18 |
+| wide | zstd | 14,306,908 | 399.56 / 391.97 | 96.98 / 96.55 | 3.71 / 3.69 |
+| otel | lz4_raw | 11,365,264 | 104.13 / 103.62 | 27.86 / 27.72 | 3.28 / 3.26 |
+| otel | zstd | 4,899,785 | 114.73 / 114.20 | 32.64 / 32.45 | 3.70 / 3.69 |
 
 Measured file-byte reductions relative to LZ4_RAW are 50.64% (app), 52.82%
 (wide) and 56.89% (OTel-like). These percentages apply only to the generated
-fixtures. Median conversion CPU rises by 9.77%, 12.49% and 11.51%, respectively.
-The current Rust full-read medians rise from 12.06 to 14.45 ms, 64.09 to 93.66 ms,
-and 26.86 to 32.26 ms. Timing variation and shared-host scheduling matter; the
+fixtures. Median conversion CPU rises by 10.57%, 12.06% and 10.21%, respectively.
+The current Rust full-read medians rise from 12.18 to 14.35 ms, 66.75 to 96.98 ms,
+and 27.86 to 32.64 ms. Timing variation and shared-host scheduling matter; the
 [raw samples](evidence/codec.jsonl) are retained rather than claiming precision
 beyond this run. Every measured round produced the same closed file length.
 The [chart](evidence/comparison.html) can be regenerated with:
@@ -57,9 +59,11 @@ Exact readers tested:
   metadata and all values against saved input IPC, and independently validated
   each row group's min/max and null counts for every column. Six verification
   records and 60 read samples are in [the raw output](evidence/pyarrow-18.1.0.jsonl).
-  Supplemental warm full-read medians (wall / CPU ms): app LZ4_RAW 23.04 / 24.39,
-  ZSTD 21.55 / 22.34; wide 155.97 / 159.95 and 155.86 / 160.43; OTel-like
-  43.92 / 45.35 and 45.02 / 46.80. Its dataset reader has different overhead
+  Supplemental warm full-read medians (wall / CPU ms):
+  app LZ4_RAW 22.08 / 22.61, ZSTD 22.88 / 23.87;
+  wide LZ4_RAW 158.16 / 161.79, ZSTD 156.30 / 163.23;
+  OTel-like LZ4_RAW 43.86 / 44.88, ZSTD 45.10 / 46.87.
+  Its dataset reader has different overhead
   and behavior; these numbers do not constitute an A/B of reader versions.
 
 A separate 100-row smoke run with a 37-row group limit passed both readers,
@@ -98,12 +102,74 @@ estimate also needs workload volume, retention, request patterns, CPU and storag
 pricing. **Smaller new files do not shrink already retained objects.** There is
 no rewrite, compaction, catalog, lifecycle or infrastructure change in this work.
 
-Timed writes include creating or truncating the previous round's output file.
+Timed writes include creating a fresh output file. Previous outputs are unlinked
+outside the timed region.
 The standalone release profile and system allocator differ from production's
 `release-lto` profile and jemalloc. Absolute timings may not carry over to the
 service; see [Method](README.md#method).
 
-Builds used two jobs and a ten-minute timeout; the measured run used a three-minute
-timeout and completed normally. Build target was about 315 MiB; generated main
-fixtures and files about 299 MiB. Generated fixtures and build artifacts are
+Builds used two jobs and a four-minute timeout; the measured run used a three-minute
+timeout and completed normally. Generated main fixtures and files total about
+299 MiB; the standalone build additionally uses several hundred MiB. Generated fixtures and build artifacts are
 kept outside the repository.
+
+## Review follow-up
+
+The original run timed truncation of each previous output file and did not
+match all root Zstd features. Its raw samples and artifact manifest are retained
+as `codec-before-review.jsonl`, `pyarrow-before-review.jsonl` and
+`manifest-before-review.json`. The table and chart above use the fresh run with
+untimed unlink and aligned codec features. All twelve regenerated fixture and
+output artifact hashes match the original run; file-byte reductions are unchanged.
+Clock differences across these shared-host runs are not a controlled estimate
+of either remediation's independent timing effect.
+
+The timestamp values are much more varied than batch-constant production
+`p_timestamp`, and the trace/span IDs are structured counters. Those choices
+can favor compression and limit extrapolation to production. Dictionary encoding
+was actually used for `p_timestamp`; the configured delta encoding is a fallback.
+See README Method for the fixture limitations.
+
+## Additional finding: timestamp dictionary selection
+
+The configured delta encoding is bypassed while the timestamp dictionary fits.
+The committed [column inspection](evidence/columns.json) confirms actual
+`PLAIN`, `RLE`, `RLE_DICTIONARY` encodings, not `DELTA_BINARY_PACKED`. In the app
+fixture, the timestamp column is 11.84% of the LZ4_RAW file and 17.47% of the ZSTD
+file; the request-ID column is 74.36% and 61.24%. Thus timestamp cardinality is
+one influence, not the only source of the codec size difference.
+
+A standalone probe disabled the dictionary only for `p_timestamp`, retaining
+the existing delta fallback. A second control used a non-null timestamp that
+is constant within each 8,192-row IPC batch. Compressed timestamp-column bytes
+and whole-file changes are identical across the three shapes for each case:
+
+| Timestamp fixture | Codec | Timestamp bytes: dictionary | Timestamp bytes: delta | Whole-file change |
+|---|---|---:|---:|---:|
+| Dense, three rows per millisecond, 1% null | LZ4_RAW | 799,870 | 1,333 | -798,622 bytes |
+| Dense, three rows per millisecond, 1% null | ZSTD | 582,946 | 1,035 | -581,994 bytes |
+| Non-null, constant per IPC batch | LZ4_RAW | 664 | 917 | +240 bytes |
+| Non-null, constant per IPC batch | ZSTD | 735 | 924 | +175 bytes |
+
+The dense probe used warmup plus five measured rounds. Both control arms used
+warmup plus three measured rounds, on 270,000 rows per shape. All rounds passed
+the current Rust reader, including required page indexes and expected actual
+encodings. Arrow C++ 18.1.0 independently verified schema, values, nulls,
+timestamps, row counts and row-group statistics in all variants. Input IPC
+hashes match across dictionary/delta arms within each fixture. See the
+`timestamp-dictionary-disabled*` and `timestamp-batch-*` raw records, column
+inspections, source patches and manifests in `evidence/`.
+
+This is evidence for testing column-specific dictionary selection on dense
+time columns. It does not support disabling dictionaries globally: the control
+is slightly worse, production batch sizes vary, and user time-partition paths
+were not run through the service. The dictionary arms were separate runs on a
+shared host, not interleaved against each other, so their CPU/time differences
+are descriptive and are not claimed as an encoding speedup. No production
+writer, default or public file format was changed. Reproduction steps are in
+[README](README.md#timestamp-encoding-probes).
+
+The column inspection also records footer metadata lengths. It does not measure
+physical S3 requests or prove that a smaller metadata-size hint would save
+money. That candidate still requires a cold/warm server-side Range-header
+trace, as described in the bloom benchmark README.

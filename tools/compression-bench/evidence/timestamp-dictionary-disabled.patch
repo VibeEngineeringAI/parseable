@@ -1,0 +1,30 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -222,6 +222,7 @@
+     let props = WriterProperties::builder()
+         .set_max_row_group_row_count(Some(rg))
+         .set_compression(codec)
++        .set_column_dictionary_enabled(ColumnPath::new(vec!["p_timestamp".into()]), false)
+         .set_column_encoding(
+             ColumnPath::new(vec!["p_timestamp".into()]),
+             Encoding::DELTA_BINARY_PACKED,
+@@ -237,7 +238,7 @@
+         props.encoding(&time_column),
+         Some(Encoding::DELTA_BINARY_PACKED)
+     );
+-    assert!(props.dictionary_enabled(&time_column));
++    assert!(!props.dictionary_enabled(&time_column));
+     let mut writer = ArrowWriter::try_new(File::create(path)?, input.schema(), Some(props))?;
+     for batch in input {
+         writer.write(&batch?)?;
+@@ -308,8 +309,8 @@
+             assert!(
+                 time_column
+                     .encodings()
+-                    .any(|e| e == Encoding::RLE_DICTIONARY),
+-                "expected dictionary encoding for this bounded timestamp fixture"
++                    .any(|e| e == Encoding::DELTA_BINARY_PACKED),
++                "expected delta encoding for this timestamp probe"
+             );
+         }
+     }
