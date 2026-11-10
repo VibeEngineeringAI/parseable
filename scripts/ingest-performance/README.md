@@ -34,3 +34,5 @@ python scripts/ingest-performance/plot.py --burst /abs/results/burst --sustained
 ```
 
 The local-store results do not establish S3 ingestion capacity. Multipart memory and failure behavior require separate storage probes. Keep exact build provenance and limitations with any reported figures.
+
+For fixed-work 1/10/100/1000-row request comparisons and timestamp-adjusted compatibility probes, see [small-batch-staging](small-batch-staging/README.md).

@@ -710,6 +710,73 @@ mod tests {
     }
 
     #[test]
+    fn mixed_compression_includes_dictionary_message_metadata() {
+        use arrow_ipc::{CompressionType, reader::StreamReader};
+        let raw = IpcWriteOptions::default();
+        let compressed = IpcWriteOptions::default()
+            .try_with_compression(Some(CompressionType::LZ4_FRAME))
+            .unwrap();
+        let batches = [1, 1000, 10]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let value = if i % 2 == 0 { "alpha" } else { "beta" };
+                RecordBatch::try_from_iter([(
+                    "dict",
+                    Arc::new(DictionaryArray::<Int32Type>::from_iter(
+                        (0..n).map(|_| value),
+                    )) as Arc<dyn Array>,
+                )])
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut tracker = DictionaryTracker::new(false);
+        let generator = IpcDataGenerator::default();
+        let mut context = IpcWriteContext::default();
+        let mut bytes = Vec::new();
+        let schema = generator.schema_to_bytes_with_dictionary_tracker(
+            &batches[0].schema(),
+            &mut tracker,
+            &compressed,
+        );
+        write_message(&mut bytes, schema, &compressed).unwrap();
+        for (i, batch) in batches.iter().enumerate() {
+            let options = if i % 2 == 0 { &raw } else { &compressed };
+            let (dicts, message) = generator
+                .encode(batch, &mut tracker, options, &mut context)
+                .unwrap();
+            assert_eq!(dicts.len(), 1);
+            for dict in dicts {
+                write_message(&mut bytes, dict, options).unwrap();
+            }
+            write_message(&mut bytes, message, options).unwrap();
+        }
+        bytes.extend_from_slice(&[255, 255, 255, 255, 0, 0, 0, 0]);
+        assert_eq!(
+            StreamReader::try_new(Cursor::new(&bytes), None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            batches
+        );
+        assert_eq!(
+            get_forward_reader(Cursor::new(&bytes))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            batches
+        );
+        // Reverse staging readers cannot replay dictionary replacements in reverse
+        // order. DiskWriter deliberately retains legacy encoding for these schemas.
+        assert!(
+            get_reverse_reader(Cursor::new(&bytes))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn reverse_reader_recovers_complete_batches_before_truncated_tail() {
         let mut bytes = write_mem(&[rb(2), rb(3)]);
         truncate_last_record_batch(&mut bytes);
