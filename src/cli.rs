@@ -506,7 +506,8 @@ pub struct Options {
     )]
     pub row_group_size: usize,
 
-    /// Top-level columns only; absent columns and metrics streams are ignored.
+    /// Top-level scalar columns only; names are trimmed, and absent columns and metrics
+    /// streams are ignored.
     #[arg(
         long,
         env = "P_PARQUET_BLOOM_FILTER_COLUMNS",
@@ -518,9 +519,9 @@ pub struct Options {
     #[arg(
         long,
         env = "P_PARQUET_BLOOM_FILTER_POSITION",
-        default_value = "end",
-        value_parser = ["end", "after-row-group"],
-        help = "Position of opt-in log/trace bloom filters; does not affect metrics filters"
+        default_value = "after-row-group",
+        value_parser = ["after-row-group", "end"],
+        help = "Position of opt-in log/trace bloom filters. 'end' keeps every row group's filters in memory until the file is closed. Does not affect metrics filters"
     )]
     pub parquet_bloom_filter_position: String,
 

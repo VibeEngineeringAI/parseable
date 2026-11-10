@@ -10,14 +10,13 @@ requires reading the data. The target false-positive rate is 1%.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `P_PARQUET_BLOOM_FILTER_COLUMNS` / `--parquet-bloom-filter-columns` | unset (disabled) | Comma-separated literal top-level column names, for example `trace_id,request_id`. Missing columns are ignored. Dots do not traverse nested fields. |
-| `P_PARQUET_BLOOM_FILTER_POSITION` / `--parquet-bloom-filter-position` | `end` | `end` places filters at the end of the file; `after-row-group` places them after each row group. |
+| `P_PARQUET_BLOOM_FILTER_COLUMNS` / `--parquet-bloom-filter-columns` | unset (disabled) | Comma-separated top-level column names, for example `trace_id,request_id`. Spaces around names are ignored. Names are case-sensitive and matched literally: dots do not traverse nested fields, and a struct or list column gets no filter. Columns a stream does not have are ignored. |
+| `P_PARQUET_BLOOM_FILTER_POSITION` / `--parquet-bloom-filter-position` | `after-row-group` | `after-row-group` writes each row group's filters right after it. `end` writes them all at the end of the file and holds them in memory until then. |
 
-For example, set these in the server environment before starting Parseable:
+For example, set this in the server environment before starting Parseable:
 
 ```sh
 export P_PARQUET_BLOOM_FILTER_COLUMNS=trace_id,request_id
-export P_PARQUET_BLOOM_FILTER_POSITION=end
 ```
 
 Selection applies across streams, except OTel metrics streams. Their existing
@@ -33,16 +32,19 @@ patterns cannot use membership filters to prove absence. Casts that transform
 stored values should not be assumed to benefit.
 
 Filters add hashing work during conversion, writer memory, and stored bytes for
-each selected column in each row group. Initial sizing uses the configured
-`P_PARQUET_ROW_GROUP_SIZE` as the maximum distinct-value estimate; short or
-low-cardinality groups can fold to smaller filters. Select a few frequently
-queried ID columns rather than every column.
+each selected column in each row group. A filter is sized for
+`P_PARQUET_ROW_GROUP_SIZE` distinct values, which is about 512 KiB of memory per
+selected column per row group at the default row group size, whatever the
+column's real cardinality; short or low-cardinality groups are written as
+smaller filters. With `after-row-group` that memory is released as each row
+group is written. With `end` it is held for every row group until the file is
+closed: 16 columns over 128 row groups would hold about 1 GiB. Select a few
+frequently queried ID columns rather than every column.
 
-The current reader fetches each surviving row group's column filter separately.
-Putting filters at `end` does not coalesce these reads. On object storage, extra
+The current reader fetches each surviving row group's column filter separately,
+with either position. On object storage, extra
 GET latency can outweigh saved data reads for present IDs, broad ranges, or
-queries that reject few groups. Compare both file positions on your workload;
-position alone does not fix request amplification. Avoid enabling filters for
+queries that reject few groups. Avoid enabling filters for
 columns rarely used in selective equality lookups, or when min/max pruning
 already eliminates the relevant groups.
 
@@ -75,8 +77,10 @@ dataset, not production capacity.
 | No predicate on the ID column | object storage | 443 ms | 447 ms |
 
 The two slower rows are the cost described above. A full-range lookup issued
-50 object-store GETs without filters and 138 with them (146 with
-`after-row-group`), because each row group's filter is a separate read. With a
+50 object-store GETs without filters and 138 with them, because each row
+group's filter is a separate read. With `after-row-group` the same lookups
+issued 146 GETs and timings were within a few percent (355 ms against 346 ms
+for the absent-ID lookup on object storage). With a
 narrow time range, min/max statistics already leave little to skip, so the
 filter reads are overhead (6 GETs became 10). A `!=` predicate still fetches
 the filters but cannot use them.

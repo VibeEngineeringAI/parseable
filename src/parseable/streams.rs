@@ -2012,8 +2012,10 @@ impl Stream {
         // Parquet 59 folds each filter at close, reducing short/low-NDV groups.
         if !is_otel_metrics && !self.options.parquet_bloom_filter_columns.is_empty() {
             for name in &self.options.parquet_bloom_filter_columns {
+                // "a, b" is a natural way to write the list
+                let name = name.trim();
                 if merged_schema.index_of(name).is_ok() {
-                    let path = ColumnPath::new(vec![name.clone()]);
+                    let path = ColumnPath::new(vec![name.to_owned()]);
                     props = props
                         .set_column_bloom_filter_enabled(path.clone(), true)
                         .set_column_bloom_filter_max_ndv(
@@ -2023,11 +2025,15 @@ impl Stream {
                         .set_column_bloom_filter_fpp(path, 0.01);
                 }
             }
+            // A filter is allocated at its full size for every selected column of
+            // every row group, and with `End` the writer keeps all of them until
+            // the file is closed. Writing them after each row group releases them
+            // as it goes, so that is the default.
             props = props.set_bloom_filter_position(
-                if self.options.parquet_bloom_filter_position == "after-row-group" {
-                    BloomFilterPosition::AfterRowGroup
-                } else {
+                if self.options.parquet_bloom_filter_position == "end" {
                     BloomFilterPosition::End
+                } else {
+                    BloomFilterPosition::AfterRowGroup
                 },
             );
         }
@@ -4185,7 +4191,8 @@ mod tests {
         let staging = Stream::new(
             Arc::new(Options {
                 row_group_size: 4096,
-                parquet_bloom_filter_columns: vec!["id".into(), "level".into()],
+                // Names are trimmed, as in "id, level"
+                parquet_bloom_filter_columns: vec!["id".into(), " level ".into()],
                 ..Default::default()
             }),
             "bloom-folding",
@@ -4207,6 +4214,20 @@ mod tests {
             ],
         )
         .unwrap();
+        let props = staging.parquet_writer_props(&schema, None, None, true);
+        // Unless `end` is asked for, filters are written, and released, per row group
+        assert_eq!(
+            props.bloom_filter_position(),
+            BloomFilterPosition::AfterRowGroup
+        );
+        for name in ["id", "level"] {
+            assert!(
+                props
+                    .bloom_filter_properties(&ColumnPath::new(vec![name.into()]))
+                    .is_some(),
+                "{name}"
+            );
+        }
         let path = dir.path().join("folded.parquet");
         let mut writer = ArrowWriter::try_new(
             File::create(&path).unwrap(),
