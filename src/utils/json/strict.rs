@@ -159,11 +159,17 @@ impl<'de> Visitor<'de> for ValueSeed<'_> {
         let mut inline = [const { None }; 16];
         let mut len = 0;
         let mut entries = self.scratch.objects.pop().unwrap_or_default();
+        let had_error = self.error.is_some();
+        // The first entry whose value recorded a deferred error
+        let mut first_value_error = None;
         while let Some(key) = map.next_key::<String>()? {
             let value = map.next_value_seed(ValueSeed {
                 error: self.error,
                 scratch: self.scratch,
             })?;
+            if !had_error && first_value_error.is_none() && self.error.is_some() {
+                first_value_error = Some(len);
+            }
             if len < inline.len() {
                 inline[len] = Some((key, value));
             } else {
@@ -172,15 +178,23 @@ impl<'de> Visitor<'de> for ValueSeed<'_> {
             len += 1;
         }
         let mut obj = serde_json::Map::with_capacity(len);
-        for (key, value) in inline
+        for (index, (key, value)) in inline
             .iter_mut()
             .filter_map(Option::take)
             .chain(entries.drain(..))
+            .enumerate()
         {
             match obj.entry(key) {
                 serde_json::map::Entry::Occupied(_) => {
                     // Finish parsing before exposing this error: syntax wins.
-                    self.error.get_or_insert("duplicate key in JSON");
+                    // The former converter went through an object entry by entry,
+                    // checking the key before converting the value. Keep its
+                    // choice of error: a duplicate at or before the first entry
+                    // with a value error is reported instead of that error. An
+                    // error from before this object stays.
+                    if !had_error && first_value_error.is_none_or(|first| index <= first) {
+                        *self.error = Some("duplicate key in JSON");
+                    }
                 }
                 serde_json::map::Entry::Vacant(entry) => {
                     entry.insert(value);
@@ -840,6 +854,43 @@ mod tests {
             f64::NEG_INFINITY,
         ] {
             compare!(F64Deserializer::<Error>::new(v));
+        }
+    }
+
+    #[test]
+    fn mixed_deferred_errors_match_oracle() {
+        use serde::de::value::{Error, MapDeserializer};
+        let nan = f64::NAN;
+        let cases: [(&[(&str, f64)], &str); 6] = [
+            (
+                &[("a", 1.0), ("a", 2.0), ("b", nan)],
+                "duplicate key in JSON",
+            ),
+            (&[("a", 1.0), ("a", nan)], "duplicate key in JSON"),
+            (&[("a", nan), ("a", 1.0)], "not a valid JSON number"),
+            (
+                &[("a", nan), ("b", 1.0), ("b", 2.0)],
+                "not a valid JSON number",
+            ),
+            (
+                &[("a", 1.0), ("b", nan), ("a", 2.0)],
+                "not a valid JSON number",
+            ),
+            (
+                &[("a", 1.0), ("b", nan), ("b", 2.0)],
+                "not a valid JSON number",
+            ),
+        ];
+        for (entries, expected) in cases {
+            let input = || MapDeserializer::<_, Error>::new(entries.iter().copied());
+            let new = StrictValue::deserialize(input())
+                .map(|v| fingerprint(v.inner))
+                .map_err(|e| e.to_string());
+            let old = Oracle::deserialize(input())
+                .map(|v| fingerprint(v.0))
+                .map_err(|e| e.to_string());
+            assert_eq!(new, old, "{entries:?}");
+            assert_eq!(new.unwrap_err(), expected, "{entries:?}");
         }
     }
 }
