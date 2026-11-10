@@ -1,0 +1,83 @@
+# Standard Parquet codec A/B
+
+This standalone harness measures the existing `lz4_raw` and `zstd` options without
+building Parseable. It changes no defaults or production behavior. Results and
+compatibility limits are in [RESULTS.md](RESULTS.md).
+
+## Reproduce on Linux
+
+Run from the repository root. Use a new output directory for each run. The harness
+refuses to reuse an existing directory. It accepts 100–300,000 rows, 1–9 measured
+rounds, and 1–262,144 rows per row group. Disk and memory depend on those limits;
+the recorded run uses under 1 GiB of artifacts, including its standalone build.
+No server, credentials, S3 requests, container image, or experimental index is needed.
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR="$HOME/.cache/parseable-compression-bench-target"
+export TMPDIR="$HOME/.cache/parseable-compression-tmp"
+mkdir -p "$TMPDIR"
+CARGO_BUILD_JOBS=2 timeout 600 cargo build --release --locked \
+  --manifest-path tools/compression-bench/Cargo.toml
+OUT="$HOME/.cache/parseable-codec-measurement-1"
+timeout 180 "$CARGO_TARGET_DIR/release/compression-bench" \
+  "$OUT" 270000 5 262144 > "$OUT.jsonl"
+python tools/compression-bench/summarize.py "$OUT.jsonl"
+# Optional independent older reader, isolated from system Python:
+UV_CACHE_DIR="$HOME/.cache/parseable-compression-uv" uv venv --python 3.12 \
+  "$HOME/.cache/parseable-compression-reader"
+UV_CACHE_DIR="$HOME/.cache/parseable-compression-uv" uv pip install \
+  --python "$HOME/.cache/parseable-compression-reader/bin/python" pyarrow==18.1.0
+"$HOME/.cache/parseable-compression-reader/bin/python" \
+  tools/compression-bench/verify_reader.py "$OUT" > "$OUT-reader.jsonl"
+```
+
+Use a quiet host and record `rustc -Vv`, `uname -a`, CPU model, affinity and load.
+The committed lockfile inherits every shared dependency version from the root
+lockfile at `36c3978acf3aa559a7e8ea7032fdc0abb6ea6f2a` (including Arrow/Parquet
+59.2.0, zstd 0.13.3 / zstd-sys 2.0.16+zstd.1.5.7, lz4_flex 0.14.0).
+Recheck that alignment when production dependencies change.
+
+## Method
+
+Three deterministic synthetic shapes approximate ordinary application logs (8
+columns), sparse flattened wide logs (56 columns), and flattened OTel-like logs
+(14 columns). They include repeated low-cardinality labels and bodies, unique
+request IDs, floats, booleans, millisecond timestamps, nanosecond integer time,
+Unicode, null values and an entirely null column. Wide attributes are 80% null.
+They are illustrative shapes, not sampled customer traffic. OTel-like records
+are logs, not the special OTel metrics conversion path.
+
+Each fixture is generated once and saved as Arrow IPC in 8,192-row batches. Both
+codecs read exactly that file with the same schema, row order, batch boundaries,
+row-group size and writer properties. `ZstdLevel::default()` is level 1 in this
+Parquet version (the existing CLI mapping); no custom compression level is used.
+The writer mirrors `Stream::parquet_writer_props` for ordinary unclustered logs:
+262,144-row groups in the measured run, delta-binary encoding for `p_timestamp`,
+and descending/nulls-last time sort metadata. Other properties use the same
+Parquet 59.2.0 defaults: Parquet 1.0 writer, dictionary encoding enabled, 1 MiB
+page/dictionary limits, 20,000-row page limit, 1,024-row write batches and page
+statistics. No optional bloom filters, custom partitions, clustering or new
+indexes are enabled. The harness mirrors these few properties rather than
+compiling `streams.rs`; it must be checked against production after changes.
+
+There is one discarded warmup followed by five measured rounds. Codec order
+alternates AB/BA. Actual closed file length includes footer and page indexes;
+all measured rounds must have identical file sizes. Conversion wall and process
+user+system CPU time cover IPC open/decode, writer construction, encoding,
+filesystem writes and close, but not fixture generation or correctness checks.
+There is no fsync: these are page-cache-backed local writes, not durable S3
+uploads. Full and three-column projected read timings cover open, metadata and
+complete decoding/materialization; result drops and value checks are outside
+the timed read. Correctness verification precedes timed reads, so reads are warm.
+These timings do not measure SQL pruning, DataFusion scheduling or S3 latency.
+
+For every file on every round, the Rust reader checks exact Arrow schema and
+all rows/values/nulls/timestamps, both full and projected. It compares Parquet
+schema, row-group counts/row counts, sorting metadata, encodings, row-group
+statistics and page column-index statistics across codecs. Byte offsets and
+compressed sizes are intentionally excluded from semantic comparisons. The
+older independent reader compares full schema (including metadata) and all
+values to the input IPC, and validates every row group's min/max and null counts
+against the input via Arrow compute. Its warm read samples are supplemental;
+reader implementations and versions must not be compared as a controlled A/B.

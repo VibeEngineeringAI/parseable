@@ -1,0 +1,7 @@
+{"type": "reader", "pyarrow": "18.1.0", "cpp": "18.1.0"}
+{"type": "verified", "dataset": "app", "codec": "lz4_raw", "rows": 100, "row_groups": 3, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "verified", "dataset": "app", "codec": "zstd", "rows": 100, "row_groups": 3, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "verified", "dataset": "wide", "codec": "lz4_raw", "rows": 100, "row_groups": 3, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "verified", "dataset": "wide", "codec": "zstd", "rows": 100, "row_groups": 3, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "verified", "dataset": "otel", "codec": "lz4_raw", "rows": 100, "row_groups": 3, "schema_values_nulls_timestamps_statistics": "pass"}
+{"type": "verified", "dataset": "otel", "codec": "zstd", "rows": 100, "row_groups": 3, "schema_values_nulls_timestamps_statistics": "pass"}

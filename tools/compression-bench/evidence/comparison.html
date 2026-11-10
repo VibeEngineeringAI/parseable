@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><style>
+    body {font:14px var(--font-sans,system-ui);color:var(--foreground,#ddd);margin:0}
+    .panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}
+    .group{margin:16px 0}.track{height:22px;margin:4px 0;background:var(--secondary,#333);border-radius:4px}
+    .track>div{height:22px;line-height:22px;box-sizing:border-box;padding-left:8px;white-space:nowrap;border-radius:4px}
+    .lz4{background:var(--chart-1,#4169a1);color:var(--primary-foreground,#fff)}
+    .zstd{background:var(--chart-2,#267060);color:var(--primary-foreground,#fff)}
+    p{color:var(--muted-foreground,#aaa);font-size:12px}
+    @media(max-width:450px){.panels{grid-template-columns:1fr}}
+    </style><div class="panels"><section><strong>Closed file bytes</strong><div class="group">app<div class="track"><div class="lz4" style="width:80%">LZ4_RAW 100</div></div><div class="track"><div class="zstd" style="width:39.49%">ZSTD 49.4</div></div></div><div class="group">wide<div class="track"><div class="lz4" style="width:80%">LZ4_RAW 100</div></div><div class="track"><div class="zstd" style="width:37.74%">ZSTD 47.2</div></div></div><div class="group">otel<div class="track"><div class="lz4" style="width:80%">LZ4_RAW 100</div></div><div class="track"><div class="zstd" style="width:34.49%">ZSTD 43.1</div></div></div></section><section><strong>Conversion CPU</strong><div class="group">app<div class="track"><div class="lz4" style="width:80%">LZ4_RAW 100</div></div><div class="track"><div class="zstd" style="width:87.81%">ZSTD 109.8</div></div></div><div class="group">wide<div class="track"><div class="lz4" style="width:80%">LZ4_RAW 100</div></div><div class="track"><div class="zstd" style="width:89.99%">ZSTD 112.5</div></div></div><div class="group">otel<div class="track"><div class="lz4" style="width:80%">LZ4_RAW 100</div></div><div class="track"><div class="zstd" style="width:89.21%">ZSTD 111.5</div></div></div></section></div>
+    <p>LZ4_RAW = 100 within each fixture. 270,000 synthetic rows; five-round medians.
+    Arrow/Parquet Rust 59.2.0. Lower is better. Local warm-cache experiment.</p>
