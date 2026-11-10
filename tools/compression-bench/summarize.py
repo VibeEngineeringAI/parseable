@@ -7,13 +7,23 @@ import statistics
 import sys
 
 rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+environments = [r for r in rows if r['type'] == 'environment']
+assert len(environments) == 1, 'expected one environment record'
+environment = environments[0]
+repeats = environment['repeats']
+assert 1 <= repeats <= 9, 'invalid measured round count'
+all_samples = [r for r in rows if r['type'] == 'sample']
+assert len(all_samples) == 6 * (repeats + 1), 'incomplete or duplicate sample records'
 print('| Dataset | Codec | File bytes | Write wall / CPU ms | Full read wall / CPU ms | Project read wall / CPU ms |')
 print('|---|---|---:|---:|---:|---:|')
 for dataset in ('app', 'wide', 'otel'):
     for codec in ('lz4_raw', 'zstd'):
         samples = [r for r in rows if r['type'] == 'sample' and r['dataset'] == dataset
                    and r['codec'] == codec and not r['warmup']]
-        assert samples
+        assert sorted(r['round'] for r in samples) == list(range(1, repeats + 1)), 'missing or duplicate measured rounds'
+        warmups = [r for r in all_samples if r['dataset'] == dataset and r['codec'] == codec and r['warmup']]
+        assert len(warmups) == 1 and warmups[0]['round'] == 0, 'expected one warmup per arm'
+        assert all(r['rows'] == environment['rows'] for r in samples), 'fixture row count differs'
         sizes = {r['file_bytes'] for r in samples}
         assert len(sizes) == 1, 'unexpected nondeterministic size'
         med = lambda key: statistics.median(r[key] for r in samples)
@@ -22,7 +32,6 @@ for dataset in ('app', 'wide', 'otel'):
 
 if len(sys.argv) == 3:
     # Optional self-contained report; the raw JSONL remains the source of truth.
-    environment = next(r for r in rows if r['type'] == 'environment')
     panels = []
     for metric, label in [('file_bytes', 'Closed file bytes'), ('write_cpu_ms', 'Conversion CPU'),
                           ('read_wall_ms', 'Full read time')]:

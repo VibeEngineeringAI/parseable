@@ -213,6 +213,7 @@ dependencies = [
  "libc",
  "parquet",
  "serde_json",
+ "zstd",
 ]
 
 [[package]]

@@ -9,7 +9,10 @@ compatibility limits are in [RESULTS.md](RESULTS.md).
 Run from the repository root. Use a new output directory for each run. The harness
 refuses to reuse an existing directory. It accepts 100–300,000 rows, 1–9 measured
 rounds, and 1–262,144 rows per row group. Disk and memory depend on those limits;
-the recorded run uses under 1 GiB of artifacts, including its standalone build.
+the total is also limited to 128 row groups per file, preventing tiny row groups
+from creating millions of column chunks. Invalid runs are rejected before output
+creation. The recorded run uses under 1 GiB of artifacts, including its
+standalone build.
 No server, credentials, S3 requests, container image, or experimental index is needed.
 
 ```sh
@@ -37,6 +40,9 @@ The committed lockfile inherits every shared dependency version from the root
 lockfile at `36c3978acf3aa559a7e8ea7032fdc0abb6ea6f2a` (including Arrow/Parquet
 59.2.0, zstd 0.13.3 / zstd-sys 2.0.16+zstd.1.5.7, lz4_flex 0.14.0).
 Recheck that alignment when production dependencies change.
+The direct `zstd` dependency matches the server's codec feature unification;
+version equality alone is insufficient. The checked Linux feature sets and
+commands are recorded in `evidence/codec-features.json`.
 
 ## Method
 
@@ -48,18 +54,30 @@ Unicode, null values and an entirely null column. Wide attributes are 80% null.
 They are illustrative shapes, not sampled customer traffic. OTel-like records
 are logs, not the special OTel metrics conversion path.
 
+The timestamp fixture deliberately repeats each millisecond three times and
+has a 1% null tail. Production `p_timestamp` is non-null and constant within
+each ingested batch, so this fixture has much higher timestamp cardinality.
+OTel-like trace/span IDs are descriptive prefixes plus sequential zero-padded
+counters, not random hexadecimal IDs. The multiplicative request-ID generator
+is deterministic too. These structured inputs can favor compression, and the
+recorded percentages must not be generalized to real trace traffic. Strings
+are short; long-message statistics truncation is not exercised.
+
 Each fixture is generated once and saved as Arrow IPC in 8,192-row batches. Both
 codecs read exactly that file with the same schema, row order, batch boundaries,
 row-group size and writer properties. `ZstdLevel::default()` is level 1 in this
 Parquet version (the existing CLI mapping); no custom compression level is used.
 The writer mirrors `Stream::parquet_writer_props` for ordinary unclustered logs:
-262,144-row groups in the measured run, delta-binary encoding for `p_timestamp`,
-and descending/nulls-last time sort metadata. Other properties use the same
+262,144-row groups in the measured run, delta-binary fallback encoding configured
+for `p_timestamp`, and descending/nulls-last time sort metadata. Other properties use the same
 Parquet 59.2.0 defaults: Parquet 1.0 writer, dictionary encoding enabled, 1 MiB
 page/dictionary limits, 20,000-row page limit, 1,024-row write batches and page
 statistics. No optional bloom filters, custom partitions, clustering or new
 indexes are enabled. The harness mirrors these few properties rather than
 compiling `streams.rs`; it must be checked against production after changes.
+Dictionary encoding takes precedence while its dictionary fits. In these
+fixtures `p_timestamp` uses `PLAIN`, `RLE` and `RLE_DICTIONARY` instead of
+`DELTA_BINARY_PACKED`; configuring the fallback does not force its use.
 
 There is one discarded warmup followed by five measured rounds. Codec order
 alternates AB/BA. Actual closed file length includes footer and page indexes;
@@ -71,19 +89,22 @@ uploads. Full and three-column projected read timings cover open, metadata and
 complete decoding/materialization; result drops and value checks are outside
 the timed read. Correctness verification precedes timed reads, so reads are warm.
 These timings do not measure SQL pruning, DataFusion scheduling or S3 latency.
-The timed write includes creating or truncating the previous round's output
-file. The standalone `release` profile uses the system allocator, whereas the
-Linux production build uses `release-lto` with fat LTO, one codegen unit and
+Before each round the previous output is unlinked outside the timed region.
+Creating the new output remains timed. The standalone `release` profile uses
+the system allocator, whereas the Linux production build uses `release-lto`
+with fat LTO, one codegen unit and
 jemalloc; absolute timings may differ from the service.
 
 For every file on every round, the Rust reader checks exact Arrow schema and
 all rows/values/nulls/timestamps, both full and projected. It also checks every
 column chunk's codec against the requested codec, separately from semantic
-comparisons. It compares Parquet
-schema, row-group counts/row counts, sorting metadata, encodings, row-group
+comparisons. It compares Parquet schema, row-group counts/row counts, sorting
+metadata, encodings, row-group
 statistics and page column-index statistics across codecs. Byte offsets and
 compressed sizes are intentionally excluded from semantic comparisons. The
-older independent reader compares full schema (including metadata) and all
+configured fallback and dictionary setting, expected sort metadata and actual
+timestamp dictionary encoding are asserted separately from codec comparisons.
+The older independent reader compares full schema (including metadata) and all
 values to the input IPC, and validates every row group's min/max and null counts
 against the input via Arrow compute. Its warm read samples are supplemental;
 reader implementations and versions must not be compared as a controlled A/B.

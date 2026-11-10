@@ -1,3 +1,20 @@
+/*
+ * Parseable Server (C) 2022 - 2025 Parseable, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 //! Bounded codec-only experiment; no server, S3 or catalog dependencies.
 use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
@@ -215,6 +232,12 @@ fn convert(ipc: &Path, path: &Path, codec: Compression, rg: usize) -> Result<()>
             nulls_first: false,
         }]))
         .build();
+    let time_column = ColumnPath::new(vec!["p_timestamp".into()]);
+    assert_eq!(
+        props.encoding(&time_column),
+        Some(Encoding::DELTA_BINARY_PACKED)
+    );
+    assert!(props.dictionary_enabled(&time_column));
     let mut writer = ArrowWriter::try_new(File::create(path)?, input.schema(), Some(props))?;
     for batch in input {
         writer.write(&batch?)?;
@@ -261,8 +284,33 @@ fn verify(path: &Path, expected: &RecordBatch, codec: Compression) -> Result<Val
         expected.num_rows()
     );
     for group in meta.row_groups() {
+        assert_eq!(
+            group.sorting_columns(),
+            Some(
+                [SortingColumn {
+                    column_idx: 0,
+                    descending: true,
+                    nulls_first: false
+                }]
+                .as_slice()
+            ),
+            "unexpected sorting metadata"
+        );
         for column in group.columns() {
             assert_eq!(column.compression(), codec, "unexpected column codec");
+        }
+        let time_column = group.column(0);
+        if time_column
+            .statistics()
+            .and_then(|stats| stats.null_count_opt())
+            != Some(group.num_rows() as u64)
+        {
+            assert!(
+                time_column
+                    .encodings()
+                    .any(|e| e == Encoding::RLE_DICTIONARY),
+                "expected dictionary encoding for this bounded timestamp fixture"
+            );
         }
     }
     // Deliberately omit codec, offsets and compressed sizes; compare semantic statistics.
@@ -286,14 +334,15 @@ fn main() -> Result<()> {
     if !(100..=300_000).contains(&rows)
         || !(1..=9).contains(&repeats)
         || !(1..=262_144).contains(&rg)
+        || rows.div_ceil(rg.max(1)) > 128
     {
-        return Err("bounds: rows 100..300000, repeats 1..9, row group 1..262144".into());
+        return Err("bounds: rows 100..300000, repeats 1..9, row group 1..262144, at most 128 groups per file".into());
     }
     // Exclusive directory prevents accidentally overwriting another experiment.
     fs::create_dir(out)?;
     println!(
         "{}",
-        json!({"type":"environment", "arrow":"59.2.0", "parquet":"59.2.0", "rows":rows, "repeats":repeats, "row_group_rows":rg, "loadavg":fs::read_to_string("/proc/loadavg")?})
+        json!({"type":"environment", "arrow":"59.2.0", "parquet":"59.2.0", "rows":rows, "repeats":repeats, "row_group_rows":rg, "write_output_reuse":"unlink_before_timing", "loadavg":fs::read_to_string("/proc/loadavg")?})
     );
     for kind in ["app", "wide", "otel"] {
         let batch = fixture(kind, rows);
@@ -314,6 +363,10 @@ fn main() -> Result<()> {
             for k in 0..2 {
                 let (name, codec) = codecs[if round % 2 == 0 { k } else { 1 - k }];
                 let path = out.join(format!("{kind}-{name}.parquet"));
+                // Keep replacement of the previous round's file outside timing.
+                if path.try_exists()? {
+                    fs::remove_file(&path)?;
+                }
                 let (_, write_wall, write_cpu) = measure(|| convert(&ipc, &path, codec, rg))?;
                 let stats = verify(&path, &batch, codec)?;
                 if let Some(ref expected) = baseline {

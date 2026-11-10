@@ -2,6 +2,7 @@
 """Independent older-reader validation against saved input IPC; no data generation."""
 import argparse
 import json
+import platform
 from pathlib import Path
 import time
 import pyarrow as pa
@@ -12,7 +13,8 @@ import pyarrow.parquet as pq
 parser = argparse.ArgumentParser()
 parser.add_argument('directory', type=Path)
 args = parser.parse_args()
-print(json.dumps({'type': 'reader', 'pyarrow': pa.__version__, 'cpp': pa.cpp_version}))
+print(json.dumps({'type': 'reader', 'pyarrow': pa.__version__, 'cpp': pa.cpp_version,
+                  'python': platform.python_version()}))
 for kind in ('app', 'wide', 'otel'):
     with ipc.open_file(args.directory / f'{kind}.arrow') as f:
         expected = f.read_all()
