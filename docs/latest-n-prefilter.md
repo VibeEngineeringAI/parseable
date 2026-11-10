@@ -15,7 +15,10 @@ The optimization requires a single stream scan, plain column projections, at
 least eight output columns, and one descending sort on the stream's timestamp
 column followed by a literal nonzero LIMIT. LIMIT plus OFFSET must be at most
 1,000. Joins, aggregates, expressions in the projection or sort, and distributed
-query modes bypass it. Nullable timestamps with NULLS FIRST require a predicate
+query modes bypass it. So does a predicate that contains a subquery or a
+function whose result depends on when it runs, such as `now()` or `random()`:
+the probes and the final query run separately and must agree on which rows
+match. Nullable timestamps with NULLS FIRST require a predicate
 that excludes null timestamps.
 
 ```sql
@@ -57,5 +60,10 @@ The option remains experimental and disabled by default. Metadata reuse removes
 repeated planning reads on historical ranges; it does not impose a total work
 budget or guarantee a maximum fallback regression. Sharing decoded Parquet
 metadata or predicate reads, or enforcing a scan budget, requires further work.
-Concurrent retention and publication also need stress coverage before broader
-adoption. No file formats, HTTP response shapes, or existing defaults change.
+Stream metadata read for a probe is reused by the final scan. If retention
+deletes a day of data between the two, the final scan can fail on a missing
+file where a query without the option would have seen the updated snapshot;
+the same failure is possible without the option, in a shorter window, when
+retention runs between a query's metadata read and its file reads. Rerun the
+query. Concurrent retention and publication need stress coverage before
+broader adoption. No file formats, HTTP response shapes, or existing defaults change.

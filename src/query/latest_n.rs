@@ -26,7 +26,7 @@ use datafusion::{
         tree_node::{Transformed, TreeNode},
     },
     error::Result,
-    logical_expr::{Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator},
+    logical_expr::{Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, Volatility},
     prelude::{SessionContext, lit},
 };
 
@@ -90,6 +90,28 @@ fn excludes_null_time(expr: &Expr, time: &str) -> bool {
         )
 }
 
+/// The probes and the final query are separate executions, each with its own
+/// start time. A threshold found by a probe only holds for the final query if
+/// the predicate gives the same answer for a row in both, so anything that
+/// depends on when or how often it is evaluated (`now()`, `random()`), and any
+/// subquery, leaves the query to run without a prefilter.
+fn repeatable(predicate: &Expr) -> bool {
+    !predicate
+        .exists(|expr| {
+            Ok(match expr {
+                Expr::ScalarFunction(function) => {
+                    function.func.signature().volatility != Volatility::Immutable
+                }
+                Expr::ScalarSubquery(_)
+                | Expr::Exists(_)
+                | Expr::InSubquery(_)
+                | Expr::Placeholder(_) => true,
+                _ => false,
+            })
+        })
+        .unwrap_or(true)
+}
+
 pub(super) fn candidate(plan: &LogicalPlan, time: &str) -> Option<Candidate> {
     if plan.schema().fields().len() < MIN_COLUMNS {
         return None;
@@ -122,10 +144,16 @@ pub(super) fn candidate(plan: &LogicalPlan, time: &str) -> Option<Candidate> {
                 input = &p.input
             }
             LogicalPlan::Filter(f) => {
+                if !repeatable(&f.predicate) {
+                    return None;
+                }
                 excludes_null |= excludes_null_time(&f.predicate, time);
                 input = &f.input;
             }
             LogicalPlan::TableScan(scan) if scan.fetch.is_none() => {
+                if !scan.filters.iter().all(repeatable) {
+                    return None;
+                }
                 if column
                     .relation
                     .as_ref()
@@ -555,6 +583,27 @@ mod tests {
             ),
             (
                 "SELECT *, random() FROM logs ORDER BY p_timestamp DESC LIMIT 10",
+                false,
+            ),
+            // A predicate must give the same answer in the probe and the final query
+            (
+                "SELECT * FROM logs WHERE lower(level) = 'error' ORDER BY p_timestamp DESC LIMIT 10",
+                true,
+            ),
+            (
+                "SELECT * FROM logs WHERE level = 'ERROR' OR p_timestamp < now() ORDER BY p_timestamp DESC LIMIT 10",
+                false,
+            ),
+            (
+                "SELECT * FROM logs WHERE random() < 0.5 ORDER BY p_timestamp DESC LIMIT 10",
+                false,
+            ),
+            (
+                "SELECT * FROM logs WHERE level IN (SELECT level FROM logs) ORDER BY p_timestamp DESC LIMIT 10",
+                false,
+            ),
+            (
+                "SELECT * FROM logs WHERE EXISTS (SELECT 1 FROM logs) ORDER BY p_timestamp DESC LIMIT 10",
                 false,
             ),
             (
