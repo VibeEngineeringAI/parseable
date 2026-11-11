@@ -52,7 +52,7 @@ export function DashboardSections({
           description={
             writable
               ? 'Add SQL and PromQL tiles to visualize your telemetry.'
-              : 'The owner can add tiles to this dashboard.'
+              : 'The owner or an administrator can add tiles to this dashboard.'
           }
         />
       ) : (
