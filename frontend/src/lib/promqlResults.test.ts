@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { promqlTableRows, type QueryResult } from './promqlResults';
+import {
+  applyQueryAliases,
+  chartResults,
+  promqlTableRows,
+  type QueryResult,
+} from './promqlResults';
 
 const result = (id: string, data: Partial<QueryResult>): QueryResult => ({
   id,
@@ -23,6 +28,37 @@ const range = result('A', {
 });
 const instant = result('B', {
   instant: { resultType: 'vector', result: [{ metric: { host: 'b' }, value: [2, '5'] }] },
+});
+
+describe('PromQL query aliases', () => {
+  it('names empty aggregate labels while preserving series IDs, data and vector dimensions', () => {
+    const queries = [
+      result('A', {
+        range: { resultType: 'matrix', result: [{ metric: {}, values: [[1, '3.5']] }] },
+      }),
+      result('B', { range: range.range }),
+    ];
+    const original = chartResults(queries, 2);
+    const named = applyQueryAliases(original.series, {
+      A: '1-minute average',
+      B: '5-minute average',
+    });
+    expect(named.map((row) => row.label)).toEqual([
+      '1-minute average',
+      '5-minute average: {host="a"}',
+    ]);
+    expect(named.map(({ label: _label, ...row }) => row)).toEqual(
+      original.series.map(({ label: _label, ...row }) => row),
+    );
+    expect(original.series[0].label).toBe('A: {}');
+  });
+
+  it('keeps default labels for missing, blank and malformed aliases, and supports a single query', () => {
+    const series = [{ id: ':{}', label: '{}', values: [3] }];
+    expect(applyQueryAliases(series, { A: '  1 minute  ' }, 'A')[0].label).toBe('1 minute');
+    for (const aliases of [{}, { A: '' }, { A: ' ' }, { A: 5 }, { A: {} }])
+      expect(applyQueryAliases(series, aliases, 'A')[0]).toBe(series[0]);
+  });
 });
 
 describe('promqlTableRows', () => {
