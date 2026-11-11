@@ -16,6 +16,7 @@ async function serve(
   page: Page,
   tiles: unknown[] = [tile('First'), tile('Second', 4)],
   author = classic.author,
+  privilege = 'admin',
 ) {
   const writes: Dashboard[] = [];
   const queries: any[] = [];
@@ -41,7 +42,10 @@ async function serve(
       return route.fulfill({ json: { id: 'admin', username: 'admin' } });
     if (path === '/api/v1/user/admin/role')
       return route.fulfill({
-        json: { roles: { root: { actions: [{ privilege: 'admin' }], roleType: 'internal' } } },
+        json: {
+          roles: { root: { actions: [{ privilege }], roleType: 'internal' } },
+          groupRoles: {},
+        },
       });
     if (path === '/api/v1/logstream') return route.fulfill({ json: [{ name: 'app-logs' }] });
     if (path.endsWith('/schema'))
@@ -183,9 +187,9 @@ test('section add, assignment, rename, reorder, collapse and deletion round trip
 });
 
 test('read-only dashboards expose no mutation handles', async ({ page }) => {
-  const server = await serve(page, [tile('First')], 'someone-else');
+  const server = await serve(page, [tile('First')], 'someone-else', 'reader');
   await expect(
-    page.getByText('This dashboard is read-only. Only its owner can edit it.'),
+    page.getByText('This dashboard is read-only. Only its owner or an administrator can edit it.'),
   ).toBeVisible();
   await expect(page.getByRole('button', { name: /^(Move|Resize) tile/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Add section', exact: true })).toHaveCount(0);
