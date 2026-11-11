@@ -50,6 +50,18 @@ impl KafkaStreams {
         info!("Initializing KafkaStreams...");
         let multi_tenant = crate::parseable::PARSEABLE.options.is_multi_tenant();
         context.config.validate_tenant_mode(multi_tenant)?;
+        if multi_tenant
+            && context
+                .config
+                .consumer
+                .as_ref()
+                .and_then(|config| config.tenant_id.as_ref())
+                .is_none()
+        {
+            warn!(
+                "Multi-tenant Kafka consumer has no destination tenant; set --consumer-tenant-id / P_KAFKA_CONSUMER_TENANT_ID. Headerless records use the default destination; records carrying tenant headers are dropped"
+            );
+        }
         let statistics = Arc::clone(&context.statistics);
         let consumer = KafkaStreams::create_consumer(context);
         info!("KafkaStreams initialized successfully.");

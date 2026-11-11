@@ -169,7 +169,7 @@ pub struct ConsumerRecord {
     pub partition: i32,
     pub offset: i64,
     pub timestamp: Option<i64>,
-    /// Destination tenant (header-derived until the follow-up security fix).
+    /// Destination resolved exclusively from trusted consumer configuration.
     pub tenant_id: Option<String>,
 }
 
@@ -239,17 +239,25 @@ impl ConsumerRecord {
     }
 }
 
-// Behavior-preserving seam: tenant headers still select the destination here.
-// The follow-up fix will enforce the mode and trusted configuration.
+/// Headers are assertions only: every supplied value must match the trusted
+/// consumer tenant. Reject null, invalid UTF-8, and conflicting duplicate values.
+/// Single-tenant mode ignores all headers. In multi-tenant mode, without
+/// configuration only headerless records use the existing default destination.
 fn resolve_tenant<'a>(
-    _multi_tenant: bool,
-    _configured: Option<&str>,
-    headers: impl Iterator<Item = Option<&'a [u8]>>,
+    multi_tenant: bool,
+    configured: Option<&str>,
+    mut headers: impl Iterator<Item = Option<&'a [u8]>>,
 ) -> Result<Option<String>, ()> {
-    Ok(headers
-        .last()
-        .flatten()
-        .map(|value| String::from_utf8_lossy(value).into_owned()))
+    if !multi_tenant {
+        return Ok(None);
+    }
+    if headers.any(|value| match (configured, value) {
+        (Some(tenant), Some(value)) => tenant.as_bytes() != value,
+        _ => true,
+    }) {
+        return Err(());
+    }
+    Ok(configured.map(str::to_owned))
 }
 
 fn tenant_for_ingestion<'a>(

@@ -591,8 +591,23 @@ pub struct SecurityConfig {
 }
 
 impl KafkaConfig {
-    /// Behavior-preserving validation seam for the follow-up security fix.
-    pub fn validate_tenant_mode(&self, _multi_tenant: bool) -> anyhow::Result<()> {
+    /// Validate before creating a consumer: tenant IDs become object-store paths.
+    pub fn validate_tenant_mode(&self, multi_tenant: bool) -> anyhow::Result<()> {
+        if let Some(tenant) = self
+            .consumer
+            .as_ref()
+            .and_then(|consumer| consumer.tenant_id.as_deref())
+        {
+            anyhow::ensure!(
+                multi_tenant,
+                "--consumer-tenant-id / P_KAFKA_CONSUMER_TENANT_ID requires --multi-tenancy / P_MULTI_TENANCY"
+            );
+            crate::parseable::validate_tenant_id(tenant).map_err(|error| {
+                anyhow::anyhow!(
+                    "Invalid --consumer-tenant-id / P_KAFKA_CONSUMER_TENANT_ID: {error}"
+                )
+            })?;
+        }
         Ok(())
     }
 
