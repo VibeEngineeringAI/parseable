@@ -79,8 +79,11 @@ services:
 
   quest:
     platform: linux/amd64
-    image: ${QUEST_IMAGE:-quay.io/parseablehq/quest:main}
-    pull_policy: ${QUEST_PULL_POLICY:-always}
+    # Pin Quest until stream DELETE returns 202; remove with issue #151.
+    image: ${QUEST_IMAGE:-quest-pinned:f4a026e}
+    build:
+      context: https://github.com/parseablehq/quest.git#${QUEST_SOURCE_REF:-f4a026eecde1badde8776ff366a743f9bbca2e67}
+    pull_policy: ${QUEST_PULL_POLICY:-build}
     command:
       [
         "load",
