@@ -24,7 +24,7 @@ use aws_types::region::Region;
 use rdkafka::client::OAuthToken;
 use rdkafka::consumer::{ConsumerContext, Rebalance};
 use rdkafka::error::KafkaResult;
-use rdkafka::message::{BorrowedMessage, Headers};
+use rdkafka::message::BorrowedMessage;
 use rdkafka::producer::ProducerContext;
 use rdkafka::topic_partition_list::TopicPartitionListElem;
 use rdkafka::{ClientContext, Message, Offset, Statistics};
@@ -202,11 +202,7 @@ impl ConsumerRecord {
         let tenant_id = tenant_for_ingestion(
             multi_tenant,
             configured_tenant,
-            msg.headers()
-                .into_iter()
-                .flat_map(|headers| headers.iter())
-                .filter(|header| header.key == TENANT_ID)
-                .map(|header| header.value),
+            tenant_header_values(msg.headers()),
             &metrics::TENANT_MISMATCH_DROPPED,
         );
 
@@ -246,6 +242,17 @@ impl ConsumerRecord {
         )?;
         Ok(offset_to_commit)
     }
+}
+
+/// Extract only exact tenant-header keys, preserving null values for rejection.
+fn tenant_header_values<H: rdkafka::message::Headers + ?Sized>(
+    headers: Option<&H>,
+) -> impl Iterator<Item = Option<&[u8]>> + '_ {
+    headers
+        .into_iter()
+        .flat_map(|headers| (0..headers.count()).map(move |index| headers.get(index)))
+        .filter(|header| header.key == TENANT_ID)
+        .map(|header| header.value)
 }
 
 /// Headers are assertions only: every supplied value must match the trusted
@@ -564,17 +571,6 @@ mod tenant_tests {
     }
 
     #[test]
-    fn tenant_b_header_never_routes_to_b() {
-        let decision = resolve_tenant(
-            true,
-            Some("tenant-a"),
-            [Some(b"tenant-b".as_slice())].into_iter(),
-        );
-        assert_ne!(decision, Ok(Some("tenant-b".into())));
-        assert_eq!(decision, Err(()));
-    }
-
-    #[test]
     fn mismatch_is_dropped_and_counted() {
         let counter = prometheus::IntCounter::new("test_tenant_drops", "test drops").unwrap();
         let record = tenant_for_ingestion(
@@ -640,6 +636,119 @@ mod tenant_tests {
                 Err(())
             );
         }
+    }
+
+    #[test]
+    fn owned_unrelated_headers_do_not_hide_tenant_mismatch() {
+        use rdkafka::message::{Header, OwnedHeaders};
+
+        let headers = OwnedHeaders::new()
+            .insert(Header {
+                key: "trace-id",
+                value: Some("trace"),
+            })
+            .insert(Header {
+                key: "x-p-tenant",
+                value: Some("tenant-b"),
+            })
+            .insert(Header {
+                key: "content-type",
+                value: Some("application/json"),
+            });
+        let counter = prometheus::IntCounter::new("test_header_drops", "test drops").unwrap();
+        assert_eq!(
+            tenant_for_ingestion(
+                true,
+                Some("tenant-a"),
+                tenant_header_values(Some(&headers)),
+                &counter
+            ),
+            None
+        );
+        assert_eq!(counter.get(), 1);
+    }
+
+    #[test]
+    fn owned_case_variant_key_does_not_select_tenant() {
+        use rdkafka::message::{Header, OwnedHeaders};
+
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "X-P-Tenant",
+            value: Some("tenant-b"),
+        });
+        let counter = prometheus::IntCounter::new("test_header_drops", "test drops").unwrap();
+        assert_eq!(
+            tenant_for_ingestion(
+                true,
+                Some("tenant-a"),
+                tenant_header_values(Some(&headers)),
+                &counter
+            ),
+            Some(Some("tenant-a".into()))
+        );
+        assert_eq!(counter.get(), 0);
+    }
+
+    #[test]
+    fn owned_matching_tenant_header_is_accepted() {
+        use rdkafka::message::{Header, OwnedHeaders};
+
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "x-p-tenant",
+            value: Some("tenant-a"),
+        });
+        let counter = prometheus::IntCounter::new("test_header_drops", "test drops").unwrap();
+        assert_eq!(
+            tenant_for_ingestion(
+                true,
+                Some("tenant-a"),
+                tenant_header_values(Some(&headers)),
+                &counter
+            ),
+            Some(Some("tenant-a".into()))
+        );
+        assert_eq!(counter.get(), 0);
+    }
+
+    #[test]
+    fn owned_null_tenant_header_is_dropped() {
+        use rdkafka::message::{Header, OwnedHeaders};
+
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "x-p-tenant",
+            value: None::<&str>,
+        });
+        let counter = prometheus::IntCounter::new("test_header_drops", "test drops").unwrap();
+        assert_eq!(
+            tenant_for_ingestion(
+                true,
+                Some("tenant-a"),
+                tenant_header_values(Some(&headers)),
+                &counter
+            ),
+            None
+        );
+        assert_eq!(counter.get(), 1);
+    }
+
+    #[test]
+    fn absent_headers_preserve_configured_or_default_destination() {
+        use rdkafka::message::OwnedHeaders;
+
+        let counter =
+            prometheus::IntCounter::new("test_absent_header_drops", "test drops").unwrap();
+        for configured in [Some("tenant-a"), None] {
+            assert_eq!(
+                tenant_for_ingestion(
+                    true,
+                    configured,
+                    tenant_header_values(None::<&OwnedHeaders>),
+                    &counter
+                ),
+                Some(configured.map(str::to_owned))
+            );
+        }
+        assert_eq!(counter.get(), 0);
     }
 }
 
