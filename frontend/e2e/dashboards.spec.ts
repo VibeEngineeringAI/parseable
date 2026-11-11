@@ -268,6 +268,35 @@ async function mockServer(
   };
 }
 
+test('demo admin edits and renames a shared dashboard while favourites stay owner-only', async ({
+  page,
+}) => {
+  await demo(page, '/dashboards/01M4J000000000000000000003');
+  await tileAction(page, 'API events', 'Edit');
+  const editor = page.getByRole('dialog', { name: 'Edit tile', exact: true });
+  await editor.getByLabel('Tile title').fill('Updated API events');
+  await editor.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  await page
+    .getByRole('navigation', { name: 'Dashboard breadcrumb' })
+    .getByRole('link', { name: 'Dashboards', exact: true })
+    .click();
+  await page.getByRole('button', { name: 'Actions for Shared operations', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
+  const rename = page.getByRole('dialog', { name: 'Rename and tags', exact: true });
+  await rename.getByLabel('Dashboard title').fill('Renamed shared operations');
+  await rename.locator('[data-dialog-confirm]').click();
+  await expect(
+    page.getByRole('button', { name: 'Favourite Renamed shared operations', exact: true }),
+  ).toHaveAttribute('aria-disabled', 'true');
+  await page.getByRole('link', { name: 'Renamed shared operations', exact: true }).click();
+  await expect(tile(page, 'Updated API events')).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Renamed shared operations', exact: true }),
+  ).toBeVisible();
+});
+
 test('demo CRUD, SQL tile preview/config, duplicate/move and typed deletion', async ({ page }) => {
   await demo(page);
   await page.getByRole('button', { name: 'Create dashboard', exact: true }).click();
