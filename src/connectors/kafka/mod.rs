@@ -194,8 +194,8 @@ impl ConsumerRecord {
         }
     }
 
-    pub fn from_borrowed_msg(
-        msg: BorrowedMessage,
+    pub fn from_message<M: Message>(
+        msg: M,
         configured_tenant: Option<&str>,
         multi_tenant: bool,
     ) -> Self {
@@ -207,7 +207,7 @@ impl ConsumerRecord {
         );
 
         if tenant_id.is_none() {
-            warn_tenant_mismatch(msg.topic(), msg.partition());
+            warn_tenant_mismatch(msg.topic(), msg.partition(), configured_tenant.is_some());
         }
 
         // Rejected records retain their position in the partition queue, but
@@ -313,7 +313,7 @@ impl TenantDropWarnings {
     }
 }
 
-fn warn_tenant_mismatch(topic: &str, partition: i32) {
+fn warn_tenant_mismatch(topic: &str, partition: i32, tenant_configured: bool) {
     static WARNINGS: std::sync::Mutex<TenantDropWarnings> =
         std::sync::Mutex::new(TenantDropWarnings {
             last_warning: None,
@@ -327,7 +327,8 @@ fn warn_tenant_mismatch(topic: &str, partition: i32) {
             topic,
             partition,
             dropped,
-            "Dropping Kafka records with tenant headers that disagree with configured tenant; drops since previous warning across all partitions; see parseable_kafka_tenant_mismatch_dropped_total"
+            tenant_configured,
+            "Dropping Kafka records with rejected x-p-tenant headers; drops since previous warning across all partitions; see parseable_kafka_tenant_mismatch_dropped_total"
         );
     }
 }
@@ -768,6 +769,67 @@ mod tenant_warning_tests {
         assert_eq!(
             warnings.record_drop(now + Duration::from_secs(120)),
             Some(2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod message_conversion_tests {
+    use super::*;
+    use rdkafka::message::{Header, OwnedHeaders, OwnedMessage, Timestamp};
+
+    pub(super) fn message(tenant: &str) -> OwnedMessage {
+        OwnedMessage::new(
+            Some(br#"{"value":1}"#.to_vec()),
+            Some(b"record-key".to_vec()),
+            "trusted-topic".into(),
+            Timestamp::CreateTime(123456),
+            3,
+            42,
+            Some(OwnedHeaders::new().insert(Header {
+                key: TENANT_ID,
+                value: Some(tenant),
+            })),
+        )
+    }
+
+    #[test]
+    fn rejected_message_becomes_marker_with_trusted_tenant_and_broker_metadata() {
+        let record = ConsumerRecord::from_message(message("tenant-b"), Some("tenant-a"), true);
+        assert_eq!(
+            record,
+            ConsumerRecord::new(
+                None,
+                None,
+                "trusted-topic".into(),
+                3,
+                42,
+                Some(123456),
+                Some("tenant-a".into()),
+            )
+        );
+        let tpl = record.offset_to_commit().unwrap();
+        assert_eq!(
+            tpl.find_partition("trusted-topic", 3).unwrap().offset(),
+            Offset::Offset(43)
+        );
+    }
+
+    #[test]
+    fn accepted_message_preserves_payload_and_key() {
+        let msg = message("tenant-a");
+        let record = ConsumerRecord::from_message(msg, Some("tenant-a"), true);
+        assert_eq!(
+            record,
+            ConsumerRecord::new(
+                Some(br#"{"value":1}"#.to_vec()),
+                Some(b"record-key".to_vec()),
+                "trusted-topic".into(),
+                3,
+                42,
+                Some(123456),
+                Some("tenant-a".into()),
+            )
         );
     }
 }

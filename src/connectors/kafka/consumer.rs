@@ -24,9 +24,9 @@ use crate::connectors::kafka::{
     ConsumerRecord, KafkaContext, StreamConsumer, TopicPartition, partition_stream,
 };
 use futures_util::FutureExt;
+use rdkafka::Message;
 use rdkafka::Statistics;
 use rdkafka::consumer::Consumer;
-use rdkafka::message::BorrowedMessage;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
@@ -175,16 +175,15 @@ impl KafkaStreams {
     }
 
     /// Handle individual Kafka message and route it to the proper partition stream
-    async fn handle_message(
-        msg: BorrowedMessage<'_>,
+    async fn handle_message<M: Message>(
+        msg: M,
         stream_state: &RwLock<StreamState>,
         stream_tx: &mpsc::Sender<PartitionStreamReceiver>,
         configured_tenant: Option<&str>,
         multi_tenant: bool,
     ) -> anyhow::Result<()> {
-        let tp = TopicPartition::from_kafka_msg(&msg);
-        let consumer_record =
-            ConsumerRecord::from_borrowed_msg(msg, configured_tenant, multi_tenant);
+        let tp = TopicPartition::new(msg.topic().to_owned(), msg.partition());
+        let consumer_record = ConsumerRecord::from_message(msg, configured_tenant, multi_tenant);
         let mut state = stream_state.write().await;
 
         let partition_stream_tx =
@@ -268,5 +267,54 @@ impl KafkaStreams {
                 error!("Error subscribing to topics: {:?} {:?}", topics, e);
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn rejected_record_is_delivered_to_partition_stream_receiver() {
+        let state = RwLock::new(StreamState::new(1));
+        let (tx, mut rx) = mpsc::channel(1);
+        KafkaStreams::handle_message(
+            crate::connectors::kafka::message_conversion_tests::message("tenant-b"),
+            &state,
+            &tx,
+            Some("tenant-a"),
+            true,
+        )
+        .await
+        .unwrap();
+        let partition = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("rejected record must create a partition stream")
+            .unwrap();
+        assert_eq!(
+            partition.topic_partition(),
+            &TopicPartition::new("trusted-topic".into(), 3)
+        );
+        partition
+            .run_drain(|mut records| async move {
+                let record = tokio::time::timeout(Duration::from_secs(1), records.next())
+                    .await
+                    .expect("marker must be routed to the partition receiver")
+                    .unwrap();
+                assert_eq!(
+                    record,
+                    ConsumerRecord::new(
+                        None,
+                        None,
+                        "trusted-topic".into(),
+                        3,
+                        42,
+                        Some(123456),
+                        Some("tenant-a".into()),
+                    )
+                );
+            })
+            .await;
     }
 }
