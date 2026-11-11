@@ -51,7 +51,7 @@ jobs:
         run: |
           docker run -d --name migration-minio -p 127.0.0.1:59087:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/parseablehq/minio:edge server /data
           docker exec migration-minio mkdir -p /data/review /data/migration-unit
-          curl --fail --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:59087/minio/health/ready
+          curl --fail --retry 30 --retry-all-errors --retry-delay 1 http://127.0.0.1:59087/minio/health/ready
       - name: Migration and regressions on PostgreSQL 17 and MinIO
         run: 'cargo test --locked --lib metastore:: -- --nocapture --test-threads=1'
       - name: Full library suite with PostgreSQL
