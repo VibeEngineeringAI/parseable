@@ -84,7 +84,7 @@ pub struct KafkaConfig {
 pub struct ConsumerConfig {
     /// Trusted destination for every consumed topic. Headers never grant tenant access.
     #[arg(long = "consumer-tenant-id", env = "P_KAFKA_CONSUMER_TENANT_ID",
-        help = "Destination tenant for all consumed topics; requires --multi-tenancy. Use a separate consumer group or separate topics per tenant. In multi-tenant mode, mismatching x-p-tenant headers are dropped; when unset, all x-p-tenant headers (including DEFAULT_TENANT) are dropped. Single-tenant mode ignores headers",
+        help = "Destination tenant for all consumed topics; requires --multi-tenancy. Use a separate consumer group or separate topics per tenant. In multi-tenant mode, mismatching x-p-tenant headers are dropped; when unset, all x-p-tenant headers (including DEFAULT_TENANT) are dropped. Single-tenant mode ignores headers. Leave P_KAFKA_CONSUMER_TENANT_ID unset, not empty",
         value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub tenant_id: Option<String>,
 
@@ -1553,6 +1553,49 @@ mod tests {
         assert_eq!(cli.consumer.tenant_id.as_deref(), Some("tenant-a"));
         let error = ConsumerCli::try_parse_from(["test", "--consumer-tenant-id="])
             .expect_err("an explicitly empty tenant ID must fail parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("--consumer-tenant-id"));
+    }
+}
+
+#[cfg(test)]
+mod tenant_env_tests {
+    use super::*;
+
+    #[test]
+    fn empty_consumer_tenant_env_is_rejected_in_child_process() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connectors::kafka::config::tenant_env_tests::tenant_env_child",
+                "--nocapture",
+            ])
+            .env("P_KAFKA_CONSUMER_TENANT_ID", "")
+            .env("PARSEABLE_TENANT_ENV_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn tenant_env_child() {
+        if std::env::var_os("PARSEABLE_TENANT_ENV_TEST_CHILD").is_none() {
+            return;
+        }
+        #[derive(Debug, clap::Parser)]
+        struct ConsumerCli {
+            #[command(flatten)]
+            consumer: ConsumerConfig,
+        }
+        use clap::Parser;
+        let error = ConsumerCli::try_parse_from(["test"])
+            .expect_err("empty tenant env must fail startup parsing");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
         assert!(error.to_string().contains("--consumer-tenant-id"));
     }
