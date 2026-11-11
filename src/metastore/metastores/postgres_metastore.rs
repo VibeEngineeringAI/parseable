@@ -1681,8 +1681,8 @@ mod contract_tests {
             let options = PostgresOptions {
                 metastore_postgres_url: Some(url),
                 metastore_postgres_pool_size: 4,
-                metastore_postgres_connect_timeout_ms: 1000,
-                metastore_postgres_statement_timeout_ms: 3000,
+                metastore_postgres_connect_timeout_ms: 5000,
+                metastore_postgres_statement_timeout_ms: 30000,
                 metastore_postgres_id: None,
                 metastore_postgres_ca: None,
             };

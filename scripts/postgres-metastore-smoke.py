@@ -40,6 +40,22 @@ commands = []
 processes = []
 results = {"requested_modes": modes}
 http_requests = []
+def redacted_json(value):
+    return redacted_text(json.dumps(value, indent=2))
+
+def redacted_text(text):
+    replacements = [(str(ROOT) + '/', ''), (str(ROOT), '.'),
+                    (str(Path.home()), '<home>')]
+    hostname = socket.gethostname()
+    host_forms = {hostname, ''.join(c for c in hostname if c.isalnum() or c in '-_')}
+    replacements.extend((host, '<host>') for host in sorted(host_forms, key=len, reverse=True) if host)
+    target = os.environ.get('CARGO_TARGET_DIR')
+    if target:
+        replacements.insert(0, (target, 'target'))
+    for original, replacement in replacements:
+        text = text.replace(original, replacement)
+    return text
+
 def run(*args):
     attempt = sp.run(args, text=True, stdout=sp.PIPE, stderr=sp.PIPE)
     commands.append(dict(argv=list(args), exit_code=attempt.returncode))
@@ -85,13 +101,20 @@ def cleanup():
             auxiliary = None
         stop()
     finally:
+        if sys.exc_info()[0] is not None:
+            results['container_logs'] = {}
+            for name in containers:
+                attempt = sp.run(['docker','logs',name],text=True,stdout=sp.PIPE,stderr=sp.STDOUT,timeout=10)
+                results['container_logs'][name] = attempt.stdout
         for name in reversed(containers):
-            attempt = sp.run(['docker', 'rm', '-f', name], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-            commands.append(dict(argv=['docker', 'rm', '-f', name], exit_code=attempt.returncode))
+            attempt = sp.run(['docker', 'rm', '-fv', name], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            commands.append(dict(argv=['docker', 'rm', '-fv', name], exit_code=attempt.returncode))
         containers.clear()
         for process in processes:
             commands.append(dict(argv=process.args, exit_code=process.poll()))
         processes.clear()
+        for path in OUT.glob('*.log'):
+            path.write_text(redacted_text(path.read_text(errors='replace')))
         results['commands'] = commands
         results['success'] = sys.exc_info()[0] is None
         if sys.exc_info()[0] is not None:
@@ -99,11 +122,11 @@ def cleanup():
         if (OUT/'checks.json').exists():
             results['validation'] = json.loads((OUT/'checks.json').read_text())
         results['http_requests'] = http_requests
-        evidence = json.dumps(results, indent=2) + '\n'
+        evidence = redacted_json(results) + '\n'
         (OUT/'results.json').write_text(evidence)
         (ARCHIVE/(hashlib.sha256(evidence.encode()).hexdigest()+'.json')).write_text(evidence)
         runs = [json.loads(path.read_text()) for path in sorted(ARCHIVE.glob('*.json'))]
-        (ROOT/'docs/validation/postgres-metastore-smoke.json').write_text(json.dumps({'runs': runs}, indent=2)+'\n')
+        (ROOT/'docs/validation/postgres-metastore-smoke.json').write_text(redacted_json({'runs': runs})+'\n')
 
 def interrupted(signum, frame):
     raise SystemExit(128 + signum)
@@ -160,12 +183,12 @@ def list_keys(endpoint, bucket):
     assert root.findtext('{*}IsTruncated') != 'true', 'smoke fixture exceeded a listing page'
     return sorted(node.text for node in root.findall('{*}Contents/{*}Key'))
 
-def get_key(endpoint, bucket, key, body=None):
+def get_key(endpoint, bucket, key, body=None, method=None):
     """Read publication documents with SigV4 without an SDK dependency."""
     now = dt.datetime.now(dt.timezone.utc)
     stamp, day = now.strftime('%Y%m%dT%H%M%SZ'), now.strftime('%Y%m%d')
     host = endpoint.removeprefix('http://')
-    method = 'GET' if body is None else 'PUT'
+    method = method or ('GET' if body is None else 'PUT')
     payload = hashlib.sha256(body or b'').hexdigest()
     headers = f'host:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{stamp}\n'
     signed = 'host;x-amz-content-sha256;x-amz-date'
@@ -215,6 +238,7 @@ try:
     mini, cmd = container('quay.io/parseablehq/minio:edge', MINIO_ROOT_USER='minioadmin', MINIO_ROOT_PASSWORD='minioadmin')
     run(*cmd, '-p', f'127.0.0.1:{s3port}:9000', 'quay.io/parseablehq/minio:edge', 'server', '/data')
     wait_for(lambda: 'accepting connections' in run('docker', 'exec', pg, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres'))
+    wait_for(lambda: urllib.request.urlopen(f'http://127.0.0.1:{s3port}/minio/health/ready', timeout=3).status == 200)
     # An isolated CA and signed localhost server certificate; no host config changes.
     tls = OUT / 'tls'
     tls.mkdir(exist_ok=True)
@@ -242,7 +266,8 @@ try:
         env = dict(os.environ, P_ADDR=f'127.0.0.1:{http}', P_GRPC_PORT=str(grpc), P_FLIGHT_PORT=str(flight),
                    P_STAGING_DIR=str(OUT / (mode + '-staging-' + str(os.getpid()))), P_USERNAME='admin', P_PASSWORD='smoke-pass',
                    P_S3_URL=f'http://127.0.0.1:{s3port}', P_S3_BUCKET=bucket, P_S3_REGION='us-east-1',
-                   P_S3_ACCESS_KEY='minioadmin', P_S3_SECRET_KEY='minioadmin', P_S3_PATH_STYLE='true', RUST_LOG='warn')
+                   P_S3_ACCESS_KEY='minioadmin', P_S3_SECRET_KEY='minioadmin', P_S3_PATH_STYLE='true', RUST_LOG='warn',
+                   P_METASTORE_POSTGRES_STATEMENT_TIMEOUT_MS='30000')
         env.pop('P_METASTORE_POSTGRES_URL', None)
         if mode.startswith('postgres'):
             env['P_METASTORE_POSTGRES_URL'] = f'postgresql://postgres:smoke@127.0.0.1:{pgport}/parseable?sslmode=disable'
@@ -255,7 +280,7 @@ try:
             global server
             server = sp.Popen([str(Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')) / 'debug/parseable'), 's3-store'], env=env, cwd=ROOT, stdout=log, stderr=log)
             processes.append(server)
-        def request(path, method='GET', body=None, headers=None, timeout=30):
+        def request(path, method='GET', body=None, headers=None, timeout=90):
             data = None if body is None else json.dumps(body).encode()
             req = urllib.request.Request(base + path, data=data, method=method,
                 headers={'Authorization': 'Basic ' + base64.b64encode(b'admin:smoke-pass').decode(),
@@ -375,6 +400,16 @@ try:
                              request_delta=delta, observed_requests_during_window_divided_by_queries=sum(delta.values())/5))
         if mode.startswith('postgres'):
             assert results[mode]['non_parquet_keys'] == ['.parseable/postgres-metastore-id']
+            database = 'tls' if mode == 'postgres-tls' else 'parseable'
+            sql = lambda text: run('docker', 'exec', pg, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', database, '-Atc', text)
+            sql("INSERT INTO parseable_documents(tenant,key,kind,body) VALUES('','deletion-explicit/.stream/.deleting','document',''::bytea);")
+            try:
+                aux_request('/logstream/deletion-explicit', 'POST', [{'value':1}])
+            except urllib.error.HTTPError as error:
+                assert error.code == 409, error.code
+            else:
+                raise AssertionError('explicit-stream ingest admitted a pending deletion')
+            sql("DELETE FROM parseable_documents WHERE tenant='' AND key='deletion-explicit/.stream/.deleting';")
             run('docker', 'stop', pg)
             started = time.monotonic()
             assert status('/readiness') == 503
@@ -382,6 +417,13 @@ try:
             elapsed = time.monotonic()-started
             assert elapsed < 10, elapsed
             results[mode]['database_outage'] = dict(readiness=503, request_failed=True, seconds=elapsed)
+            try:
+                aux_request('/logstream/outage-explicit', 'POST', [{'value':1}])
+            except urllib.error.HTTPError as error:
+                assert error.code == 503, error.code
+            else:
+                raise AssertionError('explicit-stream ingest hid a database outage')
+            results[mode]['explicit_stream_errors'] = dict(pending_deletion=409, database_outage=503)
             run('docker', 'start', pg)
             wait_for(lambda: status('/readiness') == 200)
             assert json.loads(request('/query', 'POST', query)) == json.loads(second)
@@ -451,7 +493,7 @@ try:
         rejected_env = env.copy()
         if case == 'future-schema':
             run('docker', 'exec', pg, 'psql', '-U', 'postgres', '-d', database, '-c',
-                'UPDATE parseable_backend SET schema_version=3;')
+                'UPDATE parseable_backend SET schema_version=999;')
         elif case == 'wrong-id':
             rejected_env['P_METASTORE_POSTGRES_ID'] = 'wrong-backend'
         else:
@@ -463,12 +505,12 @@ try:
         failures[case] = attempt.stdout
         if case == 'future-schema':
             run('docker', 'exec', pg, 'psql', '-U', 'postgres', '-d', database, '-c',
-                'UPDATE parseable_backend SET schema_version=2;')
+                'UPDATE parseable_backend SET schema_version=3;')
     results['startup_rejections'] = failures
     results['postgres_rows'] = run('docker','exec',pg,'psql','-U','postgres','-d',database,'-c',
         'SELECT tenant,kind,key,version,octet_length(body) AS bytes FROM parseable_documents ORDER BY tenant,key;')
-    (OUT/'results.json').write_text(json.dumps(results,indent=2))
-    print(json.dumps(results,indent=2))
+    (OUT/'results.json').write_text(redacted_json(results))
+    print(redacted_json(results))
 finally:
     cleanup()
     atexit.unregister(cleanup)

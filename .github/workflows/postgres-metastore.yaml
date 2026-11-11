@@ -54,6 +54,10 @@ jobs:
           curl --fail --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:59087/minio/health/ready
       - name: Migration and regressions on PostgreSQL 17 and MinIO
         run: 'cargo test --locked --lib metastore:: -- --nocapture --test-threads=1'
+      - name: Full library suite with PostgreSQL
+        run: cargo test --locked --lib -- --test-threads=1
+      - name: Full library suite without PostgreSQL
+        run: env -u P_TEST_POSTGRES_URL -u P_TEST_REVIEW_S3_URL cargo test --locked --lib -- --nocapture --test-threads=1
       - name: LocalFS migration and legacy locators
         run: env -u P_TEST_REVIEW_S3_URL cargo test --locked --lib migration::tests::migration_round_trip_postgres -- --nocapture
       - name: Deadline against paused PostgreSQL
@@ -97,5 +101,6 @@ jobs:
             .postgres-smoke/results.json
             .postgres-smoke/runs/*.json
             docs/validation/postgres-metastore-smoke.json
+            docs/validation/postgres-migration*.json
             .postgres-smoke/*.log
           if-no-files-found: error

@@ -304,7 +304,7 @@ The shared document layer inventories exact stored keys rather than rebuilding
 paths. All hidden document namespaces (deployment/RBAC, users, dashboard bodies,
 locators/titles, filters, alerts/state/history, correlations, targets/settings,
 node registry, stream JSON and schemas) and date-partition manifests, including
-per-ingestor variants and tenant prefixes, are copied without reserialization.
+per-ingestor variants and tenant prefixes, are copied without reserialization, except explicit default-tenant snapshot locators that require canonicalization (described below).
 SQL versions are freshly allocated. Unfinished deletion markers are rejected.
 Parquet, staging/WAL, hot-tier/cache files and private LocalFS lock files are not
 metadata documents and are excluded, as are the pairing and transfer controls.
@@ -381,7 +381,7 @@ rebuilds its primary key transactionally under the same startup advisory lock.
 On a large database, budget startup time for that rebuild and its exclusive table
 lock. Prefix reads and deletes use explicit component-bounded ranges; they do not
 require PostgreSQL 15's `starts_with` optimization. Listings are tenant-scoped
-and key-only; manifest query planning uses one SQL batch rather than one pooled
+and key-only; manifest query planning uses bounded SQL batches rather than one pooled
 connection per manifest. SQL manifest locators are bucket-relative on every
 provider; old absolute LocalFS locators are accepted on read. No other SQL
 caller uses the provider-absolute locator form. Existing cloud
@@ -401,8 +401,11 @@ requires a single tenant path component. Absent, empty and `DEFAULT_TENANT`
 tenant identifiers use the same empty SQL tenant column. Stream lifecycle keys
 follow the existing root-path normalization.
 
-Every SQL operation, including transaction start/commit, startup migration,
-offline transfer and health, has a client deadline of statement timeout + 250 ms.
+Server SQL operations, including transaction start/commit and health, have a
+client deadline of statement timeout + 250 ms. Startup/schema migrations use
+the separate migration budget described below. Offline SQL validation can also
+use that budget; import commits and aborts use the lock session's normal
+statement deadline.
 Canceled/timed-out connections are discarded instead of recycled. Readiness has
 an overall deadline of that same duration, including pool acquisition and bucket
 probe. TCP keepalive starts after one second with one-second probes and three
@@ -423,10 +426,10 @@ store is not loaded. An empty CA bundle is rejected at configuration time. CA pl
 Normal startup refuses an existing database identity, including one with zero documents, when the bucket has no pairing marker.
 Restore the matching marker from backup. For deliberate recovery only, after
 verifying the bucket and database identity, set
-`P_METASTORE_POSTGRES_ALLOW_UNPAIRED=true` to allow creation of the missing marker.
+`P_METASTORE_POSTGRES_ALLOW_UNPAIRED=<backend-id>` to allow creation of the missing marker.
 This override never permits mismatched identities or incomplete offline transfers.
 The import tool's committed-import recovery continues to establish pairing itself
-under its durable transfer marker, and migrates schema version 1 to 2. Exported
+under its durable transfer marker, and migrates schema versions 1 and 2 to 3. Exported
 or incomplete databases still refuse server admission.
 
 Conditional-create lost responses remain ambiguous, as on object storage: a retry
@@ -472,8 +475,9 @@ This avoids stopping with an unsynced custom-partition file or comparing a cache
 pre-export bound to a freshly loaded rollback bound. It passed interrupted import
 and export, SQL-mode query/metadata equality, new ingestion, verified export and
 object-store rollback. Existing Rust test modules and expectations are unchanged.
-The protected smoke's only expectation change is future schema version 3, restoring
-version 2 afterward, because migration 002 makes version 2 supported.
+That historical review smoke rejected schema version 3 and restored version 2,
+which was current with migration 002. Current validation rejects version 999
+and restores version 3.
 
 The three-mode smoke passed object-store, verified TLS PostgreSQL and plaintext
 PostgreSQL scenarios, including lifecycle, dependency outages, CA rejection and
@@ -488,7 +492,6 @@ also exceeded the existing auxiliary-process shutdown wait; a subsequent complet
 run passed without changing that protected cleanup logic. All started containers
 were removed. Large migrations or slow storage may require increasing the
 statement timeout; the readiness/client deadline increases with that setting.
-
 
 ## Hardened offline procedure
 
@@ -572,7 +575,6 @@ listing excludes mttr.json; LocalFS stream listing uses the selected instance;
 startup cleanup waits for the entire discovery/validation pass to succeed before
 deleting any invalid tenant.
 
-
 The merged CRUD contract and boundary guard kept their assertions. The smoke's
 future-schema test now rejects 3 and restores 2 (migration 002 is supported).
 The migration smoke no longer expects ordinary rollback to fail without force;
@@ -615,10 +617,10 @@ four probes, and the original under-two-second assertions.
 
 The combined implementation was validated locally with disposable PostgreSQL 17
 and MinIO, with all task containers removed afterward. Full library runs with
-and without the database URL each passed 1,398 tests (seven ignored); SQL tests
+and without the database URL each passed 1,405 tests (seven ignored); SQL tests
 print explicit skips without prerequisites. The PostgreSQL contract and startup
 cleanup fixtures were then run explicitly and passed, as did the paused-server
-deadline test. Focused metastore runs passed 34 tests against LocalFS/PostgreSQL
+deadline test. Focused metastore runs passed 37 tests against LocalFS/PostgreSQL
 and MinIO/PostgreSQL; follow-up migration checks cover legacy absolute locators,
 both legacy tenant scopes, safe/unsafe aborts, and early pin refusal.
 
@@ -627,11 +629,14 @@ plaintext and verified TLS modes; offline migration in plaintext and verified
 TLS, including interrupted import/export, .part refusal, new SQL-mode ingestion
 and unforced object-store rollback. The smoke generated its own
 [raw evidence](validation/postgres-metastore-smoke.json).
-[Validation commands and recovery results](validation/postgres-hardening-checks.json)
-record the other checks. Plain cargo clippy --all-targets and the debug build
+[Round-two validation commands and results](validation/postgres-round2-checks.json)
+record the latest checks; [earlier results](validation/postgres-hardening-checks.json)
+remain as historical evidence. Plain cargo clippy --all-targets and the debug build
 passed; Clippy retained 21 existing library-test warnings and one existing
-integration-test warning, with no new warnings. The workflow YAML parses; its
-hosted GitHub run has not been performed because this work is local and unpushed.
+integration-test warning, with no new warnings. The first hosted workflow run
+[failed during runner setup](https://github.com/VibeEngineeringAI/parseable/actions/runs/43037438052)
+because the Ubuntu package mirror could not be resolved; compilation and tests
+never started. The expanded workflow has not been pushed or run remotely.
 
 Counts in the inventory chart are a model of request growth, not a throughput
 benchmark. No concurrent-writer fencing, automatic resolution of an interrupted
@@ -642,4 +647,122 @@ their identifier privacy risk. Deduplicating the object-safe storage guard and
 SQL startup guard adapters is deferred: both enforce the same tested controls,
 and consolidating their different error adapters adds no recovery capability.
 The required real PostgreSQL/MinIO and injected-boundary coverage is implemented;
-hosted CI remains deferred under the no-push constraint.
+the expanded hosted checks remain unrun under the no-push constraint.
+
+### Review hardening and operational limits
+
+LocalFS lookups try the exact document key first, then the old root-prefixed
+locator compatibility form. If both rows exist, the exact row wins and a warning
+is logged. Cloud locators retain their existing interpretation. Empty tenants and
+`DEFAULT_TENANT` use the same metadata paths as an absent tenant.
+
+Schema version 3 admits manifests under the same transaction advisory lock as
+stream documents and deletion markers. Startup migrations have a separate
+`P_METASTORE_POSTGRES_MIGRATION_TIMEOUT_MS` budget (default 1800000, 30 minutes).
+Migration 002 takes an exclusive table lock while changing collation and rebuilding
+indexes; stop old writers before upgrading a large populated database. Concurrent
+new initializers serialize on the startup advisory lock. Increase the migration
+budget for a large table; ordinary queries retain the statement deadline.
+
+When deletion is confirmed pending, the uploader drops staged parquet and schema
+files for that stream. If deletion wins after upload began, it first removes all
+parquet objects uploaded by that batch, then retires those staged files. A bucket
+cleanup failure preserves staging for retry. Publication delayed beyond the final
+SQL row deletion remains possible: an incarnation token is required to fence that
+window (issue 142). Do not recreate a stream while old uploaders are still active.
+Tenant deletion refuses a tenant name that collides with a known default-tenant
+stream, including SQL-only cleanup candidates. Rename or resolve that collision
+before retrying cleanup.
+
+A client SQL timeout sends a separately bounded PostgreSQL cancel request and
+discards the connection. Cancellation or its response can be lost, and a write or
+COMMIT may already have completed. Such failures have an ambiguous outcome: inspect
+state before retrying; cancellation is not a rollback guarantee.
+
+Offline transfers, including abort, hold a session advisory lock for the entire
+operation; a second invocation fails immediately. Import releases its ordinary
+database connection during spooling and the second inventory walk. The dedicated
+lock session remains connected. Bucket reads and inventory walks use concurrency
+16. No bucket I/O occurs inside the SQL import transaction.
+
+The tool requires an existing explicit staging directory, resolves it to an
+absolute path, and prints it together with the current directory's environment
+file (or that none was loaded). Run from the deployment's configuration directory;
+the tool does not search other directories for an environment file.
+
+Import validates all JSON documents before committing. The dangling snapshot
+reference override applies to both import and export, including export's final
+validation. Export dry-run reads SQL and bucket state, checks references and
+reports bucket conflicts without bootstrapping SQL or writing bucket markers.
+An imported key deleted from the bucket is a conflict. New SQL keys absent from
+the bucket are normal. Conflicts are counted, with the first 100 keys printed,
+before requiring `--overwrite-bucket-changes-since-import`. This flag also permits
+removing bucket-only metadata; back up the bucket first. Databases imported by an
+older tool without digests can export equal documents without an override; changed
+documents require it. Import abort may clear committed SQL only when the matching
+Import marker still exists and no pairing marker has ever been published.
+
+The disaster recovery setting `P_METASTORE_POSTGRES_ALLOW_UNPAIRED` must equal the
+backend UUID, rather than a boolean. Remove it after recovery.
+
+Spools contain sensitive metadata, including RBAC. They live below a private
+(mode 0700) `.parseable-migration-spool-<backend-id>` directory in the working
+directory. Normal exit removes the temporary body directory; SIGKILL can leave
+it behind. The next import with the same backend id and exclusive transfer lock
+removes that stale spool before reading metadata again.
+
+For 20 streams × 30 days, assuming 650 LIST requests per walk, one manifest per
+stream/day, and two stream documents, import makes approximately 3180 bucket
+requests: two inventories (1300 LIST), two reads of 640 documents, and 600
+snapshot-reference reads. For 1000 streams the corresponding estimate is 159000
+requests. At 150 ms/request and concurrency 16 the latency-only lower bounds are
+about 30 seconds and 25 minutes respectively; shallow discovery rounds, pagination,
+SQL verification, body sizes and network throughput add time. These are estimates,
+not measured throughput. The committed literal EXPLAIN output does not demonstrate
+prepared generic-plan behavior.
+
+Default object-store mode retains query storage-error HTTP 400 responses.
+Explicit-stream ingest in distributed mode propagates storage lookup failures
+instead of reporting a missing stream (404); actual missing streams remain 404.
+Shared
+metadata path helpers now normalize empty and explicit default tenants; malformed
+percent-encoded inventory keys return errors instead of panicking, `.keystone/`
+is accepted by the offline metadata inventory, and inventory
+discovery uses bounded concurrency. The uploader retirement policy applies to
+confirmed PostgreSQL deletion conflicts.
+
+Default-tenant alert-state enumeration now uses the canonical `.alerts/`
+directory, consistent with writes and single-state reads. It therefore includes
+states previously missed by the default-tenant listing. Per-date manifest
+inventory also normalizes explicit default-tenant aliases.
+
+Import canonicalizes explicit `DEFAULT_TENANT/` metadata keys and snapshot
+manifest locators. It retains the original source digests for rollback conflict
+checks, and verify compares the corresponding canonical representation. Other
+metadata bodies, including legacy absolute locators without that alias, retain
+their bytes. This avoids exporting a snapshot that points to an alias key
+removed during rollback; unknown JSON fields are retained when locators change.
+
+Offline commands require a direct PostgreSQL connection or session pooling: the
+whole-transfer advisory lock must stay on one database session. Transaction
+pooling cannot provide that lock lifetime.
+
+Manifest planning consults the cache for both documents and known misses. Cold
+reads select at most 32 locators (64 KiB of locator text) per sizing batch and
+transfer at most 8 MiB of bodies per chunk, decoding before fetching the next
+chunk. The body statement rechecks the limit to handle concurrent growth. One
+larger manifest is returned alone. Missing manifests still produce individual
+warnings.
+
+`export --abort` before export starts is a safe no-op, including databases
+initialized directly in PostgreSQL mode without a transfer row.
+
+Import commits and abort SQL execute on the session owning the transfer lock.
+If that session is lost during spooling, the command fails without reconnecting
+and committing its old work; rerun or abort under a new lock. Functional smoke
+fixtures use a 30-second SQL budget on shared build machines; separate timeout
+regressions retain their short deadlines.
+
+Failed PostgreSQL upload batches wait for sibling uploads to settle before
+compensation. If deletion cannot be confirmed, staging remains available for
+retry. Default object-store batches retain their existing error handling.

@@ -1055,24 +1055,34 @@ impl PostgresDocuments {
                 .await
                 .unwrap();
         }
-        let client = self.client().await.unwrap();
+        let timed = Self::new(
+            &PostgresOptions {
+                metastore_postgres_connect_timeout_ms: 1000,
+                metastore_postgres_statement_timeout_ms: 3000,
+                ..options.clone()
+            },
+            self.bucket.clone(),
+            self.storage.clone(),
+        )
+        .unwrap();
+        let client = timed.client().await.unwrap();
         let started = std::time::Instant::now();
         assert!(client.query("SELECT pg_sleep(10)", &[]).await.is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(client.query("SELECT 1", &[]).await.is_ok());
         drop(client);
         // Pool saturation is bounded and returned as an error.
-        let held = futures::future::join_all((0..4).map(|_| self.client())).await;
+        let held = futures::future::join_all((0..4).map(|_| timed.client())).await;
         assert!(held.iter().all(Result::is_ok));
         let started = std::time::Instant::now();
-        assert!(self.client().await.is_err());
+        assert!(timed.client().await.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
         drop(held);
         let marker = RelativePath::new(".parseable/postgres-metastore-id");
         let paired = self.storage.get_object(marker, &None).await.unwrap();
         self.storage.delete_object(marker, &None).await.unwrap();
         let started = std::time::Instant::now();
-        assert!(self.check_health(&None).await.is_err());
+        assert!(timed.check_health(&None).await.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
         self.storage
             .put_object(marker, Bytes::from_static(b"wrong-backend"), &None)

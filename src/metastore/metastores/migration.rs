@@ -227,6 +227,12 @@ pub async fn run(
         "requires --acknowledge-server-stopped; stop ALL servers and writers first"
     );
     eprintln!("OFFLINE migration: all servers must remain stopped. No writer fencing exists.");
+    #[cfg(test)]
+    eprintln!(
+        "TEST transfer: action={action:?} dry_run={} abort={} injection={:?}",
+        opts.migration_dry_run, opts.abort, opts.injected_failure
+    );
+
     let mut transfer_lock = db.transfer_lock().await?;
     db.migration_preflight(store.as_ref(), opts).await?;
     if opts.abort {
@@ -640,6 +646,7 @@ mod tests {
             };
         let options = PostgresOptions {
             metastore_postgres_url: Some(url.clone()),
+            metastore_postgres_statement_timeout_ms: 30000,
             ..Default::default()
         };
         let admin = PostgresDocuments::new(&options, "test".into(), store.clone())?;
@@ -655,6 +662,7 @@ mod tests {
             let opts = PostgresOptions {
                 metastore_postgres_url: Some(url.to_string()),
                 metastore_postgres_pool_size: 1,
+                metastore_postgres_statement_timeout_ms: 30000,
                 ..Default::default()
             };
             let db = PostgresDocuments::new(&opts, "test".into(), store.clone())?;
