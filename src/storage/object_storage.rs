@@ -1408,7 +1408,7 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
                     let key = stream_relative_path(
                         stream_name,
                         &filename,
-                        &upload_context.stream.get_custom_partition(),
+                        &upload_context.custom_partition,
                         &tenant_id,
                     );
                     match compensate_uploaded_parquet(self, &key, &tenant_id).await {
@@ -1498,6 +1498,13 @@ async fn process_parquet_files(
         .filter_map(claim_staged_file_for_upload)
         .collect();
 
+    let postgres = PARSEABLE.options.postgres.enabled();
+    let retirement_paths = if postgres {
+        parquet_paths.clone()
+    } else {
+        Vec::new()
+    };
+
     let mut total_size: u64 = 0;
     let mut min_dt: Option<chrono::DateTime<Utc>> = None;
     let mut max_dt: Option<chrono::DateTime<Utc>> = None;
@@ -1534,7 +1541,37 @@ async fn process_parquet_files(
     }
 
     // Collect results from all upload tasks
-    collect_upload_results(join_set).await
+    let result = collect_upload_results(join_set, postgres).await;
+    if result.is_err() && postgres {
+        // All tasks have settled, so no successful sibling upload can publish
+        // after compensation. Keep staging retryable if deletion is unconfirmed.
+        for path in &retirement_paths {
+            ACTIVE_OBJECT_STORE_SYNC_FILES.remove(path);
+        }
+        if PARSEABLE
+            .metastore
+            .is_stream_deleting(stream_name, &tenant_id)
+            .await
+            .is_ok_and(|pending| pending)
+        {
+            for path in retirement_paths {
+                let filename = path.file_name().unwrap().to_string_lossy();
+                let key = stream_relative_path(
+                    stream_name,
+                    &filename,
+                    &upload_context.custom_partition,
+                    &tenant_id,
+                );
+                compensate_uploaded_parquet(object_store.as_ref(), &key, &tenant_id).await?;
+                remove_uploaded_staged_file(path);
+            }
+            for path in upload_context.stream.schema_files() {
+                remove_uploaded_staged_file(path);
+            }
+            return Ok(Vec::new());
+        }
+    }
+    result
 }
 
 /// Spawns an individual parquet file upload task
@@ -1576,8 +1613,10 @@ async fn spawn_parquet_upload_task(
 /// Collects results from all upload tasks
 async fn collect_upload_results(
     mut join_set: JoinSet<Result<UploadResult, (PathBuf, ObjectStorageError)>>,
+    drain_on_error: bool,
 ) -> Result<Vec<UploadedParquetFile>, ObjectStorageError> {
     let mut uploaded_files = Vec::new();
+    let mut failure = None;
 
     while let Some(result) = join_set.join_next().await {
         match result {
@@ -1599,16 +1638,30 @@ async fn collect_upload_results(
             Ok(Err((path, e))) => {
                 error!("Error uploading parquet file: {e}");
                 ACTIVE_OBJECT_STORE_SYNC_FILES.remove(&path);
-                return Err(e);
+                if !drain_on_error {
+                    return Err(e);
+                }
+                if failure.is_none() {
+                    failure = Some(e);
+                }
             }
             Err(e) => {
                 error!("Task panicked: {e}");
-                return Err(ObjectStorageError::UnhandledError(Box::new(e)));
+                let error = ObjectStorageError::UnhandledError(Box::new(e));
+                if !drain_on_error {
+                    return Err(error);
+                }
+                if failure.is_none() {
+                    failure = Some(error);
+                }
             }
         }
     }
 
-    Ok(uploaded_files)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(uploaded_files),
+    }
 }
 
 /// Updates snapshot with collected manifest files
@@ -2717,6 +2770,31 @@ pub(crate) fn decode_metadata_key(key: &str) -> Result<String, ObjectStorageErro
 #[cfg(test)]
 mod metadata_key_decode_tests {
     use super::*;
+    #[tokio::test]
+    async fn postgres_batches_settle_sibling_uploads_before_error_cleanup() {
+        for drain in [false, true] {
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = completed.clone();
+            let mut uploads = JoinSet::new();
+            uploads.spawn(async {
+                Err((
+                    PathBuf::from("failed.parquet"),
+                    ObjectStorageError::Custom("upload failed".into()),
+                ))
+            });
+            uploads.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(UploadResult {
+                    file_path: PathBuf::from("sibling.parquet"),
+                    manifest_file: None,
+                })
+            });
+            assert!(collect_upload_results(uploads, drain).await.is_err());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), drain);
+        }
+    }
     #[tokio::test]
     async fn compensation_removes_only_parquet_and_tolerates_missing_objects() {
         let dir = tempfile::tempdir().unwrap();
