@@ -210,6 +210,10 @@ impl ConsumerRecord {
             &metrics::TENANT_MISMATCH_DROPPED,
         );
 
+        if tenant_id.is_none() {
+            warn_tenant_mismatch(msg.topic(), msg.partition());
+        }
+
         // Rejected records retain their position in the partition queue, but
         // never retain producer payloads or keys. Tombstones use the same shape.
         let accepted = tenant_id.is_some();
@@ -275,16 +279,49 @@ fn tenant_for_ingestion<'a>(
         Ok(tenant) => Some(tenant),
         Err(()) => {
             dropped.inc();
-            // At most one warning per process, with no producer-controlled values.
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                warn!(
-                    "Dropping Kafka records with tenant headers that disagree with configured tenant; see parseable_kafka_tenant_mismatch_dropped_total"
-                );
-            }
             None
         }
+    }
+}
+
+/// A monotonic, process-wide warning window. The counter remains unlabeled;
+/// each warning identifies the topic/partition of the drop that opens a window.
+#[derive(Default)]
+struct TenantDropWarnings {
+    last_warning: Option<std::time::Instant>,
+    dropped: u64,
+}
+
+impl TenantDropWarnings {
+    fn record_drop(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.dropped = self.dropped.saturating_add(1);
+        if self
+            .last_warning
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60))
+        {
+            return None;
+        }
+        self.last_warning = Some(now);
+        Some(std::mem::take(&mut self.dropped))
+    }
+}
+
+fn warn_tenant_mismatch(topic: &str, partition: i32) {
+    static WARNINGS: std::sync::Mutex<TenantDropWarnings> =
+        std::sync::Mutex::new(TenantDropWarnings {
+            last_warning: None,
+            dropped: 0,
+        });
+    let mut warnings = WARNINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(dropped) = warnings.record_drop(std::time::Instant::now()) {
+        warn!(
+            topic,
+            partition,
+            dropped,
+            "Dropping Kafka records with tenant headers that disagree with configured tenant; drops since previous warning across all partitions; see parseable_kafka_tenant_mismatch_dropped_total"
+        );
     }
 }
 
@@ -603,5 +640,25 @@ mod tenant_tests {
                 Err(())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tenant_warning_tests {
+    use super::*;
+
+    #[test]
+    fn tenant_drop_warnings_repeat_after_sixty_seconds_with_interval_count() {
+        let now = std::time::Instant::now();
+        let mut warnings = TenantDropWarnings::default();
+        assert_eq!(warnings.record_drop(now), Some(1));
+        assert_eq!(warnings.record_drop(now), None);
+        assert_eq!(warnings.record_drop(now + Duration::from_secs(59)), None);
+        assert_eq!(warnings.record_drop(now + Duration::from_secs(60)), Some(3));
+        assert_eq!(warnings.record_drop(now + Duration::from_secs(119)), None);
+        assert_eq!(
+            warnings.record_drop(now + Duration::from_secs(120)),
+            Some(2)
+        );
     }
 }
