@@ -84,7 +84,7 @@ pub struct KafkaConfig {
 pub struct ConsumerConfig {
     /// Trusted destination for every consumed topic. Headers never grant tenant access.
     #[arg(long = "consumer-tenant-id", env = "P_KAFKA_CONSUMER_TENANT_ID",
-        help = "Destination tenant for all consumed topics; requires --multi-tenancy. Recommended in multi-tenant mode: conflicting tenant headers are dropped; unset accepts only headerless records at the default destination. Single-tenant mode ignores tenant headers",
+        help = "Destination tenant for all consumed topics; requires --multi-tenancy. Use a separate consumer group or separate topics per tenant. In multi-tenant mode, mismatching x-p-tenant headers are dropped; when unset, all x-p-tenant headers (including DEFAULT_TENANT) are dropped. Single-tenant mode ignores headers",
         value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub tenant_id: Option<String>,
 
@@ -1537,5 +1537,23 @@ mod tests {
         );
         assert_eq!(config.get("sasl.oauthbearer.client.id"), Some("unused"));
         assert_eq!(config.get("sasl.oauthbearer.client.secret"), Some("unused"));
+    }
+
+    #[test]
+    fn empty_consumer_tenant_id_is_rejected_by_cli() {
+        #[derive(Debug, Parser)]
+        struct ConsumerCli {
+            #[command(flatten)]
+            consumer: ConsumerConfig,
+        }
+
+        // A valid value proves this CLI fixture can otherwise parse the option.
+        let cli = ConsumerCli::try_parse_from(["test", "--consumer-tenant-id=tenant-a"])
+            .expect("a nonempty tenant ID should parse");
+        assert_eq!(cli.consumer.tenant_id.as_deref(), Some("tenant-a"));
+        let error = ConsumerCli::try_parse_from(["test", "--consumer-tenant-id="])
+            .expect_err("an explicitly empty tenant ID must fail parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("--consumer-tenant-id"));
     }
 }
