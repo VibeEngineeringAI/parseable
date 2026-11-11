@@ -16,7 +16,7 @@
  *
  */
 
-//! Validated small-file bodies. Each physical scan validates before serving
+//! Validated small-file bodies. Each request validates before serving
 //! bytes, so remote overwrites and deletes are visible without a TTL. Cache
 //! scope identifies the configured provider across per-query runtime instances.
 use bytes::Bytes;
@@ -43,7 +43,6 @@ use std::{
 const MAX_FILE: u64 = 256 * 1024;
 #[cfg(test)]
 const MAX_BYTES: usize = 64 * 1024 * 1024;
-const SCAN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 #[derive(Debug, Clone)]
 struct Entry {
@@ -119,6 +118,9 @@ async fn load(
     namespace: &str,
     budget: usize,
 ) -> object_store::Result<(u64, Option<Bytes>)> {
+    if std::env::var_os("P_CACHE_TRACE").is_some() {
+        eprintln!("CACHE_LOAD scope={scope} path={path}");
+    }
     let key = Path::from(format!("{namespace}{}", path.as_ref()));
     // Keep a private reference during validation; eviction cannot lose the body
     // needed for a 304. Do not hold the cache lock across network I/O.
@@ -200,38 +202,37 @@ fn non_partial(error: &object_store::Error) -> bool {
     }
 }
 
-// Metadata and data readers of one physical scan share a bounded view. A new
-// physical scan always validates against storage; it cannot inherit this view.
+// Validated bodies live for the request, including concurrent opens and separate
+// physical scans. Unlike the process LRU this map must not evict: a late decoder
+// must see the same validation as its metadata reader. Dropping the request's
+// plans releases these references; subsequent requests get a fresh view.
+type Loaded = std::result::Result<(u64, Option<Bytes>), Arc<object_store::Error>>;
+#[derive(Debug, Default)]
+pub(super) struct RequestView {
+    files: Mutex<HashMap<Key, Arc<tokio::sync::OnceCell<Loaded>>>>,
+}
+
 async fn load_for_scan(
-    view: &Mutex<Cache>,
+    view: &RequestView,
     scope: usize,
     store: &Arc<dyn ObjectStore>,
     path: &Path,
     namespace: &str,
     budget: usize,
 ) -> object_store::Result<(u64, Option<Bytes>)> {
-    let key = Path::from(format!("{namespace}{}", path.as_ref()));
-    {
-        let mut view = view.lock().unwrap();
-        if let Some(entry) = view.remove(scope, &key) {
-            let bytes = entry.bytes.clone();
-            view.insert(entry, SCAN_BYTES);
-            return Ok((bytes.len() as u64, Some(bytes)));
-        }
-    }
-    let result = load(&CACHE, scope, store, path, namespace, budget).await?;
-    if let Some(bytes) = &result.1 {
-        view.lock().unwrap().insert(
-            Entry {
-                scope,
-                path: key,
-                etag: String::new(),
-                bytes: bytes.clone(),
-            },
-            SCAN_BYTES,
-        );
-    }
-    Ok(result)
+    let key = (scope, Path::from(format!("{namespace}{}", path.as_ref())));
+    let cell = view.files.lock().unwrap().entry(key).or_default().clone();
+    cell.get_or_init(|| async {
+        load(&CACHE, scope, store, path, namespace, budget)
+            .await
+            .map_err(Arc::new)
+    })
+    .await
+    .clone()
+    .map_err(|source| object_store::Error::Generic {
+        store: "request small-file cache",
+        source: Box::new(source),
+    })
 }
 
 pub(super) fn install(
@@ -240,6 +241,7 @@ pub(super) fn install(
     scope: usize,
     budget: usize,
     enabled: bool,
+    view: Arc<RequestView>,
 ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
     if !enabled || budget == 0 {
         return Ok(plan);
@@ -284,7 +286,7 @@ pub(super) fn install(
                 scope,
                 namespace,
                 budget,
-                view: Arc::new(Mutex::default()),
+                view,
             }));
     Ok(Arc::new(
         exec.clone().with_data_source(Arc::new(
@@ -297,7 +299,7 @@ pub(super) fn install(
 
 #[derive(Debug)]
 pub(super) struct SmallFileReaderFactory {
-    view: Arc<Mutex<Cache>>,
+    view: Arc<RequestView>,
     scope: usize,
     namespace: String,
     budget: usize,
@@ -312,6 +314,14 @@ impl ParquetFileReaderFactory for SmallFileReaderFactory {
         hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion::common::Result<Box<dyn AsyncFileReader + Send>> {
+        if std::env::var_os("P_CACHE_TRACE").is_some() {
+            eprintln!(
+                "CACHE_READER view={:p} partition={partition} path={} range={:?}",
+                Arc::as_ptr(&self.view),
+                file.object_meta.location,
+                file.range
+            );
+        }
         let fallback = self
             .fallback
             .create_reader(partition, file.clone(), hint, metrics)?;
@@ -340,7 +350,7 @@ impl ParquetFileReaderFactory for SmallFileReaderFactory {
 }
 struct Reader {
     hint: Option<usize>,
-    view: Arc<Mutex<Cache>>,
+    view: Arc<RequestView>,
     file_metrics: datafusion::datasource::physical_plan::ParquetFileMetrics,
     scope: usize,
     namespace: String,
@@ -577,11 +587,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_view_is_bounded_and_new_scan_validates_changes() {
+    async fn request_view_retains_bodies_and_new_request_validates_changes() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let scope = 99881;
         let path = Path::from("view/file.parquet");
-        let view = Mutex::new(Cache::default());
+        let view = RequestView::default();
         store
             .put(&path, Bytes::from_static(b"one").into())
             .await
@@ -607,7 +617,7 @@ mod tests {
             "one",
             "one scan retains its validated body"
         );
-        let next = Mutex::new(Cache::default());
+        let next = RequestView::default();
         assert_eq!(
             load_for_scan(&next, scope, &store, &path, "", MAX_BYTES)
                 .await
@@ -618,26 +628,106 @@ mod tests {
             "new scan must validate"
         );
         store.delete(&path).await.unwrap();
-        let next = Mutex::new(Cache::default());
+        let next = RequestView::default();
         assert!(
             load_for_scan(&next, scope, &store, &path, "", MAX_BYTES)
                 .await
                 .is_err()
         );
-        let mut view = view.lock().unwrap();
+        // A late reader must not revalidate even after traversing more than
+        // the old 8 MiB scan LRU. The process cache may still evict freely.
         for i in 0..40 {
-            view.insert(
-                Entry {
-                    scope,
-                    path: Path::from(format!("{i}")),
-                    etag: String::new(),
-                    bytes: Bytes::from(vec![0; MAX_FILE as usize]),
-                },
-                SCAN_BYTES,
-            );
+            let other = Path::from(format!("view/{i}.parquet"));
+            store
+                .put(&other, Bytes::from(vec![0; MAX_FILE as usize]).into())
+                .await
+                .unwrap();
+            load_for_scan(&view, scope, &store, &other, "", MAX_BYTES)
+                .await
+                .unwrap();
         }
-        assert!(view.bytes <= SCAN_BYTES);
-        assert!(view.remove(scope, &path).is_none());
+        assert_eq!(
+            load_for_scan(&view, scope, &store, &path, "", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .unwrap(),
+            "one"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_readers_share_validation_but_new_requests_do_not() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let store: Arc<dyn ObjectStore> = Arc::new(MetricLayer::new(
+            ThrottledStore::new(
+                InMemory::new(),
+                ThrottleConfig {
+                    wait_get_per_call: std::time::Duration::from_millis(10),
+                    ..Default::default()
+                },
+            ),
+            "request-cache-concurrent",
+        ));
+        let path = Path::from("concurrent/file.parquet");
+        store
+            .put(&path, Bytes::from_static(b"first").into())
+            .await
+            .unwrap();
+        for request in 0..2 {
+            let view = RequestView::default();
+            let window = StorageMetricWindow::start("request-cache-concurrent");
+            let readers =
+                (0..32).map(|_| load_for_scan(&view, 99882, &store, &path, "", MAX_BYTES));
+            for result in futures_util::future::join_all(readers).await {
+                assert_eq!(
+                    result.unwrap().1.unwrap(),
+                    if request == 0 { "first" } else { "second" }
+                );
+            }
+            assert_eq!(window.delta().get_requests, 1);
+            store
+                .put(&path, Bytes::from_static(b"second").into())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn request_context_keeps_catalog_and_isolates_validation_views() {
+        let shared = datafusion::prelude::SessionContext::new();
+        shared
+            .register_table(
+                "sentinel",
+                Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+                    arrow_schema::Schema::empty(),
+                ))),
+            )
+            .unwrap();
+        let first = super::super::request_context(shared.state());
+        let second = super::super::request_context(shared.state());
+        assert!(!Arc::ptr_eq(
+            &first
+                .state()
+                .config()
+                .get_extension::<RequestView>()
+                .unwrap(),
+            &second
+                .state()
+                .config()
+                .get_extension::<RequestView>()
+                .unwrap()
+        ));
+        assert!(
+            shared
+                .state()
+                .config()
+                .get_extension::<RequestView>()
+                .is_none()
+        );
+        for context in [&shared, &first, &second] {
+            assert!(context.table("sentinel").await.is_ok());
+        }
     }
 
     #[test]
@@ -670,7 +760,7 @@ mod measurement {
     use super::*;
     use crate::{
         promql::{self, QueryPlan, Sample, Series},
-        query::stream_schema_provider::build_parquet_scan_components,
+        query::stream_schema_provider::build_parquet_scan_components_with_full_filters as build_parquet_scan_components,
         storage::{StorageMetricWindow, metrics_layer::MetricLayer},
     };
     use arrow_array::{Array, Float64Array, RecordBatch, StringArray, TimestampMillisecondArray};
@@ -690,6 +780,189 @@ mod measurement {
     use object_store::ObjectStoreExt;
     use parquet::arrow::ArrowWriter;
 
+    fn metric_writer(schema: &Schema) -> parquet::file::properties::WriterProperties {
+        use crate::{
+            cli::{Cli, StorageOptions},
+            event::format::{LogSource, LogSourceEntry},
+            metadata::LogStreamMetadata,
+            parseable::Stream,
+        };
+        use clap::Parser;
+        let StorageOptions::Local(args) =
+            Cli::try_parse_from(["parseable", "local-store", "target/cache-fixture-store"])
+                .unwrap()
+                .storage
+        else {
+            unreachable!()
+        };
+        let stream = Stream::new(
+            Arc::new(args.options),
+            "cache-fixture",
+            LogStreamMetadata {
+                log_source: vec![LogSourceEntry::new(
+                    LogSource::OtelMetrics,
+                    Default::default(),
+                )],
+                ..Default::default()
+            },
+            None,
+            &None,
+        );
+        stream.parquet_writer_props(schema, None, None, false)
+    }
+
+    /// Synthetic historical minute partitions, using the ingest writer and manifest
+    /// builder. Publish before starting the isolated server; normal OTLP ingestion
+    /// can then populate its staging window without waiting 390 wall-clock minutes.
+    #[tokio::test]
+    #[ignore = "publishes an isolated HTTP reproduction fixture to MinIO"]
+    async fn publish_request_fixture() {
+        use crate::{
+            catalog::{
+                manifest::{Manifest, create_from_parquet_file, encode_manifest},
+                snapshot::ManifestItem,
+            },
+            event::format::{LogSource, LogSourceEntry},
+            storage::ObjectStoreFormat,
+        };
+        let endpoint = std::env::var("P_CACHE_TEST_MINIO_ENDPOINT").unwrap();
+        let store = s3(&endpoint);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "p_timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "time_unix_nano",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("metric_name", DataType::Utf8, true),
+            Field::new("metric_type", DataType::Utf8, true),
+            Field::new("host", DataType::Utf8, true),
+            Field::new("metric_description", DataType::Utf8, true),
+            Field::new("data_point_value", DataType::Float64, true),
+        ]));
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut days = std::collections::BTreeMap::<String, Manifest>::new();
+        let local = std::path::Path::new("target/cache-repro");
+        std::fs::create_dir_all(local).unwrap();
+        for minute in 3..393 {
+            let time = end - minute * 60_000;
+            let times: Vec<_> = (0..480).map(|i| time + (i % 120) * 500).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(TimestampMillisecondArray::from(times.clone())),
+                    Arc::new(TimestampMillisecondArray::from(times)),
+                    Arc::new(StringArray::from(
+                        (0..480)
+                            .map(|i| ["cpu", "disk", "memory", "network"][(i / 120) as usize])
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(vec!["gauge"; 480])),
+                    Arc::new(StringArray::from(
+                        (0..480)
+                            .map(|i| format!("host-{}", i % 12))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..480)
+                            .map(|i| {
+                                format!(
+                                    "{:016x}{:04x}",
+                                    ((minute * 480 + i) as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                                    (i as u16).wrapping_mul(40503)
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Float64Array::from(
+                        (0..480)
+                            .map(|i| ((minute * 480 + i) as f64).sin())
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let date = chrono::DateTime::from_timestamp_millis(time)
+                .unwrap()
+                .format("%Y-%m-%d")
+                .to_string();
+            let path = format!("repro/date={date}/{minute}.parquet");
+            let file = local.join("minute.parquet");
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(&file).unwrap(),
+                schema.clone(),
+                Some(metric_writer(&schema)),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            days.entry(date)
+                .or_default()
+                .files
+                .push(create_from_parquet_file(path.clone(), &file).unwrap());
+            store
+                .put(
+                    &Path::from(path),
+                    Bytes::from(std::fs::read(&file).unwrap()).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut format = ObjectStoreFormat {
+            created_at: chrono::DateTime::from_timestamp_millis(end - 393 * 60_000)
+                .unwrap()
+                .to_rfc3339(),
+            log_source: vec![LogSourceEntry::new(
+                LogSource::OtelMetrics,
+                Default::default(),
+            )],
+            ..Default::default()
+        };
+        for (date, manifest) in days {
+            let lower = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc();
+            let path = format!("repro/date={date}/manifest.json");
+            store
+                .put(
+                    &Path::from(path.clone()),
+                    encode_manifest(&manifest).unwrap().into(),
+                )
+                .await
+                .unwrap();
+            format.snapshot.manifest_list.push(ManifestItem {
+                manifest_path: path,
+                time_lower_bound: lower,
+                time_upper_bound: lower + chrono::Duration::days(1)
+                    - chrono::Duration::nanoseconds(1),
+                events_ingested: 0,
+                ingestion_size: 0,
+                storage_size: 0,
+            });
+        }
+        store
+            .put(
+                &Path::from("repro/.stream/.stream.json"),
+                Bytes::from(serde_json::to_vec(&format).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &Path::from("repro/.stream/.schema"),
+                Bytes::from(serde_json::to_vec(schema.as_ref()).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+        println!("Published 390 production-writer minute files ending at {end}");
+    }
+
     #[derive(Debug)]
     struct Table {
         schema: SchemaRef,
@@ -704,6 +977,13 @@ mod measurement {
         }
         fn table_type(&self) -> TableType {
             TableType::Base
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> datafusion::common::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>>
+        {
+            Ok(vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact; filters.len()])
         }
         async fn scan(
             &self,
@@ -734,6 +1014,10 @@ mod measurement {
                     12345,
                     MAX_BYTES,
                     true,
+                    state
+                        .config()
+                        .get_extension::<RequestView>()
+                        .unwrap_or_default(),
                 )
             } else if self.disabled {
                 install(
@@ -742,6 +1026,7 @@ mod measurement {
                     12345,
                     MAX_BYTES,
                     false,
+                    Arc::default(),
                 )
             } else {
                 Ok(plan)
@@ -797,9 +1082,20 @@ mod measurement {
             )
             .unwrap();
             let mut body = Vec::new();
-            let mut writer = ArrowWriter::try_new(&mut body, schema.clone(), None).unwrap();
+            let mut writer =
+                ArrowWriter::try_new(&mut body, schema.clone(), Some(metric_writer(&schema)))
+                    .unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
+            let metadata = ParquetMetaDataReader::new()
+                .parse_and_finish(&Bytes::copy_from_slice(&body))
+                .unwrap();
+            let metric = metadata
+                .row_group(0)
+                .column(schema.index_of("metric_name").unwrap());
+            assert!(metric.bloom_filter_offset().is_some());
+            assert!(metric.column_index_offset().is_some());
+            assert!(metric.offset_index_offset().is_some());
             let path = format!("metrics/{minute}.parquet");
             files.push(PartitionedFile::new(path.clone(), body.len() as u64));
             store
@@ -826,7 +1122,6 @@ mod measurement {
         for (name, sql) in queries {
             let mut reference = None;
             let mut reference_bytes = None;
-            let mut reference_requests = None;
             for (cached, disabled) in [(false, false), (false, true), (true, false)] {
                 if cached {
                     let mut cache = CACHE.lock().unwrap();
@@ -843,7 +1138,19 @@ mod measurement {
                 for run in 0..2 {
                     // Production builds a new query session; the process cache
                     // survives these sessions, DataFusion's session cache doesn't.
-                    let mut config = SessionConfig::new().with_target_partitions(4);
+                    let mut config = SessionConfig::new()
+                        .with_target_partitions(32)
+                        .with_extension(Arc::new(RequestView::default()));
+                    config
+                        .options_mut()
+                        .execution
+                        .enable_file_stream_work_stealing = true;
+                    config
+                        .options_mut()
+                        .execution
+                        .use_row_number_estimates_to_optimize_partitioning = true;
+                    // Exercise byte-range splits even for this compact fixture.
+                    config.options_mut().optimizer.repartition_file_min_size = 1;
                     config.options_mut().execution.parquet.metadata_size_hint =
                         Some(2 * 1024 * 1024);
                     config.options_mut().execution.parquet.enable_page_index = true;
@@ -933,16 +1240,9 @@ mod measurement {
                         }
                     }
                     let delta = window.delta();
-                    let requests = (delta.get_requests, delta.get_ranges_requests);
-                    if disabled {
-                        assert_eq!(
-                            Some(requests),
-                            reference_requests,
-                            "kill switch must preserve original HTTP request pattern"
-                        );
-                    } else if !cached {
-                        reference_requests = Some(requests);
-                    }
+                    // The original reader's request count varies with concurrent
+                    // metadata-cache races across byte-range partitions. Plan
+                    // identity below tests the kill switch deterministically.
                     println!(
                         "CACHE_MEASUREMENT {name} cached={cached} disabled={disabled} run={run} GET={} GET_RANGES={}",
                         delta.get_requests, delta.get_ranges_requests
@@ -994,12 +1294,28 @@ mod measurement {
             };
             let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
             for (enabled, budget) in [(false, MAX_BYTES), (true, 0), (true, 9)] {
-                let actual = install(plan.clone(), store.clone(), 0, budget, enabled).unwrap();
+                let actual = install(
+                    plan.clone(),
+                    store.clone(),
+                    0,
+                    budget,
+                    enabled,
+                    Arc::default(),
+                )
+                .unwrap();
                 assert!(Arc::ptr_eq(&actual, &plan));
             }
             if count > MAX_ENTRIES {
                 assert!(Arc::ptr_eq(
-                    &install(plan.clone(), store.clone(), 0, MAX_BYTES, true).unwrap(),
+                    &install(
+                        plan.clone(),
+                        store.clone(),
+                        0,
+                        MAX_BYTES,
+                        true,
+                        Arc::default()
+                    )
+                    .unwrap(),
                     &plan
                 ));
             }

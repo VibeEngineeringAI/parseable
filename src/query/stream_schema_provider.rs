@@ -409,6 +409,10 @@ async fn parquet_scan_plan(
             Arc::as_ptr(&PARSEABLE.storage) as *const () as usize,
             PARSEABLE.options.small_file_cache_size,
             PARSEABLE.options.small_file_cache_enabled,
+            state
+                .config()
+                .get_extension::<super::small_file_cache::RequestView>()
+                .unwrap_or_default(),
         )
     } else {
         Ok(plan)
