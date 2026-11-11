@@ -183,11 +183,8 @@ impl KafkaStreams {
         multi_tenant: bool,
     ) -> anyhow::Result<()> {
         let tp = TopicPartition::from_kafka_msg(&msg);
-        let Some(consumer_record) =
-            ConsumerRecord::from_borrowed_msg(msg, configured_tenant, multi_tenant)
-        else {
-            return Ok(());
-        };
+        let consumer_record =
+            ConsumerRecord::from_borrowed_msg(msg, configured_tenant, multi_tenant);
         let mut state = stream_state.write().await;
 
         let partition_stream_tx =

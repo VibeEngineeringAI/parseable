@@ -198,7 +198,7 @@ impl ConsumerRecord {
         msg: BorrowedMessage,
         configured_tenant: Option<&str>,
         multi_tenant: bool,
-    ) -> Option<Self> {
+    ) -> Self {
         let tenant_id = tenant_for_ingestion(
             multi_tenant,
             configured_tenant,
@@ -208,17 +208,22 @@ impl ConsumerRecord {
                 .filter(|header| header.key == TENANT_ID)
                 .map(|header| header.value),
             &metrics::TENANT_MISMATCH_DROPPED,
-        )?;
+        );
 
-        Some(Self {
-            key: msg.key().map(|k| k.to_vec()),
-            payload: msg.payload().map(|p| p.to_vec()),
+        // Rejected records retain their position in the partition queue, but
+        // never retain producer payloads or keys. Tombstones use the same shape.
+        let accepted = tenant_id.is_some();
+        Self {
+            key: accepted.then(|| msg.key().map(|k| k.to_vec())).flatten(),
+            payload: accepted
+                .then(|| msg.payload().map(|p| p.to_vec()))
+                .flatten(),
             topic: msg.topic().to_owned(),
             partition: msg.partition(),
             offset: msg.offset(),
             timestamp: msg.timestamp().to_millis(),
-            tenant_id,
-        })
+            tenant_id: tenant_id.unwrap_or_else(|| configured_tenant.map(str::to_owned)),
+        }
     }
 
     pub fn key_str(&self) -> String {
