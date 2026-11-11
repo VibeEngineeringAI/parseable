@@ -67,6 +67,13 @@ jobs:
       PARSEABLE_TEST_IMAGE: parseable-ci:${{ github.sha }}
       COMPOSE_FILE: ${{ matrix.compose }}
       QUEST_MODE: ${{ inputs.full && 'load' || 'smoke' }}
+      # Quest is built from a fixed source commit instead of pulling the
+      # floating quay.io/parseablehq/quest:main image. Later Quest commits
+      # expect 202 from stream deletion, which this server does not return yet.
+      # Remove the pin when issue #151 is done.
+      QUEST_SOURCE_REF: f4a026eecde1badde8776ff366a743f9bbca2e67
+      QUEST_IMAGE: quest-ci:pinned
+      QUEST_PULL_POLICY: never
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -84,6 +91,14 @@ jobs:
         run: |
           docker compose up --no-build --wait --wait-timeout 180 "$SERVER"
           docker compose exec -T "$SERVER" sh -ec 'curl --fail --silent --show-error --location http://localhost:8000/next/ | grep -q "Parseable · Observability"'
+      - name: Build Quest from the pinned source commit
+        run: |
+          src="$RUNNER_TEMP/quest-src"
+          git init --quiet "$src"
+          git -C "$src" fetch --quiet --depth 1 https://github.com/parseablehq/quest.git "$QUEST_SOURCE_REF"
+          git -C "$src" checkout --quiet FETCH_HEAD
+          test "$(git -C "$src" rev-parse HEAD)" = "$QUEST_SOURCE_REF"
+          docker build --tag "$QUEST_IMAGE" "$src"
       - name: Run Quest
         run: docker compose up --no-build --exit-code-from quest
       - name: Capture service logs
