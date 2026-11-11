@@ -31,7 +31,6 @@ use chrono::Utc;
 use clap::{Parser, error::ErrorKind};
 use once_cell::sync::{Lazy, OnceCell};
 use regex::Regex;
-use relative_path::RelativePathBuf;
 pub use staging::StagingError;
 use streams::StreamRef;
 pub use streams::{Stream, StreamNotFound, Streams};
@@ -72,8 +71,7 @@ use crate::{
     static_schema::{StaticSchema, convert_static_schema_to_arrow_schema},
     storage::{
         ObjectStorage, ObjectStorageError, ObjectStorageProvider, ObjectStoreFormat, Owner,
-        Permisssion, StorageMetadata, StreamType, object_storage::is_tombstoned,
-        put_remote_metadata,
+        Permisssion, StorageMetadata, StreamType, put_remote_metadata,
     },
     tenants::{Service, TENANT_METADATA},
     validator,
@@ -498,10 +496,20 @@ impl Parseable {
         let storage = self.storage.get_object_store();
         // A deletion in progress (or left unfinished by a crashed node) must
         // never be resurrected by a concurrent lazy reload.
-        if is_tombstoned(storage.as_ref(), stream_name, tenant_id).await? {
+        if self
+            .metastore
+            .is_stream_deleting(stream_name, tenant_id)
+            .await
+            .map_err(crate::metastore::MetastoreError::into_storage_error)?
+        {
             return Ok(false);
         }
-        if !storage.stream_exists(stream_name, tenant_id).await? {
+        if !self
+            .metastore
+            .stream_exists(stream_name, tenant_id)
+            .await
+            .map_err(crate::metastore::MetastoreError::into_storage_error)?
+        {
             return Ok(false);
         }
         let (stream_metadata_bytes, schema_bytes) = try_join!(
@@ -1235,13 +1243,11 @@ impl Parseable {
     async fn load_tenants(&self) -> Result<(), anyhow::Error> {
         let is_multi_tenant = self.options.is_multi_tenant();
 
-        let obj_store = self.storage().get_object_store();
-        let dirs: Vec<String> = obj_store
-            .list_dirs_relative(&RelativePathBuf::from_iter([""]), &None)
-            .await?
-            .into_iter()
-            .filter(|d| !d.starts_with("."))
-            .collect();
+        let dirs = self
+            .metastore
+            .list_tenant_candidates()
+            .await
+            .map_err(crate::metastore::MetastoreError::into_storage_error)?;
 
         let mut recognized_tenants = vec![];
 
@@ -1267,9 +1273,11 @@ impl Parseable {
                 );
 
                 // delete from storage
-                if let Err(e) = obj_store
-                    .delete_prefix(&RelativePathBuf::from_iter([&tenant_id]), &None)
+                if let Err(e) = self
+                    .metastore
+                    .delete_tenant(&tenant_id)
                     .await
+                    .map_err(crate::metastore::MetastoreError::into_storage_error)
                 {
                     tracing::error!(
                         "Unable to delete invalid directory- {tenant_id} with error-\n{e}"
@@ -1432,7 +1440,8 @@ mod tests {
             storage.clone(),
         );
         let stream = server.get_or_create_stream("logs", &None);
-        let remote_path = RelativePathBuf::from("logs/.stream/.ingestor.other.schema");
+        let remote_path =
+            relative_path::RelativePathBuf::from("logs/.stream/.ingestor.other.schema");
         storage
             .put_object(
                 &remote_path,

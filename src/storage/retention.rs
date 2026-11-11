@@ -210,7 +210,6 @@ mod action {
     use crate::catalog::{ingestor_cleanup_reaches_tenant, remove_manifest_from_snapshot};
     use crate::option::Mode;
     use crate::parseable::PARSEABLE;
-    use crate::storage::object_storage::stream_data_path;
     use crate::tenants::TENANT_METADATA;
     use chrono::{Days, NaiveDate, Utc};
     use futures::{StreamExt, stream::FuturesUnordered};
@@ -266,13 +265,13 @@ mod action {
 
             for date in dates_to_delete {
                 // The tenant's own data, not a same-named stream of the default tenant.
-                let path = stream_data_path(&stream_name, &[&date], tenant_id);
+                let stream_name = &stream_name;
                 delete_tasks.push(async move {
                     PARSEABLE
-                        .storage
-                        .get_object_store()
-                        .delete_prefix(&path, tenant_id)
+                        .metastore
+                        .delete_stream_partition(stream_name, &date, tenant_id)
                         .await
+                        .map_err(crate::metastore::MetastoreError::into_storage_error)
                 });
             }
 

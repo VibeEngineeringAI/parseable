@@ -119,13 +119,7 @@ pub async fn readiness(req: HttpRequest) -> HttpResponse {
 
 pub async fn readiness_internal(tenant_id: &Option<String>) -> StatusCode {
     // Check the object store connection
-    if PARSEABLE
-        .storage
-        .get_object_store()
-        .check(tenant_id)
-        .await
-        .is_ok()
-    {
+    if PARSEABLE.metastore.check_health(tenant_id).await.is_ok() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
