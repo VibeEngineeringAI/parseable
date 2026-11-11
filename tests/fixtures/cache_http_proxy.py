@@ -21,7 +21,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         mode = mode_file.read_text()
         with mode_file.with_suffix('.requests').open('a') as log:
             log.write(str(bool(self.headers.get('If-None-Match'))) + '\n')
-        if mode == 'fail' and self.headers.get('If-None-Match'):
+        if (mode == 'headfail' and self.command == 'HEAD') or (mode == 'fail' and self.headers.get('If-None-Match')):
             self.send_response(503)
             self.send_header('Content-Length', '0')
             self.end_headers()

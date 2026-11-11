@@ -44,7 +44,7 @@ and column reads then use slices of the same body. On a subsequent request, a
 conditional GET validates the cached ETag. A 304 reuses the bytes without a body;
 a changed object replaces them. A 404/error invalidates the entry and propagates.
 Absent or weak (`W/`) ETags mean no cross-request body reuse. Growth past the limit uses the original
-reader with the newly observed size. The bounded probe prevents an unexpected
+reader with the newly observed size only for unsplit files; ranged growth fails. The bounded probe prevents an unexpected
 large replacement from being read into memory in full.
 
 Keys use the process's singleton storage-provider identity, object-store URL, and full object path,
@@ -56,8 +56,8 @@ concurrent metadata, bloom-filter and decoder opens. Validated bodies stay refer
 until the request finishes; they are not evicted by a second, smaller LRU. New
 requests never inherit the view. The keyed linked-list LRU performs lookup, promotion, and removal in O(1),
 without holding its mutex across I/O. Storage defaults to 64 MiB and 4,096 entries. Active readers
-can retain evicted bodies; as with existing scan buffers, their memory also depends
-on query concurrency. This limit is a cache residency limit, not a process RSS cap.
+can retain evicted bodies under the separate 64 MiB process-wide view reservation
+limit described below. Neither limit is a process RSS cap.
 
 Stream/tenant removal and retention need no cached catalog invalidation because
 catalog objects aren't cached across requests. They stop selecting deleted files.
@@ -83,7 +83,7 @@ across dashboard refreshes. No TLS handshake benefit has been measured here.
 ## Reproduction
 
 Build locally with `PATH=$HOME/.cargo/bin:$PATH`, `P_BUILD_NO_UI=1`, and
-`CARGO_BUILD_JOBS=4`. Run one Cargo command at a time:
+`CARGO_BUILD_JOBS=6`. Run one Cargo command at a time:
 
 ```
 cargo test --lib query::small_file_cache -- --nocapture
@@ -97,7 +97,7 @@ cargo clippy --all-targets
 The measurement uses MetricLayer and StorageMetricWindow, hence the same
 `parseable_storage_request_response_time_count` samples exposed by `/api/v1/metrics`.
 It generates 60 one-minute parquet files, opens a fresh DataFusion query session
-for each run, compares returned rows, and evaluates a PromQL rate range expression
+for each run, sharing a runtime for each cold/warm pair, compares returned rows, and evaluates a PromQL rate range expression
 from the scanned samples. It isolates parquet I/O: HTTP handlers, schema refresh,
 `stream.json` and manifest reads are outside the measurement. Do not interpret
 its table as a reproduction of the supplied live-instance endpoint totals.
@@ -136,8 +136,7 @@ the original DataFusion reader and its request pattern.
 `--small-file-cache-size` / `P_SMALL_FILE_CACHE_SIZE` defaults to `67108864` bytes
 (64 MiB); zero also disables installation. The process cache entry cap stays at 4,096. The request view retains admitted
 files until completion (including streaming completion); its references can outlive
-process-LRU residency, just as active readers can. These are residency limits, not RSS
-limits. No new required configuration or dependency was added.
+process-LRU residency. See the bounded admission policy below. No new required configuration or dependency was added.
 
 A scan whose selected small-file manifest sizes exceed the configured byte limit,
 or whose small-file count exceeds 4,096, bypasses installation entirely. It cannot
@@ -232,7 +231,7 @@ bloom filters, page indexes and sorted metric names. This is synthetic fixture
 publication, not a claim that 390 files were ingested over wall-clock minutes.
 The HTTP script ingests an actual OTLP gauge into staging before querying. Files
 are approximately 19.7 KB. Run a debug standalone server against this isolated
-bucket with `P_CACHE_TRACE=1`, then run
+bucket with `RUST_LOG=parseable::query::small_file_cache=trace`, then run
 `scripts/performance/request_cache_repro.py`. Set `CACHE_REPRO_REQUESTS` to a
 worktree-local JSON path to freeze the exact request ranges for before/after;
 set `CACHE_REPRO_ASSERT_ONCE=1` for the regression assertions. It performs two
@@ -288,3 +287,102 @@ and staging API compatibility warning; no warnings point to changed code.
 The temporary standalone process was stopped and the MinIO container and its
 anonymous volume were removed. No live-service settings, data or processes were
 changed. No push or PR was performed.
+
+
+## Review fixes and memory bound
+
+Admission accumulates unique selected manifest bytes across all scans in a request,
+including UNION branches, up to the configured budget and 4,096 paths. Separately,
+all live request views share a fixed 64 MiB reservation pool. Admission reserves
+256 KiB per distinct small file, so stale manifest sizes cannot underreserve a
+body. If either limit is exhausted the entire new scan uses the original reader
+immediately. Duplicate paths within an admitted request need no extra reservation.
+This conservative reservation can bypass a scan even when its actual bodies would
+fit. A bypassed scan has the original reader's I/O costs.
+
+Resident cache-owned body memory is bounded by the configured process LRU budget
+plus 64 MiB in request views/readers (128 MiB at defaults), counting shared
+allocations conservatively twice. During validation, a loader can temporarily
+hold both the previous body and its replacement; at most one loader per reserved
+file adds at most another 64 MiB. The worst-case body-memory bound including these
+transient references is therefore the LRU budget plus 128 MiB (192 MiB at defaults).
+This excludes ordinary DataFusion scan buffers, HTTP client
+buffers, decoded batches, metadata and small map/error overhead. It is not an RSS
+cap. Large-to-small recovery uses the original reader and cannot acquire an
+unreserved body. Every reader owns its view, keeping the reservation alive until
+its bytes can be dropped. Bodies remain in the view until request completion:
+DataFusion opens replacement decoders and later scan branches after prior readers
+have dropped, so reader-count-based release would restore double validation.
+The process bound covers concurrent requests, including slow streaming clients.
+
+DataFusion memory-pool registration is not used: these immutable shared Bytes
+cross runtime/pool boundaries through the process LRU; assigning a reservation to
+one pool would outlive that query or double-charge shared allocations. Admission
+and process reservations enforce a separate explicit bound without blocking.
+
+Ranged scans reject growth past the planned manifest EOF, including small-body
+loads. Existing partitions cannot cover new row groups beyond that EOF. Shrinkage
+can still recover; HEAD failures preserve the original metadata error.
+
+Trace instrumentation uses `tracing::trace!`, enabled by
+`RUST_LOG=parseable::query::small_file_cache=trace`; configure plain, uncolored log
+output for the reproduction script. The script uses default development
+credentials (`admin` / `admin`) and must target only an isolated development
+server. The HTTP fixture proxy is located under `tests/fixtures` via the crate
+root, independent of the test process working directory.
+
+The boolean parser was left unchanged after checking clap's sources and adding
+parity coverage with the existing `--dashboard-agent-writes` option: both accept
+only lowercase `true` and `false`; `1`, `0`, `yes`, `no` and uppercase variants
+are rejected by both. Broadening just this option would break that consistency.
+
+## Review remeasurement (2026-11-11)
+
+The 60-file, 579,821-byte fixture was run again against isolated real MinIO HTTP,
+through the production scan builder, forcing 32 byte-range partitions. Each pair
+uses separate request sessions on one shared runtime. The original reader and
+disabled-cache reader produced the same counts. All rows, evaluated PromQL points,
+and billing `bytes_scanned` matched for both cold and warm runs.
+
+| Shape | Original cold GET / GET_RANGES | Original shared-runtime warm | Pre-fix cache | Fixed cold | Fixed shared-runtime warm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| COUNT | 0 / 91 | 0 / 0 | 60 / 0 | 60 / 0 | 60 / 0 |
+| Filtered GROUP BY | 1 / 211 | 1 / 120 | 60 / 0 | 60 / 0 | 60 / 0 |
+| PromQL scan and evaluation | 120 / 270 | 120 / 180 | 60 / 0 | 60 / 0 | 60 / 0 |
+
+All columns were remeasured here. The pre-fix cache used the implementation from
+633b8e13 with only the harness changed to share a runtime for cold/warm pairs.
+Pre-fix and fixed cache counts were identical for all three shapes, cold and warm.
+Every fixed warm run issued 60 conditional GETs, received 60 not-modified outcomes,
+and transferred zero body bytes. Cold fixed runs transferred exactly 579,821 bytes.
+A warm metadata-only COUNT is cheaper with the original reader's runtime metadata
+cache; the validated cache intentionally pays one validation per selected file to
+observe remote mutations. Admission bypass preserves original-reader behavior.
+
+The new non-ignored production-path test uses two distinct UNION scans, each split
+across byte ranges, through `request_context` and the production scan builder. It
+asserts four GETs for four files on each of two independent requests, so losing
+the request extension causes duplicate validations across the UNION branches.
+The ranged-growth regression was also run with the growth guards temporarily
+removed: it failed because a query succeeded despite row groups beyond manifest
+EOF. Restoring the guards makes all three growth cases fail safely.
+
+An additional dependency limitation was observed while constructing a fault test:
+with a stale size and a range starting at zero, a short HTTP body can reach a
+Parquet 59 buffer-length assertion in the original DataFusion reader. The HEAD
+failure test instead uses a size-consistent corrupt body to isolate error
+precedence. The cache-disabled reader is unchanged; this separate upstream
+short-range panic was not changed by these fixes.
+
+The private object_store non-partial-error contract also has a non-ignored CI
+test using a minimal loopback HTTP server returning 200 to a Range request;
+this exercises the dependency's real response parser without MinIO.
+
+Final review validation: the full library suite passed with 1,393 passed, zero
+failed and seven visibly ignored tests. All 15 cache tests then passed with
+`--include-ignored --nocapture --test-threads=1` against isolated MinIO, including
+all three opt-in HTTP tests and the independent loopback HTTP contract test.
+Plain `cargo clippy --all-targets` passed with the existing 21 library-test
+warnings and staging API compatibility warning; none refer to changed code.
+The temporary MinIO container and its anonymous volume were removed. No live
+service, configuration or bucket was used. No push or PR change was performed.

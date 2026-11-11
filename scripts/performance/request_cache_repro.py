@@ -52,7 +52,8 @@ for name, path, body in shapes:
         after = metrics()
         with open(LOG) as trace:
             trace.seek(offset)
-            loads = collections.Counter(re.findall(r'CACHE_LOAD .*path=(\S+)',trace.read()))
+            lines = re.sub(r'\x1b\[[0-9;]*m', '', trace.read()).splitlines()
+            loads = collections.Counter(path for line in lines if 'CACHE_LOAD' in line for path in re.findall(r'\bpath=(\S+)', line))
         if run:
             print(json.dumps({'shape':name,'calls':int(after-before),'selected_files':len(loads),'validations':sum(loads.values()),'multiplicity':dict(collections.Counter(loads.values()))}), flush=True)
         if os.environ.get('CACHE_REPRO_ASSERT_ONCE'):

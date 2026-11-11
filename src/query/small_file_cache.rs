@@ -37,7 +37,10 @@ use parquet::{
 use std::{
     collections::HashMap,
     ops::Range,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -118,9 +121,7 @@ async fn load(
     namespace: &str,
     budget: usize,
 ) -> object_store::Result<(u64, Option<Bytes>)> {
-    if std::env::var_os("P_CACHE_TRACE").is_some() {
-        eprintln!("CACHE_LOAD scope={scope} path={path}");
-    }
+    tracing::trace!(scope, path = %path, "CACHE_LOAD");
     let key = Path::from(format!("{namespace}{}", path.as_ref()));
     // Keep a private reference during validation; eviction cannot lose the body
     // needed for a 304. Do not hold the cache lock across network I/O.
@@ -179,7 +180,10 @@ async fn load(
         Err(error) if non_partial(&error) => {
             cache.lock().unwrap().remove(scope, &key);
             // HEAD obtains the current size without trusting a stale manifest.
-            Ok((store.head(path).await?.size, None))
+            match store.head(path).await {
+                Ok(meta) => Ok((meta.size, None)),
+                Err(_) => Err(error),
+            }
         }
         Err(error) => {
             cache.lock().unwrap().remove(scope, &key);
@@ -190,9 +194,16 @@ async fn load(
 
 fn non_partial(error: &object_store::Error) -> bool {
     use std::error::Error;
+    // object_store 0.13's private GetResultError::NotPartial is exposed only
+    // through Generic. Match its leaf message, never arbitrary wrapper text.
+    if !matches!(error, object_store::Error::Generic { .. }) {
+        return false;
+    }
     let mut cause: &dyn Error = error;
     loop {
-        if cause.to_string() == "Received non-partial response when range requested" {
+        if cause.source().is_none()
+            && cause.to_string() == "Received non-partial response when range requested"
+        {
             return true;
         }
         match cause.source() {
@@ -210,6 +221,108 @@ type Loaded = std::result::Result<(u64, Option<Bytes>), Arc<object_store::Error>
 #[derive(Debug, Default)]
 pub(super) struct RequestView {
     files: Mutex<HashMap<Key, Arc<tokio::sync::OnceCell<Loaded>>>>,
+    admission: Mutex<Admission>,
+}
+
+// Reserve the maximum possible small body, rather than trusting manifest sizes.
+// Reservations also cover bodies held by readers after their plans are dropped:
+// every reader owns the view. No network operation waits for capacity.
+const VIEW_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+static VIEW_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[derive(Debug, Default)]
+struct Admission {
+    predicted: u128,
+    reserved: usize,
+    files: HashMap<Key, u64>,
+}
+impl RequestView {
+    fn admit(&self, files: HashMap<Key, u64>, budget: usize) -> bool {
+        let mut admission = self.admission.lock().unwrap();
+        let new: Vec<_> = files
+            .into_iter()
+            .filter(|(key, _)| !admission.files.contains_key(key))
+            .collect();
+        let predicted =
+            admission.predicted + new.iter().map(|(_, size)| *size as u128).sum::<u128>();
+        if predicted > budget as u128 || admission.files.len() + new.len() > MAX_ENTRIES {
+            return false;
+        }
+        let reserve = new.len() * MAX_FILE as usize;
+        if VIEW_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(reserve)
+                    .filter(|total| *total <= VIEW_BYTES_LIMIT)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        admission.predicted = predicted;
+        admission.reserved += reserve;
+        admission.files.extend(new);
+        true
+    }
+}
+impl Drop for RequestView {
+    fn drop(&mut self) {
+        // Drop bodies before making their reserved capacity available again.
+        self.files.get_mut().unwrap().clear();
+        VIEW_BYTES.fetch_sub(self.admission.get_mut().unwrap().reserved, Ordering::AcqRel);
+    }
+}
+
+// object_store::Error is not Clone. Reconstruct public classifications while
+// retaining the original error and its source chain in the shared source.
+fn shared_error(error: Arc<object_store::Error>) -> object_store::Error {
+    use object_store::Error::*;
+    match error.as_ref() {
+        NotFound { path, .. } => NotFound {
+            path: path.clone(),
+            source: Box::new(error),
+        },
+        AlreadyExists { path, .. } => AlreadyExists {
+            path: path.clone(),
+            source: Box::new(error),
+        },
+        Precondition { path, .. } => Precondition {
+            path: path.clone(),
+            source: Box::new(error),
+        },
+        NotModified { path, .. } => NotModified {
+            path: path.clone(),
+            source: Box::new(error),
+        },
+        PermissionDenied { path, .. } => PermissionDenied {
+            path: path.clone(),
+            source: Box::new(error),
+        },
+        Unauthenticated { path, .. } => Unauthenticated {
+            path: path.clone(),
+            source: Box::new(error),
+        },
+        NotSupported { .. } => NotSupported {
+            source: Box::new(error),
+        },
+        NotImplemented {
+            operation,
+            implementer,
+        } => NotImplemented {
+            operation: operation.clone(),
+            implementer: implementer.clone(),
+        },
+        UnknownConfigurationKey { store, key } => UnknownConfigurationKey {
+            store,
+            key: key.clone(),
+        },
+        Generic { store, .. } => Generic {
+            store,
+            source: Box::new(error),
+        },
+        _ => Generic {
+            store: "request small-file cache",
+            source: Box::new(error),
+        },
+    }
 }
 
 async fn load_for_scan(
@@ -229,10 +342,7 @@ async fn load_for_scan(
     })
     .await
     .clone()
-    .map_err(|source| object_store::Error::Generic {
-        store: "request small-file cache",
-        source: Box::new(source),
-    })
+    .map_err(shared_error)
 }
 
 pub(super) fn install(
@@ -256,23 +366,25 @@ pub(super) fn install(
     let (conf, source) = exec
         .downcast_to_file_source::<ParquetSource>()
         .expect("parquet source");
-    // Bypass scans whose predicted working set cannot survive one traversal.
-    let small = conf
+    let namespace = conf.object_store_url.to_string();
+    let files = conf
         .file_groups
         .iter()
         .flat_map(|group| group.iter())
         .filter(|file| file.object_meta.size <= MAX_FILE)
-        .collect::<Vec<_>>();
-    if small.len() > MAX_ENTRIES
-        || small
-            .iter()
-            .map(|file| file.object_meta.size as u128)
-            .sum::<u128>()
-            > budget as u128
-    {
+        .map(|file| {
+            (
+                (
+                    scope,
+                    Path::from(format!("{namespace}{}", file.object_meta.location)),
+                ),
+                file.object_meta.size,
+            )
+        })
+        .collect();
+    if !view.admit(files, budget) {
         return Ok(plan);
     }
-    let namespace = conf.object_store_url.to_string();
     let fallback = source
         .parquet_file_reader_factory()
         .cloned()
@@ -314,14 +426,7 @@ impl ParquetFileReaderFactory for SmallFileReaderFactory {
         hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion::common::Result<Box<dyn AsyncFileReader + Send>> {
-        if std::env::var_os("P_CACHE_TRACE").is_some() {
-            eprintln!(
-                "CACHE_READER view={:p} partition={partition} path={} range={:?}",
-                Arc::as_ptr(&self.view),
-                file.object_meta.location,
-                file.range
-            );
-        }
+        tracing::trace!(view = ?Arc::as_ptr(&self.view), partition, path = %file.object_meta.location, range = ?file.range, "CACHE_READER");
         let fallback = self
             .fallback
             .create_reader(partition, file.clone(), hint, metrics)?;
@@ -338,6 +443,7 @@ impl ParquetFileReaderFactory for SmallFileReaderFactory {
             scope: self.scope,
             namespace: self.namespace.clone(),
             budget: self.budget,
+            planned_size: file.object_meta.size,
             file,
             partition,
             metrics: metrics.clone(),
@@ -349,6 +455,7 @@ impl ParquetFileReaderFactory for SmallFileReaderFactory {
     }
 }
 struct Reader {
+    planned_size: u64,
     hint: Option<usize>,
     view: Arc<RequestView>,
     file_metrics: datafusion::datasource::physical_plan::ParquetFileMetrics,
@@ -364,10 +471,17 @@ struct Reader {
     initialized: bool,
     bytes: Option<Bytes>,
 }
+impl Drop for Reader {
+    fn drop(&mut self) {
+        // The view may be this reader's last reference. Release private body
+        // ownership before its reservation can be returned by RequestView::drop.
+        self.bytes = None;
+    }
+}
 impl Reader {
     async fn init(&mut self) -> Result<()> {
         if !self.initialized {
-            if self.file.object_meta.size > MAX_FILE {
+            if self.planned_size > MAX_FILE {
                 self.initialized = true;
                 return Ok(());
             }
@@ -381,6 +495,11 @@ impl Reader {
             )
             .await
             .map_err(|e| ParquetError::External(Box::new(e)))?;
+            if self.file.range.is_some() && size > self.planned_size {
+                return Err(ParquetError::General(
+                    "Stale manifest: ranged parquet file grew beyond planned size".into(),
+                ));
+            }
             if bytes.is_none() {
                 self.file.object_meta.size = size;
                 self.fallback = self
@@ -438,12 +557,13 @@ impl AsyncFileReader for Reader {
                     Err(error) => {
                         // A formerly large object may have shrunk while the
                         // manifest still describes its old footer position.
-                        let current = self
-                            .store
-                            .head(&self.file.object_meta.location)
-                            .await
-                            .map_err(|e| ParquetError::External(Box::new(e)))?;
-                        if current.size == self.file.object_meta.size {
+                        let current = match self.store.head(&self.file.object_meta.location).await {
+                            Ok(current) => current,
+                            Err(_) => return Err(error),
+                        };
+                        if current.size == self.file.object_meta.size
+                            || (self.file.range.is_some() && current.size > self.planned_size)
+                        {
                             return Err(error);
                         }
                         self.file.object_meta = current;
@@ -730,6 +850,119 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shared_not_found_keeps_its_kind() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let view = RequestView::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                load_for_scan(&view, 98901, &store, &Path::from("absent"), "", MAX_BYTES).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_non_partial_error_contract() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=0-1")
+            );
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nabc").await.unwrap();
+        });
+        let store = object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(format!("http://{address}"))
+            .with_allow_http(true)
+            .with_region("us-east-1")
+            .with_bucket_name("test")
+            .with_access_key_id("test")
+            .with_secret_access_key("test")
+            .with_retry(object_store::RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+        let error = store
+            .get_opts(
+                &Path::from("file"),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(
+            non_partial(&error),
+            "object_store's private non-partial error contract changed: {error:?}"
+        );
+        let unrelated = object_store::Error::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::other("unrelated")),
+        };
+        assert!(!non_partial(&unrelated));
+    }
+
+    #[test]
+    fn cache_boolean_matches_existing_boolean_options() {
+        use clap::Parser;
+        for value in ["true", "false", "1", "0", "yes", "no", "TRUE", "FALSE"] {
+            let cache = crate::cli::Cli::try_parse_from([
+                "parseable",
+                "local-store",
+                "target/cache-cli-test",
+                "--small-file-cache-enabled",
+                value,
+            ]);
+            let existing = crate::cli::Cli::try_parse_from([
+                "parseable",
+                "local-store",
+                "target/cache-cli-test",
+                "--dashboard-agent-writes",
+                value,
+            ]);
+            assert_eq!(cache.is_ok(), existing.is_ok(), "{value}");
+            assert_eq!(cache.is_ok(), matches!(value, "true" | "false"));
+        }
+    }
+
+    #[test]
+    fn cumulative_admission_and_process_bound() {
+        let view = RequestView::default();
+        let files = |name: &str, size| [((717, Path::from(name)), size)].into();
+        assert!(view.admit(files("a", 10), 15));
+        assert!(
+            view.admit(files("a", 10), 15),
+            "repeated paths cost no extra reservation"
+        );
+        assert!(
+            !view.admit(files("b", 10), 15),
+            "UNION scans share a request budget"
+        );
+        assert_eq!(view.admission.lock().unwrap().reserved, MAX_FILE as usize);
+        let too_many = (0..257)
+            .map(|i| ((718, Path::from(i.to_string())), 1))
+            .collect();
+        assert!(
+            !RequestView::default().admit(too_many, MAX_BYTES),
+            "process capacity bypasses without waiting"
+        );
+    }
+
     #[test]
     fn bounds_eviction_and_replacement() {
         let mut cache = Cache::default();
@@ -760,18 +993,13 @@ mod measurement {
     use super::*;
     use crate::{
         promql::{self, QueryPlan, Sample, Series},
-        query::stream_schema_provider::build_parquet_scan_components_with_full_filters as build_parquet_scan_components,
         storage::{StorageMetricWindow, metrics_layer::MetricLayer},
     };
     use arrow_array::{Array, Float64Array, RecordBatch, StringArray, TimestampMillisecondArray};
     use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use datafusion::{
         catalog::Session,
-        datasource::{
-            TableProvider,
-            file_format::FileFormat,
-            physical_plan::{FileGroup, FileScanConfigBuilder},
-        },
+        datasource::TableProvider,
         execution::object_store::ObjectStoreUrl,
         logical_expr::TableType,
         physical_plan::ExecutionPlan,
@@ -992,46 +1220,174 @@ mod measurement {
             filters: &[Expr],
             limit: Option<usize>,
         ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-            let url = ObjectStoreUrl::parse("s3://cache-measurement").unwrap();
-            let (format, source) =
-                build_parquet_scan_components(self.schema.clone(), filters, state)?;
-            let mut builder = FileScanConfigBuilder::new(url.clone(), source.into())
-                .with_file_groups(
-                    self.files
-                        .chunks(15)
-                        .map(|files| FileGroup::new(files.to_vec()))
-                        .collect(),
-                )
-                .with_limit(limit);
-            if let Some(p) = projection {
-                builder = builder.with_projection_indices(Some(p.clone()))?;
-            }
-            let plan = format.create_physical_plan(state, builder.build()).await?;
-            if self.cached {
-                install(
-                    plan,
-                    state.runtime_env().object_store(url)?,
-                    12345,
-                    MAX_BYTES,
-                    true,
-                    state
-                        .config()
-                        .get_extension::<RequestView>()
-                        .unwrap_or_default(),
-                )
-            } else if self.disabled {
-                install(
-                    plan,
-                    state.runtime_env().object_store(url)?,
-                    12345,
-                    MAX_BYTES,
-                    false,
-                    Arc::default(),
-                )
-            } else {
-                Ok(plan)
-            }
+            super::super::stream_schema_provider::parquet_scan_plan_with_cache_options(
+                self.schema.clone(),
+                ObjectStoreUrl::parse("s3://cache-measurement").unwrap(),
+                self.files.chunks(15).map(|files| files.to_vec()).collect(),
+                datafusion::common::Statistics::new_unknown(&self.schema),
+                projection,
+                filters,
+                limit,
+                state,
+                8192,
+                (12345, MAX_BYTES, self.cached && !self.disabled),
+            )
+            .await
         }
+    }
+
+    fn split_context(store: Arc<dyn ObjectStore>, files: Vec<PartitionedFile>) -> SessionContext {
+        let mut config = SessionConfig::new().with_target_partitions(32);
+        config.options_mut().optimizer.repartition_file_min_size = 1;
+        config.options_mut().optimizer.repartition_file_scans = true;
+        config
+            .options_mut()
+            .execution
+            .enable_file_stream_work_stealing = true;
+        let shared = SessionContext::new_with_config(config);
+        shared
+            .runtime_env()
+            .register_object_store(&url::Url::parse("s3://cache-measurement").unwrap(), store);
+        shared
+            .register_table(
+                "metrics",
+                Arc::new(Table {
+                    schema: Arc::new(Schema::new(vec![Field::new(
+                        "value",
+                        DataType::Int64,
+                        false,
+                    )])),
+                    files,
+                    cached: true,
+                    disabled: false,
+                }),
+            )
+            .unwrap();
+        shared
+    }
+
+    #[tokio::test]
+    async fn production_request_validates_once_across_range_readers() {
+        let store: Arc<dyn ObjectStore> = Arc::new(MetricLayer::new(
+            object_store::memory::InMemory::new(),
+            "production-request",
+        ));
+        let body = parquet((0..1000).collect());
+        let mut files = Vec::new();
+        for i in 0..4 {
+            let path = format!("production/{i}.parquet");
+            store
+                .put(&Path::from(path.clone()), body.clone().into())
+                .await
+                .unwrap();
+            files.push(PartitionedFile::new(path, body.len() as u64));
+        }
+        let shared = split_context(store, files);
+        for _ in 0..2 {
+            let ctx = super::super::request_context(shared.state());
+            let window = StorageMetricWindow::start("production-request");
+            let plan = ctx
+                .sql("SELECT SUM(value) FROM metrics WHERE value >= 0 UNION ALL SELECT SUM(value) FROM metrics WHERE value > -1")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let display = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                display.contains("parquet:0.."),
+                "must split into byte ranges: {display}"
+            );
+            let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                2
+            );
+            for batch in &batches {
+                for value in batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .values()
+                {
+                    assert_eq!(*value, 4 * 999 * 1000 / 2);
+                }
+            }
+            assert_eq!(window.delta().get_requests, 4);
+            assert_eq!(window.delta().get_ranges_requests, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ranged_growth_must_fail_instead_of_losing_row_groups() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        // Separate uncompressed row groups put first-page offsets beyond the
+        // stale manifest EOF, for both formerly small and formerly large files.
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(arrow_array::Int64Array::from(
+                (0..100_000).collect::<Vec<i64>>(),
+            )) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let mut body = Vec::new();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1000))
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut body, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&Bytes::copy_from_slice(&body))
+            .unwrap();
+        for planned in [1024, MAX_FILE + 1024] {
+            assert!(
+                metadata
+                    .row_groups()
+                    .iter()
+                    .any(|rg| rg.column(0).data_page_offset() as u64 >= planned)
+            );
+            store
+                .put(
+                    &Path::from("growth.parquet"),
+                    Bytes::copy_from_slice(&body).into(),
+                )
+                .await
+                .unwrap();
+            let shared = split_context(
+                store.clone(),
+                vec![PartitionedFile::new("growth.parquet", planned)],
+            );
+            let ctx = super::super::request_context(shared.state());
+            let df = ctx.sql("SELECT SUM(value) FROM metrics").await.unwrap();
+            assert!(
+                df.collect().await.is_err(),
+                "growth beyond planned ranges must not succeed with missing rows"
+            );
+        }
+        // A fetched small body may also grow beyond its stale planned ranges.
+        let body = parquet((0..1000).collect());
+        store
+            .put(&Path::from("growth.parquet"), body.into())
+            .await
+            .unwrap();
+        let ctx = super::super::request_context(
+            split_context(store, vec![PartitionedFile::new("growth.parquet", 32)]).state(),
+        );
+        assert!(
+            ctx.sql("SELECT SUM(value) FROM metrics")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .is_err()
+        );
     }
 
     // This uses the production ParquetFormat, scan components, metrics layer,
@@ -1135,9 +1491,8 @@ mod measurement {
                         );
                     }
                 }
+                let runtime = Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default());
                 for run in 0..2 {
-                    // Production builds a new query session; the process cache
-                    // survives these sessions, DataFusion's session cache doesn't.
                     let mut config = SessionConfig::new()
                         .with_target_partitions(32)
                         .with_extension(Arc::new(RequestView::default()));
@@ -1155,7 +1510,9 @@ mod measurement {
                         Some(2 * 1024 * 1024);
                     config.options_mut().execution.parquet.enable_page_index = true;
                     config.options_mut().execution.parquet.pushdown_filters = true;
-                    let ctx = SessionContext::new_with_config(config);
+                    let ctx = super::super::request_context(
+                        SessionContext::new_with_config_rt(config, runtime.clone()).state(),
+                    );
                     ctx.runtime_env().register_object_store(
                         &url::Url::parse("s3://cache-measurement").unwrap(),
                         store.clone(),
@@ -1425,7 +1782,10 @@ mod measurement {
             std::process::Command::new("python3")
                 .args([
                     "-u",
-                    "src/query/cache_http_proxy.py",
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/cache_http_proxy.py"
+                    ),
                     &endpoint,
                     mode.to_str().unwrap(),
                 ])
@@ -1492,6 +1852,23 @@ mod measurement {
             backend.put(&path, new.clone().into()).await.unwrap();
             std::fs::write(&mode, fault).unwrap();
             std::fs::write(mode.with_extension("requests"), "").unwrap();
+            if fault == "full" {
+                let error = store
+                    .get_opts(
+                        &path,
+                        GetOptions {
+                            range: Some(GetRange::Bounded(0..MAX_FILE + 1)),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, object_store::Error::Generic { .. }));
+                assert!(
+                    non_partial(&error),
+                    "object_store non-partial error contract changed: {error:?}"
+                );
+            }
             let window = StorageMetricWindow::start("http-mutations");
             for _ in 0..2 {
                 assert_eq!(
@@ -1509,6 +1886,24 @@ mod measurement {
             }
             std::fs::write(&mode, "normal").unwrap();
         }
+        std::fs::write(&mode, "headfail").unwrap();
+        backend
+            .put(&path, Bytes::from(vec![0; MAX_FILE as usize + 1]).into())
+            .await
+            .unwrap();
+        let original = query(store.clone(), MAX_FILE + 1, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        let recovered = query(store.clone(), MAX_FILE + 1, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            recovered, original,
+            "HEAD failure must preserve the metadata error"
+        );
+        std::fs::write(&mode, "normal").unwrap();
         // Unique integers defeat dictionary compression, producing a real large parquet file.
         let values = (0..100_000).collect::<Vec<i64>>();
         let large = parquet(values.clone());

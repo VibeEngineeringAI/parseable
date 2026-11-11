@@ -363,15 +363,51 @@ async fn parquet_scan_plan(
     state: &dyn Session,
     batch_size: usize,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    let (file_format, file_source) = build_parquet_scan_components(schema, filters, state)?;
-    let cache_store = if object_store_url.as_str() != "file:///"
-        && PARSEABLE.options.small_file_cache_enabled
-        && PARSEABLE.options.small_file_cache_size > 0
-    {
-        Some(state.runtime_env().object_store(&object_store_url)?)
+    let cache_options = if object_store_url.as_str() == "file:///" {
+        (0, 0, false)
     } else {
-        None
+        (
+            Arc::as_ptr(&PARSEABLE.storage) as *const () as usize,
+            PARSEABLE.options.small_file_cache_size,
+            PARSEABLE.options.small_file_cache_enabled,
+        )
     };
+    parquet_scan_plan_with_cache_options(
+        schema,
+        object_store_url,
+        partitions,
+        statistics,
+        projection,
+        filters,
+        limit,
+        state,
+        batch_size,
+        cache_options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn parquet_scan_plan_with_cache_options(
+    schema: SchemaRef,
+    object_store_url: ObjectStoreUrl,
+    partitions: Vec<Vec<PartitionedFile>>,
+    statistics: Statistics,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+    state: &dyn Session,
+    batch_size: usize,
+    cache_options: (usize, usize, bool),
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let (file_format, file_source) = build_parquet_scan_components(schema, filters, state)?;
+    let (cache_scope, cache_budget, cache_enabled) = cache_options;
+    let cache_store =
+        if object_store_url.as_str() != "file:///" && cache_enabled && cache_budget > 0 {
+            Some(state.runtime_env().object_store(&object_store_url)?)
+        } else {
+            None
+        };
 
     // create file groups from vec file partitions
     let file_groups = partitions.into_iter().map(FileGroup::new).collect_vec();
@@ -406,9 +442,9 @@ async fn parquet_scan_plan(
         super::small_file_cache::install(
             plan,
             store,
-            Arc::as_ptr(&PARSEABLE.storage) as *const () as usize,
-            PARSEABLE.options.small_file_cache_size,
-            PARSEABLE.options.small_file_cache_enabled,
+            cache_scope,
+            cache_budget,
+            cache_enabled,
             state
                 .config()
                 .get_extension::<super::small_file_cache::RequestView>()
