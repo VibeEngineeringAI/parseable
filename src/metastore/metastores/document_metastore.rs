@@ -143,7 +143,7 @@ impl $name {
         tenant_id: &Option<String>,
     ) -> Result<Vec<Filter>, MetastoreError> {
         let users_dir =
-            RelativePathBuf::from_iter([tenant_id.as_deref().unwrap_or(""), USERS_ROOT_DIR]);
+            RelativePathBuf::from_iter([tenant_id.as_deref().filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT).unwrap_or(""), USERS_ROOT_DIR]);
         let mut grouped: BTreeMap<(String, String), Vec<(RelativePathBuf, Filter)>> =
             BTreeMap::new();
         for user in self
@@ -357,7 +357,7 @@ impl Metastore for $name {
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError> {
         let id = obj.get_object_id();
-        let path = if let Some(tenant_id) = tenant_id.as_ref() {
+        let path = if let Some(tenant_id) = tenant_id.as_ref().filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT) {
             RelativePathBuf::from_iter([tenant_id, ".keystone", &format!("{id}.json")])
         } else {
             RelativePathBuf::from_iter([".keystone", &format!("{id}.json")])
@@ -375,7 +375,7 @@ impl Metastore for $name {
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError> {
         let id = obj.get_object_id();
-        let path = if let Some(tenant_id) = tenant_id.as_ref() {
+        let path = if let Some(tenant_id) = tenant_id.as_ref().filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT) {
             RelativePathBuf::from_iter([tenant_id, ".keystone", &format!("{id}.json")])
         } else {
             RelativePathBuf::from_iter([".keystone", &format!("{id}.json")])
@@ -415,7 +415,7 @@ impl Metastore for $name {
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError> {
         let id = obj.get_object_id();
-        let path = if let Some(tenant_id) = tenant_id.as_ref() {
+        let path = if let Some(tenant_id) = tenant_id.as_ref().filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT) {
             RelativePathBuf::from_iter([tenant_id, ".keystone", &format!("conv_{id}.json")])
         } else {
             RelativePathBuf::from_iter([".keystone", &format!("conv_{id}.json")])
@@ -433,7 +433,7 @@ impl Metastore for $name {
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError> {
         let id = obj.get_object_id();
-        let path = if let Some(tenant_id) = tenant_id.as_ref() {
+        let path = if let Some(tenant_id) = tenant_id.as_ref().filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT) {
             RelativePathBuf::from_iter([tenant_id, ".keystone", &format!("conv_{id}.json")])
         } else {
             RelativePathBuf::from_iter([".keystone", &format!("conv_{id}.json")])
@@ -513,7 +513,7 @@ impl Metastore for $name {
         &self,
         tenant_id: &Option<String>,
     ) -> Result<Vec<AlertStateEntry>, MetastoreError> {
-        let tenant = tenant_id.as_deref().unwrap_or(DEFAULT_TENANT);
+        let tenant = tenant_id.as_deref().filter(|t| !t.is_empty() && *t != DEFAULT_TENANT).unwrap_or("");
         let base_path = RelativePathBuf::from_iter([tenant, ALERTS_ROOT_DIRECTORY]);
         let alert_state_bytes = self
             .storage
@@ -770,7 +770,7 @@ impl Metastore for $name {
         tenant_id: &Option<String>,
     ) -> Result<Vec<Bytes>, MetastoreError> {
         let users =
-            RelativePathBuf::from_iter([tenant_id.as_deref().unwrap_or(""), USERS_ROOT_DIR]);
+            RelativePathBuf::from_iter([tenant_id.as_deref().filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT).unwrap_or(""), USERS_ROOT_DIR]);
         let mut dashboards = Vec::new();
         for owner in self.storage.list_dirs_relative(&users, tenant_id).await? {
             if owner.starts_with('.') {
@@ -966,7 +966,7 @@ impl Metastore for $name {
         tenant_id: &Option<String>,
         _is_migration: bool,
     ) -> Result<Bytes, MetastoreError> {
-        let tenant = tenant_id.as_deref().unwrap_or("");
+        let tenant = tenant_id.as_deref().filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT).unwrap_or("");
         let path = if get_base {
             RelativePathBuf::from_iter([
                 tenant,
@@ -988,7 +988,7 @@ impl Metastore for $name {
         tenant_id: &Option<String>,
         _is_migration: bool,
     ) -> Result<Vec<Bytes>, MetastoreError> {
-        let root = tenant_id.as_deref().unwrap_or("");
+        let root = tenant_id.as_deref().filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT).unwrap_or("");
         let path = RelativePathBuf::from_iter([root, stream_name, STREAM_ROOT_DIRECTORY]);
         if let Some(mode) = mode {
             if mode.eq(&Mode::Ingest) {
@@ -1058,7 +1058,7 @@ impl Metastore for $name {
             let inventory_limit = inventory_limit.clone();
             async move {
                 let t_start = std::time::Instant::now();
-                let date_path = if let Some(tenant) = tenant.as_ref() {
+                let date_path = if let Some(tenant) = tenant.as_ref().filter(|t| !t.is_empty() && t.as_str() != DEFAULT_TENANT) {
                     object_store::path::Path::from(format!("{}/{}/{}", tenant, stream, date))
                 } else {
                     object_store::path::Path::from(format!("{}/{}", stream, date))
@@ -1338,7 +1338,7 @@ impl Metastore for $name {
         stream_name: &str,
         tenant_id: &Option<String>,
     ) -> Result<Vec<Schema>, MetastoreError> {
-        let path_prefix = if let Some(tenant) = tenant_id {
+        let path_prefix = if let Some(tenant) = tenant_id.as_ref().filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT) {
             relative_path::RelativePathBuf::from(format!(
                 "{tenant}/{stream_name}/{STREAM_ROOT_DIRECTORY}"
             ))
@@ -1392,7 +1392,7 @@ impl Metastore for $name {
         };
         if canonical.as_ref().map(normalize) != Some(normalize(&merged)) {
             let path = RelativePathBuf::from_iter([
-                tenant_id.as_deref().unwrap_or(""),
+                tenant_id.as_deref().filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT).unwrap_or(""),
                 stream_name,
                 STREAM_ROOT_DIRECTORY,
                 schema_file,
@@ -1432,7 +1432,7 @@ impl Metastore for $name {
         &self,
         tenant_id: &Option<String>,
     ) -> Result<Option<Bytes>, MetastoreError> {
-        let path = if let Some(tenant_id) = tenant_id.as_ref() {
+        let path = if let Some(tenant_id) = tenant_id.as_ref().filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT) {
             RelativePathBuf::from_iter([tenant_id, ".parseable.json"])
         } else {
             parseable_json_path()
@@ -1477,7 +1477,7 @@ impl Metastore for $name {
         obj: &dyn MetastoreObject,
         tenant_id: &Option<String>,
     ) -> Result<(), MetastoreError> {
-        let path = if let Some(tenant_id) = tenant_id.as_ref() {
+        let path = if let Some(tenant_id) = tenant_id.as_ref().filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT) {
             RelativePathBuf::from_iter([tenant_id, ".parseable.json"])
         } else {
             parseable_json_path()
@@ -1637,7 +1637,14 @@ pub(crate) fn document_scope(key: &str) -> Option<(String, &'static str)> {
         let date = parts.iter().position(|p| p.starts_with("date="))?;
         return match date {
             1 => Some((String::new(), "manifest")),
-            2 => Some((parts[0].to_owned(), "manifest")),
+            2 => Some((
+                if parts[0] == crate::parseable::DEFAULT_TENANT {
+                    String::new()
+                } else {
+                    parts[0].to_owned()
+                },
+                "manifest",
+            )),
             _ => None,
         };
     }

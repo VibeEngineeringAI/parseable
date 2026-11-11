@@ -60,6 +60,10 @@ mod tests {
     fn unavailable_and_deleting_http_status() {
         use crate::storage::ObjectStorageError;
         use actix_web::{ResponseError, http::StatusCode};
+        let query = crate::handlers::http::query::QueryError::ObjectStorage(
+            ObjectStorageError::Custom("ordinary storage failure".into()),
+        );
+        assert_eq!(query.status_code(), StatusCode::BAD_REQUEST);
         for (error, status) in [
             (ObjectStorageError::StreamDeleting, StatusCode::CONFLICT),
             (
@@ -210,6 +214,22 @@ mod tests {
         )?);
         db.check(&None).await?;
         assert_eq!(db.client().await?.query_one("SHOW application_name",&[]).await?.get::<_,String>(0),"review-preserved");
+        // With the server timeout disabled, a client timeout must send CancelRequest.
+        let cancel_db = PostgresDocuments::new(&PostgresOptions {
+            metastore_postgres_statement_timeout_ms: 300, ..opts.clone()
+        }, "review".into(), storage.clone())?;
+        let cancel_client = cancel_db.client().await?;
+        let pid: i32 = cancel_client.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        cancel_client.batch_execute("SET statement_timeout=0").await?;
+        assert!(cancel_client.query("SELECT pg_sleep(30)", &[]).await.is_err());
+        let mut still_active = true;
+        for _ in 0..50 {
+            still_active = db.client().await?.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND state='active')", &[&pid]).await?.get(0);
+            if !still_active { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!still_active, "client timeout left its statement running");
+        drop(cancel_client);
         let store = PostgresMetastore {
             storage: db.clone(),
         };

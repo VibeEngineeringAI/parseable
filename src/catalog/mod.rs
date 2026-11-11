@@ -585,7 +585,10 @@ pub fn partition_path(
     upper_bound: DateTime<Utc>,
     tenant_id: &Option<String>,
 ) -> RelativePathBuf {
-    let root = tenant_id.as_deref().unwrap_or("");
+    let root = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     let lower = lower_bound.date_naive().format("%Y-%m-%d").to_string();
     let upper = upper_bound.date_naive().format("%Y-%m-%d").to_string();
     if lower == upper {

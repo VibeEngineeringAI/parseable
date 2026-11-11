@@ -246,6 +246,7 @@ mod boundary_tests {
                     (function, token.as_str()),
                     ("upload_single_parquet_file", "upload_multipart")
                         | ("upload_single_parquet_file", "delete_object")
+                        | ("compensate_uploaded_parquet", "delete_object")
                 );
             if !allowed
                 && matches!(

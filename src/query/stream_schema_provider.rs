@@ -752,15 +752,22 @@ async fn collect_from_snapshot_cached(
     // latency, so run them concurrently instead of serially. `buffered` keeps
     // the snapshot ordering, which the `rev()` below depends on.
     let items = snapshot.manifests(time_filters);
+    let mut uncached = Vec::new();
+    for item in &items {
+        if let Some(cache) = cache
+            && cache
+                .manifests
+                .lock()
+                .await
+                .contains_key(&item.manifest_path)
+        {
+            continue;
+        }
+        uncached.push(item.manifest_path.clone());
+    }
     let batch = PARSEABLE
         .metastore
-        .manifest_batch(
-            &items
-                .iter()
-                .map(|m| m.manifest_path.clone())
-                .collect::<Vec<_>>(),
-            tenant_id,
-        )
+        .manifest_batch(&uncached, tenant_id)
         .await
         .map_err(|e| DataFusionError::Plan(e.to_string()))?;
     let manifest_files = futures_util::stream::iter(items)
@@ -773,26 +780,27 @@ async fn collect_from_snapshot_cached(
             } = manifest_item;
             let batch = batch.as_ref();
             async move {
-                if let Some(batch) = batch {
-                    return Ok(batch.get(&manifest_path).cloned().flatten());
-                }
                 if let Some(cache) = cache
                     && let Some(manifest) =
                         cache.manifests.lock().await.get(&manifest_path).cloned()
                 {
                     return Ok(manifest);
                 }
-                let manifest_opt = PARSEABLE
-                    .metastore
-                    .get_manifest(
-                        stream_name,
-                        time_lower_bound,
-                        time_upper_bound,
-                        Some(manifest_path.clone()),
-                        tenant_id,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+                let manifest_opt = if let Some(batch) = batch {
+                    batch.get(&manifest_path).cloned().flatten()
+                } else {
+                    PARSEABLE
+                        .metastore
+                        .get_manifest(
+                            stream_name,
+                            time_lower_bound,
+                            time_upper_bound,
+                            Some(manifest_path.clone()),
+                            tenant_id,
+                        )
+                        .await
+                        .map_err(|e| DataFusionError::Plan(e.to_string()))?
+                };
                 if manifest_opt.is_none() {
                     tracing::warn!(
                         "Manifest missing for stream={} [{:?} - {:?}]",

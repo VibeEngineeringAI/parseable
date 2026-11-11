@@ -8,11 +8,12 @@ super::document_metastore::document_metastore!(
             paths: &[String],
             tenant: &Option<String>,
         ) -> Result<Option<HashMap<String, Option<Manifest>>>, MetastoreError> {
-            let rows = self.storage.manifest_batch(paths, tenant).await?;
             let mut result: HashMap<String, Option<Manifest>> =
                 paths.iter().map(|p| (p.clone(), None)).collect();
-            for (key, body) in rows {
-                result.insert(key, Some(decode_manifest_blocking(body).await?));
+            for chunk in paths.chunks(32) {
+                for (key, body) in self.storage.manifest_batch(chunk, tenant).await? {
+                    result.insert(key, Some(decode_manifest_blocking(body).await?));
+                }
             }
             Ok(Some(result))
         }
@@ -227,7 +228,21 @@ pub async fn run_migration(
         "migration requires explicit P_STAGING_DIR or --local-staging-path"
     );
     // Staging metadata alone is normal; event buffers must have uploaded first.
-    let mut dirs = vec![options.local_staging_path.clone()];
+    let staging = options.local_staging_path.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "staging directory must exist ({}): {e}",
+            options.local_staging_path.display()
+        )
+    })?;
+    anyhow::ensure!(staging.is_dir(), "staging path must be a directory");
+    eprintln!("Resolved staging directory: {}", staging.display());
+    eprintln!(
+        "Environment file: {}",
+        crate::interactive::loaded_env_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none (explicit environment/CLI only)".into())
+    );
+    let mut dirs = vec![staging];
     while let Some(dir) = dirs.pop() {
         if !dir.exists() {
             continue;
@@ -303,7 +318,12 @@ mod contract_tests {
                 options.multi_tenancy = true;
                 options.postgres.metastore_postgres_url =
                     Some(std::env::var("P_CONTRACT_STARTUP_URL").unwrap());
-                options.postgres.metastore_postgres_statement_timeout_ms = 500;
+                options.postgres.metastore_postgres_statement_timeout_ms =
+                    if std::env::var("P_CONTRACT_STARTUP_FAILURE").as_deref() == Ok("none") {
+                        500
+                    } else {
+                        5000
+                    };
                 Arc::new(PostgresMetastore {
                     storage: Arc::new(
                         super::super::postgres_documents::PostgresDocuments::new(
@@ -800,15 +820,18 @@ mod contract_tests {
                     .unwrap()
                     .is_some()
             );
-            // Preserve the existing default-state directory mismatch.
-            let placeholder = Document {
-                id: "placeholder".into(),
-                path: format!("{}/.alerts/placeholder", crate::parseable::DEFAULT_TENANT),
-                value: String::new(),
-            };
-            store.put_dashboard(&placeholder, &None).await.unwrap();
             let states = store.get_alert_states(&tenant).await.unwrap();
-            assert_eq!(states.len(), usize::from(tenant.is_some()));
+            assert_eq!(states.len(), 1);
+            if tenant.is_none() {
+                assert_eq!(
+                    store
+                        .get_alert_states(&Some(crate::parseable::DEFAULT_TENANT.into()))
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
             store.delete_alert_state(&state, &tenant).await.unwrap();
             assert!(
                 store
@@ -1077,7 +1100,7 @@ mod contract_tests {
             let storage: Arc<dyn ObjectStorage> = Arc::new(LocalFS::new(dir.path().to_owned()));
             let options = PostgresOptions {
                 metastore_postgres_url: Some(url.to_string()),
-                metastore_postgres_statement_timeout_ms: 500,
+                metastore_postgres_statement_timeout_ms: if case == 7 { 5000 } else { 500 },
                 metastore_postgres_connect_timeout_ms: 500,
                 ..Default::default()
             };
@@ -1093,7 +1116,41 @@ mod contract_tests {
             let store = PostgresMetastore {
                 storage: documents.clone(),
             };
-            if case == 0 {
+            if case == 7 {
+                let name = dir.path().file_name().unwrap().to_str().unwrap();
+                for tenant in [None, Some(name.to_owned())] {
+                    let prefix = tenant.as_ref().map(|t| format!("{t}/")).unwrap_or_default();
+                    let exact = format!("{prefix}{name}/date=2026-01-01/manifest.json");
+                    documents.put_object(RelativePath::new(&exact), Bytes::from_static(b"exact"), &tenant).await.unwrap();
+                    assert_eq!(documents.get_object(RelativePath::new(&exact), &tenant).await.unwrap(), Bytes::from_static(b"exact"));
+                    let absolute = format!("{}/{exact}", dir.path().to_string_lossy().trim_start_matches('/'));
+                    assert_eq!(documents.get_object(RelativePath::new(&absolute), &tenant).await.unwrap(), Bytes::from_static(b"exact"));
+                    let paths = vec![exact.clone(), absolute];
+                    assert_eq!(documents.manifest_batch(&paths, &tenant).await.unwrap().len(), 2);
+                    documents.put_object(RelativePath::new(&format!("{prefix}{name}/.stream/.deleting")), Bytes::new(), &tenant).await.unwrap();
+                    assert!(matches!(documents.put_object(RelativePath::new(&exact), Bytes::new(), &tenant).await, Err(ObjectStorageError::StreamDeleting)));
+                }
+                let collision = super::super::postgres_documents::PostgresDocuments::new(
+                    &options, database.clone(), Arc::new(LocalFS::new(std::path::PathBuf::from("logs")))).unwrap();
+                for tenant in [None, Some("logs".to_owned())] {
+                    let key = if tenant.is_none() { "logs/date=2026-01-01/exact.manifest.json" } else { "logs/logs/date=2026-01-01/exact.manifest.json" };
+                    let fallback = key.strip_prefix("logs/").unwrap();
+                    collision.put_object(RelativePath::new(key), Bytes::from_static(b"exact"), &tenant).await.unwrap();
+                    collision.put_object(RelativePath::new(fallback), Bytes::from_static(b"fallback"), &tenant).await.unwrap();
+                    assert_eq!(collision.get_object(RelativePath::new(key), &tenant).await.unwrap(), Bytes::from_static(b"exact"));
+                    assert_eq!(collision.manifest_batch(&[key.to_owned()], &tenant).await.unwrap()[0].1, Bytes::from_static(b"exact"));
+                }
+                // SQL tenant candidates cannot bypass deletion collision protection.
+                store.put_stream_json(&crate::storage::ObjectStoreFormat::default(), "protected", &None).await.unwrap();
+                documents.put_object(RelativePath::new("protected/other/.stream/.schema"), Bytes::new(), &Some("protected".into())).await.unwrap();
+                assert!(documents.delete_prefix(RelativePath::new("protected"), &None).await.unwrap_err().to_string().contains("collides"));
+                store.put_stream_json(&crate::storage::ObjectStoreFormat::default(), "alias", &Some(crate::parseable::DEFAULT_TENANT.into())).await.unwrap();
+                assert!(store.stream_exists("alias", &None).await.unwrap());
+                assert!(documents.get_object(RelativePath::new("alias/.stream/.stream.json"), &None).await.is_ok());
+                let paths: Vec<_> = (0..70).map(|i| format!("batch/date=2026-01-01/{i}.manifest.json")).collect();
+                for key in &paths { documents.put_object(RelativePath::new(key), Bytes::new(), &None).await.unwrap(); }
+                assert_eq!(documents.manifest_batch(&paths, &None).await.unwrap().len(), 70);
+            } else if case == 0 {
                 let date = chrono::Utc::now();
                 let manifest = crate::catalog::manifest::Manifest::default();
                 store
@@ -1276,7 +1333,7 @@ mod contract_tests {
                 .unwrap();
             // Restrict the injected SQL error to the per-tenant body read;
             // volatile view expressions can also execute during discovery.
-            client.batch_execute("ALTER TABLE parseable_documents RENAME TO startup_documents; CREATE FUNCTION startup_read_failure() RETURNS bytea LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected transient tenant read failure' USING ERRCODE='08006'; END $$; CREATE VIEW parseable_documents AS SELECT tenant,kind,key,CASE WHEN tenant='z-valid' AND key='z-valid/.parseable.json' AND current_query() LIKE 'SELECT body%FROM parseable_documents%' THEN startup_read_failure() ELSE body END AS body,version,created_at,updated_at FROM startup_documents;").await.unwrap();
+            client.batch_execute("ALTER TABLE parseable_documents RENAME TO startup_documents; CREATE FUNCTION startup_read_failure() RETURNS bytea LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected transient tenant read failure' USING ERRCODE='08006'; END $$; CREATE VIEW parseable_documents AS SELECT tenant,kind,key,CASE WHEN tenant='z-valid' AND key='z-valid/.parseable.json' AND (current_query() LIKE 'SELECT body%FROM parseable_documents%' OR current_query() LIKE 'SELECT key,body%FROM parseable_documents%') THEN startup_read_failure() ELSE body END AS body,version,created_at,updated_at FROM startup_documents;").await.unwrap();
             assert!(context.validate_multi_tenancy().await.is_err());
             assert_eq!(
                 storage
@@ -1451,6 +1508,10 @@ mod contract_tests {
     #[tokio::test]
     async fn postgres_health_deadline_regression() {
         postgres_regression(3).await;
+    }
+    #[tokio::test]
+    async fn postgres_round_two_backend_regressions() {
+        postgres_regression(7).await;
     }
     #[tokio::test]
     async fn postgres_manifest_url_regression() {

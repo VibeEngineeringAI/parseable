@@ -67,6 +67,9 @@ pub async fn optional(store: &dyn ObjectStorage, key: &str) -> anyhow::Result<Op
         Err(e) => Err(e.into()),
     }
 }
+pub(crate) fn recovery_override(value: Option<&str>, id: &[u8]) -> bool {
+    value.is_some_and(|v| v.as_bytes() == id)
+}
 pub async fn guard(store: &dyn ObjectStorage, postgres: bool) -> anyhow::Result<()> {
     ensure!(
         optional(store, BUSY).await?.is_none(),
@@ -76,7 +79,10 @@ pub async fn guard(store: &dyn ObjectStorage, postgres: bool) -> anyhow::Result<
         && !postgres
     {
         ensure!(
-            std::env::var("P_ALLOW_PAIRED_BUCKET").is_ok_and(|v| v.as_bytes() == id.as_ref()),
+            recovery_override(
+                std::env::var("P_ALLOW_PAIRED_BUCKET").ok().as_deref(),
+                id.as_ref()
+            ),
             "bucket paired with PostgreSQL; object-store metadata is stale. Export first, or explicitly set P_ALLOW_PAIRED_BUCKET=<pairing-id> for disaster recovery"
         );
     }
@@ -115,6 +121,27 @@ pub(crate) fn stream_references(body: &[u8]) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// An explicit default-tenant prefix is an alias only for tenant-shaped
+/// metadata (not for a default stream actually named DEFAULT_TENANT).
+pub(crate) fn canonical_key(key: &str) -> &str {
+    let Some(rest) = key.strip_prefix("DEFAULT_TENANT/") else {
+        return key;
+    };
+    let parts: Vec<_> = rest.split('/').collect();
+    if parts.first().is_some_and(|p| {
+        p.starts_with('.') && *p != ".stream" && *p != ".schema" && *p != ".stream.json"
+    }) || parts.get(1).is_some_and(|p| {
+        *p == ".stream"
+            || p.contains(".schema")
+            || p.ends_with("stream.json")
+            || p.starts_with("date=")
+    }) {
+        rest
+    } else {
+        key
+    }
+}
+
 pub(crate) async fn validate(
     store: &dyn ObjectStorage,
     key: &str,
@@ -132,6 +159,8 @@ pub(crate) async fn validate(
         }
     } else if key.contains(".schema") {
         serde_json::from_slice::<arrow_schema::Schema>(body).with_context(|| key.to_owned())?;
+    } else {
+        serde_json::from_slice::<serde_json::Value>(body).with_context(|| key.to_owned())?;
     }
     ensure!(
         !key.ends_with(".deleting") && !key.contains(".tombstones/"),
@@ -155,6 +184,7 @@ pub async fn run(
         "requires --acknowledge-server-stopped; stop ALL servers and writers first"
     );
     eprintln!("OFFLINE migration: all servers must remain stopped. No writer fencing exists.");
+    let _transfer_lock = db.transfer_lock().await?;
     db.migration_preflight(store.as_ref(), opts).await?;
     if opts.abort {
         return db.abort_migration(store.as_ref(), action).await;
@@ -174,6 +204,7 @@ pub async fn run(
                 matches!(
                     component,
                     ".parseable"
+                        | ".keystone"
                         | ".users"
                         | ".alerts"
                         | ".targets"
@@ -197,41 +228,61 @@ pub async fn run(
         .iter()
         .filter_map(|(k, modified)| document_scope(k).map(|scope| (k.clone(), scope, *modified)))
         .collect();
+    let canonical: std::collections::HashSet<_> =
+        keys.iter().map(|(key, _, _)| canonical_key(key)).collect();
+    ensure!(
+        canonical.len() == keys.len(),
+        "duplicate metadata keys after default-tenant normalization"
+    );
     let mut counts = BTreeMap::<(String, String), (usize, usize)>::new();
-    for (key, (tenant, kind), modified) in &keys {
-        let body = store.get_object(RelativePath::new(key), &None).await?;
-        if action != Action::Export {
-            match validate(store.as_ref(), key, &body).await {
-                Err(e)
-                    if opts.allow_dangling_snapshot_references
-                        && e.to_string().contains("missing manifest") =>
-                {
-                    eprintln!("OVERRIDE dangling snapshot reference: {e:#}")
+    use futures::{StreamExt, TryStreamExt};
+    let statistics: Vec<_> = futures::stream::iter(&keys)
+        .map(|(key, (tenant, kind), modified)| {
+            let store = &store;
+            async move {
+                let body = store.get_object(RelativePath::new(key), &None).await?;
+                if action != Action::Export {
+                    match validate(store.as_ref(), key, &body).await {
+                        Err(e)
+                            if opts.allow_dangling_snapshot_references
+                                && e.to_string().contains("missing manifest") =>
+                        {
+                            eprintln!("OVERRIDE dangling snapshot reference: {e:#}")
+                        }
+                        result => result?,
+                    }
                 }
-                result => result?,
+                if chrono::Utc::now()
+                    .signed_duration_since(*modified)
+                    .num_seconds()
+                    < 120
+                {
+                    eprintln!("WARNING recently modified metadata (possible active writer): {key}");
+                }
+                println!(
+                    "bucket tenant={tenant:?} kind={kind} key={key} bytes={} sha256={}",
+                    body.len(),
+                    digest(&body)
+                );
+                Ok::<_, anyhow::Error>(((tenant.clone(), kind.to_string()), body.len()))
             }
-        }
-        if chrono::Utc::now()
-            .signed_duration_since(*modified)
-            .num_seconds()
-            < 120
-        {
-            eprintln!("WARNING recently modified metadata (possible active writer): {key}");
-        }
-        let count = counts
-            .entry((tenant.clone(), kind.to_string()))
-            .or_default();
+        })
+        .buffer_unordered(16)
+        .try_collect()
+        .await?;
+    for (scope, bytes) in statistics {
+        let count = counts.entry(scope).or_default();
         count.0 += 1;
-        count.1 += body.len();
-        println!(
-            "bucket tenant={tenant:?} kind={kind} key={key} bytes={} sha256={}",
-            body.len(),
-            digest(&body)
-        );
+        count.1 += bytes;
     }
     eprintln!("counts by (tenant, kind): {counts:?}");
     // Dry-run never bootstraps SQL or writes a bucket marker.
     if opts.migration_dry_run {
+        if action == Action::Export {
+            let client = db.client().await?;
+            db.export_preflight(&client, store.as_ref(), opts, &keys)
+                .await?;
+        }
         return Ok(());
     }
     db.migrate(store, opts, &keys).await
@@ -254,7 +305,28 @@ mod tests {
     use crate::{metastore::metastores::postgres_metastore::PostgresOptions, storage::LocalFS};
 
     #[test]
+    fn recovery_overrides_require_exact_backend_id() {
+        for value in [
+            None,
+            Some("true"),
+            Some("false"),
+            Some(""),
+            Some("another-backend"),
+        ] {
+            assert!(!recovery_override(value, b"backend"));
+        }
+        assert!(recovery_override(Some("backend"), b"backend"));
+    }
+    #[test]
     fn inventory_scope_preserves_all_document_namespaces() {
+        assert_eq!(
+            canonical_key("DEFAULT_TENANT/logs/.ingestor.node.schema"),
+            "logs/.ingestor.node.schema"
+        );
+        assert_eq!(
+            canonical_key("DEFAULT_TENANT/logs/.ingestor.node.stream.json"),
+            "logs/.ingestor.node.stream.json"
+        );
         for (key, tenant, kind) in [
             (".parseable.json", "", "document"),
             ("logs/.stream.json", "", "stream"),
@@ -407,10 +479,72 @@ mod tests {
             "parquet files must not add inventory requests"
         );
         assert_eq!(before, after);
+        for expected in [
+            "café/.stream/.schema",
+            ".users/auth0|é/filters/one.json",
+            manifest_key.as_str(),
+        ] {
+            assert!(
+                after.iter().any(|(key, _)| key == expected),
+                "inventory missing {expected}"
+            );
+        }
         for (key, _) in after {
             store.get_object(RelativePath::new(&key), &None).await?;
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn dangling_import_can_be_exported_with_the_same_override() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("P_TEST_POSTGRES_URL") else {
+            eprintln!("SKIP dangling import/export: P_TEST_POSTGRES_URL unset");
+            return Ok(());
+        };
+        let root = tempfile::tempdir()?;
+        let storage: Arc<dyn ObjectStorage> = Arc::new(LocalFS::new(root.path().to_owned()));
+        let admin = PostgresDocuments::new(
+            &PostgresOptions {
+                metastore_postgres_url: Some(url.clone()),
+                ..Default::default()
+            },
+            "dangling".into(),
+            storage.clone(),
+        )?;
+        let database = format!("dangling_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .client()
+            .await?
+            .batch_execute(&format!("CREATE DATABASE {database}"))
+            .await?;
+        let result = async {
+            let mut url = url::Url::parse(&url)?;
+            url.set_path(&database);
+            let db = PostgresDocuments::new(&PostgresOptions { metastore_postgres_url: Some(url.to_string()), ..Default::default() }, "dangling".into(), storage.clone())?;
+            let body = Bytes::from_static(br#"{"version":"v3","snapshot":{"manifest_list":[{"manifest_path":"logs/date=2026-01-01/missing.manifest.json"}]}}"#);
+            storage.put_object(RelativePath::new("logs/.stream/.stream.json"), body.clone(), &None).await?;
+            let mut command = MigrationOptions { metadata_migration: Some(Action::Import), acknowledge_server_stopped: true, ..Default::default() };
+            assert!(run(storage.clone(), &db, &command).await.is_err());
+            command.allow_dangling_snapshot_references = true;
+            run(storage.clone(), &db, &command).await?;
+            command.metadata_migration = Some(Action::Export);
+            command.migration_dry_run = true;
+            command.allow_dangling_snapshot_references = false;
+            assert!(run(storage.clone(), &db, &command).await.is_err());
+            command.allow_dangling_snapshot_references = true;
+            run(storage.clone(), &db, &command).await?;
+            command.migration_dry_run = false;
+            run(storage.clone(), &db, &command).await?;
+            assert_eq!(storage.get_object(RelativePath::new("logs/.stream/.stream.json"), &None).await?, body);
+            storage.check_migration_guard().await?;
+            anyhow::Ok(())
+        }.await;
+        admin
+            .client()
+            .await?
+            .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await?;
+        result
     }
 
     #[tokio::test]
@@ -525,6 +659,18 @@ mod tests {
                     ));
                 }
             }
+            documents.push((
+                "DEFAULT_TENANT/alias/.stream/.stream.json".into(),
+                Bytes::from(serde_json::to_vec(
+                    &crate::storage::ObjectStoreFormat::default(),
+                )?),
+            ));
+            documents.push((
+                "DEFAULT_TENANT/alias/date=2026-01-01/manifest.json".into(),
+                crate::catalog::manifest::encode_manifest(
+                    &crate::catalog::manifest::Manifest::default(),
+                )?,
+            ));
             for (key, body) in &documents {
                 store
                     .put_object(RelativePath::new(key), body.clone(), &None)
@@ -549,6 +695,15 @@ mod tests {
                     .to_string()
                     .contains("pinned backend")
             );
+            let lock = db.transfer_lock().await?;
+            assert!(
+                run(store.clone(), &db, &command)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another offline")
+            );
+            drop(lock);
             run(store.clone(), &db, &command).await?;
             assert!(optional(store.as_ref(), PAIR).await?.is_none());
             command.migration_dry_run = false;
@@ -567,6 +722,19 @@ mod tests {
             ] {
                 command.injected_failure = Some(step);
                 assert!(run(store.clone(), &db, &command).await.is_err(), "{step}");
+                if step == "import-commit" {
+                    command.abort = true;
+                    run(store.clone(), &db, &command).await?;
+                    assert_eq!(
+                        db.client()
+                            .await?
+                            .query_one("SELECT count(*) FROM parseable_documents", &[])
+                            .await?
+                            .get::<_, i64>(0),
+                        0
+                    );
+                    command.abort = false;
+                }
             }
             command.injected_failure = None;
             command.abort = true;
@@ -580,6 +748,99 @@ mod tests {
             assert!(run(store.clone(), &db, &command).await.is_err());
             command.metadata_migration = Some(Action::Verify);
             run(store.clone(), &db, &command).await?;
+            command.metadata_migration = Some(Action::Export);
+            command.migration_dry_run = true;
+            run(store.clone(), &db, &command).await?;
+            let original = store
+                .get_object(RelativePath::new(&documents[0].0), &None)
+                .await?;
+            store
+                .delete_object(RelativePath::new(&documents[0].0), &None)
+                .await?;
+            assert!(
+                run(store.clone(), &db, &command).await.is_err(),
+                "deleted imported key must conflict even in dry run"
+            );
+            command.overwrite_bucket_changes_since_import = true;
+            run(store.clone(), &db, &command).await?;
+            assert!(
+                optional(store.as_ref(), &documents[0].0).await?.is_none(),
+                "dry run must not restore key"
+            );
+            store
+                .put_object(RelativePath::new(&documents[0].0), original, &None)
+                .await?;
+            let extra = ".users/owner/filters/after-import.json";
+            store
+                .put_object(RelativePath::new(extra), Bytes::from_static(b"{}"), &None)
+                .await?;
+            command.overwrite_bucket_changes_since_import = false;
+            assert!(run(store.clone(), &db, &command).await.is_err());
+            command.overwrite_bucket_changes_since_import = true;
+            run(store.clone(), &db, &command).await?;
+            assert!(optional(store.as_ref(), extra).await?.is_some());
+            store.delete_object(RelativePath::new(extra), &None).await?;
+            command.overwrite_bucket_changes_since_import = false;
+            db.client()
+                .await?
+                .batch_execute(
+                    "ALTER TABLE parseable_import_digests RENAME TO saved_import_digests",
+                )
+                .await?;
+            // Equal bodies need no baseline, but any changed body does.
+            db.put_object(
+                RelativePath::new(&documents[0].0),
+                Bytes::from_static(b"{}"),
+                &None,
+            )
+            .await?;
+            assert!(run(store.clone(), &db, &command).await.is_err());
+            command.overwrite_bucket_changes_since_import = true;
+            run(store.clone(), &db, &command).await?;
+            db.put_object(
+                RelativePath::new(&documents[0].0),
+                documents[0].1.clone(),
+                &None,
+            )
+            .await?;
+            db.client()
+                .await?
+                .batch_execute(
+                    "ALTER TABLE saved_import_digests RENAME TO parseable_import_digests",
+                )
+                .await?;
+            command.overwrite_bucket_changes_since_import = false;
+            let stream_key = documents
+                .iter()
+                .find(|(key, _)| key.ends_with("stream.json"))
+                .unwrap()
+                .0
+                .clone();
+            let mut dangling = config.clone();
+            dangling.snapshot.manifest_list[0].manifest_path =
+                "café/date=2026-01-01/missing.manifest.json".into();
+            db.put_object(
+                RelativePath::new(&stream_key),
+                Bytes::from(serde_json::to_vec(&dangling)?),
+                &None,
+            )
+            .await?;
+            assert!(run(store.clone(), &db, &command).await.is_err());
+            command.allow_dangling_snapshot_references = true;
+            run(store.clone(), &db, &command).await?;
+            db.put_object(
+                RelativePath::new(&stream_key),
+                documents
+                    .iter()
+                    .find(|(k, _)| k == &stream_key)
+                    .unwrap()
+                    .1
+                    .clone(),
+                &None,
+            )
+            .await?;
+            command.allow_dangling_snapshot_references = false;
+            command.migration_dry_run = false;
             // Simulate crash after committed import, before marker cleanup.
             let id = optional(store.as_ref(), PAIR).await?.unwrap();
             store
@@ -630,8 +891,11 @@ mod tests {
             .await?;
             let deleted = documents.pop().unwrap().0;
             let deleted_tenant = document_scope(&deleted).unwrap().0;
-            db.delete_object(RelativePath::new(&deleted), &Some(deleted_tenant))
-                .await?;
+            db.delete_object(
+                RelativePath::new(canonical_key(&deleted)),
+                &Some(deleted_tenant),
+            )
+            .await?;
             for step in [
                 "marker",
                 "export-state",
@@ -661,7 +925,9 @@ mod tests {
             assert!(optional(store.as_ref(), &deleted).await?.is_none());
             for (key, body) in documents {
                 assert_eq!(
-                    store.get_object(RelativePath::new(&key), &None).await?,
+                    store
+                        .get_object(RelativePath::new(canonical_key(&key)), &None)
+                        .await?,
                     body,
                     "byte-for-byte round trip: {key}"
                 );

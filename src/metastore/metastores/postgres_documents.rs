@@ -8,9 +8,10 @@ use bytes::Bytes;
 use relative_path::RelativePath;
 use std::{sync::Arc, time::Duration};
 
-#[derive(Debug)]
 pub struct PostgresDocuments {
     pool: deadpool_postgres::Pool,
+    lock_pool: deadpool_postgres::Pool,
+    tls: tokio_postgres_rustls::MakeRustlsConnect,
     deadline: Duration,
     bucket: String,
     expected_id: Option<String>,
@@ -19,12 +20,25 @@ pub struct PostgresDocuments {
     #[cfg(test)]
     pub(super) deletion_fault: std::sync::atomic::AtomicU8,
 }
+impl std::fmt::Debug for PostgresDocuments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresDocuments")
+            .field("bucket", &self.bucket)
+            .finish_non_exhaustive()
+    }
+}
 fn err(e: impl std::fmt::Display) -> ObjectStorageError {
     if e.to_string().contains("stream deletion pending") {
         ObjectStorageError::StreamDeleting
     } else {
         ObjectStorageError::MetastoreUnavailable(e.to_string())
     }
+}
+fn legacy_key<'a>(key: &'a str, base: &str) -> Option<&'a str> {
+    if base.is_empty() {
+        return None;
+    }
+    key.strip_prefix(base).and_then(|p| p.strip_prefix('/'))
 }
 fn tenant(t: &Option<String>) -> &str {
     t.as_deref()
@@ -97,10 +111,15 @@ impl PostgresDocuments {
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
         .with_no_client_auth();
-        let manager = deadpool_postgres::Manager::new(
-            config,
-            tokio_postgres_rustls::MakeRustlsConnect::new(tls),
-        );
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls);
+        let lock_manager = deadpool_postgres::Manager::new(config.clone(), tls.clone());
+        let manager = deadpool_postgres::Manager::new(config, tls.clone());
+        let lock_pool = deadpool_postgres::Pool::builder(lock_manager)
+            .max_size(2)
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .wait_timeout(Some(timeout))
+            .create_timeout(Some(timeout))
+            .build()?;
         let pool = deadpool_postgres::Pool::builder(manager)
             .max_size(options.metastore_postgres_pool_size as usize)
             .runtime(deadpool_postgres::Runtime::Tokio1)
@@ -110,6 +129,8 @@ impl PostgresDocuments {
             .build()?;
         Ok(Self {
             pool,
+            lock_pool,
+            tls,
             deadline: Duration::from_millis(
                 options
                     .metastore_postgres_statement_timeout_ms
@@ -132,7 +153,45 @@ impl PostgresDocuments {
                 .map_err(err)?
                 .map_err(err)?,
             self.deadline,
+            self.tls.clone(),
         ))
+    }
+    async fn migration_client(&self) -> Result<super::postgres_client::Client, ObjectStorageError> {
+        let millis: u64 = std::env::var("P_METASTORE_POSTGRES_MIGRATION_TIMEOUT_MS")
+            .unwrap_or_else(|_| "1800000".into())
+            .parse()
+            .map_err(err)?;
+        if millis == 0 {
+            return Err(err("migration timeout must be positive"));
+        }
+        let mut client = self.client().await?;
+        client.discard_on_drop();
+        client.set_timeout(Duration::from_millis(millis.saturating_add(250)));
+        client
+            .batch_execute(&format!(
+                "SET statement_timeout={millis}; SET lock_timeout={millis}"
+            ))
+            .await?;
+        Ok(client)
+    }
+    pub(crate) async fn transfer_lock(
+        &self,
+    ) -> Result<super::postgres_client::Client, ObjectStorageError> {
+        let client = super::postgres_client::Client::new(
+            self.lock_pool.get().await.map_err(err)?,
+            self.deadline,
+            self.tls.clone(),
+        );
+        client.discard_on_drop(); // Close socket to release session lock on every exit.
+        client.batch_execute("SET idle_session_timeout=0").await?;
+        let acquired: bool = client
+            .query_one("SELECT pg_try_advisory_lock(8104050183641399917)", &[])
+            .await?
+            .get(0);
+        if !acquired {
+            return Err(err("another offline metadata transfer is running"));
+        }
+        Ok(client)
     }
     pub async fn check_migration_guard(&self) -> Result<(), ObjectStorageError> {
         super::migration::guard(self.storage.as_ref(), true)
@@ -144,7 +203,7 @@ impl PostgresDocuments {
             .await
             .map_err(err)?;
         self.initialized.get_or_try_init(|| async {
-            let mut client = self.client().await?;
+            let mut client = self.migration_client().await?;
             let tx = client.transaction().await.map_err(err)?;
             tx.batch_execute("SELECT pg_advisory_xact_lock(8104050183641399916)").await.map_err(err)?;
             let (actual, _, created) = self.bootstrap(&tx, &uuid::Uuid::new_v4().to_string()).await?;
@@ -161,8 +220,8 @@ impl PostgresDocuments {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-            if !created && super::migration::optional(self.storage.as_ref(), ".parseable/postgres-metastore-id").await.map_err(err)?.is_none() && std::env::var("P_METASTORE_POSTGRES_ALLOW_UNPAIRED").as_deref() != Ok("true") {
-                return Err(err("nonempty database and missing bucket pairing marker; restore the marker or explicitly set P_METASTORE_POSTGRES_ALLOW_UNPAIRED=true after verifying the bucket"));
+            if !created && super::migration::optional(self.storage.as_ref(), ".parseable/postgres-metastore-id").await.map_err(err)?.is_none() && !super::migration::recovery_override(std::env::var("P_METASTORE_POSTGRES_ALLOW_UNPAIRED").ok().as_deref(), actual.as_bytes()) {
+                return Err(err("nonempty database and missing bucket pairing marker; restore the marker or explicitly set P_METASTORE_POSTGRES_ALLOW_UNPAIRED=<backend-id> after verifying the bucket"));
             }
             match self.storage.put_metadata_conditional(marker, Bytes::from(actual.clone()), MetadataWriteCondition::Create, &None).await {
                 Ok(_) | Err(ConditionalMetadataError::Conflict) => {},
@@ -197,7 +256,7 @@ impl PostgresDocuments {
         {
             return Err(err("backend/bucket identity mismatch"));
         }
-        if !(0..=2).contains(&row.get::<_, i32>(2)) || row.get::<_, i32>(3) != 1 {
+        if !(0..=3).contains(&row.get::<_, i32>(2)) || row.get::<_, i32>(3) != 1 {
             return Err(err(
                 "unsupported schema/protocol version; upgrade this server",
             ));
@@ -217,6 +276,10 @@ impl PostgresDocuments {
             tx.batch_execute(include_str!("../migrations/002_review_fixes.sql"))
                 .await
                 .map_err(err)?;
+        }
+        if row.get::<_, i32>(2) < 3 {
+            tx.batch_execute(include_str!("../migrations/003_manifest_admission.sql"))
+                .await?;
         }
         tx.batch_execute("CREATE TABLE IF NOT EXISTS parseable_transfer (singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton), state text NOT NULL)").await.map_err(err)?;
         let has_documents: bool = tx
@@ -382,33 +445,72 @@ impl PostgresDocuments {
         paths: &[String],
         t: &Option<String>,
     ) -> Result<Vec<(String, Bytes)>, ObjectStorageError> {
-        let base = self.storage.absolute_url(RelativePath::new(""));
-        let normalized: Vec<String> = paths
-            .iter()
-            .map(|p| {
-                p.strip_prefix(base.as_ref())
-                    .and_then(|p| p.strip_prefix('/'))
-                    .unwrap_or(p)
-                    .to_owned()
-            })
-            .collect();
-        let rows = self
-            .client()
-            .await?
-            .query(
-                "SELECT key,body FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)",
-                &[&tenant(t), &normalized],
-            )
-            .await?;
-        let bodies: std::collections::HashMap<String, Bytes> = rows
-            .into_iter()
-            .map(|r| (r.get(0), Bytes::from(r.get::<_, Vec<u8>>(1))))
-            .collect();
-        Ok(paths
-            .iter()
-            .zip(normalized)
-            .filter_map(|(original, key)| bodies.get(&key).map(|b| (original.clone(), b.clone())))
-            .collect())
+        // Bound both parameter count and encoded key bytes. Each query returns at
+        // most 32 bodies; a single large manifest remains an indivisible document.
+        let mut result = Vec::new();
+        let mut offset = 0;
+        while offset < paths.len() {
+            let mut end = offset;
+            let mut bytes = 0;
+            while end < paths.len() && end - offset < 32 {
+                let size = paths[end].len();
+                if end > offset && bytes + size > 64 * 1024 {
+                    break;
+                }
+                bytes += size;
+                end += 1;
+            }
+            let base = self.storage.absolute_url(RelativePath::new(""));
+            let mut keys = Vec::new();
+            for path in &paths[offset..end] {
+                keys.push(path.clone());
+                if let Some(legacy) = legacy_key(path, base.as_ref()) {
+                    keys.push(legacy.to_owned());
+                }
+            }
+            let client = self.client().await?;
+            let sizes = client.query("SELECT key,octet_length(body) FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)", &[&tenant(t), &keys]).await?;
+            let mut bodies = std::collections::HashMap::<String, Bytes>::new();
+            let mut batch = Vec::<String>::new();
+            let mut batch_bytes = 0usize;
+            for row in sizes {
+                let size = row.get::<_, i32>(1) as usize;
+                if !batch.is_empty() && batch_bytes + size > 8 * 1024 * 1024 {
+                    for r in client.query("SELECT key,body FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)", &[&tenant(t), &batch]).await? {
+                        bodies.insert(r.get(0), Bytes::from(r.get::<_, Vec<u8>>(1)));
+                    }
+                    batch.clear();
+                    batch_bytes = 0;
+                }
+                batch.push(row.get(0));
+                batch_bytes += size;
+            }
+            if !batch.is_empty() {
+                for r in client
+                    .query(
+                        "SELECT key,body FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)",
+                        &[&tenant(t), &batch],
+                    )
+                    .await?
+                {
+                    bodies.insert(r.get(0), Bytes::from(r.get::<_, Vec<u8>>(1)));
+                }
+            }
+            for path in &paths[offset..end] {
+                let fallback = legacy_key(path, base.as_ref()).and_then(|k| bodies.get(k));
+                if bodies.contains_key(path) && fallback.is_some() {
+                    tracing::warn!(
+                        key = path,
+                        "exact and legacy metadata keys exist; using exact key"
+                    );
+                }
+                if let Some(body) = bodies.get(path).or(fallback) {
+                    result.push((path.clone(), body.clone()));
+                }
+            }
+            offset = end;
+        }
+        Ok(result)
     }
     pub async fn get_object(
         &self,
@@ -427,21 +529,22 @@ impl PostgresDocuments {
         t: &Option<String>,
     ) -> Result<Option<VersionedMetadata>, ConditionalMetadataError> {
         let base = self.storage.absolute_url(RelativePath::new(""));
-        let normalized = path
-            .as_str()
-            .strip_prefix(base.as_ref())
-            .and_then(|p| p.strip_prefix('/'))
-            .unwrap_or(path.as_str());
         let c = self.client().await?;
-        Ok(c.query_opt(
-            "SELECT body,version FROM parseable_documents WHERE tenant=$1 AND key=$2",
-            &[&tenant(t), &normalized],
-        )
-        .await
-        .map_err(err)?
-        .map(|r| VersionedMetadata {
-            bytes: Bytes::from(r.get::<_, Vec<u8>>(0)),
-            version: version(r.get(1)),
+        let exact = path.as_str();
+        let fallback = legacy_key(exact, base.as_ref()).unwrap_or(exact);
+        let rows = c.query(
+            "SELECT key,body,version FROM parseable_documents WHERE tenant=$1 AND (key=$2 OR key=$3) ORDER BY (key=$2) DESC",
+            &[&tenant(t), &exact, &fallback],
+        ).await?;
+        if rows.len() > 1 {
+            tracing::warn!(
+                key = exact,
+                "exact and legacy metadata keys exist; using exact key"
+            );
+        }
+        Ok(rows.first().map(|r| VersionedMetadata {
+            bytes: Bytes::from(r.get::<_, Vec<u8>>(1)),
+            version: version(r.get(2)),
         }))
     }
     pub async fn put_object(
@@ -575,6 +678,12 @@ impl PostgresDocuments {
     ) -> Result<(), ObjectStorageError> {
         if path.as_str().is_empty() || path.as_str().contains('/') {
             return Err(err("tenant deletion requires one nonempty path component"));
+        }
+        if self.client().await?.query_one(
+            "SELECT EXISTS(SELECT 1 FROM parseable_documents WHERE tenant='' AND (key >= $1 || '/' AND key < $1 || '0') AND (key LIKE '%/.stream/%' OR key LIKE '%/.stream.json' OR key LIKE '%/.schema'))",
+            &[&path.as_str()],
+        ).await?.get::<_, bool>(0) {
+            return Err(err(format!("tenant {} collides with a default-tenant stream; refusing data deletion", path)));
         }
         self.delete_data(path, &None).await?;
         self.client()
@@ -969,7 +1078,7 @@ impl PostgresDocuments {
         use super::migration::{Action, BUSY, PAIR, digest, optional};
         use anyhow::ensure;
         let action = opts.metadata_migration.unwrap();
-        let mut client = self.client().await?;
+        let mut client = self.migration_client().await?;
         // All remote I/O and validation happen before the import transaction.
         let tx = &client;
         if action == Action::Verify {
@@ -979,7 +1088,7 @@ impl PostgresDocuments {
                 .get(0);
             let bucket_keys: std::collections::BTreeSet<_> = keys
                 .iter()
-                .map(|(k, (t, _), _)| (t.as_str(), k.as_str()))
+                .map(|(k, (t, _), _)| (t.as_str(), super::migration::canonical_key(k)))
                 .collect();
             let mut differences = 0;
             for (key, (tenant, kind), _) in keys {
@@ -987,7 +1096,7 @@ impl PostgresDocuments {
                 let sql = if exists {
                     tx.query_opt(
                         "SELECT body FROM parseable_documents WHERE tenant=$1 AND key=$2",
-                        &[tenant, key],
+                        &[tenant, &super::migration::canonical_key(key)],
                     )
                     .await?
                     .map(|r| r.get::<_, Vec<u8>>(0))
@@ -1075,51 +1184,8 @@ impl PostgresDocuments {
                 pair.is_some() || busy.is_some(),
                 "export requires a paired bucket or interrupted export"
             );
-            // Preflight every destination before any overwrite.
-            let mut last = (String::new(), String::new());
-            loop {
-                let rows = tx.query("SELECT tenant,key,body FROM parseable_documents WHERE (tenant COLLATE \"C\",key COLLATE \"C\") > ($1,$2) ORDER BY tenant COLLATE \"C\",key COLLATE \"C\" LIMIT 32", &[&last.0,&last.1]).await?;
-                if rows.is_empty() {
-                    break;
-                }
-                for row in rows {
-                    last = (row.get(0), row.get(1));
-                    let body: Vec<u8> = row.get(2);
-                    self.validate_export_row(&client, &last.1, &Bytes::from(body.clone()))
-                        .await?;
-                    if let Some(old) = optional(store.as_ref(), &last.1).await? {
-                        let baseline = self.import_digest(&client, &last.1).await?;
-                        ensure!(
-                            old.as_ref() == body
-                                || baseline.as_deref() == Some(digest(&old).as_str())
-                                || opts.overwrite_bucket_changes_since_import,
-                            "bucket changed since import: {}; after backup use --overwrite-bucket-changes-since-import",
-                            last.1
-                        );
-                    }
-                }
-            }
-            // Bucket-only metadata would resurrect deleted SQL objects on downgrade.
-            for (key, (tenant, _), _) in keys {
-                if tx
-                    .query_opt(
-                        "SELECT 1 FROM parseable_documents WHERE tenant=$1 AND key=$2",
-                        &[tenant, key],
-                    )
-                    .await?
-                    .is_none()
-                {
-                    ensure!(
-                        self.import_digest(&client, key).await?.as_deref()
-                            == Some(
-                                digest(&store.get_object(RelativePath::new(key), &None).await?)
-                                    .as_str()
-                            )
-                            || opts.overwrite_bucket_changes_since_import,
-                        "bucket-only metadata changed since import: {key}; use --overwrite-bucket-changes-since-import after backup"
-                    );
-                }
-            }
+            self.export_preflight(&client, store.as_ref(), opts, keys)
+                .await?;
         }
         store
             .put_metadata_conditional(
@@ -1138,11 +1204,34 @@ impl PostgresDocuments {
             })?;
         super::migration::failure_point(opts, "marker")?;
         if action == Action::Import {
-            let spool = tempfile::tempdir_in(std::env::current_dir()?)?;
-            for (index, (key, _, _)) in keys.iter().enumerate() {
-                let body = store.get_object(RelativePath::new(key), &None).await?;
-                std::fs::write(spool.path().join(index.to_string()), &body)?;
+            drop(client);
+            let spool_root =
+                std::env::current_dir()?.join(format!(".parseable-migration-spool-{id}"));
+            // The session transfer lock proves no other invocation uses this directory.
+            if spool_root.exists() {
+                std::fs::remove_dir_all(&spool_root)?;
             }
+            std::fs::create_dir(&spool_root)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&spool_root, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let spool = tempfile::tempdir_in(&spool_root)?;
+            use futures::{StreamExt, TryStreamExt};
+            futures::stream::iter(keys.iter().enumerate())
+                .map(|(index, (key, _, _))| {
+                    let store = &store;
+                    let path = spool.path().join(index.to_string());
+                    async move {
+                        let body = store.get_object(RelativePath::new(key), &None).await?;
+                        std::fs::write(path, &body)?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                })
+                .buffer_unordered(16)
+                .try_collect::<Vec<_>>()
+                .await?;
             super::migration::failure_point(opts, "spool")?;
             let current = store.metadata_inventory().await?;
             let current: Vec<_> = current
@@ -1157,6 +1246,7 @@ impl PostgresDocuments {
                         .all(|((k, m), (old, _, om))| k == old && m == om),
                 "bucket metadata changed during import"
             );
+            let mut client = self.client().await?;
             let tx = client.transaction().await?;
             tx.query("SELECT pg_advisory_xact_lock(8104050183641399916)", &[])
                 .await?;
@@ -1172,14 +1262,16 @@ impl PostgresDocuments {
                     )?);
                     tenants.push(tenant.clone());
                     kinds.push(kind.to_string());
-                    paths.push(key.clone());
+                    paths.push(super::migration::canonical_key(key).to_owned());
                     bodies.push(body.to_vec());
                 }
                 if count == 0 {
                     tx.execute("INSERT INTO parseable_documents(tenant,kind,key,body) SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::bytea[])", &[&tenants,&kinds,&paths,&bodies]).await?;
                 }
-                for ((key, tenant), body) in paths.iter().zip(&tenants).zip(&bodies) {
-                    tx.execute("INSERT INTO parseable_import_digests(key,digest) VALUES($1,$2) ON CONFLICT DO NOTHING", &[key, &digest(body)]).await?;
+                for (((key, tenant), body), (source_key, _, _)) in
+                    paths.iter().zip(&tenants).zip(&bodies).zip(batch)
+                {
+                    tx.execute("INSERT INTO parseable_import_digests(key,digest) VALUES($1,$2) ON CONFLICT DO NOTHING", &[source_key, &digest(body)]).await?;
                     let reread: Vec<u8> = tx
                         .query_one(
                             "SELECT body FROM parseable_documents WHERE tenant=$1 AND key=$2",
@@ -1265,12 +1357,21 @@ impl PostgresDocuments {
                 }
                 for row in rows {
                     last_key = row.get(0);
-                    super::migration::validate(
+                    let result = super::migration::validate(
                         store.as_ref(),
                         &last_key,
                         &Bytes::from(row.get::<_, Vec<u8>>(1)),
                     )
-                    .await?;
+                    .await;
+                    match result {
+                        Err(e)
+                            if opts.allow_dangling_snapshot_references
+                                && e.to_string().contains("missing manifest") =>
+                        {
+                            eprintln!("OVERRIDE {e:#}")
+                        }
+                        result => result?,
+                    }
                 }
             }
             if optional(store.as_ref(), PAIR).await?.is_some() {
@@ -1284,6 +1385,119 @@ impl PostgresDocuments {
 }
 
 impl PostgresDocuments {
+    pub(crate) async fn export_preflight(
+        &self,
+        client: &super::postgres_client::Client,
+        store: &dyn ObjectStorage,
+        opts: &super::migration::MigrationOptions,
+        keys: &[super::migration::InventoryDocument],
+    ) -> anyhow::Result<()> {
+        use super::migration::{digest, optional};
+        let mut conflicts = 0usize;
+        let resuming_export = optional(store, super::migration::BUSY)
+            .await?
+            .is_some_and(|marker| marker.starts_with(b"Export:"))
+            && client
+                .query_opt("SELECT state FROM parseable_transfer WHERE singleton", &[])
+                .await?
+                .is_some_and(|row| row.get::<_, String>(0) == "exported");
+        let has_digests: bool = client
+            .query_one(
+                "SELECT to_regclass('parseable_import_digests') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        if has_digests && !resuming_export {
+            let mut last_key = String::new();
+            loop {
+                let rows = client.query("SELECT key FROM parseable_import_digests WHERE key COLLATE \"C\" > $1 ORDER BY key COLLATE \"C\" LIMIT 128", &[&last_key]).await?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    last_key = row.get(0);
+                    let canonical = super::migration::canonical_key(&last_key);
+                    if canonical != last_key
+                        && optional(store, &last_key).await?.is_none()
+                        && client
+                            .query_opt(
+                                "SELECT 1 FROM parseable_documents WHERE key=$1",
+                                &[&canonical],
+                            )
+                            .await?
+                            .is_some()
+                    {
+                        conflicts += 1;
+                        if conflicts <= 100 {
+                            eprintln!("CONFLICT deleted import alias key={last_key}");
+                        }
+                    }
+                }
+            }
+        }
+        // Preflight every destination before any overwrite.
+        let mut last = (String::new(), String::new());
+        loop {
+            let rows = client.query("SELECT tenant,key,body FROM parseable_documents WHERE (tenant COLLATE \"C\",key COLLATE \"C\") > ($1,$2) ORDER BY tenant COLLATE \"C\",key COLLATE \"C\" LIMIT 32", &[&last.0,&last.1]).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                last = (row.get(0), row.get(1));
+                let body: Vec<u8> = row.get(2);
+                self.validate_export_row(
+                    client,
+                    &last.1,
+                    &Bytes::from(body.clone()),
+                    opts.allow_dangling_snapshot_references,
+                )
+                .await?;
+                let old = optional(store, &last.1).await?;
+                let baseline = self.import_digest(client, &last.1).await?;
+                let unchanged = match old {
+                    Some(old) => {
+                        old.as_ref() == body || baseline.as_deref() == Some(digest(&old).as_str())
+                    }
+                    None => baseline.is_none(),
+                };
+                if !unchanged {
+                    conflicts += 1;
+                    if conflicts <= 100 {
+                        eprintln!("CONFLICT key={}", last.1);
+                    }
+                }
+            }
+        }
+        // Bucket-only metadata would resurrect deleted SQL objects on downgrade.
+        for (key, (tenant, _), _) in keys {
+            if client
+                .query_opt(
+                    "SELECT 1 FROM parseable_documents WHERE tenant=$1 AND key=$2",
+                    &[tenant, key],
+                )
+                .await?
+                .is_none()
+            {
+                if self.import_digest(client, key).await?.as_deref()
+                    != Some(
+                        digest(&store.get_object(RelativePath::new(key), &None).await?).as_str(),
+                    )
+                {
+                    conflicts += 1;
+                    if conflicts <= 100 {
+                        eprintln!("CONFLICT bucket-only key={key}");
+                    }
+                }
+            }
+        }
+        anyhow::ensure!(
+            conflicts == 0 || opts.overwrite_bucket_changes_since_import,
+            "{conflicts} bucket conflicts (first 100 shown); after backup use --overwrite-bucket-changes-since-import"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn migration_preflight(
         &self,
         store: &dyn ObjectStorage,
@@ -1303,15 +1517,10 @@ impl PostgresDocuments {
                 self.expected_id.is_none(),
                 "pinned backend id requires an initialized database"
             );
-            if let Some(marker) = &busy {
-                ensure!(
-                    opts.metadata_migration == Some(Action::Import)
-                        && std::str::from_utf8(marker).is_ok_and(|s| s
-                            .strip_prefix("Import:")
-                            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())),
-                    "another transfer owns migration marker"
-                );
-            }
+            ensure!(
+                busy.is_none(),
+                "migration marker requires its original initialized database"
+            );
             ensure!(
                 pair.is_none(),
                 "paired bucket requires its original database"
@@ -1331,7 +1540,7 @@ impl PostgresDocuments {
         let id: String = row.get(0);
         ensure!(
             row.get::<_, String>(1) == self.bucket
-                && (0..=2).contains(&row.get::<_, i32>(2))
+                && (0..=3).contains(&row.get::<_, i32>(2))
                 && row.get::<_, i32>(3) == 1,
             "backend identity/version mismatch"
         );
@@ -1369,6 +1578,14 @@ impl PostgresDocuments {
                 "refusing import into nonempty database"
             );
         }
+        if opts.metadata_migration == Some(Action::Import) && !opts.migration_dry_run {
+            // Caller already holds the transfer lock and identity checks passed.
+            uuid::Uuid::parse_str(&id)?;
+            let stale = std::env::current_dir()?.join(format!(".parseable-migration-spool-{id}"));
+            if stale.exists() {
+                std::fs::remove_dir_all(stale)?;
+            }
+        }
         Ok(())
     }
 
@@ -1401,6 +1618,7 @@ impl PostgresDocuments {
         client: &super::postgres_client::Client,
         key: &str,
         body: &Bytes,
+        allow_dangling: bool,
     ) -> anyhow::Result<()> {
         use anyhow::ensure;
         ensure!(
@@ -1422,13 +1640,17 @@ impl PostgresDocuments {
                     .unwrap_or(&manifest_path);
                 let row = client
                     .query_opt(
-                        "SELECT body FROM parseable_documents WHERE key=$1",
-                        &[&normalized],
+                        "SELECT body FROM parseable_documents WHERE key=$1 OR key=$2 ORDER BY (key=$1) DESC LIMIT 1",
+                        &[&manifest_path, &normalized],
                     )
                     .await?;
-                let row = row.ok_or_else(|| {
-                    anyhow::anyhow!("{key}: missing SQL manifest {}", manifest_path)
-                })?;
+                let Some(row) = row else {
+                    if allow_dangling {
+                        eprintln!("OVERRIDE {key}: missing SQL manifest {manifest_path}");
+                        continue;
+                    }
+                    anyhow::bail!("{key}: missing SQL manifest {manifest_path}");
+                };
                 crate::catalog::manifest::decode_manifest(&Bytes::from(row.get::<_, Vec<u8>>(0)))?;
             }
         } else if key.contains(".schema") {
@@ -1465,24 +1687,44 @@ impl PostgresDocuments {
                     .query_one("SELECT to_regclass('parseable_documents') IS NOT NULL", &[])
                     .await?
                     .get(0);
-                if docs {
-                    let count: i64 = client
-                        .query_one("SELECT count(*) FROM parseable_documents", &[])
-                        .await?
-                        .get(0);
+                let pair = optional(store, super::migration::PAIR).await?;
+                let busy = optional(store, BUSY).await?;
+                let id = if docs {
+                    Some(
+                        client
+                            .query_one("SELECT id FROM parseable_backend", &[])
+                            .await?
+                            .get::<_, String>(0),
+                    )
+                } else {
+                    None
+                };
+                let unpaired_commit = state.as_deref() == Some("ready")
+                    && pair.is_none()
+                    && id.as_ref().is_some_and(|id| {
+                        busy.as_ref()
+                            .is_some_and(|b| b.as_ref() == format!("Import:{id}").as_bytes())
+                    });
+                if unpaired_commit {
+                    client.batch_execute("BEGIN; DELETE FROM parseable_documents; DELETE FROM parseable_import_digests; DELETE FROM parseable_transfer; COMMIT;").await?;
+                } else {
+                    let count: i64 = if docs {
+                        client
+                            .query_one("SELECT count(*) FROM parseable_documents", &[])
+                            .await?
+                            .get(0)
+                    } else {
+                        0
+                    };
                     ensure!(
-                        count == 0,
-                        "SQL contains committed documents; complete import and export instead of aborting"
+                        count == 0 && state.is_none() && pair.is_none(),
+                        "import committed or paired; complete import then export instead of aborting"
                     );
                 }
-                ensure!(
-                    state.is_none(),
-                    "import committed; complete import, then export to return to bucket mode"
-                );
             }
             Action::Export => {
                 ensure!(
-                    state.as_deref() == Some("ready"),
+                    state.is_none() || state.as_deref() == Some("ready"),
                     "export has begun writing; rerun export to finish; abort is unsafe"
                 );
             }

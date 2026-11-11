@@ -92,7 +92,11 @@ fn deserialize_dataset<'de, D: serde::Deserializer<'de>>(
 
 impl MetastoreObject for Dashboard {
     fn get_object_path(&self) -> String {
-        let root = self.tenant_id.as_deref().unwrap_or("");
+        let root = self
+            .tenant_id
+            .as_deref()
+            .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+            .unwrap_or("");
         RelativePathBuf::from_iter([
             root,
             USERS_ROOT_DIR,
@@ -412,6 +416,24 @@ mod tests {
                     .get("dataset")
                     .is_none()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod default_tenant_path_tests {
+    use super::*;
+    #[test]
+    fn dashboard_default_tenant_aliases_share_a_key() {
+        let mut dashboard = Dashboard {
+            author: Some("owner".into()),
+            dashboard_id: Some(Ulid::new()),
+            ..Default::default()
+        };
+        let path = dashboard.get_object_path();
+        for alias in ["", crate::parseable::DEFAULT_TENANT] {
+            dashboard.tenant_id = Some(alias.into());
+            assert_eq!(dashboard.get_object_path(), path);
         }
     }
 }

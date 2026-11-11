@@ -538,7 +538,10 @@ impl ObjectStorage for LocalFS {
         tenant_id: &Option<String>,
     ) -> Result<Vec<(String, Bytes)>, ObjectStorageError> {
         let prefix = RelativePathBuf::from_iter([
-            tenant_id.as_deref().unwrap_or(""),
+            tenant_id
+                .as_deref()
+                .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+                .unwrap_or(""),
             stream_name,
             STREAM_ROOT_DIRECTORY,
         ]);

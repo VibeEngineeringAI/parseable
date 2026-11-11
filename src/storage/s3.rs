@@ -1424,17 +1424,14 @@ impl ObjectStorage for S3 {
         prefix: object_store::path::Path,
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, ObjectStorageError> {
         use futures::TryStreamExt;
-        self.client
-            .list(Some(&prefix))
-            .map_ok(|o| {
-                (
-                    crate::storage::object_storage::decode_metadata_key(o.location.as_ref()),
-                    o.last_modified,
-                )
+        let objects: Vec<_> = self.client.list(Some(&prefix)).try_collect().await?;
+        objects
+            .into_iter()
+            .map(|o| {
+                crate::storage::object_storage::decode_metadata_key(o.location.as_ref())
+                    .map(|key| (key, o.last_modified))
             })
-            .try_collect()
-            .await
-            .map_err(Into::into)
+            .collect()
     }
 
     async fn list_with_delimiter(

@@ -400,7 +400,8 @@ pub async fn post_event(
                 .await
             {
                 Ok(true) => {}
-                Ok(false) | Err(_) => return Err(StreamNotFound(stream_name.clone()).into()),
+                Ok(false) => return Err(StreamNotFound(stream_name.clone()).into()),
+                Err(e) => return Err(e.into()),
             }
         } else {
             return Err(StreamNotFound(stream_name.clone()).into());
