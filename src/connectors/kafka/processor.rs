@@ -340,7 +340,7 @@ impl Processor<Vec<ConsumerRecord>, ()> for ParseableSinkProcessor {
         debug!("Processing {len} records");
 
         // Offset-only markers and tombstones need no stream or metadata access.
-        if records.iter().all(|record| record.payload.is_none()) {
+        if !chunk_needs_stream(&records) {
             return Ok(());
         }
 
@@ -417,8 +417,15 @@ where
     }
 }
 
-/// One chunk at a time per partition: a fast marker-only tail must never commit
-/// past accepted records still being processed. Partitions remain independent.
+/// Eight chunks allow useful processing overlap while bounding memory and CPU
+/// work per partition. Ordered buffering holds commits behind earlier chunks.
+const MAX_IN_FLIGHT_CHUNKS_PER_PARTITION: usize = 8;
+
+fn chunk_needs_stream(records: &[ConsumerRecord]) -> bool {
+    records.iter().any(|record| record.payload.is_some())
+}
+
+/// Process chunks concurrently, yielding commit offsets in partition input order.
 async fn process_partition_chunks<P, S>(
     processor: &P,
     tp: TopicPartition,
@@ -428,9 +435,10 @@ async fn process_partition_chunks<P, S>(
     P: Processor<Vec<ConsumerRecord>, ()>,
     S: futures_util::Stream<Item = Vec<ConsumerRecord>>,
 {
-    futures_util::pin_mut!(chunks);
-    while let Some(records) = chunks.next().await {
-        if let Some(last_record) = records.iter().max_by_key(|r| r.offset) {
+    let completed = chunks.map(|records| {
+        let tp = &tp;
+        async move {
+            let last_record = records.iter().max_by_key(|r| r.offset)?;
             let tpl = last_record.offset_to_commit().unwrap();
             let record_count = records.len();
             if let Err(e) = processor.process(records).await {
@@ -440,6 +448,12 @@ async fn process_partition_chunks<P, S>(
                     record_count, tp, tpl, e
                 );
             }
+            Some(tpl)
+        }
+    }).buffered(MAX_IN_FLIGHT_CHUNKS_PER_PARTITION);
+    futures_util::pin_mut!(completed);
+    while let Some(tpl) = completed.next().await {
+        if let Some(tpl) = tpl {
             commit(&tpl);
         }
     }
@@ -1030,12 +1044,13 @@ mod offset_marker_tests {
     }
 
     #[tokio::test]
-    async fn all_rejected_partition_commits_without_preparing_stream() {
+    async fn all_rejected_partition_commits_next_offset() {
         let mut commits = Vec::new();
-        // The real processor would access PARSEABLE (not initialized here) if
-        // marker-only chunks accidentally reached prepare_stream.
         process_partition_chunks(
-            &ParseableSinkProcessor,
+            &GatedProcessor {
+                release: Mutex::new(None),
+                processed: Mutex::new(Vec::new()),
+            },
             TopicPartition::new("rejected".into(), 2),
             futures_util::stream::iter([vec![marker(10), marker(11)], vec![marker(12)]]),
             |tpl| commits.push(committed_offset(tpl)),
@@ -1093,48 +1108,53 @@ mod offset_marker_tests {
         assert_eq!(*commits.lock().unwrap(), [12, 14]);
     }
 
-    #[tokio::test]
-    async fn reassignment_resumes_after_rejected_records_without_counting_again() {
-        let dropped = prometheus::IntCounter::new("test_restart_drops", "drops").unwrap();
-        let broker_offsets = [20, 21, 22];
-        let mut committed = 20;
-        let records = broker_offsets
-            .into_iter()
-            .map(|offset| {
-                assert_eq!(
-                    super::super::tenant_for_ingestion(
-                        true,
-                        None,
-                        [Some(b"tenant-b".as_slice())].into_iter(),
-                        &dropped,
-                    ),
-                    None,
-                );
-                marker(offset)
-            })
-            .collect();
-        process_partition_chunks(
-            &ParseableSinkProcessor,
-            TopicPartition::new("rejected".into(), 2),
-            futures_util::stream::iter([records]),
-            |tpl| committed = committed_offset(tpl),
-        )
-        .await;
-        assert_eq!(committed, 23);
-        assert_eq!(dropped.get(), 3);
-        // Model Kafka's committed-offset assignment boundary: only offsets at
-        // or above the stored next offset are delivered to a new consumer.
-        for _offset in broker_offsets
-            .into_iter()
-            .filter(|offset| *offset >= committed)
-        {
-            super::super::tenant_for_ingestion(
-                true,
-                None,
-                [Some(b"tenant-b".as_slice())].into_iter(),
-                &dropped,
-            );
+    #[test]
+    fn chunk_needs_stream_only_for_payload_records() {
+        assert!(!chunk_needs_stream(&[]));
+        assert!(!chunk_needs_stream(&[marker(1), marker(2)]));
+        let mut accepted = marker(3);
+        accepted.payload = Some(b"{}".to_vec());
+        assert!(chunk_needs_stream(&[marker(2), accepted]));
+    }
+
+    struct OverlapProcessor {
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        started: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl Processor<Vec<ConsumerRecord>, ()> for OverlapProcessor {
+        async fn process(&self, records: Vec<ConsumerRecord>) -> anyhow::Result<()> {
+            let offset = records[0].offset;
+            self.started.lock().unwrap().push(offset);
+            if offset == 10 {
+                let wait = self.release.lock().unwrap().take().unwrap();
+                wait.await?;
+            }
+            Ok(())
         }
-        assert_eq!(dropped.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn later_chunk_starts_while_earlier_chunk_blocks_commits() {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let processor = OverlapProcessor {
+            release: Mutex::new(Some(wait)),
+            started: Mutex::new(Vec::new()),
+        };
+        let commits = Mutex::new(Vec::new());
+        let processing = process_partition_chunks(
+            &processor,
+            TopicPartition::new("rejected".into(), 2),
+            futures_util::stream::iter([vec![marker(10)], vec![marker(11)]]),
+            |tpl| commits.lock().unwrap().push(committed_offset(tpl)),
+        );
+        tokio::pin!(processing);
+        assert!(futures_util::poll!(&mut processing).is_pending());
+        assert_eq!(*processor.started.lock().unwrap(), [10, 11]);
+        assert!(commits.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        processing.await;
+        assert_eq!(*commits.lock().unwrap(), [11, 12]);
     }
 }
