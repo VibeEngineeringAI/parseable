@@ -631,7 +631,7 @@ pub static STORAGE_READ_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
             "storage_read_bytes_total",
-            "Logical bytes requested from an object store",
+            "Body bytes returned successfully by an object store",
         )
         .namespace(METRICS_NAMESPACE),
         &["provider"],

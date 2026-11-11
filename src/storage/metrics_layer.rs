@@ -61,6 +61,7 @@ struct StorageMetricSnapshot {
     response_time_sum_seconds: f64,
     response_time_count: u64,
     non_2xx_requests: u64,
+    not_modified_requests: u64,
     inflight: u64,
 }
 
@@ -100,7 +101,9 @@ impl StorageMetricSnapshot {
                 }
                 snapshot.response_time_count += count;
                 snapshot.response_time_sum_seconds += histogram.get_sample_sum();
-                if !status.starts_with('2') {
+                if status == "304" {
+                    snapshot.not_modified_requests += count;
+                } else if !status.starts_with('2') {
                     snapshot.non_2xx_requests += count;
                 }
             }
@@ -123,6 +126,9 @@ impl StorageMetricSnapshot {
                 .response_time_count
                 .saturating_sub(self.response_time_count),
             non_2xx_requests: end.non_2xx_requests.saturating_sub(self.non_2xx_requests),
+            not_modified_requests: end
+                .not_modified_requests
+                .saturating_sub(self.not_modified_requests),
             peak_inflight_sampled,
         }
     }
@@ -139,6 +145,7 @@ pub struct StorageMetricDelta {
     pub response_time_sum_seconds: f64,
     pub response_time_count: u64,
     pub non_2xx_requests: u64,
+    pub not_modified_requests: u64,
     pub peak_inflight_sampled: u64,
 }
 
@@ -333,11 +340,6 @@ impl<T: ObjectStore> ObjectStore for MetricLayer<T> {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        let requested_bytes = options.range.as_ref().and_then(|range| match range {
-            object_store::GetRange::Bounded(range) => Some(range.end.saturating_sub(range.start)),
-            object_store::GetRange::Suffix(bytes) => Some(*bytes),
-            object_store::GetRange::Offset(_) => None,
-        });
         STORAGE_READ_RANGES_TOTAL
             .with_label_values(&[&self.provider])
             .inc();
@@ -354,18 +356,27 @@ impl<T: ObjectStore> ObjectStore for MetricLayer<T> {
         STORAGE_REQUEST_RESPONSE_TIME
             .with_label_values(&[&self.provider, "GET", status])
             .observe(elapsed);
-        let requested_bytes = requested_bytes.or_else(|| {
-            result
-                .as_ref()
-                .ok()
-                .map(|result| result.range.end.saturating_sub(result.range.start))
-        });
-        if let Some(bytes) = requested_bytes {
-            STORAGE_READ_BYTES_TOTAL
-                .with_label_values(&[&self.provider])
-                .inc_by(bytes);
-        }
-        result
+        result.map(|response| {
+            let meta = response.meta.clone();
+            let range = response.range.clone();
+            let attributes = response.attributes.clone();
+            let counter = STORAGE_READ_BYTES_TOTAL.with_label_values(&[&self.provider]);
+            let stream = response
+                .into_stream()
+                .map(move |chunk| {
+                    if let Ok(bytes) = &chunk {
+                        counter.inc_by(bytes.len() as u64);
+                    }
+                    chunk
+                })
+                .boxed();
+            GetResult {
+                payload: object_store::GetResultPayload::Stream(stream),
+                meta,
+                range,
+                attributes,
+            }
+        })
     }
 
     async fn get_ranges(
@@ -373,20 +384,17 @@ impl<T: ObjectStore> ObjectStore for MetricLayer<T> {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> ObjectStoreResult<Vec<Bytes>> {
-        STORAGE_READ_BYTES_TOTAL
-            .with_label_values(&[&self.provider])
-            .inc_by(
-                ranges
-                    .iter()
-                    .map(|range| range.end.saturating_sub(range.start))
-                    .sum(),
-            );
         STORAGE_READ_RANGES_TOTAL
             .with_label_values(&[&self.provider])
             .inc_by(ranges.len() as u64);
         let _guard = InflightGuard::new(&self.provider, "GET_RANGES");
         let time = time::Instant::now();
         let result = self.inner.get_ranges(location, ranges).await;
+        if let Ok(bytes) = &result {
+            STORAGE_READ_BYTES_TOTAL
+                .with_label_values(&[&self.provider])
+                .inc_by(bytes.iter().map(|bytes| bytes.len() as u64).sum());
+        }
         let elapsed = time.elapsed().as_secs_f64();
 
         let status = match &result {
@@ -537,8 +545,8 @@ mod tests {
     use std::sync::Mutex;
 
     use object_store::{
-        Attribute, Attributes, ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory,
-        path::Path,
+        Attribute, Attributes, GetOptions, ObjectStore, ObjectStoreExt, PutPayload,
+        memory::InMemory, path::Path,
     };
 
     use super::{MetricLayer, StorageMetricSnapshot, StorageMetricWindow};
@@ -590,6 +598,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn actual_body_bytes_exclude_not_modified_and_errors() {
+        let layer = MetricLayer::new(InMemory::new(), "actual-body-metrics");
+        let path = Path::from("file");
+        layer
+            .put(&path, PutPayload::from_static(b"abc"))
+            .await
+            .unwrap();
+        let window = StorageMetricWindow::start("actual-body-metrics");
+        let result = layer
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(object_store::GetRange::Bounded(0..262145)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let etag = result.meta.e_tag.clone();
+        assert_eq!(result.bytes().await.unwrap(), "abc");
+        assert!(matches!(
+            layer
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        if_none_match: etag,
+                        range: Some(object_store::GetRange::Bounded(0..262145)),
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(object_store::Error::NotModified { .. })
+        ));
+        let missing = Path::from("missing");
+        assert!(
+            layer
+                .get_opts(
+                    &missing,
+                    GetOptions {
+                        range: Some(object_store::GetRange::Bounded(0..262145)),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            layer
+                .get_ranges(&missing, std::slice::from_ref(&(0..10)))
+                .await
+                .is_err()
+        );
+        let delta = window.delta();
+        assert_eq!(delta.read_bytes, 3);
+        assert_eq!(delta.not_modified_requests, 1);
+        assert_eq!(delta.non_2xx_requests, 2);
+    }
+
     #[test]
     fn process_window_metric_delta_arithmetic_is_saturating_and_derives_average() {
         let start = StorageMetricSnapshot {
@@ -600,6 +667,7 @@ mod tests {
             response_time_sum_seconds: 1.0,
             response_time_count: 6,
             non_2xx_requests: 1,
+            not_modified_requests: 0,
             inflight: 3,
         };
         let end = StorageMetricSnapshot {
@@ -610,6 +678,7 @@ mod tests {
             response_time_sum_seconds: 2.6,
             response_time_count: 14,
             non_2xx_requests: 3,
+            not_modified_requests: 0,
             inflight: 1,
         };
         let delta = start.delta_to(&end, 17);

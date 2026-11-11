@@ -28,19 +28,20 @@ use datafusion::{
     physical_plan::metrics::ExecutionPlanMetricsSet,
 };
 use futures_util::{FutureExt, future::BoxFuture};
-use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
+use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path};
 use parquet::{
     arrow::{arrow_reader::ArrowReaderOptions, async_reader::AsyncFileReader},
     errors::{ParquetError, Result},
     file::metadata::{ParquetMetaData, ParquetMetaDataReader},
 };
 use std::{
-    collections::VecDeque,
+    collections::HashMap,
     ops::Range,
     sync::{Arc, LazyLock, Mutex},
 };
 
 const MAX_FILE: u64 = 256 * 1024;
+#[cfg(test)]
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const SCAN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -51,20 +52,35 @@ struct Entry {
     etag: String,
     bytes: Bytes,
 }
+type Key = (usize, Path);
+#[derive(Debug)]
+struct Node {
+    entry: Entry,
+    prev: Option<Key>,
+    next: Option<Key>,
+}
 #[derive(Debug, Default)]
 struct Cache {
-    entries: VecDeque<Entry>,
+    entries: HashMap<Key, Node>,
+    first: Option<Key>,
+    last: Option<Key>,
     bytes: usize,
 }
 impl Cache {
     fn remove(&mut self, scope: usize, path: &Path) -> Option<Entry> {
-        let i = self
-            .entries
-            .iter()
-            .position(|e| e.scope == scope && &e.path == path)?;
-        let entry = self.entries.remove(i)?;
-        self.bytes -= entry.bytes.len();
-        Some(entry)
+        let node = self.entries.remove(&(scope, path.clone()))?;
+        if let Some(prev) = &node.prev {
+            self.entries.get_mut(prev).unwrap().next = node.next.clone();
+        } else {
+            self.first = node.next.clone();
+        }
+        if let Some(next) = &node.next {
+            self.entries.get_mut(next).unwrap().prev = node.prev.clone();
+        } else {
+            self.last = node.prev.clone();
+        }
+        self.bytes -= node.entry.bytes.len();
+        Some(node.entry)
     }
     fn insert(&mut self, entry: Entry, budget: usize) {
         self.remove(entry.scope, &entry.path);
@@ -72,11 +88,25 @@ impl Cache {
             return;
         }
         while self.bytes + entry.bytes.len() > budget || self.entries.len() >= MAX_ENTRIES {
-            let old = self.entries.pop_front().expect("nonempty cache");
-            self.bytes -= old.bytes.len();
+            let (scope, path) = self.first.clone().expect("nonempty cache");
+            self.remove(scope, &path);
+        }
+        let key = (entry.scope, entry.path.clone());
+        if let Some(last) = &self.last {
+            self.entries.get_mut(last).unwrap().next = Some(key.clone());
+        } else {
+            self.first = Some(key.clone());
         }
         self.bytes += entry.bytes.len();
-        self.entries.push_back(entry);
+        self.entries.insert(
+            key.clone(),
+            Node {
+                entry,
+                prev: self.last.take(),
+                next: None,
+            },
+        );
+        self.last = Some(key);
     }
 }
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
@@ -86,14 +116,17 @@ async fn load(
     scope: usize,
     store: &Arc<dyn ObjectStore>,
     path: &Path,
+    namespace: &str,
+    budget: usize,
 ) -> object_store::Result<(u64, Option<Bytes>)> {
+    let key = Path::from(format!("{namespace}{}", path.as_ref()));
     // Keep a private reference during validation; eviction cannot lose the body
     // needed for a 304. Do not hold the cache lock across network I/O.
     let old = {
         let mut cache = cache.lock().unwrap();
-        let old = cache.remove(scope, path);
+        let old = cache.remove(scope, &key);
         if let Some(entry) = old.clone() {
-            cache.insert(entry, MAX_BYTES);
+            cache.insert(entry, budget);
         }
         old
     };
@@ -116,28 +149,53 @@ async fn load(
             let size = response.meta.size;
             let etag = response.meta.e_tag.clone();
             if size > MAX_FILE {
-                cache.lock().unwrap().remove(scope, path);
+                cache.lock().unwrap().remove(scope, &key);
                 return Ok((size, None));
             }
-            let bytes = response.bytes().await?;
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    cache.lock().unwrap().remove(scope, &key);
+                    return Err(error);
+                }
+            };
             let mut cache = cache.lock().unwrap();
-            cache.remove(scope, path);
-            if let Some(etag) = etag {
+            cache.remove(scope, &key);
+            if let Some(etag) = etag.filter(|tag| !tag.starts_with("W/")) {
                 cache.insert(
                     Entry {
                         scope,
-                        path: path.clone(),
+                        path: key.clone(),
                         etag,
                         bytes: bytes.clone(),
                     },
-                    MAX_BYTES,
+                    budget,
                 );
             }
             Ok((size, Some(bytes)))
         }
+        Err(error) if non_partial(&error) => {
+            cache.lock().unwrap().remove(scope, &key);
+            // HEAD obtains the current size without trusting a stale manifest.
+            Ok((store.head(path).await?.size, None))
+        }
         Err(error) => {
-            cache.lock().unwrap().remove(scope, path);
+            cache.lock().unwrap().remove(scope, &key);
             Err(error)
+        }
+    }
+}
+
+fn non_partial(error: &object_store::Error) -> bool {
+    use std::error::Error;
+    let mut cause: &dyn Error = error;
+    loop {
+        if cause.to_string() == "Received non-partial response when range requested" {
+            return true;
+        }
+        match cause.source() {
+            Some(source) => cause = source,
+            None => return false,
         }
     }
 }
@@ -149,21 +207,24 @@ async fn load_for_scan(
     scope: usize,
     store: &Arc<dyn ObjectStore>,
     path: &Path,
+    namespace: &str,
+    budget: usize,
 ) -> object_store::Result<(u64, Option<Bytes>)> {
+    let key = Path::from(format!("{namespace}{}", path.as_ref()));
     {
         let mut view = view.lock().unwrap();
-        if let Some(entry) = view.remove(scope, path) {
+        if let Some(entry) = view.remove(scope, &key) {
             let bytes = entry.bytes.clone();
             view.insert(entry, SCAN_BYTES);
             return Ok((bytes.len() as u64, Some(bytes)));
         }
     }
-    let result = load(&CACHE, scope, store, path).await?;
+    let result = load(&CACHE, scope, store, path, namespace, budget).await?;
     if let Some(bytes) = &result.1 {
         view.lock().unwrap().insert(
             Entry {
                 scope,
-                path: path.clone(),
+                path: key,
                 etag: String::new(),
                 bytes: bytes.clone(),
             },
@@ -177,7 +238,12 @@ pub(super) fn install(
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     store: Arc<dyn ObjectStore>,
     scope: usize,
+    budget: usize,
+    enabled: bool,
 ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    if !enabled || budget == 0 {
+        return Ok(plan);
+    }
     use datafusion::datasource::{
         physical_plan::{FileScanConfigBuilder, ParquetSource},
         source::DataSourceExec,
@@ -188,6 +254,23 @@ pub(super) fn install(
     let (conf, source) = exec
         .downcast_to_file_source::<ParquetSource>()
         .expect("parquet source");
+    // Bypass scans whose predicted working set cannot survive one traversal.
+    let small = conf
+        .file_groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|file| file.object_meta.size <= MAX_FILE)
+        .collect::<Vec<_>>();
+    if small.len() > MAX_ENTRIES
+        || small
+            .iter()
+            .map(|file| file.object_meta.size as u128)
+            .sum::<u128>()
+            > budget as u128
+    {
+        return Ok(plan);
+    }
+    let namespace = conf.object_store_url.to_string();
     let fallback = source
         .parquet_file_reader_factory()
         .cloned()
@@ -199,6 +282,8 @@ pub(super) fn install(
                 store,
                 fallback,
                 scope,
+                namespace,
+                budget,
                 view: Arc::new(Mutex::default()),
             }));
     Ok(Arc::new(
@@ -214,6 +299,8 @@ pub(super) fn install(
 pub(super) struct SmallFileReaderFactory {
     view: Arc<Mutex<Cache>>,
     scope: usize,
+    namespace: String,
+    budget: usize,
     pub store: Arc<dyn ObjectStore>,
     fallback: Arc<dyn ParquetFileReaderFactory>,
 }
@@ -228,9 +315,6 @@ impl ParquetFileReaderFactory for SmallFileReaderFactory {
         let fallback = self
             .fallback
             .create_reader(partition, file.clone(), hint, metrics)?;
-        if file.object_meta.size > MAX_FILE {
-            return Ok(fallback);
-        }
         let file_metrics = datafusion::datasource::physical_plan::ParquetFileMetrics::new(
             partition,
             file.object_meta.location.as_ref(),
@@ -242,6 +326,8 @@ impl ParquetFileReaderFactory for SmallFileReaderFactory {
             view: self.view.clone(),
             store: self.store.clone(),
             scope: self.scope,
+            namespace: self.namespace.clone(),
+            budget: self.budget,
             file,
             partition,
             metrics: metrics.clone(),
@@ -257,6 +343,8 @@ struct Reader {
     view: Arc<Mutex<Cache>>,
     file_metrics: datafusion::datasource::physical_plan::ParquetFileMetrics,
     scope: usize,
+    namespace: String,
+    budget: usize,
     factory: Arc<dyn ParquetFileReaderFactory>,
     store: Arc<dyn ObjectStore>,
     file: PartitionedFile,
@@ -269,11 +357,17 @@ struct Reader {
 impl Reader {
     async fn init(&mut self) -> Result<()> {
         if !self.initialized {
+            if self.file.object_meta.size > MAX_FILE {
+                self.initialized = true;
+                return Ok(());
+            }
             let (size, bytes) = load_for_scan(
                 &self.view,
                 self.scope,
                 &self.store,
                 &self.file.object_meta.location,
+                &self.namespace,
+                self.budget,
             )
             .await
             .map_err(|e| ParquetError::External(Box::new(e)))?;
@@ -328,12 +422,42 @@ impl AsyncFileReader for Reader {
     ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         async move {
             self.init().await?;
+            if self.bytes.is_none() {
+                match self.fallback.get_metadata(options).await {
+                    Ok(metadata) => return Ok(metadata),
+                    Err(error) => {
+                        // A formerly large object may have shrunk while the
+                        // manifest still describes its old footer position.
+                        let current = self
+                            .store
+                            .head(&self.file.object_meta.location)
+                            .await
+                            .map_err(|e| ParquetError::External(Box::new(e)))?;
+                        if current.size == self.file.object_meta.size {
+                            return Err(error);
+                        }
+                        self.file.object_meta = current;
+                        self.fallback = self
+                            .factory
+                            .create_reader(
+                                self.partition,
+                                self.file.clone(),
+                                self.hint,
+                                &self.metrics,
+                            )
+                            .map_err(|e| ParquetError::External(Box::new(e)))?;
+                        self.initialized = false;
+                        self.init().await?;
+                    }
+                }
+            }
             if let Some(bytes) = &self.bytes {
                 let size = bytes.len() as u64;
+                let mut reader = std::io::Cursor::new(bytes.clone());
                 Ok(Arc::new(
                     ParquetMetaDataReader::new()
                         .with_arrow_reader_options(options)
-                        .load_and_finish(self, size)
+                        .load_and_finish(&mut reader, size)
                         .await?,
                 ))
             } else {
@@ -362,14 +486,25 @@ mod tests {
             .unwrap();
         let window = StorageMetricWindow::start("small-cache-test");
         assert_eq!(
-            load(&cache, 1, &store, &path).await.unwrap().1.unwrap(),
+            load(&cache, 1, &store, &path, "", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .unwrap(),
             "old"
         );
         assert_eq!(
-            load(&cache, 1, &store, &path).await.unwrap().1.unwrap(),
+            load(&cache, 1, &store, &path, "", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .unwrap(),
             "old"
         );
         assert_eq!(window.delta().get_requests, 2, "one validation per reader");
+        assert_eq!(window.delta().read_bytes, 3);
+        assert_eq!(window.delta().not_modified_requests, 1);
+        assert_eq!(window.delta().non_2xx_requests, 0);
         assert_eq!(
             crate::metrics::STORAGE_REQUEST_RESPONSE_TIME
                 .with_label_values(&["small-cache-test", "GET", "304"])
@@ -382,28 +517,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            load(&cache, 1, &store, &path).await.unwrap().1.unwrap(),
+            load(&cache, 1, &store, &path, "", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .unwrap(),
             "new"
         );
         store.delete(&path).await.unwrap();
-        assert!(load(&cache, 1, &store, &path).await.is_err());
+        assert!(load(&cache, 1, &store, &path, "", MAX_BYTES).await.is_err());
         assert!(cache.lock().unwrap().entries.is_empty());
         store
             .put(&path, Bytes::from_static(b"reborn").into())
             .await
             .unwrap();
         assert_eq!(
-            load(&cache, 1, &store, &path).await.unwrap().1.unwrap(),
+            load(&cache, 1, &store, &path, "", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .unwrap(),
             "reborn"
         );
         let other: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        assert!(load(&cache, 2, &other, &path).await.is_err());
+        other
+            .put(&path, Bytes::from_static(b"separate").into())
+            .await
+            .unwrap();
+        assert_eq!(
+            load(&cache, 1, &other, &path, "s3://other/", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .unwrap(),
+            "separate"
+        );
+        assert_eq!(
+            load(&cache, 1, &store, &path, "s3://original/", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .unwrap(),
+            "reborn"
+        );
+        other.delete(&path).await.unwrap();
+        assert!(load(&cache, 2, &other, &path, "", MAX_BYTES).await.is_err());
         store
             .put(&path, Bytes::from(vec![0; MAX_FILE as usize + 1]).into())
             .await
             .unwrap();
-        assert!(load(&cache, 1, &store, &path).await.unwrap().1.is_none());
-        assert!(cache.lock().unwrap().entries.is_empty());
+        assert!(
+            load(&cache, 1, &store, &path, "", MAX_BYTES)
+                .await
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert!(cache.lock().unwrap().remove(1, &path).is_none());
     }
 
     #[tokio::test]
@@ -417,7 +587,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            load_for_scan(&view, scope, &store, &path)
+            load_for_scan(&view, scope, &store, &path, "", MAX_BYTES)
                 .await
                 .unwrap()
                 .1
@@ -429,7 +599,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            load_for_scan(&view, scope, &store, &path)
+            load_for_scan(&view, scope, &store, &path, "", MAX_BYTES)
                 .await
                 .unwrap()
                 .1
@@ -439,7 +609,7 @@ mod tests {
         );
         let next = Mutex::new(Cache::default());
         assert_eq!(
-            load_for_scan(&next, scope, &store, &path)
+            load_for_scan(&next, scope, &store, &path, "", MAX_BYTES)
                 .await
                 .unwrap()
                 .1
@@ -449,7 +619,11 @@ mod tests {
         );
         store.delete(&path).await.unwrap();
         let next = Mutex::new(Cache::default());
-        assert!(load_for_scan(&next, scope, &store, &path).await.is_err());
+        assert!(
+            load_for_scan(&next, scope, &store, &path, "", MAX_BYTES)
+                .await
+                .is_err()
+        );
         let mut view = view.lock().unwrap();
         for i in 0..40 {
             view.insert(
@@ -513,7 +687,7 @@ mod measurement {
         physical_plan::ExecutionPlan,
         prelude::{Expr, SessionConfig, SessionContext},
     };
-    use object_store::{ObjectStoreExt, memory::InMemory};
+    use object_store::ObjectStoreExt;
     use parquet::arrow::ArrowWriter;
 
     #[derive(Debug)]
@@ -521,6 +695,7 @@ mod measurement {
         schema: SchemaRef,
         files: Vec<PartitionedFile>,
         cached: bool,
+        disabled: bool,
     }
     #[async_trait::async_trait]
     impl TableProvider for Table {
@@ -553,7 +728,21 @@ mod measurement {
             }
             let plan = format.create_physical_plan(state, builder.build()).await?;
             if self.cached {
-                install(plan, state.runtime_env().object_store(url)?, 12345)
+                install(
+                    plan,
+                    state.runtime_env().object_store(url)?,
+                    12345,
+                    MAX_BYTES,
+                    true,
+                )
+            } else if self.disabled {
+                install(
+                    plan,
+                    state.runtime_env().object_store(url)?,
+                    12345,
+                    MAX_BYTES,
+                    false,
+                )
             } else {
                 Ok(plan)
             }
@@ -564,7 +753,10 @@ mod measurement {
     // and PromQL evaluator. It isolates file I/O from HTTP admission and mutable
     // catalog reads; those costs must not be presented as measured here.
     #[tokio::test]
+    #[ignore = "requires real MinIO; set P_CACHE_TEST_MINIO_ENDPOINT and run --ignored --nocapture"]
     async fn repeated_sixty_file_queries() {
+        let endpoint = std::env::var("P_CACHE_TEST_MINIO_ENDPOINT")
+            .expect("HTTP test requires P_CACHE_TEST_MINIO_ENDPOINT");
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "p_timestamp",
@@ -580,22 +772,7 @@ mod measurement {
             Field::new("job", DataType::Utf8, false),
             Field::new("data_point_value", DataType::Float64, false),
         ]));
-        let backend: Arc<dyn ObjectStore> =
-            if let Ok(endpoint) = std::env::var("P_CACHE_TEST_MINIO_ENDPOINT") {
-                Arc::new(
-                    object_store::aws::AmazonS3Builder::new()
-                        .with_endpoint(endpoint)
-                        .with_allow_http(true)
-                        .with_region("us-east-1")
-                        .with_bucket_name("cache-measurement")
-                        .with_access_key_id("minioadmin")
-                        .with_secret_access_key("minioadmin")
-                        .build()
-                        .unwrap(),
-                )
-            } else {
-                Arc::new(InMemory::new())
-            };
+        let backend: Arc<dyn ObjectStore> = s3(&endpoint);
         let store: Arc<dyn ObjectStore> = Arc::new(MetricLayer::new(backend, "cache-measurement"));
         let mut files = Vec::new();
         for minute in 0..60 {
@@ -648,11 +825,19 @@ mod measurement {
         ];
         for (name, sql) in queries {
             let mut reference = None;
-            for cached in [false, true] {
+            let mut reference_bytes = None;
+            let mut reference_requests = None;
+            for (cached, disabled) in [(false, false), (false, true), (true, false)] {
                 if cached {
                     let mut cache = CACHE.lock().unwrap();
                     for file in &files {
-                        cache.remove(12345, &file.object_meta.location);
+                        cache.remove(
+                            12345,
+                            &Path::from(format!(
+                                "s3://cache-measurement/{}",
+                                file.object_meta.location
+                            )),
+                        );
                     }
                 }
                 for run in 0..2 {
@@ -674,6 +859,7 @@ mod measurement {
                             schema: schema.clone(),
                             files: files.clone(),
                             cached,
+                            disabled,
                         }),
                     )
                     .unwrap();
@@ -684,7 +870,18 @@ mod measurement {
                     };
                     let before_304 = not_modified();
                     let window = StorageMetricWindow::start("cache-measurement");
-                    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+                    let df = ctx.sql(sql).await.unwrap();
+                    let task = ctx.task_ctx();
+                    let plan = df.create_physical_plan().await.unwrap();
+                    let batches = datafusion::physical_plan::collect(plan.clone(), task)
+                        .await
+                        .unwrap();
+                    let scanned = scanned_bytes(&plan);
+                    if let Some(expected) = reference_bytes {
+                        assert_eq!(scanned, expected, "{name} cached={cached} run={run}");
+                    } else {
+                        reference_bytes = Some(scanned);
+                    }
                     let result = arrow::util::pretty::pretty_format_batches(&batches)
                         .unwrap()
                         .to_string();
@@ -726,14 +923,40 @@ mod measurement {
                         let result =
                             promql::evaluate_range(&plan, &[series], 300_000, 3_540_000, 60_000)
                                 .unwrap();
-                        assert!(!result.into_json().to_string().is_empty());
+                        let json = result.into_json();
+                        let values = json["result"][0]["values"].as_array().unwrap();
+                        assert_eq!(values.len(), 55);
+                        for (i, point) in values.iter().enumerate() {
+                            assert_eq!(point[0].as_f64().unwrap(), 300.0 + i as f64 * 60.0);
+                            let value: f64 = point[1].as_str().unwrap().parse().unwrap();
+                            assert!((value - 8.0).abs() < 1e-9, "{point}");
+                        }
                     }
                     let delta = window.delta();
+                    let requests = (delta.get_requests, delta.get_ranges_requests);
+                    if disabled {
+                        assert_eq!(
+                            Some(requests),
+                            reference_requests,
+                            "kill switch must preserve original HTTP request pattern"
+                        );
+                    } else if !cached {
+                        reference_requests = Some(requests);
+                    }
                     println!(
-                        "CACHE_MEASUREMENT {name} cached={cached} run={run} GET={} GET_RANGES={}",
+                        "CACHE_MEASUREMENT {name} cached={cached} disabled={disabled} run={run} GET={} GET_RANGES={}",
                         delta.get_requests, delta.get_ranges_requests
                     );
                     if cached {
+                        assert_eq!(delta.non_2xx_requests, 0);
+                        assert_eq!(
+                            delta.read_bytes,
+                            if run == 0 {
+                                files.iter().map(|f| f.object_meta.size).sum()
+                            } else {
+                                0
+                            }
+                        );
                         if run == 1 {
                             assert_eq!(
                                 not_modified() - before_304,
@@ -747,5 +970,247 @@ mod measurement {
                 }
             }
         }
+    }
+    #[tokio::test]
+    async fn disabled_and_oversized_install_preserve_original_plan() {
+        let ctx = SessionContext::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        ctx.runtime_env().register_object_store(
+            &url::Url::parse("s3://cache-measurement").unwrap(),
+            store.clone(),
+        );
+        for count in [1, MAX_ENTRIES + 1] {
+            let table = Table {
+                schema: Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                files: (0..count)
+                    .map(|i| PartitionedFile::new(format!("{i}.parquet"), 10))
+                    .collect(),
+                cached: false,
+                disabled: false,
+            };
+            let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+            for (enabled, budget) in [(false, MAX_BYTES), (true, 0), (true, 9)] {
+                let actual = install(plan.clone(), store.clone(), 0, budget, enabled).unwrap();
+                assert!(Arc::ptr_eq(&actual, &plan));
+            }
+            if count > MAX_ENTRIES {
+                assert!(Arc::ptr_eq(
+                    &install(plan.clone(), store.clone(), 0, MAX_BYTES, true).unwrap(),
+                    &plan
+                ));
+            }
+        }
+    }
+
+    fn s3(endpoint: &str) -> Arc<dyn ObjectStore> {
+        Arc::new(
+            object_store::aws::AmazonS3Builder::new()
+                .with_retry(object_store::RetryConfig {
+                    max_retries: 0,
+                    ..Default::default()
+                })
+                .with_endpoint(endpoint)
+                .with_allow_http(true)
+                .with_region("us-east-1")
+                .with_bucket_name("cache-measurement")
+                .with_access_key_id("minioadmin")
+                .with_secret_access_key("minioadmin")
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn scanned_bytes(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("bytes_scanned"))
+            .map(|m| m.as_usize())
+            .unwrap_or(0)
+            + plan
+                .children()
+                .iter()
+                .map(|p| scanned_bytes(p))
+                .sum::<usize>()
+    }
+
+    struct Proxy(std::process::Child);
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    async fn query(
+        store: Arc<dyn ObjectStore>,
+        size: u64,
+        cached: bool,
+    ) -> datafusion::common::Result<Vec<i64>> {
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(&url::Url::parse("s3://cache-measurement").unwrap(), store);
+        ctx.register_table(
+            "metrics",
+            Arc::new(Table {
+                schema: Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                files: vec![PartitionedFile::new("mutations/data.parquet", size)],
+                cached,
+                disabled: false,
+            }),
+        )?;
+        let batches = ctx
+            .sql("SELECT value FROM metrics ORDER BY value")
+            .await?
+            .collect()
+            .await?;
+        Ok(batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect())
+    }
+
+    fn parquet(values: Vec<i64>) -> Bytes {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(arrow_array::Int64Array::from(values)) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let mut body = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut body, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(body)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real MinIO; set P_CACHE_TEST_MINIO_ENDPOINT and run --ignored --nocapture"]
+    async fn http_mutations_and_faults() {
+        use std::io::{BufRead, BufReader};
+        let endpoint = std::env::var("P_CACHE_TEST_MINIO_ENDPOINT")
+            .expect("HTTP test requires P_CACHE_TEST_MINIO_ENDPOINT");
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let mode = dir.path().join("mode");
+        std::fs::write(&mode, "normal").unwrap();
+        let mut proxy = Proxy(
+            std::process::Command::new("python3")
+                .args([
+                    "-u",
+                    "src/query/cache_http_proxy.py",
+                    &endpoint,
+                    mode.to_str().unwrap(),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut port = String::new();
+        BufReader::new(proxy.0.stdout.take().unwrap())
+            .read_line(&mut port)
+            .unwrap();
+        let backend = s3(&endpoint);
+        let store: Arc<dyn ObjectStore> = Arc::new(MetricLayer::new(
+            s3(&format!("http://127.0.0.1:{}", port.trim())),
+            "http-mutations",
+        ));
+        let path = Path::from("mutations/data.parquet");
+        let old = parquet(vec![1, 2, 3]);
+        let new = parquet(vec![4, 5, 6]);
+        assert_eq!(old.len(), new.len());
+        backend.put(&path, old.clone().into()).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                query(store.clone(), old.len() as u64, true).await.unwrap(),
+                [1, 2, 3]
+            );
+        }
+        backend.put(&path, new.clone().into()).await.unwrap();
+        assert_eq!(
+            query(store.clone(), old.len() as u64, true).await.unwrap(),
+            [4, 5, 6]
+        );
+        backend.delete(&path).await.unwrap();
+        assert!(query(store.clone(), old.len() as u64, false).await.is_err());
+        assert!(query(store.clone(), old.len() as u64, true).await.is_err());
+        backend.put(&path, old.clone().into()).await.unwrap();
+        assert_eq!(
+            query(store.clone(), old.len() as u64, true).await.unwrap(),
+            [1, 2, 3]
+        );
+        std::fs::write(&mode, "fail").unwrap();
+        assert!(query(store.clone(), old.len() as u64, true).await.is_err());
+        std::fs::write(&mode, "normal").unwrap();
+        assert_eq!(
+            query(store.clone(), old.len() as u64, true).await.unwrap(),
+            [1, 2, 3]
+        );
+        backend.put(&path, new.clone().into()).await.unwrap();
+        std::fs::write(&mode, "broken").unwrap();
+        assert!(query(store.clone(), old.len() as u64, true).await.is_err());
+        assert!(!CACHE.lock().unwrap().entries.contains_key(&(
+            12345,
+            Path::from("s3://cache-measurement/mutations/data.parquet")
+        )));
+        std::fs::write(&mode, "normal").unwrap();
+        assert_eq!(
+            query(store.clone(), new.len() as u64, true).await.unwrap(),
+            [4, 5, 6]
+        );
+        for fault in ["absent", "weak", "full"] {
+            // Remove a prior strong validator, then exercise two independent scans.
+            backend.delete(&path).await.unwrap();
+            assert!(query(store.clone(), old.len() as u64, true).await.is_err());
+            backend.put(&path, new.clone().into()).await.unwrap();
+            std::fs::write(&mode, fault).unwrap();
+            std::fs::write(mode.with_extension("requests"), "").unwrap();
+            let window = StorageMetricWindow::start("http-mutations");
+            for _ in 0..2 {
+                assert_eq!(
+                    query(store.clone(), new.len() as u64, true).await.unwrap(),
+                    [4, 5, 6]
+                );
+            }
+            assert_eq!(window.delta().not_modified_requests, 0, "{fault}");
+            if fault != "full" {
+                assert_eq!(
+                    std::fs::read_to_string(mode.with_extension("requests")).unwrap(),
+                    "False\nFalse\n",
+                    "{fault}"
+                );
+            }
+            std::fs::write(&mode, "normal").unwrap();
+        }
+        // Unique integers defeat dictionary compression, producing a real large parquet file.
+        let values = (0..100_000).collect::<Vec<i64>>();
+        let large = parquet(values.clone());
+        assert!(large.len() as u64 > MAX_FILE);
+        backend.put(&path, large.clone().into()).await.unwrap();
+        for size in [old.len(), large.len()] {
+            assert_eq!(
+                query(store.clone(), size as u64, true).await.unwrap(),
+                values
+            );
+        }
+        backend.put(&path, old.clone().into()).await.unwrap();
+        for size in [large.len(), old.len()] {
+            assert_eq!(
+                query(store.clone(), size as u64, true).await.unwrap(),
+                [1, 2, 3]
+            );
+        }
+        backend.delete(&path).await.unwrap();
     }
 }

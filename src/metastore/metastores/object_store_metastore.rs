@@ -1571,45 +1571,84 @@ impl Metastore for ObjectStoreMetastore {
                         && name != TOMBSTONE_ROOT_DIRECTORY
                 })
                 .collect::<Vec<_>>();
-            let results =
-                futures::stream::iter(streams)
-                    .map(|stream| {
-                        let root = root.clone();
-                        async move {
-                            let stream_path = if let Some(root) = root.as_ref() {
-                                object_store::path::Path::from_iter([
-                                    root.as_ref(),
-                                    &stream,
-                                    STREAM_ROOT_DIRECTORY,
-                                ])
-                            } else {
-                                object_store::path::Path::from(format!(
-                                    "{}/{}",
-                                    stream, STREAM_ROOT_DIRECTORY
-                                ))
-                            };
-                            let resp = self.storage.list_with_delimiter(Some(stream_path)).await?;
-                            if resp.objects.iter().any(|name| {
-                                name.location.filename().unwrap().ends_with("stream.json")
-                            }) {
-                                Ok::<_, MetastoreError>(Some(stream))
-                            } else {
-                                Ok(None)
-                            }
-                        }
-                    })
-                    .buffer_unordered(16)
-                    .try_collect::<Vec<_>>()
-                    .await?;
+            let results = collect_dataset_probes(streams.into_iter().map(|stream| {
+                let root = root.clone();
+                async move {
+                    let stream_path = if let Some(root) = root.as_ref() {
+                        object_store::path::Path::from_iter([
+                            root.as_ref(),
+                            &stream,
+                            STREAM_ROOT_DIRECTORY,
+                        ])
+                    } else {
+                        object_store::path::Path::from(format!(
+                            "{}/{}",
+                            stream, STREAM_ROOT_DIRECTORY
+                        ))
+                    };
+                    let resp = self.storage.list_with_delimiter(Some(stream_path)).await?;
+                    if resp
+                        .objects
+                        .iter()
+                        .any(|name| name.location.filename().unwrap().ends_with("stream.json"))
+                    {
+                        Ok::<_, MetastoreError>(Some(stream))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            }))
+            .await?;
             Ok(results.into_iter().flatten().collect())
         }
     }
+}
+
+// All-or-error collection: a failed probe cannot publish a partial inventory.
+async fn collect_dataset_probes<T, E>(
+    probes: impl IntoIterator<Item = impl std::future::Future<Output = Result<T, E>>>,
+) -> Result<Vec<T>, E> {
+    futures::stream::iter(probes)
+        .buffer_unordered(16)
+        .try_collect()
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::LocalFS;
+
+    #[tokio::test]
+    async fn dataset_probes_are_bounded_and_fail_atomically() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for fail in [false, true] {
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let result = collect_dataset_probes((0..64).map(|i| {
+                let active = &active;
+                let peak = &peak;
+                async move {
+                    let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    if fail && i == 25 {
+                        Err("failed probe")
+                    } else {
+                        Ok(i)
+                    }
+                }
+            }))
+            .await;
+            assert_eq!(peak.load(Ordering::SeqCst), 16);
+            if fail {
+                assert_eq!(result, Err("failed probe"));
+            } else {
+                assert_eq!(result.unwrap().len(), 64);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn next_metadata_read_sees_external_writer_changes() {

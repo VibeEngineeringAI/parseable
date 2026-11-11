@@ -364,7 +364,10 @@ async fn parquet_scan_plan(
     batch_size: usize,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let (file_format, file_source) = build_parquet_scan_components(schema, filters, state)?;
-    let cache_store = if object_store_url.as_str() != "file:///" {
+    let cache_store = if object_store_url.as_str() != "file:///"
+        && PARSEABLE.options.small_file_cache_enabled
+        && PARSEABLE.options.small_file_cache_size > 0
+    {
         Some(state.runtime_env().object_store(&object_store_url)?)
     } else {
         None
@@ -404,6 +407,8 @@ async fn parquet_scan_plan(
             plan,
             store,
             Arc::as_ptr(&PARSEABLE.storage) as *const () as usize,
+            PARSEABLE.options.small_file_cache_size,
+            PARSEABLE.options.small_file_cache_enabled,
         )
     } else {
         Ok(plan)
@@ -424,8 +429,12 @@ where
     F: std::future::Future<Output = DataFusionResult<M>>,
     I: Fn(&M) -> bool,
 {
-    let mut captured = if predicted { Some(capture()?) } else { None };
+    let pending = predicted.then(&mut capture);
+    let mut captured = None;
     let mut metadata = load(false).await?;
+    if predicted && includes_staging(&metadata) {
+        captured = Some(pending.expect("predicted capture")?);
+    }
     if !predicted && includes_staging(&metadata) {
         captured = Some(capture()?);
         metadata = load(true).await?;
@@ -2502,5 +2511,20 @@ mod snapshot_capture_tests {
         .unwrap();
         assert_eq!(snapshot, 42);
         assert_eq!(staging, None);
+    }
+    #[tokio::test]
+    async fn speculative_capture_error_only_fails_when_staging_is_needed() {
+        for needed in [false, true] {
+            let result = capture_before_snapshot(
+                true,
+                || -> DataFusionResult<()> {
+                    Err(DataFusionError::Execution("capture failed".into()))
+                },
+                |_| async { Ok(needed) },
+                |needed| *needed,
+            )
+            .await;
+            assert_eq!(result.is_err(), needed);
+        }
     }
 }
