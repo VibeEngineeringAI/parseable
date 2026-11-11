@@ -3,6 +3,13 @@ import { useApp } from '../../app/AppProvider';
 import { useAsync } from '../../hooks/useAsync';
 import { sha256 } from '../../lib/sha256';
 
+export function canEditDashboard(
+  access: { hash?: string; isAdmin: boolean },
+  author: string | null | undefined,
+): boolean {
+  return access.isAdmin || (!!access.hash && access.hash === author);
+}
+
 export function useDashboardAccess() {
   const { client, identity, mode } = useApp();
   const hash = useAsync(
@@ -23,7 +30,7 @@ export function useDashboardAccess() {
     ].flatMap((role) => role.actions);
   return {
     hash: hash.data,
-    loading: hash.loading,
+    loading: hash.loading || roles.loading,
     canCreate: privileges
       ? privileges.some((item) =>
           ['superadmin', 'admin', 'editor', 'writer', 'reader'].includes(item.privilege),

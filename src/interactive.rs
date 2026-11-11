@@ -26,6 +26,10 @@ const ENV_FILE_NAME: &str = ".parseable.env";
 
 /// Guard to avoid parsing `.parseable.env` more than once per process.
 static ENV_FILE_LOADED: AtomicBool = AtomicBool::new(false);
+static LOADED_ENV_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub(crate) fn loaded_env_path() -> Option<&'static std::path::Path> {
+    LOADED_ENV_PATH.get().map(PathBuf::as_path)
+}
 
 /// A required or optional env var that the user may need to provide.
 struct EnvPrompt {
@@ -127,6 +131,7 @@ pub fn load_env_file() {
         Err(_) => return,
     };
 
+    let _ = LOADED_ENV_PATH.set(path);
     for line in io::BufReader::new(file).lines() {
         let line = match line {
             Ok(l) => l,

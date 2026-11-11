@@ -494,7 +494,8 @@ impl DashboardError {
 impl actix_web::ResponseError for DashboardError {
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::ObjectStorage(_) | Self::Custom(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ObjectStorage(e) => e.http_status(),
+            Self::Custom(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Serde(_) | Self::Metadata(_) | Self::InvalidQueryParameter | Self::Header(_) => {
                 StatusCode::BAD_REQUEST
             }

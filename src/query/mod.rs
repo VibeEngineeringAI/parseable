@@ -169,6 +169,13 @@ fn get_schema_provider(tenant_id: &Option<String>) -> Box<dyn SchemaProvider> {
     }
 }
 
+fn request_context(mut state: SessionState) -> SessionContext {
+    state
+        .config_mut()
+        .set_extension(Arc::new(small_file_cache::RequestView::default()));
+    SessionContext::new_with_state(state)
+}
+
 pub struct InMemorySessionContext {
     session_context: Arc<RwLock<SessionContext>>,
 }
@@ -436,7 +443,9 @@ impl Query {
         )
     )]
     pub async fn execute(&self, is_streaming: bool, tenant_id: &Option<String>) -> QueryResult {
-        let ctx = QUERY_SESSION.get_ctx();
+        // The catalog session is process-wide. Attach a fresh validation view
+        // only to this execution, retaining it through planning and streaming.
+        let ctx = request_context(QUERY_SESSION.get_ctx().state());
         let mut logical_plan = self.final_logical_plan(tenant_id);
         let (hot_tier_guards, guarded_hot_tier_streams) =
             hot_tier_query_guards(&logical_plan, &self.time_range).await?;
@@ -1713,3 +1722,5 @@ mod tests {
         assert_eq!(val, out);
     }
 }
+
+mod small_file_cache;

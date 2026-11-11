@@ -69,7 +69,15 @@ pub async fn delete(
     // if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
-    if !PARSEABLE.streams.contains(&stream_name, &tenant_id)
+    // A crashed PostgreSQL deletion is deliberately absent from stream loading,
+    // but an explicit DELETE must still be able to finish it after restart.
+    let pending_delete = PARSEABLE.options.postgres.enabled()
+        && PARSEABLE
+            .metastore
+            .is_stream_deleting(&stream_name, &tenant_id)
+            .await?;
+    if !pending_delete
+        && !PARSEABLE.streams.contains(&stream_name, &tenant_id)
         && !PARSEABLE
             .create_stream_and_schema_from_storage(&stream_name, &tenant_id)
             .await
@@ -78,9 +86,12 @@ pub async fn delete(
         return Err(StreamNotFound(stream_name.clone()).into());
     }
 
-    let objectstore = PARSEABLE.storage.get_object_store();
     // Delete from storage
-    objectstore.delete_stream(&stream_name, &tenant_id).await?;
+    PARSEABLE
+        .metastore
+        .delete_stream(&stream_name, &tenant_id)
+        .await
+        .map_err(crate::metastore::MetastoreError::into_storage_error)?;
     let stream_dir = PARSEABLE.get_or_create_stream(&stream_name, &tenant_id);
     if let Err(err) = fs::remove_dir_all(&stream_dir.data_path) {
         warn!(

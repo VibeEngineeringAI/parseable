@@ -31,7 +31,6 @@ use chrono::Utc;
 use clap::{Parser, error::ErrorKind};
 use once_cell::sync::{Lazy, OnceCell};
 use regex::Regex;
-use relative_path::RelativePathBuf;
 pub use staging::StagingError;
 use streams::StreamRef;
 pub use streams::{Stream, StreamNotFound, Streams};
@@ -72,8 +71,7 @@ use crate::{
     static_schema::{StaticSchema, convert_static_schema_to_arrow_schema},
     storage::{
         ObjectStorage, ObjectStorageError, ObjectStorageProvider, ObjectStoreFormat, Owner,
-        Permisssion, StorageMetadata, StreamType, object_storage::is_tombstoned,
-        put_remote_metadata,
+        Permisssion, StorageMetadata, StreamType, put_remote_metadata,
     },
     tenants::{Service, TENANT_METADATA},
     validator,
@@ -156,8 +154,15 @@ fn resolve_telemetry_type(
     }
 }
 
+#[cfg(test)]
+pub(crate) static CONTRACT_PARSEABLE_FACTORY: OnceCell<fn() -> Parseable> = OnceCell::new();
+
 /// Shared state of the Parseable server.
 pub static PARSEABLE: Lazy<Parseable> = Lazy::new(|| {
+    #[cfg(test)]
+    if let Some(factory) = CONTRACT_PARSEABLE_FACTORY.get() {
+        return factory();
+    }
     let metastore = METASTORE.get_or_init(|| {
         // Prompt user for missing env vars before clap validates them.
         // Values are set in env but NOT saved to disk yet.
@@ -181,9 +186,31 @@ pub static PARSEABLE: Lazy<Parseable> = Lazy::new(|| {
             StorageOptions::Blob(args) => args.storage.construct_client(),
             StorageOptions::Gcs(args) => args.storage.construct_client(),
         };
+        let options = match &cli.storage {
+            StorageOptions::Local(a) => &a.options,
+            StorageOptions::S3(a) => &a.options,
+            StorageOptions::Blob(a) => &a.options,
+            StorageOptions::Gcs(a) => &a.options,
+        };
+        if options.postgres.enabled() {
+            use crate::metastore::metastores::{
+                postgres_documents::PostgresDocuments, postgres_metastore::PostgresMetastore,
+            };
+            let endpoint = match &cli.storage {
+                StorageOptions::Local(a) => a.storage.get_endpoint(),
+                StorageOptions::S3(a) => a.storage.get_endpoint(),
+                StorageOptions::Blob(a) => a.storage.get_endpoint(),
+                StorageOptions::Gcs(a) => a.storage.get_endpoint(),
+            };
+            let documents = PostgresDocuments::new(&options.postgres, endpoint, storage)
+                .unwrap_or_else(|e| panic!("PostgreSQL metastore configuration failed: {e}"));
+            return Arc::new(PostgresMetastore {
+                storage: Arc::new(documents),
+            }) as Arc<dyn Metastore>;
+        }
         tracing::warn!("creating objectstoremetastore");
         let metastore = ObjectStoreMetastore { storage };
-        Arc::new(metastore)
+        Arc::new(metastore) as Arc<dyn Metastore>
     });
 
     // Prompt user for missing env vars before clap validates them.
@@ -498,10 +525,23 @@ impl Parseable {
         let storage = self.storage.get_object_store();
         // A deletion in progress (or left unfinished by a crashed node) must
         // never be resurrected by a concurrent lazy reload.
-        if is_tombstoned(storage.as_ref(), stream_name, tenant_id).await? {
+        if self
+            .metastore
+            .is_stream_deleting(stream_name, tenant_id)
+            .await
+            .map_err(crate::metastore::MetastoreError::into_storage_error)?
+        {
+            if self.options.postgres.enabled() {
+                return Err(crate::storage::ObjectStorageError::StreamDeleting.into());
+            }
             return Ok(false);
         }
-        if !storage.stream_exists(stream_name, tenant_id).await? {
+        if !self
+            .metastore
+            .stream_exists(stream_name, tenant_id)
+            .await
+            .map_err(crate::metastore::MetastoreError::into_storage_error)?
+        {
             return Ok(false);
         }
         let (stream_metadata_bytes, schema_bytes) = try_join!(
@@ -1235,15 +1275,14 @@ impl Parseable {
     async fn load_tenants(&self) -> Result<(), anyhow::Error> {
         let is_multi_tenant = self.options.is_multi_tenant();
 
-        let obj_store = self.storage().get_object_store();
-        let dirs: Vec<String> = obj_store
-            .list_dirs_relative(&RelativePathBuf::from_iter([""]), &None)
-            .await?
-            .into_iter()
-            .filter(|d| !d.starts_with("."))
-            .collect();
+        let dirs = self
+            .metastore
+            .list_tenant_candidates()
+            .await
+            .map_err(crate::metastore::MetastoreError::into_storage_error)?;
 
         let mut recognized_tenants = vec![];
+        let mut invalid_tenants = vec![];
 
         // validate the possible presence of tenant storage metadata
         for tenant_id in dirs.into_iter() {
@@ -1261,21 +1300,25 @@ impl Parseable {
                 recognized_tenants.push(tenant_id);
             } else if !is_multi_tenant {
             } else {
-                // found an invalid multi-tenant directory, delete
-                tracing::warn!(
-                    "Found invalid tenant directory with multi-tenant mode- {tenant_id}.\nDeleting."
-                );
-
-                // delete from storage
-                if let Err(e) = obj_store
-                    .delete_prefix(&RelativePathBuf::from_iter([&tenant_id]), &None)
-                    .await
-                {
-                    tracing::error!(
-                        "Unable to delete invalid directory- {tenant_id} with error-\n{e}"
-                    );
-                };
+                invalid_tenants.push(tenant_id);
             }
+        }
+        // Discovery and validation must finish before destructive cleanup.
+        for tenant_id in invalid_tenants {
+            // found an invalid multi-tenant directory, delete
+            tracing::warn!(
+                "Found invalid tenant directory with multi-tenant mode- {tenant_id}.\nDeleting."
+            );
+
+            // delete from storage
+            if let Err(e) = self
+                .metastore
+                .delete_tenant(&tenant_id)
+                .await
+                .map_err(crate::metastore::MetastoreError::into_storage_error)
+            {
+                tracing::error!("Unable to delete invalid directory- {tenant_id} with error-\n{e}");
+            };
         }
 
         if is_multi_tenant {
@@ -1432,7 +1475,8 @@ mod tests {
             storage.clone(),
         );
         let stream = server.get_or_create_stream("logs", &None);
-        let remote_path = RelativePathBuf::from("logs/.stream/.ingestor.other.schema");
+        let remote_path =
+            relative_path::RelativePathBuf::from("logs/.stream/.ingestor.other.schema");
         storage
             .put_object(
                 &remote_path,

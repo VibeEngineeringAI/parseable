@@ -131,7 +131,7 @@ test('read-only production story permits transient collapse and hides editing co
 }) => {
   await open(page, 'read-only');
   await expect(
-    page.getByText('This dashboard is read-only. Only its owner can edit it.'),
+    page.getByText('This dashboard is read-only. Only its owner or an administrator can edit it.'),
   ).toBeVisible();
   await expect(page.getByRole('button', { name: /^(Move|Resize) tile/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Add section', exact: true })).toHaveCount(0);

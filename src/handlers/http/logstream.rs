@@ -59,17 +59,27 @@ pub async fn delete(
     let stream_name = logstream.into_inner();
     // Error out if stream doesn't exist in memory, or in the case of query node, in storage as well
     let tenant_id = get_tenant_id_from_request(&req)?;
-    if !PARSEABLE
-        .check_or_load_stream(&stream_name, &tenant_id)
-        .await
+    // A crashed PostgreSQL deletion is deliberately absent from stream loading,
+    // but an explicit DELETE must still be able to finish it after restart.
+    let pending_delete = PARSEABLE.options.postgres.enabled()
+        && PARSEABLE
+            .metastore
+            .is_stream_deleting(&stream_name, &tenant_id)
+            .await?;
+    if !pending_delete
+        && !PARSEABLE
+            .check_or_load_stream(&stream_name, &tenant_id)
+            .await
     {
         return Err(StreamNotFound(stream_name).into());
     }
 
-    let objectstore = PARSEABLE.storage.get_object_store();
-
     // Delete from storage
-    objectstore.delete_stream(&stream_name, &tenant_id).await?;
+    PARSEABLE
+        .metastore
+        .delete_stream(&stream_name, &tenant_id)
+        .await
+        .map_err(crate::metastore::MetastoreError::into_storage_error)?;
     // Delete from staging
     let stream_dir = PARSEABLE.get_or_create_stream(&stream_name, &tenant_id);
     if let Err(err) = fs::remove_dir_all(&stream_dir.data_path) {
@@ -845,8 +855,8 @@ pub mod error {
                 StreamError::CreateStream(CreateStreamError::StreamNameValidation(_)) => {
                     StatusCode::BAD_REQUEST
                 }
-                StreamError::CreateStream(CreateStreamError::Storage { .. }) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
+                StreamError::CreateStream(CreateStreamError::Storage { err, .. }) => {
+                    err.http_status()
                 }
                 StreamError::CreateStream(CreateStreamError::Custom { .. }) => {
                     StatusCode::INTERNAL_SERVER_ERROR
@@ -858,7 +868,7 @@ pub mod error {
                 StreamError::TenantNotFoundError(_) => StatusCode::NOT_FOUND,
                 StreamError::Custom { status, .. } => *status,
                 StreamError::UninitializedLogstream => StatusCode::METHOD_NOT_ALLOWED,
-                StreamError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                StreamError::Storage(e) => e.http_status(),
                 StreamError::NoAlertsSet => StatusCode::NOT_FOUND,
                 StreamError::BadAlertJson { .. } => StatusCode::BAD_REQUEST,
                 StreamError::AlertValidation(_) => StatusCode::BAD_REQUEST,

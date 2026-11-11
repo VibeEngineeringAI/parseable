@@ -1956,7 +1956,7 @@ impl Stream {
     #[inline(always)]
     fn conversion_phase(&self, _phase: ConversionPhase<'_>) {}
 
-    fn parquet_writer_props(
+    pub(crate) fn parquet_writer_props(
         &self,
         merged_schema: &Schema,
         time_partition: Option<&String>,

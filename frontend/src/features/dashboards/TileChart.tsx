@@ -7,7 +7,7 @@ import {
 import { BubbleChart } from '../../components/charts/BubbleChart';
 import { GaugeChart } from '../../components/charts/GaugeChart';
 import { DataTable } from '../../components/explorer/DataTable';
-import { chartResults, promqlTableRows } from '../../lib/promqlResults';
+import { applyQueryAliases, chartResults, promqlTableRows } from '../../lib/promqlResults';
 import {
   cartesianChart,
   cartesianStyle,
@@ -47,7 +47,7 @@ export function TileChart({
   const config = record(tile.config),
     layout = record(config.layout),
     axes = record(config.axes);
-  const chart = useMemo<CartesianChart>(() => {
+  const rawChart = useMemo<CartesianChart>(() => {
     if (!result.promql) return cartesianChart(result.rows ?? [], tile);
     if (['timeseries', 'line', 'area', 'bar'].includes(text(tile.chartType))) {
       const categorical = promqlCategoryChart(result.promql);
@@ -81,6 +81,20 @@ export function TileChart({
       return { ...toChartSeries(converted[0].range), categorical: false };
     return { ...chartResults(converted, converted.length), categorical: false };
   }, [result, tile]);
+  const chart = useMemo<CartesianChart>(
+    () =>
+      result.promql && !rawChart.categorical
+        ? {
+            ...rawChart,
+            series: applyQueryAliases(
+              rawChart.series,
+              record(config.queryAliases),
+              result.promql.length === 1 ? result.promql[0].id : undefined,
+            ),
+          }
+        : rawChart,
+    [rawChart, result.promql, config.queryAliases],
+  );
   const rows = useMemo(
     () => result.rows ?? (result.promql ? promqlTableRows(result.promql) : []),
     [result],

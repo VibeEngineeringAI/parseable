@@ -860,7 +860,7 @@ pub enum OIDCError {
 impl actix_web::ResponseError for OIDCError {
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::ObjectStorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ObjectStorageError(e) => e.http_status(),
             Self::Serde(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,

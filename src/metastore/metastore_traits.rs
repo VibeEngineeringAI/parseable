@@ -49,6 +49,22 @@ pub use crate::storage::object_storage::{
 /// need different methods for different kinds of metadata.
 #[async_trait]
 pub trait Metastore: std::fmt::Debug + Send + Sync {
+    /// Optional SQL batch; the default performs no requests.
+    async fn manifest_batch(
+        &self,
+        _paths: &[String],
+        _tenant: &Option<String>,
+    ) -> Result<Option<HashMap<String, Option<Manifest>>>, MetastoreError> {
+        Ok(None)
+    }
+    /// SQL-only partition inventory for retention recovery.
+    async fn metadata_dates(
+        &self,
+        _stream: &str,
+        _tenant: &Option<String>,
+    ) -> Result<Vec<String>, MetastoreError> {
+        Ok(Vec::new())
+    }
     async fn initiate_connection(&self) -> Result<(), MetastoreError>;
     async fn get_objects(
         &self,
@@ -381,6 +397,38 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         node_type: NodeType,
     ) -> Result<bool, MetastoreError>;
     async fn put_node_metadata(&self, obj: &dyn MetastoreObject) -> Result<(), MetastoreError>;
+    /// Backend health probe; object storage preserves its historical HEAD check.
+    async fn check_health(&self, tenant_id: &Option<String>) -> Result<(), MetastoreError>;
+    /// Time a metadata read, including failed reads, for the startup banner.
+    async fn read_latency(&self, tenant_id: &Option<String>) -> std::time::Duration;
+    /// Preserve backend-specific stream existence rules without reading bucket metadata at callers.
+    async fn stream_exists(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<bool, MetastoreError>;
+    /// Whether deletion has begun and lazy loading must be suppressed.
+    async fn is_stream_deleting(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<bool, MetastoreError>;
+    /// Remove stream metadata and its data, preserving the backend's deletion order.
+    async fn delete_stream(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<(), MetastoreError>;
+    /// Delete a physical date partition together with its manifest metadata.
+    /// Snapshot removal is performed by the caller before this operation.
+    async fn delete_stream_partition(
+        &self,
+        stream_name: &str,
+        date: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<(), MetastoreError>;
+    /// Discovery candidates, including invalid entries which startup historically cleans up.
+    async fn list_tenant_candidates(&self) -> Result<Vec<String>, MetastoreError>;
     async fn list_streams(
         &self,
         tenant_id: &Option<String>,

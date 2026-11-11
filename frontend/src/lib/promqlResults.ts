@@ -8,6 +8,23 @@ export type QueryResult = {
   errors: Array<{ kind: 'range' | 'instant'; error: Error }>;
 };
 
+/** Display names change only the legend; query/series identities and label dimensions stay intact. */
+export function applyQueryAliases<T extends { id: string; label: string }>(
+  series: T[],
+  aliases: Record<string, unknown>,
+  singleQueryId?: string,
+): T[] {
+  return series.map((entry) => {
+    const queryId = entry.id.split(':', 1)[0] || singleQueryId;
+    const configured = queryId ? aliases[queryId] : undefined;
+    if (typeof configured !== 'string' || !configured.trim()) return entry;
+    const alias = configured.trim();
+    const prefix = `${queryId}: `;
+    const labels = entry.label.startsWith(prefix) ? entry.label.slice(prefix.length) : entry.label;
+    return { ...entry, label: labels === '{}' ? alias : `${alias}: ${labels}` };
+  });
+}
+
 export function chartResults(results: QueryResult[], queryCount: number) {
   const charts = results.flatMap((row) => (row.range ? [toChartSeries(row.range, row.id)] : []));
   const timestamps = [...new Set(charts.flatMap((chart) => chart.timestamps))].sort(

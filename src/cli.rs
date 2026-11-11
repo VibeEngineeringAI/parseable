@@ -137,6 +137,11 @@ pub struct GcsStoreArgs {
 
 #[derive(Parser, Debug, Default)]
 pub struct Options {
+    #[command(flatten)]
+    pub migration: crate::metastore::metastores::migration::MigrationOptions,
+    #[command(flatten)]
+    pub postgres: crate::metastore::metastores::postgres_metastore::PostgresOptions,
+
     // Authentication
     #[arg(long, env = "P_USERNAME", help = "Admin username to be set for this Parseable server", default_value = DEFAULT_USERNAME)]
     pub username: String,
@@ -495,6 +500,17 @@ pub struct Options {
         help = "Maximum size in bytes of the DataFusion Parquet metadata cache"
     )]
     pub parquet_metadata_cache_size: usize,
+
+    #[arg(long, help = "Validate and cache small remote Parquet bodies", env = "P_SMALL_FILE_CACHE_ENABLED", default_value = "true", action = clap::ArgAction::Set)]
+    pub small_file_cache_enabled: bool,
+
+    #[arg(
+        long,
+        help = "Maximum resident small-file body bytes (zero disables caching)",
+        env = "P_SMALL_FILE_CACHE_SIZE",
+        default_value = "67108864"
+    )]
+    pub small_file_cache_size: usize,
 
     // reduced the max row group size from 1048576
     // smaller row groups help in faster query performance in multi threaded query

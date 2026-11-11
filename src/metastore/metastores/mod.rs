@@ -16,4 +16,15 @@
  *
  */
 
+#[macro_use]
+mod document_metastore;
 pub mod object_store_metastore;
+pub(crate) mod postgres_documents;
+pub mod postgres_metastore;
+
+pub mod migration;
+
+mod postgres_client;
+
+#[cfg(test)]
+mod review_fix_tests;

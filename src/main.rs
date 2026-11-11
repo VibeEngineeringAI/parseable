@@ -58,6 +58,31 @@ async fn main() -> anyhow::Result<()> {
         warn!("Failed to install rustls crypto provider: {:?}", e);
     }
 
+    // Offline commands bypass server initialization and interactive configuration.
+    if std::env::args()
+        .any(|a| a == "--metadata-migration" || a.starts_with("--metadata-migration="))
+    {
+        use clap::Parser;
+        use parseable::cli::{Cli, StorageOptions};
+        use parseable::storage::ObjectStorageProvider;
+        parseable::interactive::load_env_file();
+        let cli = Cli::parse();
+        let (options, provider): (_, &dyn ObjectStorageProvider) = match &cli.storage {
+            StorageOptions::Local(a) => (&a.options, &a.storage),
+            StorageOptions::S3(a) => (&a.options, &a.storage),
+            StorageOptions::Blob(a) => (&a.options, &a.storage),
+            StorageOptions::Gcs(a) => (&a.options, &a.storage),
+        };
+        if options.migration.metadata_migration.is_some() {
+            return parseable::metastore::metastores::postgres_metastore::run_migration(
+                provider, options,
+            )
+            .await;
+        }
+    }
+
+    PARSEABLE.metastore.initiate_connection().await?;
+
     // these are empty ptrs so mem footprint should be minimal
     let server: Box<dyn ParseableServer> = match &PARSEABLE.options.mode {
         Mode::Query => Box::new(QueryServer),

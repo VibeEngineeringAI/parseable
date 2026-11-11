@@ -662,6 +662,107 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
     fn absolute_url(&self, prefix: &RelativePath) -> object_store::path::Path;
     fn store_url(&self) -> url::Url;
 
+    async fn check_migration_guard(&self) -> Result<(), ObjectStorageError> {
+        // ObjectStorage is object safe; use its primitives directly here.
+        for key in [
+            crate::metastore::metastores::migration::BUSY,
+            crate::metastore::metastores::migration::PAIR,
+        ] {
+            match self.get_object(RelativePath::new(key), &None).await {
+                Ok(ref id)
+                    if key.ends_with("postgres-metastore-id")
+                        && std::env::var("P_ALLOW_PAIRED_BUCKET")
+                            .is_ok_and(|v| v.as_bytes() == id.as_ref()) => {}
+                Ok(_) => {
+                    return Err(ObjectStorageError::Custom(format!(
+                        "bucket has {key}: PostgreSQL pairing or offline migration; complete export before object-store startup (P_ALLOW_PAIRED_BUCKET=<pairing-id> overrides pairing only)"
+                    )));
+                }
+                Err(ObjectStorageError::NoSuchKey(_)) => {}
+                Err(ObjectStorageError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                }
+                Err(e) => {
+                    return Err(ObjectStorageError::Custom(format!(
+                        "cannot probe migration marker {key}: {e}; retry after restoring bucket access"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw inventory for offline document migration; retains keys, never bodies.
+    async fn metadata_inventory(
+        &self,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, ObjectStorageError> {
+        let mut pending = vec![None];
+        let mut keys = Vec::new();
+        use futures::{StreamExt, TryStreamExt};
+        while !pending.is_empty() {
+            let round = std::mem::take(&mut pending);
+            let listings: Vec<_> = futures::stream::iter(round)
+                .map(|prefix| async move {
+                    let listing = self.list_with_delimiter(prefix).await?;
+                    let mut children = Vec::new();
+                    let mut found = Vec::new();
+                    for prefix in listing.common_prefixes {
+                        if prefix.parts().any(|c| {
+                            c.as_ref().starts_with("hour=") || c.as_ref().starts_with("minute=")
+                        }) {
+                            continue;
+                        }
+                        if prefix.filename().is_some_and(|p| p.starts_with('.')) {
+                            found.extend(self.metadata_hidden_prefix(prefix).await?);
+                        } else {
+                            children.push(Some(prefix));
+                        }
+                    }
+                    for object in listing
+                        .objects
+                        .into_iter()
+                        .filter(|o| !o.location.as_ref().ends_with(".parquet"))
+                    {
+                        found.push((
+                            decode_metadata_key(object.location.as_ref())?,
+                            object.last_modified,
+                        ));
+                    }
+                    Ok::<_, ObjectStorageError>((children, found))
+                })
+                .buffer_unordered(16)
+                .try_collect()
+                .await?;
+            for (children, found) in listings {
+                pending.extend(children);
+                keys.extend(found);
+            }
+        }
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(keys)
+    }
+
+    async fn metadata_hidden_prefix(
+        &self,
+        prefix: object_store::path::Path,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, ObjectStorageError> {
+        let mut pending = vec![prefix];
+        let mut keys = Vec::new();
+        while let Some(prefix) = pending.pop() {
+            let listing = self.list_with_delimiter(Some(prefix)).await?;
+            pending.extend(listing.common_prefixes);
+            keys.extend(
+                listing
+                    .objects
+                    .into_iter()
+                    .map(|o| {
+                        decode_metadata_key(o.location.as_ref()).map(|key| (key, o.last_modified))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(keys)
+    }
+
     async fn list_with_delimiter(
         &self,
         prefix: Option<object_store::path::Path>,
@@ -1264,13 +1365,70 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
 
         let stream = PARSEABLE.get_or_create_stream(stream_name, &tenant_id);
         let upload_context = UploadContext::new(stream);
+        if PARSEABLE.options.postgres.enabled()
+            && PARSEABLE
+                .metastore
+                .is_stream_deleting(stream_name, &tenant_id)
+                .await
+                .map_err(|e| ObjectStorageError::Custom(e.to_string()))?
+        {
+            for path in upload_context.stream.parquet_files() {
+                let filename = path.file_name().unwrap().to_string_lossy();
+                let key = stream_relative_path(
+                    stream_name,
+                    &filename,
+                    &upload_context.custom_partition,
+                    &tenant_id,
+                );
+                compensate_uploaded_parquet(self, &key, &tenant_id).await?;
+                remove_uploaded_staged_file(path);
+            }
+            for path in upload_context.stream.schema_files() {
+                remove_uploaded_staged_file(path);
+            }
+            return Ok(());
+        }
 
         // Process parquet files concurrently and collect results
         let uploaded_files =
             process_parquet_files(&upload_context, stream_name, tenant_id.clone()).await?;
 
         // Update snapshot with collected manifest files
-        update_snapshot_with_manifests(stream_name, &uploaded_files, &tenant_id).await?;
+        if let Err(e) =
+            update_snapshot_with_manifests(stream_name, &uploaded_files, &tenant_id).await
+        {
+            if PARSEABLE.options.postgres.enabled()
+                && e.http_status() == actix_web::http::StatusCode::CONFLICT
+            {
+                // The marker can land between upload and manifest publication.
+                // Compensate every upload in this batch, including partially
+                // published manifests, before retiring its local staging files.
+                for file in &uploaded_files {
+                    let filename = file.file_path.file_name().unwrap().to_string_lossy();
+                    let key = stream_relative_path(
+                        stream_name,
+                        &filename,
+                        &upload_context.custom_partition,
+                        &tenant_id,
+                    );
+                    match compensate_uploaded_parquet(self, &key, &tenant_id).await {
+                        Ok(()) | Err(ObjectStorageError::NoSuchKey(_)) => {}
+                        Err(cleanup) => {
+                            for pending in &uploaded_files {
+                                ACTIVE_OBJECT_STORE_SYNC_FILES.remove(&pending.file_path);
+                            }
+                            return Err(cleanup);
+                        }
+                    }
+                }
+                cleanup_uploaded_staged_files(uploaded_files).await;
+                for path in upload_context.stream.schema_files() {
+                    remove_uploaded_staged_file(path);
+                }
+                return Ok(());
+            }
+            return Err(e);
+        }
 
         // Calculate stats after snapshot update so uploads are visible before stats work starts.
         calculate_stats_for_uploaded_files(
@@ -1287,6 +1445,24 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
         process_schema_files(&upload_context, stream_name, &tenant_id).await?;
 
         Ok(())
+    }
+}
+
+// Data-only compensation for an upload rejected by the metastore deletion guard.
+async fn compensate_uploaded_parquet(
+    storage: &(impl ObjectStorage + ?Sized),
+    key: &str,
+    tenant: &Option<String>,
+) -> Result<(), ObjectStorageError> {
+    if !key.ends_with(".parquet") {
+        return Err(ObjectStorageError::Custom(
+            "upload compensation requires parquet key".into(),
+        ));
+    }
+    match storage.delete_object(RelativePath::new(key), tenant).await {
+        Ok(()) | Err(ObjectStorageError::NoSuchKey(_)) => Ok(()),
+        Err(ObjectStorageError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 
@@ -1321,6 +1497,13 @@ async fn process_parquet_files(
         .into_par_iter()
         .filter_map(claim_staged_file_for_upload)
         .collect();
+
+    let postgres = PARSEABLE.options.postgres.enabled();
+    let retirement_paths = if postgres {
+        parquet_paths.clone()
+    } else {
+        Vec::new()
+    };
 
     let mut total_size: u64 = 0;
     let mut min_dt: Option<chrono::DateTime<Utc>> = None;
@@ -1358,7 +1541,37 @@ async fn process_parquet_files(
     }
 
     // Collect results from all upload tasks
-    collect_upload_results(join_set).await
+    let result = collect_upload_results(join_set, postgres).await;
+    if result.is_err() && postgres {
+        // All tasks have settled, so no successful sibling upload can publish
+        // after compensation. Keep staging retryable if deletion is unconfirmed.
+        for path in &retirement_paths {
+            ACTIVE_OBJECT_STORE_SYNC_FILES.remove(path);
+        }
+        if PARSEABLE
+            .metastore
+            .is_stream_deleting(stream_name, &tenant_id)
+            .await
+            .is_ok_and(|pending| pending)
+        {
+            for path in retirement_paths {
+                let filename = path.file_name().unwrap().to_string_lossy();
+                let key = stream_relative_path(
+                    stream_name,
+                    &filename,
+                    &upload_context.custom_partition,
+                    &tenant_id,
+                );
+                compensate_uploaded_parquet(object_store.as_ref(), &key, &tenant_id).await?;
+                remove_uploaded_staged_file(path);
+            }
+            for path in upload_context.stream.schema_files() {
+                remove_uploaded_staged_file(path);
+            }
+            return Ok(Vec::new());
+        }
+    }
+    result
 }
 
 /// Spawns an individual parquet file upload task
@@ -1400,8 +1613,10 @@ async fn spawn_parquet_upload_task(
 /// Collects results from all upload tasks
 async fn collect_upload_results(
     mut join_set: JoinSet<Result<UploadResult, (PathBuf, ObjectStorageError)>>,
+    drain_on_error: bool,
 ) -> Result<Vec<UploadedParquetFile>, ObjectStorageError> {
     let mut uploaded_files = Vec::new();
+    let mut failure = None;
 
     while let Some(result) = join_set.join_next().await {
         match result {
@@ -1423,16 +1638,30 @@ async fn collect_upload_results(
             Ok(Err((path, e))) => {
                 error!("Error uploading parquet file: {e}");
                 ACTIVE_OBJECT_STORE_SYNC_FILES.remove(&path);
-                return Err(e);
+                if !drain_on_error {
+                    return Err(e);
+                }
+                if failure.is_none() {
+                    failure = Some(e);
+                }
             }
             Err(e) => {
                 error!("Task panicked: {e}");
-                return Err(ObjectStorageError::UnhandledError(Box::new(e)));
+                let error = ObjectStorageError::UnhandledError(Box::new(e));
+                if !drain_on_error {
+                    return Err(error);
+                }
+                if failure.is_none() {
+                    failure = Some(error);
+                }
             }
         }
     }
 
-    Ok(uploaded_files)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(uploaded_files),
+    }
 }
 
 /// Updates snapshot with collected manifest files
@@ -1752,14 +1981,20 @@ fn stream_metadata_prefix(
     tenant_id: &Option<String>,
 ) -> object_store::path::Path {
     object_store::path::Path::from_iter([
-        tenant_id.as_deref().unwrap_or(""),
+        tenant_id
+            .as_deref()
+            .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+            .unwrap_or(""),
         stream_name,
         STREAM_ROOT_DIRECTORY,
     ])
 }
 
 pub fn schema_path(stream_name: &str, tenant_id: &Option<String>) -> RelativePathBuf {
-    let tenant = tenant_id.as_deref().unwrap_or("");
+    let tenant = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     if PARSEABLE.options.mode == Mode::Ingest {
         let id = INGESTOR_META
             .get()
@@ -1775,7 +2010,10 @@ pub fn schema_path(stream_name: &str, tenant_id: &Option<String>) -> RelativePat
 
 #[inline(always)]
 pub fn stream_json_path(stream_name: &str, tenant_id: &Option<String>) -> RelativePathBuf {
-    let tenant = tenant_id.as_deref().unwrap_or("");
+    let tenant = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     if PARSEABLE.options.mode == Mode::Ingest {
         let id = INGESTOR_META
             .get()
@@ -1805,7 +2043,10 @@ pub fn stream_json_path(stream_name: &str, tenant_id: &Option<String>) -> Relati
 /// scan to find it.
 #[inline(always)]
 pub fn tombstone_path(stream_name: &str, tenant_id: &Option<String>) -> RelativePathBuf {
-    let tenant = tenant_id.as_deref().unwrap_or("");
+    let tenant = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     RelativePathBuf::from_iter([
         TOMBSTONE_ROOT_DIRECTORY,
         tenant,
@@ -1855,7 +2096,10 @@ pub async fn list_tombstoned_streams(
     storage: &(impl ObjectStorage + ?Sized),
     tenant_id: &Option<String>,
 ) -> Result<Vec<String>, ObjectStorageError> {
-    let tenant = tenant_id.as_deref().unwrap_or("");
+    let tenant = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     let root = RelativePathBuf::from_iter([TOMBSTONE_ROOT_DIRECTORY, tenant]);
     let candidates = storage.list_dirs_relative(&root, tenant_id).await?;
 
@@ -1876,7 +2120,10 @@ pub fn filter_path(
     filter_file_name: &str,
     tenant_id: &Option<String>,
 ) -> RelativePathBuf {
-    let root = tenant_id.as_deref().unwrap_or("");
+    let root = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     RelativePathBuf::from_iter([
         root,
         USERS_ROOT_DIR,
@@ -1896,7 +2143,10 @@ pub fn parseable_json_path() -> RelativePathBuf {
 /// TODO: Needs to be updated for distributed mode
 #[inline(always)]
 pub fn alert_json_path(alert_id: Ulid, tenant_id: &Option<String>) -> RelativePathBuf {
-    if let Some(tenant_id) = tenant_id.as_ref() {
+    if let Some(tenant_id) = tenant_id
+        .as_ref()
+        .filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT)
+    {
         RelativePathBuf::from_iter([
             tenant_id,
             ALERTS_ROOT_DIRECTORY,
@@ -1910,7 +2160,10 @@ pub fn alert_json_path(alert_id: Ulid, tenant_id: &Option<String>) -> RelativePa
 /// TODO: Needs to be updated for distributed mode
 #[inline(always)]
 pub fn target_json_path(target_id: &Ulid, tenant_id: &Option<String>) -> RelativePathBuf {
-    let root = tenant_id.as_deref().unwrap_or("");
+    let root = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     RelativePathBuf::from_iter([
         root,
         SETTINGS_ROOT_DIRECTORY,
@@ -1923,7 +2176,10 @@ pub fn target_json_path(target_id: &Ulid, tenant_id: &Option<String>) -> Relativ
 /// Format: "<tenant>/settings/outbound_http_policy.json"
 #[inline(always)]
 pub fn outbound_http_policy_json_path(tenant_id: &Option<String>) -> RelativePathBuf {
-    let root = tenant_id.as_deref().unwrap_or("");
+    let root = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     RelativePathBuf::from_iter([root, SETTINGS_ROOT_DIRECTORY, "outbound_http_policy.json"])
 }
 
@@ -1931,7 +2187,10 @@ pub fn outbound_http_policy_json_path(tenant_id: &Option<String>) -> RelativePat
 /// Format: ".alerts/alert_state_{alert_id}.json"
 #[inline(always)]
 pub fn alert_state_json_path(alert_id: Ulid, tenant_id: &Option<String>) -> RelativePathBuf {
-    let root = tenant_id.as_deref().unwrap_or("");
+    let root = tenant_id
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != crate::parseable::DEFAULT_TENANT)
+        .unwrap_or("");
     RelativePathBuf::from_iter([
         root,
         ALERTS_ROOT_DIRECTORY,
@@ -1943,7 +2202,10 @@ pub fn alert_state_json_path(alert_id: Ulid, tenant_id: &Option<String>) -> Rela
 /// Format: ".alerts/mttr.json"
 #[inline(always)]
 pub fn mttr_json_path(tenant_id: &Option<String>) -> RelativePathBuf {
-    if let Some(tenant) = tenant_id.as_ref() {
+    if let Some(tenant) = tenant_id
+        .as_ref()
+        .filter(|t| !t.is_empty() && t.as_str() != crate::parseable::DEFAULT_TENANT)
+    {
         RelativePathBuf::from_iter([tenant, ALERTS_ROOT_DIRECTORY, "mttr.json"])
     } else {
         RelativePathBuf::from_iter([ALERTS_ROOT_DIRECTORY, "mttr.json"])
@@ -2477,5 +2739,93 @@ mod query_reload_tests {
         );
         assert!(stream.get_schema().fields().is_empty());
         assert_eq!(stream.schema_files().len(), 1);
+    }
+}
+
+/// Decode exactly one object_store path encoding layer.
+pub(crate) fn decode_metadata_key(key: &str) -> Result<String, ObjectStorageError> {
+    let bytes = key.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let digits = bytes
+                .get(i + 1..i + 3)
+                .and_then(|d| std::str::from_utf8(d).ok())
+                .and_then(|d| u8::from_str_radix(d, 16).ok())
+                .ok_or_else(|| {
+                    ObjectStorageError::Custom("invalid percent-encoded metadata key".into())
+                })?;
+            out.push(digits);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|e| ObjectStorageError::Custom(format!("invalid UTF-8 metadata key: {e}")))
+}
+
+#[cfg(test)]
+mod metadata_key_decode_tests {
+    use super::*;
+    #[tokio::test]
+    async fn postgres_batches_settle_sibling_uploads_before_error_cleanup() {
+        for drain in [false, true] {
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = completed.clone();
+            let mut uploads = JoinSet::new();
+            uploads.spawn(async {
+                Err((
+                    PathBuf::from("failed.parquet"),
+                    ObjectStorageError::Custom("upload failed".into()),
+                ))
+            });
+            uploads.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(UploadResult {
+                    file_path: PathBuf::from("sibling.parquet"),
+                    manifest_file: None,
+                })
+            });
+            assert!(collect_upload_results(uploads, drain).await.is_err());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), drain);
+        }
+    }
+    #[tokio::test]
+    async fn compensation_removes_only_parquet_and_tolerates_missing_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::LocalFS::new(dir.path().to_owned());
+        let key = "logs/date=2026-01-01/file.parquet";
+        storage
+            .put_object(RelativePath::new(key), Bytes::from_static(b"data"), &None)
+            .await
+            .unwrap();
+        compensate_uploaded_parquet(&storage, key, &None)
+            .await
+            .unwrap();
+        compensate_uploaded_parquet(&storage, key, &None)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .get_object(RelativePath::new(key), &None)
+                .await
+                .is_err()
+        );
+        assert!(
+            compensate_uploaded_parquet(&storage, "logs/.stream/.stream.json", &None)
+                .await
+                .is_err()
+        );
+    }
+    #[test]
+    fn invalid_encoded_keys_never_panic() {
+        assert!(decode_metadata_key("%FF").is_err());
+        assert!(decode_metadata_key("%é").is_err());
+        assert_eq!(decode_metadata_key("caf%C3%A9").unwrap(), "café");
     }
 }

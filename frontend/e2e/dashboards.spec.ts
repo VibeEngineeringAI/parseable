@@ -60,6 +60,7 @@ async function mockServer(
     rows?: DashboardSummary[];
     failTitle?: string;
     privilege?: string;
+    groupAdmin?: boolean;
     queryRows?: Record<string, unknown>[];
   } = {},
 ) {
@@ -70,8 +71,8 @@ async function mockServer(
     calls: Call[] = [];
   const documents = new Map<string, Dashboard>([[current.dashboardId, current]]);
   await page.context().addCookies([
-    { name: 'user_id', value: 'admin', url: 'http://127.0.0.1:5173' },
-    { name: 'username', value: 'admin', url: 'http://127.0.0.1:5173' },
+    { name: 'user_id', value: 'admin', url: String(test.info().project.use.baseURL) },
+    { name: 'username', value: 'admin', url: String(test.info().project.use.baseURL) },
   ]);
   await page.route('**/api/**', async (route) => {
     const request = route.request(),
@@ -105,7 +106,9 @@ async function mockServer(
           roles: {
             root: { actions: [{ privilege: options.privilege ?? 'admin' }], roleType: 'internal' },
           },
-          groupRoles: {},
+          groupRoles: options.groupAdmin
+            ? { operators: { admin: { actions: [{ privilege: 'admin' }], roleType: 'internal' } } }
+            : {},
         },
       });
     if (path === '/api/v1/logstream')
@@ -264,6 +267,35 @@ async function mockServer(
     current: () => current,
   };
 }
+
+test('demo admin edits and renames a shared dashboard while favourites stay owner-only', async ({
+  page,
+}) => {
+  await demo(page, '/dashboards/01M4J000000000000000000003');
+  await tileAction(page, 'API events', 'Edit');
+  const editor = page.getByRole('dialog', { name: 'Edit tile', exact: true });
+  await editor.getByLabel('Tile title').fill('Updated API events');
+  await editor.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  await page
+    .getByRole('navigation', { name: 'Dashboard breadcrumb' })
+    .getByRole('link', { name: 'Dashboards', exact: true })
+    .click();
+  await page.getByRole('button', { name: 'Actions for Shared operations', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
+  const rename = page.getByRole('dialog', { name: 'Rename and tags', exact: true });
+  await rename.getByLabel('Dashboard title').fill('Renamed shared operations');
+  await rename.locator('[data-dialog-confirm]').click();
+  await expect(
+    page.getByRole('button', { name: 'Favourite Renamed shared operations', exact: true }),
+  ).toHaveAttribute('aria-disabled', 'true');
+  await page.getByRole('link', { name: 'Renamed shared operations', exact: true }).click();
+  await expect(tile(page, 'Updated API events')).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Renamed shared operations', exact: true }),
+  ).toBeVisible();
+});
 
 test('demo CRUD, SQL tile preview/config, duplicate/move and typed deletion', async ({ page }) => {
   await demo(page);
@@ -561,7 +593,7 @@ test('non-owners see read-only tiles, including unknown and unavailable chart pl
   await page.goto(`${detail}/`);
   await expect(
     page.getByText(
-      'This dashboard is read-only. Only its owner can edit it. Duplicate it to make an editable copy.',
+      'This dashboard is read-only. Only its owner or an administrator can edit it. Duplicate it to make an editable copy.',
       { exact: true },
     ),
   ).toBeVisible();
@@ -1631,7 +1663,7 @@ test('duplicate and nil tile ids are repaired on load, so editing and deleting a
   await expect(page.getByText(/The next save will assign new IDs/)).toHaveCount(0);
 });
 
-for (const privilege of ['reader', 'admin'])
+for (const privilege of ['reader'])
   test(`${privilege} non-owners with repaired tile IDs can leave and duplicate without unsaved changes`, async ({
     page,
   }) => {
@@ -1872,11 +1904,16 @@ test('import rejects files over 5 MB before reading them', async ({ page }) => {
   expect(server.creates).toEqual([]);
 });
 
-for (const privilege of ['reader', 'admin', 'ingestor'])
+for (const privilege of ['reader', 'admin', 'superadmin', 'group-admin', 'ingestor'])
   test(`${privilege} permissions govern all non-owner controls and disabled favourites`, async ({
     page,
   }) => {
-    const server = await mockServer(page, { privilege, document: { ...classic, author: 'other' } });
+    const administrative = ['admin', 'superadmin', 'group-admin'].includes(privilege);
+    const server = await mockServer(page, {
+      privilege: privilege === 'group-admin' ? 'reader' : privilege,
+      groupAdmin: privilege === 'group-admin',
+      document: { ...classic, author: 'other' },
+    });
     await page.goto('/dashboards');
     await page.waitForLoadState('networkidle');
     const favourite = page.getByRole('button', { name: 'Unfavourite Service health', exact: true });
@@ -1888,10 +1925,10 @@ for (const privilege of ['reader', 'admin', 'ingestor'])
     expect(server.writes).toEqual([]);
     await page.getByRole('button', { name: 'Actions for Service health', exact: true }).click();
     await expect(page.getByRole('menuitem', { name: 'Rename and tags', exact: true })).toHaveCount(
-      0,
+      administrative ? 1 : 0,
     );
     await expect(page.getByRole('menuitem', { name: 'Delete', exact: true })).toHaveCount(
-      privilege === 'admin' ? 1 : 0,
+      administrative ? 1 : 0,
     );
     if (privilege === 'ingestor') {
       const duplicate = page.getByRole('menuitem', { name: 'Duplicate', exact: true });
@@ -1901,19 +1938,165 @@ for (const privilege of ['reader', 'admin', 'ingestor'])
     }
     await page.keyboard.press('Escape');
     await page.getByRole('link', { name: classic.title, exact: true }).click();
-    await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Add variable', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(
+      administrative ? 1 : 0,
+    );
+    await expect(page.getByRole('button', { name: 'Add variable', exact: true })).toHaveCount(
+      administrative ? 1 : 0,
+    );
     await page.getByRole('button', { name: 'Dashboard actions', exact: true }).click();
     await expect(page.getByRole('menuitem', { name: 'Rename and tags', exact: true })).toHaveCount(
-      0,
+      administrative ? 1 : 0,
     );
     await expect(page.getByRole('menuitem', { name: 'Delete dashboard', exact: true })).toHaveCount(
-      privilege === 'admin' ? 1 : 0,
+      administrative ? 1 : 0,
     );
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Actions for tile Host load', exact: true }).click();
     for (const action of ['Edit', 'Delete tile', 'Duplicate tile', 'Move earlier', 'Move later'])
-      await expect(page.getByRole('menuitem', { name: action, exact: true })).toHaveCount(0);
+      await expect(page.getByRole('menuitem', { name: action, exact: true })).toHaveCount(
+        administrative ? 1 : 0,
+      );
+  });
+
+test('non-owner admin changes Percent fill, saves and reloads without changing ownership', async ({
+  page,
+}) => {
+  const source: Dashboard = {
+    ...classic,
+    author: 'original-owner',
+    variables: [],
+    sections: [],
+    tiles: [
+      {
+        ...classic.tiles[1],
+        title: 'CPU',
+        tileType: 'code',
+        chartType: 'query-value',
+        config: { type: 'query-value', layout: { unit: '%', precision: 0 } },
+      },
+    ],
+  };
+  const server = await mockServer(page, { document: source });
+  await page.goto(detail);
+  await tileAction(page, 'CPU', 'Edit');
+  const editor = page.getByRole('dialog', { name: 'Edit tile', exact: true });
+  await editor.getByLabel('Percent fill', { exact: true }).selectOption('vertical');
+  await editor.getByRole('button', { name: 'Apply tile', exact: true }).click();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  expect(server.writes).toHaveLength(1);
+  expect(server.writes[0]).toMatchObject({
+    dashboardId: source.dashboardId,
+    author: source.author,
+    tenantId: source.tenantId,
+    tiles: [{ config: { layout: { percentFill: 'vertical' } } }],
+  });
+  await page.reload();
+  await expect(tile(page, 'CPU').locator('.dashboard-stat-fill')).toHaveAttribute(
+    'data-direction',
+    'vertical',
+  );
+  await tileAction(page, 'CPU', 'Edit');
+  await expect(page.getByRole('dialog').getByLabel('Percent fill', { exact: true })).toHaveValue(
+    'vertical',
+  );
+  expect(server.current().author).toBe(source.author);
+});
+
+test('non-owner admin can rename from the list without acquiring ownership', async ({ page }) => {
+  const server = await mockServer(page, { document: { ...classic, author: 'other' } });
+  await page.goto('/dashboards');
+  await page.getByRole('button', { name: 'Actions for Service health', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Rename and tags', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Rename and tags', exact: true });
+  await editor.getByLabel('Dashboard title').fill('Admin rename');
+  await editor.locator('[data-dialog-confirm]').click();
+  await expect(page.getByRole('link', { name: 'Admin rename', exact: true })).toBeVisible();
+  expect(server.writes[0]).toMatchObject({ author: 'other', title: 'Admin rename' });
+  await expect(
+    page.getByRole('button', { name: 'Unfavourite Admin rename', exact: true }),
+  ).toHaveAttribute('aria-disabled', 'true');
+});
+
+test('non-owner admin can save repaired tile IDs while preserving ownership', async ({ page }) => {
+  const first = { ...classic.tiles[1], tileType: 'code', chartType: 'query-value' };
+  const source: Dashboard = {
+    ...classic,
+    author: 'other',
+    variables: [],
+    sections: [],
+    tiles: [
+      first,
+      { ...first, title: 'Repeated' },
+      { ...first, title: 'Nil', tile_id: '00000000000000000000000000' },
+    ],
+  };
+  const server = await mockServer(page, { document: source });
+  await page.goto(detail);
+  await expect(page.getByText(/The next save will assign new IDs/)).toBeVisible();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Dashboard saved.', { exact: true })).toBeVisible();
+  const saved = server.writes[0];
+  expect(saved.author).toBe('other');
+  const ids = saved.tiles!.map((item) => item.tile_id);
+  expect(new Set(ids).size).toBe(3);
+  expect(ids).not.toContain('00000000000000000000000000');
+  await page.reload();
+  await expect(page.getByText(/The next save will assign new IDs/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+});
+
+test('non-owner admin waits for roles without a read-only flash or premature edit controls', async ({
+  page,
+}) => {
+  await mockServer(page, { document: { ...classic, author: 'other' } });
+  await page.addInitScript(() =>
+    new MutationObserver(() => {
+      if (document.body?.textContent?.includes('This dashboard is read-only.'))
+        document.documentElement.dataset.readOnlyFlash = 'true';
+    }).observe(document, { childList: true, subtree: true }),
+  );
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/v1/user/admin/role', async (route) => {
+    await gate;
+    await route.fallback();
+  });
+  await page.goto(detail);
+  await expect(page.getByRole('heading', { name: classic.title, exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
+  await expect(page.getByText(/This dashboard is read-only/)).toHaveCount(0);
+  release();
+  await expect(page.getByRole('button', { name: 'Add tile', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
+  expect(await page.locator('html').getAttribute('data-read-only-flash')).toBeNull();
+});
+
+for (const owned of [false, true])
+  test(`role lookup failure ${owned ? 'preserves owner editing' : 'keeps non-owners read-only'}`, async ({
+    page,
+  }) => {
+    const server = await mockServer(page, {
+      document: { ...classic, author: owned ? classic.author : 'other' },
+    });
+    await page.route('**/api/v1/user/admin/role', (route) =>
+      route.fulfill({ status: 503, body: 'Roles unavailable' }),
+    );
+    await page.goto(detail);
+    if (owned) {
+      await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
+      await tileAction(page, 'Errors', 'Edit');
+      await expect(page.getByRole('dialog', { name: 'Edit tile', exact: true })).toBeVisible();
+    } else {
+      await expect(page.getByText(/This dashboard is read-only/)).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0);
+      await page.getByRole('button', { name: 'Actions for tile Errors', exact: true }).click();
+      await expect(page.getByRole('menuitem', { name: 'Edit', exact: true })).toHaveCount(0);
+    }
+    expect(server.writes).toEqual([]);
   });
 
 test('favourite toggles the latest row, and list conflicts can be cancelled for further editing', async ({
