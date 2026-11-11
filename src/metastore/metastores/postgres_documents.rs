@@ -40,6 +40,18 @@ fn legacy_key<'a>(key: &'a str, base: &str) -> Option<&'a str> {
     }
     key.strip_prefix(base).and_then(|p| p.strip_prefix('/'))
 }
+fn read_keys(path: &str, base: &str) -> Vec<String> {
+    let mut keys = vec![path.to_owned()];
+    let legacy = legacy_key(path, base).unwrap_or(path);
+    if legacy != path {
+        keys.push(legacy.to_owned());
+    }
+    let canonical = super::migration::canonical_key(legacy);
+    if canonical != legacy {
+        keys.push(canonical.to_owned());
+    }
+    keys
+}
 fn tenant(t: &Option<String>) -> &str {
     t.as_deref()
         .filter(|v| !v.is_empty() && *v != "DEFAULT_TENANT")
@@ -440,77 +452,130 @@ impl PostgresDocuments {
     pub fn absolute_url(&self, path: &RelativePath) -> object_store::path::Path {
         object_store::path::Path::parse(path.as_str()).expect("valid document key")
     }
+    /// Yield at most 32 selected locators and 8 MiB of raw bodies at a time.
+    /// A larger single document is indivisible and is yielded alone. The caller
+    /// decodes each chunk before requesting another; connections end at yield.
+    pub fn manifest_chunks<'a>(
+        &'a self,
+        paths: &'a [String],
+        t: &'a Option<String>,
+    ) -> impl futures::Stream<Item = Result<Vec<(String, Bytes)>, ObjectStorageError>> + Send + 'a
+    {
+        use std::collections::{HashMap, VecDeque};
+        futures::stream::try_unfold(
+            (0usize, VecDeque::<(String, String, usize)>::new()),
+            move |(mut offset, mut pending)| async move {
+                loop {
+                    if pending.is_empty() {
+                        if offset == paths.len() {
+                            return Ok(None);
+                        }
+                        let start = offset;
+                        let mut key_bytes = 0;
+                        while offset < paths.len() && offset - start < 32 {
+                            let size = paths[offset].len();
+                            if offset > start && key_bytes + size > 64 * 1024 {
+                                break;
+                            }
+                            key_bytes += size;
+                            offset += 1;
+                        }
+                        let base = self.storage.absolute_url(RelativePath::new(""));
+                        let candidates: Vec<_> = paths[start..offset]
+                            .iter()
+                            .flat_map(|path| read_keys(path, base.as_ref()))
+                            .collect();
+                        let rows = self.client().await?.query(
+                            "SELECT key,octet_length(body) FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)",
+                            &[&tenant(t), &candidates],
+                        ).await?;
+                        let sizes: HashMap<String, usize> = rows
+                            .into_iter()
+                            .map(|row| (row.get(0), row.get::<_, i32>(1) as usize))
+                            .collect();
+                        for original in &paths[start..offset] {
+                            let keys = read_keys(original, base.as_ref());
+                            let matches: Vec<_> = keys
+                                .iter()
+                                .filter_map(|key| sizes.get(key).map(|size| (key, *size)))
+                                .collect();
+                            if matches.len() > 1 {
+                                tracing::warn!(
+                                    key = original,
+                                    "multiple metadata candidates exist; exact key takes precedence"
+                                );
+                            }
+                            if let Some((key, size)) = matches.first() {
+                                pending.push_back((original.clone(), (*key).clone(), *size));
+                            }
+                        }
+                        if pending.is_empty() {
+                            continue;
+                        }
+                    }
+                    let mut selected = Vec::new();
+                    let mut body_bytes = 0usize;
+                    while let Some((_, _, size)) = pending.front() {
+                        if !selected.is_empty() && body_bytes + size > 8 * 1024 * 1024 {
+                            break;
+                        }
+                        body_bytes += size;
+                        selected.push(pending.pop_front().unwrap());
+                    }
+                    let keys: Vec<_> = selected.iter().map(|(_, key, _)| key.clone()).collect();
+                    let rows = self.client().await?.query(
+                        "WITH sized AS (SELECT key,body,octet_length(body) AS size,row_number() OVER (ORDER BY array_position($2,key)) AS n,sum(octet_length(body)) OVER (ORDER BY array_position($2,key)) AS total FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)) SELECT key,CASE WHEN n=1 OR total<=8388608 THEN body END,size FROM sized",
+                        &[&tenant(t), &keys],
+                    ).await?;
+                    // Recheck the byte bound in the body statement itself: a
+                    // manifest can grow after the sizing query. Requeue only
+                    // rows withheld by the byte budget, never deleted rows.
+                    let bodies: HashMap<String, (Option<Bytes>, usize)> = rows
+                        .into_iter()
+                        .map(|row| {
+                            (
+                                row.get(0),
+                                (
+                                    row.get::<_, Option<Vec<u8>>>(1).map(Bytes::from),
+                                    row.get::<_, i32>(2) as usize,
+                                ),
+                            )
+                        })
+                        .collect();
+                    for (original, key, _) in selected.iter().rev() {
+                        if let Some((None, size)) = bodies.get(key) {
+                            pending.push_front((original.clone(), key.clone(), *size));
+                        }
+                    }
+                    let batch = selected
+                        .into_iter()
+                        .filter_map(|(original, key, _)| {
+                            bodies
+                                .get(&key)
+                                .and_then(|(body, _)| body.as_ref())
+                                .map(|body| (original, body.clone()))
+                        })
+                        .collect();
+                    return Ok(Some((batch, (offset, pending))));
+                }
+            },
+        )
+    }
+
+    #[cfg(test)]
     pub async fn manifest_batch(
         &self,
         paths: &[String],
         t: &Option<String>,
     ) -> Result<Vec<(String, Bytes)>, ObjectStorageError> {
-        // Bound both parameter count and encoded key bytes. Each query returns at
-        // most 32 bodies; a single large manifest remains an indivisible document.
-        let mut result = Vec::new();
-        let mut offset = 0;
-        while offset < paths.len() {
-            let mut end = offset;
-            let mut bytes = 0;
-            while end < paths.len() && end - offset < 32 {
-                let size = paths[end].len();
-                if end > offset && bytes + size > 64 * 1024 {
-                    break;
-                }
-                bytes += size;
-                end += 1;
-            }
-            let base = self.storage.absolute_url(RelativePath::new(""));
-            let mut keys = Vec::new();
-            for path in &paths[offset..end] {
-                keys.push(path.clone());
-                if let Some(legacy) = legacy_key(path, base.as_ref()) {
-                    keys.push(legacy.to_owned());
-                }
-            }
-            let client = self.client().await?;
-            let sizes = client.query("SELECT key,octet_length(body) FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)", &[&tenant(t), &keys]).await?;
-            let mut bodies = std::collections::HashMap::<String, Bytes>::new();
-            let mut batch = Vec::<String>::new();
-            let mut batch_bytes = 0usize;
-            for row in sizes {
-                let size = row.get::<_, i32>(1) as usize;
-                if !batch.is_empty() && batch_bytes + size > 8 * 1024 * 1024 {
-                    for r in client.query("SELECT key,body FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)", &[&tenant(t), &batch]).await? {
-                        bodies.insert(r.get(0), Bytes::from(r.get::<_, Vec<u8>>(1)));
-                    }
-                    batch.clear();
-                    batch_bytes = 0;
-                }
-                batch.push(row.get(0));
-                batch_bytes += size;
-            }
-            if !batch.is_empty() {
-                for r in client
-                    .query(
-                        "SELECT key,body FROM parseable_documents WHERE tenant=$1 AND key=ANY($2)",
-                        &[&tenant(t), &batch],
-                    )
-                    .await?
-                {
-                    bodies.insert(r.get(0), Bytes::from(r.get::<_, Vec<u8>>(1)));
-                }
-            }
-            for path in &paths[offset..end] {
-                let fallback = legacy_key(path, base.as_ref()).and_then(|k| bodies.get(k));
-                if bodies.contains_key(path) && fallback.is_some() {
-                    tracing::warn!(
-                        key = path,
-                        "exact and legacy metadata keys exist; using exact key"
-                    );
-                }
-                if let Some(body) = bodies.get(path).or(fallback) {
-                    result.push((path.clone(), body.clone()));
-                }
-            }
-            offset = end;
+        use futures::TryStreamExt;
+        let chunks = self.manifest_chunks(paths, t);
+        futures::pin_mut!(chunks);
+        let mut rows = Vec::new();
+        while let Some(chunk) = chunks.try_next().await? {
+            rows.extend(chunk);
         }
-        Ok(result)
+        Ok(rows)
     }
     pub async fn get_object(
         &self,
@@ -531,10 +596,10 @@ impl PostgresDocuments {
         let base = self.storage.absolute_url(RelativePath::new(""));
         let c = self.client().await?;
         let exact = path.as_str();
-        let fallback = legacy_key(exact, base.as_ref()).unwrap_or(exact);
+        let keys = read_keys(exact, base.as_ref());
         let rows = c.query(
-            "SELECT key,body,version FROM parseable_documents WHERE tenant=$1 AND (key=$2 OR key=$3) ORDER BY (key=$2) DESC",
-            &[&tenant(t), &exact, &fallback],
+            "SELECT key,body,version FROM parseable_documents WHERE tenant=$1 AND key=ANY($2) ORDER BY array_position($2,key)",
+            &[&tenant(t), &keys],
         ).await?;
         if rows.len() > 1 {
             tracing::warn!(
@@ -1092,7 +1157,11 @@ impl PostgresDocuments {
                 .collect();
             let mut differences = 0;
             for (key, (tenant, kind), _) in keys {
-                let bucket = store.get_object(RelativePath::new(key), &None).await?;
+                let bucket = super::migration::import_body(
+                    store.as_ref(),
+                    key,
+                    &store.get_object(RelativePath::new(key), &None).await?,
+                )?;
                 let sql = if exists {
                     tx.query_opt(
                         "SELECT body FROM parseable_documents WHERE tenant=$1 AND key=$2",
@@ -1256,10 +1325,13 @@ impl PostgresDocuments {
                 let mut kinds = Vec::new();
                 let mut paths = Vec::new();
                 let mut bodies = Vec::new();
+                let mut source_digests = Vec::new();
                 for (key, (tenant, kind), _) in batch {
                     let body = Bytes::from(std::fs::read(
                         spool.path().join((index * 32 + bodies.len()).to_string()),
                     )?);
+                    source_digests.push(digest(&body));
+                    let body = super::migration::import_body(store.as_ref(), key, &body)?;
                     tenants.push(tenant.clone());
                     kinds.push(kind.to_string());
                     paths.push(super::migration::canonical_key(key).to_owned());
@@ -1268,10 +1340,14 @@ impl PostgresDocuments {
                 if count == 0 {
                     tx.execute("INSERT INTO parseable_documents(tenant,kind,key,body) SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::bytea[])", &[&tenants,&kinds,&paths,&bodies]).await?;
                 }
-                for (((key, tenant), body), (source_key, _, _)) in
-                    paths.iter().zip(&tenants).zip(&bodies).zip(batch)
+                for (row_index, (((key, tenant), body), (source_key, _, _))) in paths
+                    .iter()
+                    .zip(&tenants)
+                    .zip(&bodies)
+                    .zip(batch)
+                    .enumerate()
                 {
-                    tx.execute("INSERT INTO parseable_import_digests(key,digest) VALUES($1,$2) ON CONFLICT DO NOTHING", &[source_key, &digest(body)]).await?;
+                    tx.execute("INSERT INTO parseable_import_digests(key,digest) VALUES($1,$2) ON CONFLICT DO NOTHING", &[source_key, &source_digests[row_index]]).await?;
                     let reread: Vec<u8> = tx
                         .query_one(
                             "SELECT body FROM parseable_documents WHERE tenant=$1 AND key=$2",
@@ -1478,16 +1554,14 @@ impl PostgresDocuments {
                 )
                 .await?
                 .is_none()
-            {
-                if self.import_digest(client, key).await?.as_deref()
+                && self.import_digest(client, key).await?.as_deref()
                     != Some(
                         digest(&store.get_object(RelativePath::new(key), &None).await?).as_str(),
                     )
-                {
-                    conflicts += 1;
-                    if conflicts <= 100 {
-                        eprintln!("CONFLICT bucket-only key={key}");
-                    }
+            {
+                conflicts += 1;
+                if conflicts <= 100 {
+                    eprintln!("CONFLICT bucket-only key={key}");
                 }
             }
         }
@@ -1634,16 +1708,11 @@ impl PostgresDocuments {
         } else if key.ends_with("stream.json") {
             for manifest_path in super::migration::stream_references(body)? {
                 let base = self.storage.absolute_url(RelativePath::new(""));
-                let normalized = manifest_path
-                    .strip_prefix(base.as_ref())
-                    .and_then(|p| p.strip_prefix('/'))
-                    .unwrap_or(&manifest_path);
-                let row = client
-                    .query_opt(
-                        "SELECT body FROM parseable_documents WHERE key=$1 OR key=$2 ORDER BY (key=$1) DESC LIMIT 1",
-                        &[&manifest_path, &normalized],
-                    )
-                    .await?;
+                let keys = read_keys(&manifest_path, base.as_ref());
+                let row = client.query_opt(
+                    "SELECT body FROM parseable_documents WHERE key=ANY($1) ORDER BY array_position($1,key) LIMIT 1",
+                    &[&keys],
+                ).await?;
                 let Some(row) = row else {
                     if allow_dangling {
                         eprintln!("OVERRIDE {key}: missing SQL manifest {manifest_path}");

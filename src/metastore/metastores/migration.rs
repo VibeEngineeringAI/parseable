@@ -142,6 +142,49 @@ pub(crate) fn canonical_key(key: &str) -> &str {
     }
 }
 
+// Keep bytes unchanged unless a legacy explicit default-tenant locator must
+// follow its document to the canonical namespace. Unknown JSON fields survive.
+pub(crate) fn import_body(
+    store: &dyn ObjectStorage,
+    key: &str,
+    body: &Bytes,
+) -> anyhow::Result<Bytes> {
+    if !key.ends_with("stream.json") {
+        return Ok(body.clone());
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(body)?;
+    let base = store.absolute_url(RelativePath::new(""));
+    let mut changed = false;
+    if let Some(items) = value
+        .pointer_mut("/snapshot/manifest_list")
+        .and_then(|v| v.as_array_mut())
+    {
+        for item in items {
+            if let Some(path) = item.get("manifest_path").and_then(|v| v.as_str()) {
+                let relative = path
+                    .strip_prefix(base.as_ref())
+                    .and_then(|s| s.strip_prefix('/'))
+                    .unwrap_or(path);
+                let canonical = canonical_key(relative);
+                if canonical != relative {
+                    let replacement = if relative != path {
+                        format!("{base}/{canonical}")
+                    } else {
+                        canonical.to_owned()
+                    };
+                    item["manifest_path"] = replacement.into();
+                    changed = true;
+                }
+            }
+        }
+    }
+    Ok(if changed {
+        Bytes::from(serde_json::to_vec(&value)?)
+    } else {
+        body.clone()
+    })
+}
+
 pub(crate) async fn validate(
     store: &dyn ObjectStorage,
     key: &str,
@@ -231,7 +274,7 @@ pub async fn run(
     let canonical: std::collections::HashSet<_> =
         keys.iter().map(|(key, _, _)| canonical_key(key)).collect();
     ensure!(
-        canonical.len() == keys.len(),
+        action != Action::Import || canonical.len() == keys.len(),
         "duplicate metadata keys after default-tenant normalization"
     );
     let mut counts = BTreeMap::<(String, String), (usize, usize)>::new();
@@ -398,6 +441,15 @@ mod tests {
                 &store,
                 "logs/.stream/.stream.json",
                 &Bytes::from(serde_json::to_vec(&config).unwrap())
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            validate(
+                &store,
+                ".users/owner/filters/broken.json",
+                &Bytes::from_static(b"not-json")
             )
             .await
             .is_err()
@@ -598,6 +650,7 @@ mod tests {
             url.set_path(&format!("/{schema}"));
             let opts = PostgresOptions {
                 metastore_postgres_url: Some(url.to_string()),
+                metastore_postgres_pool_size: 1,
                 ..Default::default()
             };
             let db = PostgresDocuments::new(&opts, "test".into(), store.clone())?;
@@ -651,6 +704,7 @@ mod tests {
                 ".settings",
                 ".parseable",
                 ".correlations",
+                ".keystone",
             ] {
                 for tenant in ["", "tenant/"] {
                     documents.push((
@@ -661,9 +715,7 @@ mod tests {
             }
             documents.push((
                 "DEFAULT_TENANT/alias/.stream/.stream.json".into(),
-                Bytes::from(serde_json::to_vec(
-                    &crate::storage::ObjectStoreFormat::default(),
-                )?),
+                Bytes::from_static(br#"{"version":"v3","snapshot":{"manifest_list":[{"manifest_path":"DEFAULT_TENANT/alias/date=2026-01-01/manifest.json"}]}}"#),
             ));
             documents.push((
                 "DEFAULT_TENANT/alias/date=2026-01-01/manifest.json".into(),
@@ -703,6 +755,9 @@ mod tests {
                     .to_string()
                     .contains("another offline")
             );
+            command.abort = true;
+            assert!(run(store.clone(), &db, &command).await.unwrap_err().to_string().contains("another offline"));
+            command.abort = false;
             drop(lock);
             run(store.clone(), &db, &command).await?;
             assert!(optional(store.as_ref(), PAIR).await?.is_none());
@@ -722,6 +777,19 @@ mod tests {
             ] {
                 command.injected_failure = Some(step);
                 assert!(run(store.clone(), &db, &command).await.is_err(), "{step}");
+                if step == "spool" {
+                    let id: String = db.client().await?.query_one("SELECT id FROM parseable_backend", &[]).await?.get(0);
+                    let spool = std::env::current_dir()?.join(format!(".parseable-migration-spool-{id}"));
+                    #[cfg(unix)] {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(std::fs::metadata(&spool)?.permissions().mode() & 0o777, 0o700);
+                    }
+                    std::fs::write(spool.join("stale"), b"private RBAC metadata")?;
+                    command.abort = true;
+                    run(store.clone(), &db, &command).await?;
+                    assert!(!spool.exists(), "abort must clean stale private spools under the transfer lock");
+                    command.abort = false;
+                }
                 if step == "import-commit" {
                     command.abort = true;
                     run(store.clone(), &db, &command).await?;
@@ -748,6 +816,9 @@ mod tests {
             assert!(run(store.clone(), &db, &command).await.is_err());
             command.metadata_migration = Some(Action::Verify);
             run(store.clone(), &db, &command).await?;
+            let alias = "DEFAULT_TENANT/alias/date=2026-01-01/manifest.json";
+            assert!(db.get_object(RelativePath::new(alias), &None).await.is_ok());
+            assert_eq!(db.manifest_batch(&[alias.to_owned()], &None).await?.len(), 1);
             command.metadata_migration = Some(Action::Export);
             command.migration_dry_run = true;
             run(store.clone(), &db, &command).await?;
@@ -889,13 +960,22 @@ mod tests {
                 &None,
             )
             .await?;
-            let deleted = documents.pop().unwrap().0;
+            let deleted_index = documents.iter().position(|(key, _)| key == "tenant/.correlations/fixture.json").unwrap();
+            let deleted = documents.remove(deleted_index).0;
             let deleted_tenant = document_scope(&deleted).unwrap().0;
             db.delete_object(
                 RelativePath::new(canonical_key(&deleted)),
                 &Some(deleted_tenant),
             )
             .await?;
+            // Exercise the actual destructive override, with multiple conflicts.
+            store.put_object(RelativePath::new(extra), Bytes::from_static(b"{}"), &None).await?;
+            store.put_object(RelativePath::new(&documents[0].0), Bytes::from_static(b"{\"external\":true}"), &None).await?;
+            command.migration_dry_run = true;
+            let conflicts = run(store.clone(), &db, &command).await.unwrap_err();
+            assert!(conflicts.to_string().contains("2 bucket conflicts"), "{conflicts:#}");
+            command.migration_dry_run = false;
+            command.overwrite_bucket_changes_since_import = true;
             for step in [
                 "marker",
                 "export-state",
@@ -923,13 +1003,14 @@ mod tests {
             assert!(optional(store.as_ref(), PAIR).await?.is_none());
             store.check_migration_guard().await?;
             assert!(optional(store.as_ref(), &deleted).await?.is_none());
+            assert!(optional(store.as_ref(), extra).await?.is_none(), "override must remove bucket-only keys");
             for (key, body) in documents {
                 assert_eq!(
                     store
                         .get_object(RelativePath::new(canonical_key(&key)), &None)
                         .await?,
-                    body,
-                    "byte-for-byte round trip: {key}"
+                    import_body(store.as_ref(), &key, &body)?,
+                    "byte-for-byte round trip (canonical default locator): {key}"
                 );
             }
             command.metadata_migration = Some(Action::Verify);

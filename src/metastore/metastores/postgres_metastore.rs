@@ -10,8 +10,10 @@ super::document_metastore::document_metastore!(
         ) -> Result<Option<HashMap<String, Option<Manifest>>>, MetastoreError> {
             let mut result: HashMap<String, Option<Manifest>> =
                 paths.iter().map(|p| (p.clone(), None)).collect();
-            for chunk in paths.chunks(32) {
-                for (key, body) in self.storage.manifest_batch(chunk, tenant).await? {
+            let chunks = self.storage.manifest_chunks(paths, tenant);
+            futures::pin_mut!(chunks);
+            while let Some(rows) = chunks.try_next().await? {
+                for (key, body) in rows {
                     result.insert(key, Some(decode_manifest_blocking(body).await?));
                 }
             }
@@ -1117,6 +1119,11 @@ mod contract_tests {
                 storage: documents.clone(),
             };
             if case == 7 {
+                let abort = super::super::migration::MigrationOptions {
+                    metadata_migration: Some(super::super::migration::Action::Export),
+                    acknowledge_server_stopped: true, abort: true, ..Default::default()
+                };
+                super::super::migration::run(Arc::new(LocalFS::new(dir.path().to_owned())), &documents, &abort).await.unwrap();
                 let name = dir.path().file_name().unwrap().to_str().unwrap();
                 for tenant in [None, Some(name.to_owned())] {
                     let prefix = tenant.as_ref().map(|t| format!("{t}/")).unwrap_or_default();
@@ -1143,13 +1150,43 @@ mod contract_tests {
                 // SQL tenant candidates cannot bypass deletion collision protection.
                 store.put_stream_json(&crate::storage::ObjectStoreFormat::default(), "protected", &None).await.unwrap();
                 documents.put_object(RelativePath::new("protected/other/.stream/.schema"), Bytes::new(), &Some("protected".into())).await.unwrap();
+                let data = dir.path().join("protected/date=2026-01-01/data.parquet");
+                std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+                std::fs::write(&data, b"sentinel").unwrap();
+                assert!(documents.list_tenant_candidates().await.unwrap().contains(&"protected".to_owned()));
                 assert!(documents.delete_prefix(RelativePath::new("protected"), &None).await.unwrap_err().to_string().contains("collides"));
+                assert_eq!(std::fs::read(&data).unwrap(), b"sentinel");
                 store.put_stream_json(&crate::storage::ObjectStoreFormat::default(), "alias", &Some(crate::parseable::DEFAULT_TENANT.into())).await.unwrap();
                 assert!(store.stream_exists("alias", &None).await.unwrap());
                 assert!(documents.get_object(RelativePath::new("alias/.stream/.stream.json"), &None).await.is_ok());
                 let paths: Vec<_> = (0..70).map(|i| format!("batch/date=2026-01-01/{i}.manifest.json")).collect();
                 for key in &paths { documents.put_object(RelativePath::new(key), Bytes::new(), &None).await.unwrap(); }
                 assert_eq!(documents.manifest_batch(&paths, &None).await.unwrap().len(), 70);
+                let large_paths: Vec<_> = (0..3).map(|i| format!("large/date=2026-01-01/{i}.manifest.json")).collect();
+                for key in &large_paths { documents.put_object(RelativePath::new(key), Bytes::from(vec![b'x'; 5 * 1024 * 1024]), &None).await.unwrap(); }
+                // Model growth between the size lookup and the body read:
+                // only sizing queries see one byte; body queries see real data.
+                documents.client().await.unwrap().batch_execute("ALTER TABLE parseable_documents RENAME TO batch_documents; CREATE VIEW parseable_documents AS SELECT tenant,kind,key,CASE WHEN current_query() LIKE 'SELECT key,octet_length%' THEN substring(body from 1 for 1) ELSE body END AS body,version,created_at,updated_at FROM batch_documents;").await.unwrap();
+                let chunks = documents.manifest_chunks(&large_paths, &None);
+                futures::pin_mut!(chunks);
+                use futures::TryStreamExt;
+                let mut chunks_seen = 0;
+                while let Some(rows) = chunks.try_next().await.unwrap() {
+                    assert!(rows.iter().map(|(_, body)| body.len()).sum::<usize>() <= 8 * 1024 * 1024);
+                    chunks_seen += 1;
+                }
+                assert_eq!(chunks_seen, 3);
+                documents.client().await.unwrap().batch_execute("DROP VIEW parseable_documents; ALTER TABLE batch_documents RENAME TO parseable_documents;").await.unwrap();
+                documents.client().await.unwrap().batch_execute(include_str!("../migrations/002_review_fixes.sql")).await.unwrap();
+                let restart_a = super::super::postgres_documents::PostgresDocuments::new(&options, database.clone(), Arc::new(LocalFS::new(dir.path().to_owned()))).unwrap();
+                let restart_b = super::super::postgres_documents::PostgresDocuments::new(&options, database.clone(), Arc::new(LocalFS::new(dir.path().to_owned()))).unwrap();
+                tokio::try_join!(restart_a.check(&None), restart_b.check(&None)).unwrap();
+                assert_eq!(documents.get_object(RelativePath::new(&large_paths[0]), &None).await.unwrap().len(), 5 * 1024 * 1024);
+                assert_eq!(documents.client().await.unwrap().query_one("SELECT schema_version FROM parseable_backend", &[]).await.unwrap().get::<_, i32>(0), 3);
+                documents.put_object(RelativePath::new("upgrade/.stream/.deleting"), Bytes::new(), &None).await.unwrap();
+                assert!(matches!(documents.put_object(RelativePath::new("upgrade/date=2026-01-01/manifest.json"), Bytes::new(), &None).await, Err(ObjectStorageError::StreamDeleting)));
+
+
             } else if case == 0 {
                 let date = chrono::Utc::now();
                 let manifest = crate::catalog::manifest::Manifest::default();
@@ -1290,6 +1327,15 @@ mod contract_tests {
                     Bytes::from_static(b"default tenant data"),
                     &None,
                 )
+                .await
+                .unwrap();
+            let invalid = Document {
+                id: "collision".into(),
+                path: "defaultlogs/other/.stream/.schema".into(),
+                value: "invalid".into(),
+            };
+            store
+                .put_dashboard(&invalid, &Some("defaultlogs".into()))
                 .await
                 .unwrap();
             context.validate_multi_tenancy().await.unwrap();
