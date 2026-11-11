@@ -227,10 +227,12 @@ pub async fn run(
         "requires --acknowledge-server-stopped; stop ALL servers and writers first"
     );
     eprintln!("OFFLINE migration: all servers must remain stopped. No writer fencing exists.");
-    let _transfer_lock = db.transfer_lock().await?;
+    let mut transfer_lock = db.transfer_lock().await?;
     db.migration_preflight(store.as_ref(), opts).await?;
     if opts.abort {
-        return db.abort_migration(store.as_ref(), action).await;
+        return db
+            .abort_migration(store.as_ref(), action, &transfer_lock)
+            .await;
     }
     let inventory = store.metadata_inventory().await?;
     let mut skipped = 0;
@@ -326,9 +328,11 @@ pub async fn run(
             db.export_preflight(&client, store.as_ref(), opts, &keys)
                 .await?;
         }
+        transfer_lock.batch_execute("SELECT 1").await?;
         return Ok(());
     }
-    db.migrate(store, opts, &keys).await
+    transfer_lock.batch_execute("SELECT 1").await?;
+    db.migrate(store, opts, &keys, &mut transfer_lock).await
 }
 
 pub(crate) fn failure_point(opts: &MigrationOptions, step: &str) -> anyhow::Result<()> {
@@ -771,6 +775,7 @@ mod tests {
             for step in [
                 "marker",
                 "spool",
+                "lock-loss",
                 "import-before-commit",
                 "import-commit",
                 "paired",
@@ -788,6 +793,13 @@ mod tests {
                     command.abort = true;
                     run(store.clone(), &db, &command).await?;
                     assert!(!spool.exists(), "abort must clean stale private spools under the transfer lock");
+                    command.abort = false;
+                }
+                if step == "lock-loss" {
+                    assert_eq!(db.client().await?.query_one("SELECT count(*) FROM parseable_documents", &[]).await?.get::<_, i64>(0), 0);
+                    assert!(optional(store.as_ref(), PAIR).await?.is_none());
+                    command.abort = true;
+                    run(store.clone(), &db, &command).await?;
                     command.abort = false;
                 }
                 if step == "import-commit" {
@@ -1022,11 +1034,23 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        admin
+        // The CI workflow runs this fixture repeatedly against one isolated
+        // bucket. Remove both source aliases and canonical export keys.
+        let cleanup = async {
+            for (key, _) in store.metadata_inventory().await? {
+                store.delete_object(RelativePath::new(&key), &None).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        let dropped = admin
             .client()
             .await?
             .batch_execute(&format!("DROP DATABASE {schema} WITH (FORCE)"))
-            .await?;
-        result
+            .await;
+        result?;
+        cleanup?;
+        dropped?;
+        Ok(())
     }
 }

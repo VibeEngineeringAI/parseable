@@ -1139,6 +1139,7 @@ impl PostgresDocuments {
         store: Arc<dyn ObjectStorage>,
         opts: &super::migration::MigrationOptions,
         keys: &[super::migration::InventoryDocument],
+        transfer_lock: &mut super::postgres_client::Client,
     ) -> anyhow::Result<()> {
         use super::migration::{Action, BUSY, PAIR, digest, optional};
         use anyhow::ensure;
@@ -1205,6 +1206,7 @@ impl PostgresDocuments {
                 }
             }
             ensure!(differences == 0, "{differences} metadata differences");
+            transfer_lock.batch_execute("SELECT 1").await?;
             println!("representations match");
             return Ok(());
         }
@@ -1256,6 +1258,7 @@ impl PostgresDocuments {
             self.export_preflight(&client, store.as_ref(), opts, keys)
                 .await?;
         }
+        transfer_lock.batch_execute("SELECT 1").await?;
         store
             .put_metadata_conditional(
                 RelativePath::new(BUSY),
@@ -1315,8 +1318,20 @@ impl PostgresDocuments {
                         .all(|((k, m), (old, _, om))| k == old && m == om),
                 "bucket metadata changed during import"
             );
-            let mut client = self.client().await?;
-            let tx = client.transaction().await?;
+            #[cfg(test)]
+            if opts.injected_failure == Some("lock-loss") {
+                let pid: i32 = transfer_lock
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await?
+                    .get(0);
+                self.client()
+                    .await?
+                    .query_one("SELECT pg_terminate_backend($1,1000)", &[&pid])
+                    .await?;
+            }
+            // Commit on the lock-owning session: a lost lock connection must
+            // fail this transfer, rather than reconnecting and committing stale work.
+            let tx = transfer_lock.transaction().await?;
             tx.query("SELECT pg_advisory_xact_lock(8104050183641399916)", &[])
                 .await?;
             tx.batch_execute("CREATE TABLE IF NOT EXISTS parseable_import_digests (key text PRIMARY KEY, digest text NOT NULL)").await?;
@@ -1367,6 +1382,7 @@ impl PostgresDocuments {
             super::migration::failure_point(opts, "import-before-commit")?;
             tx.commit().await?;
             super::migration::failure_point(opts, "import-commit")?;
+            transfer_lock.batch_execute("SELECT 1").await?;
             store
                 .put_metadata_conditional(
                     RelativePath::new(PAIR),
@@ -1388,7 +1404,9 @@ impl PostgresDocuments {
             );
             super::migration::failure_point(opts, "paired")?;
         } else {
-            tx.execute("INSERT INTO parseable_transfer(state) VALUES('exported') ON CONFLICT(singleton) DO UPDATE SET state='exported'", &[]).await?;
+            drop(client);
+            let client = &*transfer_lock;
+            client.execute("INSERT INTO parseable_transfer(state) VALUES('exported') ON CONFLICT(singleton) DO UPDATE SET state='exported'", &[]).await?;
             super::migration::failure_point(opts, "export-state")?;
             let mut last = (String::new(), String::new());
             loop {
@@ -1399,6 +1417,7 @@ impl PostgresDocuments {
                 for row in rows {
                     last = (row.get(0), row.get(1));
                     let body = Bytes::from(row.get::<_, Vec<u8>>(2));
+                    client.batch_execute("SELECT 1").await?;
                     store
                         .put_object(RelativePath::new(&last.1), body.clone(), &None)
                         .await?;
@@ -1451,10 +1470,12 @@ impl PostgresDocuments {
                 }
             }
             if optional(store.as_ref(), PAIR).await?.is_some() {
+                client.batch_execute("SELECT 1").await?;
                 store.delete_object(RelativePath::new(PAIR), &None).await?;
             }
             super::migration::failure_point(opts, "pair-removed")?;
         }
+        transfer_lock.batch_execute("SELECT 1").await?;
         store.delete_object(RelativePath::new(BUSY), &None).await?;
         Ok(())
     }
@@ -1734,10 +1755,10 @@ impl PostgresDocuments {
         &self,
         store: &dyn ObjectStorage,
         action: super::migration::Action,
+        client: &super::postgres_client::Client,
     ) -> anyhow::Result<()> {
         use super::migration::{Action, BUSY, optional};
         use anyhow::ensure;
-        let client = self.client().await?;
         let exists: bool = client
             .query_one("SELECT to_regclass('parseable_transfer') IS NOT NULL", &[])
             .await?
@@ -1800,6 +1821,7 @@ impl PostgresDocuments {
             Action::Verify => anyhow::bail!("verify cannot be aborted"),
         }
         if optional(store, BUSY).await?.is_some() {
+            client.batch_execute("SELECT 1").await?;
             store.delete_object(RelativePath::new(BUSY), &None).await?;
         }
         println!(
