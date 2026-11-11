@@ -38,6 +38,7 @@ pub struct KafkaStreams {
     stream_state: Arc<RwLock<StreamState>>,
     statistics: Arc<std::sync::RwLock<Statistics>>,
     shutdown_handle: Shutdown,
+    multi_tenant: bool,
 }
 
 impl KafkaStreams {
@@ -47,6 +48,8 @@ impl KafkaStreams {
         shutdown_handle: Shutdown,
     ) -> anyhow::Result<KafkaStreams> {
         info!("Initializing KafkaStreams...");
+        let multi_tenant = crate::parseable::PARSEABLE.options.is_multi_tenant();
+        context.config.validate_tenant_mode(multi_tenant)?;
         let statistics = Arc::clone(&context.statistics);
         let consumer = KafkaStreams::create_consumer(context);
         info!("KafkaStreams initialized successfully.");
@@ -56,6 +59,7 @@ impl KafkaStreams {
             stream_state,
             statistics,
             shutdown_handle,
+            multi_tenant,
         })
     }
 
@@ -102,6 +106,13 @@ impl KafkaStreams {
     pub fn partitioned(&self) -> ReceiverStream<PartitionStreamReceiver> {
         let (stream_tx, stream_rx) = mpsc::channel(100);
         let consumer = self.consumer();
+        let multi_tenant = self.multi_tenant;
+        let configured_tenant = consumer
+            .context()
+            .config
+            .consumer
+            .as_ref()
+            .and_then(|config| config.tenant_id.clone());
         let stream_state = self.state();
         let tokio_handle = tokio::runtime::Handle::current();
         let shutdown_handle = self.shutdown_handle.clone();
@@ -112,7 +123,7 @@ impl KafkaStreams {
                     let result: Result<(), ConnectorError> = tokio::select! {
                         result = consumer.recv() => {
                             match result {
-                                Ok(msg) => KafkaStreams::handle_message(msg, &stream_state, &stream_tx).await.map_err(Into::into),
+                                Ok(msg) => KafkaStreams::handle_message(msg, &stream_state, &stream_tx, configured_tenant.as_deref(), multi_tenant).await.map_err(Into::into),
                                 Err(e) => Err(e.into())
                             }
                         }
@@ -156,10 +167,16 @@ impl KafkaStreams {
         msg: BorrowedMessage<'_>,
         stream_state: &RwLock<StreamState>,
         stream_tx: &mpsc::Sender<PartitionStreamReceiver>,
+        configured_tenant: Option<&str>,
+        multi_tenant: bool,
     ) -> anyhow::Result<()> {
-        let mut state = stream_state.write().await;
         let tp = TopicPartition::from_kafka_msg(&msg);
-        let consumer_record = ConsumerRecord::from_borrowed_msg(msg);
+        let Some(consumer_record) =
+            ConsumerRecord::from_borrowed_msg(msg, configured_tenant, multi_tenant)
+        else {
+            return Ok(());
+        };
+        let mut state = stream_state.write().await;
 
         let partition_stream_tx =
             KafkaStreams::get_or_create_partition_stream(&mut state, stream_tx, tp).await;

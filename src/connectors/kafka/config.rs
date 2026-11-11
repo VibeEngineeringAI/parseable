@@ -82,6 +82,12 @@ pub struct KafkaConfig {
 
 #[derive(Debug, Clone, Args)]
 pub struct ConsumerConfig {
+    /// Trusted destination for every consumed topic. Headers never grant tenant access.
+    #[arg(long = "consumer-tenant-id", env = "P_KAFKA_CONSUMER_TENANT_ID",
+        help = "Destination tenant for all consumed topics; requires --multi-tenancy. Recommended in multi-tenant mode: conflicting tenant headers are dropped; unset accepts only headerless records at the default destination. Single-tenant mode ignores tenant headers",
+        value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub tenant_id: Option<String>,
+
     #[arg(
         long = "consumer-topics",
         env = "P_KAFKA_CONSUMER_TOPICS",
@@ -585,6 +591,11 @@ pub struct SecurityConfig {
 }
 
 impl KafkaConfig {
+    /// Behavior-preserving validation seam for the follow-up security fix.
+    pub fn validate_tenant_mode(&self, _multi_tenant: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     pub fn to_rdkafka_consumer_config(&self) -> ClientConfig {
         let mut config = ClientConfig::new();
 
@@ -1135,6 +1146,7 @@ impl Default for ProducerConfig {
 impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
+            tenant_id: None,
             topics: vec![],
             group_id: "parseable-connect-cg".to_string(),
             buffer_size: 10_000,

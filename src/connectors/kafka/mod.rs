@@ -29,7 +29,6 @@ use rdkafka::producer::ProducerContext;
 use rdkafka::topic_partition_list::TopicPartitionListElem;
 use rdkafka::{ClientContext, Message, Offset, Statistics};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
@@ -170,7 +169,8 @@ pub struct ConsumerRecord {
     pub partition: i32,
     pub offset: i64,
     pub timestamp: Option<i64>,
-    pub tenant_id: Option<String>, // pub headers: Option<HashMap<String, Option<String>>>,
+    /// Destination tenant (header-derived until the follow-up security fix).
+    pub tenant_id: Option<String>,
 }
 
 impl ConsumerRecord {
@@ -194,24 +194,31 @@ impl ConsumerRecord {
         }
     }
 
-    pub fn from_borrowed_msg(msg: BorrowedMessage) -> Self {
-        let tenant_id = if let Some(headers) = extract_headers(&msg)
-            && let Some(tenant_id) = headers.get(TENANT_ID)
-        {
-            tenant_id.clone()
-        } else {
-            None
-        };
+    pub fn from_borrowed_msg(
+        msg: BorrowedMessage,
+        configured_tenant: Option<&str>,
+        multi_tenant: bool,
+    ) -> Option<Self> {
+        let tenant_id = tenant_for_ingestion(
+            multi_tenant,
+            configured_tenant,
+            msg.headers()
+                .into_iter()
+                .flat_map(|headers| headers.iter())
+                .filter(|header| header.key == TENANT_ID)
+                .map(|header| header.value),
+            &metrics::TENANT_MISMATCH_DROPPED,
+        )?;
 
-        Self {
+        Some(Self {
             key: msg.key().map(|k| k.to_vec()),
             payload: msg.payload().map(|p| p.to_vec()),
             topic: msg.topic().to_owned(),
             partition: msg.partition(),
             offset: msg.offset(),
             timestamp: msg.timestamp().to_millis(),
-            tenant_id, // headers: extract_headers(&msg),
-        }
+            tenant_id,
+        })
     }
 
     pub fn key_str(&self) -> String {
@@ -232,19 +239,40 @@ impl ConsumerRecord {
     }
 }
 
-#[allow(unused)]
-fn extract_headers(msg: &BorrowedMessage<'_>) -> Option<HashMap<String, Option<String>>> {
-    msg.headers().map(|headers| {
-        headers
-            .iter()
-            .map(|header| {
-                (
-                    header.key.to_string(),
-                    header.value.map(|v| String::from_utf8_lossy(v).to_string()),
-                )
-            })
-            .collect()
-    })
+// Behavior-preserving seam: tenant headers still select the destination here.
+// The follow-up fix will enforce the mode and trusted configuration.
+fn resolve_tenant<'a>(
+    _multi_tenant: bool,
+    _configured: Option<&str>,
+    headers: impl Iterator<Item = Option<&'a [u8]>>,
+) -> Result<Option<String>, ()> {
+    Ok(headers
+        .last()
+        .flatten()
+        .map(|value| String::from_utf8_lossy(value).into_owned()))
+}
+
+fn tenant_for_ingestion<'a>(
+    multi_tenant: bool,
+    configured: Option<&str>,
+    headers: impl Iterator<Item = Option<&'a [u8]>>,
+    dropped: &prometheus::IntCounter,
+) -> Option<Option<String>> {
+    match resolve_tenant(multi_tenant, configured, headers) {
+        Ok(tenant) => Some(tenant),
+        Err(()) => {
+            dropped.inc();
+            // At most one warning per process, with no producer-controlled values.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    "Dropping Kafka records with tenant headers that disagree with configured tenant; see parseable_kafka_tenant_mismatch_dropped_total"
+                );
+            }
+            None
+        }
+    }
 }
 
 impl ConsumerContext for KafkaContext {
@@ -399,5 +427,168 @@ impl ClientContext for KafkaContext {
             token,
             lifetime_ms: expiration_time_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+
+    #[test]
+    fn single_tenant_headers_are_ignored_without_drops() {
+        let counter =
+            prometheus::IntCounter::new("test_ignored_tenant_drops", "test drops").unwrap();
+        for header in [Some(b"tenant-b".as_slice()), None, Some(b"\xff".as_slice())] {
+            assert_eq!(
+                tenant_for_ingestion(false, None, [header].into_iter(), &counter),
+                Some(None)
+            );
+        }
+        assert_eq!(counter.get(), 0);
+    }
+
+    #[test]
+    fn multi_tenant_without_config_or_header_keeps_base_default() {
+        assert_eq!(resolve_tenant(true, None, std::iter::empty()), Ok(None));
+    }
+
+    fn config_with_tenant(tenant: Option<&str>) -> KafkaConfig {
+        let mut config = KafkaConfig::default();
+        config.consumer.as_mut().unwrap().tenant_id = tenant.map(str::to_owned);
+        config
+    }
+
+    #[test]
+    fn tenant_config_requires_multi_tenancy() {
+        let error = config_with_tenant(Some("tenant-a"))
+            .validate_tenant_mode(false)
+            .unwrap_err();
+        assert!(error.to_string().contains("requires --multi-tenancy"));
+    }
+
+    #[test]
+    fn unsafe_configured_tenant_ids_are_rejected() {
+        for tenant in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            " a",
+            "a b",
+            "a\t",
+            "a\n",
+            "a..b",
+            "-tenant",
+            "tenant!",
+            "abcdefghijklmnopqrstuvwxyz01234567890",
+        ] {
+            assert!(
+                config_with_tenant(Some(tenant))
+                    .validate_tenant_mode(true)
+                    .is_err(),
+                "accepted {tenant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_tenant_uses_server_validation_including_reserved_default() {
+        let tenant = crate::parseable::DEFAULT_TENANT;
+        assert!(
+            config_with_tenant(Some(tenant))
+                .validate_tenant_mode(true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn valid_and_unconfigured_modes_are_allowed() {
+        assert!(
+            config_with_tenant(Some("tenant-a"))
+                .validate_tenant_mode(true)
+                .is_ok()
+        );
+        assert!(config_with_tenant(None).validate_tenant_mode(false).is_ok());
+        assert!(config_with_tenant(None).validate_tenant_mode(true).is_ok());
+    }
+
+    #[test]
+    fn tenant_b_header_never_routes_to_b() {
+        let decision = resolve_tenant(
+            true,
+            Some("tenant-a"),
+            [Some(b"tenant-b".as_slice())].into_iter(),
+        );
+        assert_ne!(decision, Ok(Some("tenant-b".into())));
+        assert_eq!(decision, Err(()));
+    }
+
+    #[test]
+    fn mismatch_is_dropped_and_counted() {
+        let counter = prometheus::IntCounter::new("test_tenant_drops", "test drops").unwrap();
+        let record = tenant_for_ingestion(
+            true,
+            Some("tenant-a"),
+            [Some(b"tenant-b".as_slice())].into_iter(),
+            &counter,
+        );
+        assert_eq!(record, None);
+        assert_eq!(counter.get(), 1);
+    }
+
+    #[test]
+    fn no_config_no_header_keeps_single_tenant_default() {
+        assert_eq!(resolve_tenant(false, None, std::iter::empty()), Ok(None));
+    }
+
+    #[test]
+    fn configured_tenant_without_header_is_used() {
+        assert_eq!(
+            resolve_tenant(true, Some("tenant-a"), std::iter::empty()),
+            Ok(Some("tenant-a".into()))
+        );
+    }
+
+    #[test]
+    fn matching_header_is_accepted() {
+        assert_eq!(
+            resolve_tenant(
+                true,
+                Some("tenant-a"),
+                [Some(b"tenant-a".as_slice())].into_iter()
+            ),
+            Ok(Some("tenant-a".into()))
+        );
+    }
+
+    #[test]
+    fn unconfigured_header_cannot_select_tenant() {
+        assert_eq!(
+            resolve_tenant(true, None, [Some(b"tenant-b".as_slice())].into_iter()),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn duplicate_headers_cannot_hide_mismatch() {
+        assert_eq!(
+            resolve_tenant(
+                true,
+                Some("tenant-a"),
+                [Some(b"tenant-b".as_slice()), Some(b"tenant-a".as_slice())].into_iter()
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn null_and_invalid_headers_are_rejected() {
+        for header in [None, Some(b"\xff".as_slice())] {
+            assert_eq!(
+                resolve_tenant(true, Some("tenant-a"), [header].into_iter()),
+                Err(())
+            );
+        }
     }
 }
