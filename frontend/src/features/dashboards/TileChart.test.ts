@@ -26,6 +26,44 @@ const tile = (chartType: string) =>
   }) satisfies DashboardTile;
 
 describe('TileChart', () => {
+  it('renders saved PromQL display names in the legend without opaque aggregate labels', () => {
+    const markup = renderToStaticMarkup(
+      createElement(TileChart, {
+        tile: {
+          tile_id: 'load',
+          tileType: 'promql',
+          chartType: 'line',
+          config: { queryAliases: { A: '1-minute average', B: '5-minute average' } },
+        },
+        result: {
+          promql: ['A', 'B'].map((id) => ({
+            id,
+            pending: 0,
+            errors: [],
+            range: {
+              resultType: 'matrix' as const,
+              result: [
+                {
+                  metric: {},
+                  values: [
+                    [1, '3'],
+                    [2, '4'],
+                  ] as [number, string][],
+                },
+              ],
+            },
+          })),
+        },
+        start: 1,
+        end: 2,
+        height: 200,
+      }),
+    );
+    expect(markup).toContain('1-minute average');
+    expect(markup).toContain('5-minute average');
+    expect(markup).not.toContain('A: {}');
+    expect(markup).not.toContain('B: {}');
+  });
   it.each(['timeseries', 'line', 'area', 'bar'])(
     'only enables zoom for time data in timeseries tiles: %s',
     (chartType) => {

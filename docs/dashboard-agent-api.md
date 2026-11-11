@@ -25,6 +25,13 @@ chart styles, sections, variables, layouts, and saved time/refresh defaults.
 The dashboard's `dataset` is the default for newly authored tiles. It does not
 rewrite existing SQL or switch every tile's own `dbName`.
 
+PromQL time-series legends accept per-query display names in a tile's
+`config.queryAliases`, for example `{"A":"1-minute average","B":"5-minute average"}`.
+Aggregates with empty labels display that name directly; labeled vectors retain
+their label dimensions after the name. Query expressions, series identities and
+sample values remain unchanged. Queries without a configured name keep the
+existing legend format.
+
 ## External tool policy
 
 The canonical registry and executor remain at:
