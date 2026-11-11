@@ -9,7 +9,7 @@ const rows = [
   { service: 'worker', requests: 7 },
 ];
 
-async function serve(page: Page, holdQueries = false) {
+async function serve(page: Page, holdQueries = false, privilege = 'admin') {
   const queries: { sql: string; startTime: string; endTime: string; route: Route }[] = [];
   const writes: { method: string; body: DashboardRequest }[] = [];
   let current: Dashboard = structuredClone(classic);
@@ -35,7 +35,10 @@ async function serve(page: Page, holdQueries = false) {
       return route.fulfill({ json: { id: 'admin', username: 'admin' } });
     if (path === '/api/v1/user/admin/role')
       return route.fulfill({
-        json: { roles: { root: { actions: [{ privilege: 'admin' }], roleType: 'internal' } } },
+        json: {
+          roles: { root: { actions: [{ privilege }], roleType: 'internal' } },
+          groupRoles: {},
+        },
       });
     if (path === '/api/v1/logstream')
       return route.fulfill({ json: [{ name: 'app-logs' }, { name: 'other-logs' }] });
@@ -71,8 +74,14 @@ async function serve(page: Page, holdQueries = false) {
       }
       return route.fulfill({ json: current });
     }
-    if (path === `/api/v1/dashboards/${foreign.dashboardId}`)
+    if (path === `/api/v1/dashboards/${foreign.dashboardId}`) {
+      if (request.method() === 'PUT') {
+        const body: Dashboard = request.postDataJSON();
+        writes.push({ method: 'PUT', body: structuredClone(body) });
+        Object.assign(foreign, body);
+      }
       return route.fulfill({ json: foreign });
+    }
     return route.fulfill({ json: [] });
   });
   await page.goto('/sql-editor');
@@ -326,10 +335,27 @@ for (const target of ['new', 'existing'] as const) {
   });
 }
 
+test('non-owner admin adds a SQL chart without changing the dashboard owner', async ({ page }) => {
+  const server = await serve(page);
+  const original = structuredClone(server.foreign);
+  await chart(page);
+  const dialog = await destination(page, original.dashboardId);
+  await dialog.getByRole('button', { name: 'Add chart', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole('link', { name: original.title, exact: true })).toBeVisible();
+  expect(server.writes).toHaveLength(1);
+  const write = server.writes[0];
+  const added = write.body.tiles!.at(-1)!;
+  expect(write.method).toBe('PUT');
+  expect(write.body).toEqual({ ...original, tiles: [...original.tiles!, added] });
+  expect(added).toMatchObject({ title: 'Requests by service', chartQuery: executed });
+  expect(server.foreign.author).toBe(original.author);
+});
+
 test('dashboard ownership is checked on the loaded document as well as the destination list', async ({
   page,
 }) => {
-  const server = await serve(page);
+  const server = await serve(page, false, 'reader');
   await chart(page);
   const dialog = await destination(page, classic.dashboardId);
   await expect(
@@ -342,7 +368,10 @@ test('dashboard ownership is checked on the loaded document as well as the desti
   server.replace({ ...server.current(), author: 'new-owner' });
   await page.getByRole('button', { name: 'Add to Dashboard', exact: true }).click();
   await expect(
-    dialog.getByText('This dashboard is read-only. Only its owner can edit it.', { exact: true }),
+    dialog.getByText(
+      'This dashboard is read-only. Only its owner or an administrator can edit it.',
+      { exact: true },
+    ),
   ).toBeVisible();
   await expect(
     dialog

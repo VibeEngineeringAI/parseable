@@ -224,13 +224,11 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
         fail('Tile ID must be provided');
       if (new Set(tiles.map((item) => item.tile_id)).size !== tiles.length)
         fail('Tile IDs must be unique');
-      if (original.author !== owner)
-        fail('Dashboard does not exist or you do not have permission to access it');
       unique(body, id);
       const value: Dashboard = {
         ...clone(body),
         version: 'v1',
-        author: owner,
+        author: original.author,
         dashboardId: id,
         created: original.created,
         modified: timestamp(),
@@ -255,7 +253,7 @@ export function createDemoDashboards(now = Date.now()): Pick<ParseableClient, Me
     async deleteDashboard(id) {
       await ready();
       get(id, 'Dashboard does not exist or you do not have permission to access it');
-      // The demo identity has admin privileges: DELETE permits any owner, unlike PUT.
+      // The demo identity has admin privileges, so it can delete any dashboard.
       dashboards = dashboards.filter((item) => item.dashboardId !== id);
     },
   };

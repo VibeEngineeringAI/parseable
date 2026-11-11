@@ -13,7 +13,7 @@ import { TileChart } from '../dashboards/TileChart';
 import { TileBindingFields } from '../dashboards/TileBindingFields';
 import { TileAppearanceFields } from '../dashboards/TileAppearanceFields';
 import { chartIssues } from '../dashboards/chartPicker';
-import { useDashboardAccess } from '../dashboards/owner';
+import { canEditDashboard, useDashboardAccess } from '../dashboards/owner';
 import { classicTimeRange } from '../dashboards/timeRange';
 import { text, tileDatasets } from '../dashboards/tiles';
 import { appendSqlTile, executedSqlTile, type SqlChartConfig } from './sqlChart';
@@ -94,7 +94,7 @@ export function SqlChartPanel({
         : invalid.size
           ? 'Correct the chart options.'
           : (chartIssues(config)[0] ?? '');
-  const writable = selected.data && !!access.hash && selected.data.author === access.hash;
+  const writable = selected.data && canEditDashboard(access, selected.data.author);
   const destinationIssue =
     destination === 'new'
       ? !access.canCreate
@@ -104,9 +104,11 @@ export function SqlChartPanel({
           : ''
       : selected.loading
         ? 'Loading dashboard…'
-        : !writable
-          ? 'This dashboard is read-only. Only its owner can edit it.'
-          : '';
+        : !writable && access.loading
+          ? 'Loading dashboard permissions…'
+          : !writable
+            ? 'This dashboard is read-only. Only its owner or an administrator can edit it.'
+            : '';
   return (
     <div className="stack sql-chart-panel">
       {rows.length > 0 && (
@@ -188,9 +190,11 @@ export function SqlChartPanel({
                   saveRead.current = controller;
                   const latest = await client.getDashboard(loaded.dashboardId, controller.signal);
                   if (!mutation.isActive()) return;
-                  if (!access.hash || latest.author !== access.hash) {
+                  if (!canEditDashboard(access, latest.author)) {
                     selected.reload();
-                    throw new Error('This dashboard is read-only. Only its owner can edit it.');
+                    throw new Error(
+                      'This dashboard is read-only. Only its owner or an administrator can edit it.',
+                    );
                   }
                   if (JSON.stringify(latest) !== JSON.stringify(loaded)) {
                     selected.reload();
@@ -239,10 +243,10 @@ export function SqlChartPanel({
                 <option
                   key={item.dashboardId}
                   value={item.dashboardId}
-                  disabled={!access.hash || item.author !== access.hash}
+                  disabled={!canEditDashboard(access, item.author)}
                 >
                   {item.title}
-                  {item.author !== access.hash ? ' (read-only)' : ''}
+                  {!access.loading && !canEditDashboard(access, item.author) ? ' (read-only)' : ''}
                 </option>
               ))}
             </Select>
