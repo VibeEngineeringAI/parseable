@@ -1713,3 +1713,5 @@ mod tests {
         assert_eq!(val, out);
     }
 }
+
+mod small_file_cache;

@@ -1552,7 +1552,6 @@ impl Metastore for ObjectStoreMetastore {
                 .map_err(MetastoreError::ObjectStorageError)
         } else {
             // not local-disk, object storage
-            let mut result_file_list = HashSet::new();
             let root = tenant_id
                 .as_ref()
                 .map(|tenant| object_store::path::Path::from_iter([tenant.clone()]));
@@ -1572,26 +1571,37 @@ impl Metastore for ObjectStoreMetastore {
                         && name != TOMBSTONE_ROOT_DIRECTORY
                 })
                 .collect::<Vec<_>>();
-            for stream in streams {
-                let stream_path = if let Some(root) = root.as_ref() {
-                    object_store::path::Path::from_iter([
-                        root.as_ref(),
-                        &stream,
-                        STREAM_ROOT_DIRECTORY,
-                    ])
-                } else {
-                    object_store::path::Path::from(format!("{}/{}", stream, STREAM_ROOT_DIRECTORY))
-                };
-                let resp = self.storage.list_with_delimiter(Some(stream_path)).await?;
-                if resp
-                    .objects
-                    .iter()
-                    .any(|name| name.location.filename().unwrap().ends_with("stream.json"))
-                {
-                    result_file_list.insert(stream);
-                }
-            }
-            Ok(result_file_list)
+            let results =
+                futures::stream::iter(streams)
+                    .map(|stream| {
+                        let root = root.clone();
+                        async move {
+                            let stream_path = if let Some(root) = root.as_ref() {
+                                object_store::path::Path::from_iter([
+                                    root.as_ref(),
+                                    &stream,
+                                    STREAM_ROOT_DIRECTORY,
+                                ])
+                            } else {
+                                object_store::path::Path::from(format!(
+                                    "{}/{}",
+                                    stream, STREAM_ROOT_DIRECTORY
+                                ))
+                            };
+                            let resp = self.storage.list_with_delimiter(Some(stream_path)).await?;
+                            if resp.objects.iter().any(|name| {
+                                name.location.filename().unwrap().ends_with("stream.json")
+                            }) {
+                                Ok::<_, MetastoreError>(Some(stream))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                    })
+                    .buffer_unordered(16)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+            Ok(results.into_iter().flatten().collect())
         }
     }
 }
@@ -1600,6 +1610,85 @@ impl Metastore for ObjectStoreMetastore {
 mod tests {
     use super::*;
     use crate::storage::LocalFS;
+
+    #[tokio::test]
+    async fn next_metadata_read_sees_external_writer_changes() {
+        for tenant in [None, Some("tenant".to_owned())] {
+            let dir = tempfile::tempdir_in(".").unwrap();
+            let storage = Arc::new(LocalFS::new(dir.path().to_owned()));
+            let reader = ObjectStoreMetastore {
+                storage: storage.clone(),
+            };
+            let stream_path = RelativePathBuf::from_iter([
+                tenant.as_deref().unwrap_or(""),
+                "metrics",
+                STREAM_ROOT_DIRECTORY,
+                STREAM_METADATA_FILE_NAME,
+            ]);
+            let manifest_path = RelativePathBuf::from_iter([
+                tenant.as_deref().unwrap_or(""),
+                "metrics",
+                "day",
+                "manifest.json",
+            ]);
+            for generation in ["first", "external-update"] {
+                // Write directly through storage, bypassing this reader's API.
+                let format = crate::storage::ObjectStoreFormat {
+                    created_at: generation.into(),
+                    ..Default::default()
+                };
+                storage
+                    .put_object(&stream_path, to_bytes(&format), &tenant)
+                    .await
+                    .unwrap();
+                let loaded: crate::storage::ObjectStoreFormat = serde_json::from_slice(
+                    &reader
+                        .get_stream_json("metrics", true, &tenant, false)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(loaded.created_at, generation);
+                let manifest = Manifest {
+                    version: generation.into(),
+                    ..Default::default()
+                };
+                storage
+                    .put_object(&manifest_path, encode_manifest(&manifest).unwrap(), &tenant)
+                    .await
+                    .unwrap();
+                let loaded = reader
+                    .get_manifest(
+                        "metrics",
+                        Utc::now(),
+                        Utc::now(),
+                        Some(manifest_path.to_string()),
+                        &tenant,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(loaded.version, generation);
+            }
+            storage
+                .delete_object(&manifest_path, &tenant)
+                .await
+                .unwrap();
+            assert!(
+                reader
+                    .get_manifest(
+                        "metrics",
+                        Utc::now(),
+                        Utc::now(),
+                        Some(manifest_path.to_string()),
+                        &tenant
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn remote_schema_refresh_publishes_only_changes() {
