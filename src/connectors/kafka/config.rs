@@ -1566,6 +1566,7 @@ mod tenant_env_tests {
     fn empty_consumer_tenant_env_is_rejected_in_child_process() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
                 "connectors::kafka::config::tenant_env_tests::tenant_env_child",
                 "--nocapture",
@@ -1584,6 +1585,7 @@ mod tenant_env_tests {
     }
 
     #[test]
+    #[ignore = "run only as a child of empty_consumer_tenant_env_is_rejected_in_child_process"]
     fn tenant_env_child() {
         if std::env::var_os("PARSEABLE_TENANT_ENV_TEST_CHILD").is_none() {
             return;
