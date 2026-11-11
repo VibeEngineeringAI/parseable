@@ -1397,7 +1397,9 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
         if let Err(e) =
             update_snapshot_with_manifests(stream_name, &uploaded_files, &tenant_id).await
         {
-            if e.http_status() == actix_web::http::StatusCode::CONFLICT {
+            if PARSEABLE.options.postgres.enabled()
+                && e.http_status() == actix_web::http::StatusCode::CONFLICT
+            {
                 // The marker can land between upload and manifest publication.
                 // Compensate every upload in this batch, including partially
                 // published manifests, before retiring its local staging files.
