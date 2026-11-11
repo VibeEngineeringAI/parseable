@@ -9,7 +9,7 @@ import { useAsync } from '../../hooks/useAsync';
 import { useRowDeletionFocus } from '../../hooks/useRowDeletionFocus';
 import { createLimiter } from '../../lib/concurrency';
 import type { Dashboard, DashboardTile as Tile } from '../../lib/types';
-import { useDashboardAccess } from './owner';
+import { canEditDashboard, useDashboardAccess } from './owner';
 import { dashboardError, dashboardPresets, duplicateDashboard } from './helpers';
 import { moveTile, text } from './tiles';
 import { duplicateTile } from './draft';
@@ -65,7 +65,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
   const [resolutions, setResolutions] = useState<VariableResolutions>({});
   const about = useAsync(useCallback((signal) => client.about(signal), [client]));
   const promqlEnabled = about.data ? about.data.capabilities.promqlDashboard === true : undefined;
-  const writable = !!access.hash && access.hash === draft.author;
+  const writable = canEditDashboard(access, draft.author);
   const editing = writable && !mutation.pending && !presentation.presenting;
   const limit = useMemo(() => createLimiter(4), [client]);
   const tileFocus = useRowDeletionFocus(
@@ -186,7 +186,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
                         }
                       }),
                   },
-                  ...(writable || access.isAdmin
+                  ...(writable
                     ? [
                         {
                           id: 'delete',
@@ -243,7 +243,7 @@ function DashboardFields({ original }: { original: Dashboard }) {
         </div>
         {!access.loading && !writable && (
           <p className="notice" data-dashboard-presentation-hide data-dashboard-export-ignore>
-            This dashboard is read-only. Only its owner can edit it.
+            This dashboard is read-only. Only its owner or an administrator can edit it.
             {access.canCreate ? ' Duplicate it to make an editable copy.' : ''}
           </p>
         )}

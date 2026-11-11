@@ -194,8 +194,8 @@ services:
 
   quest:
     platform: linux/amd64
-    image: quay.io/parseablehq/quest:main
-    pull_policy: always
+    image: ${QUEST_IMAGE:-quay.io/parseablehq/quest:main}
+    pull_policy: ${QUEST_PULL_POLICY:-always}
     command:
       [
         "load",

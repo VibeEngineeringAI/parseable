@@ -38,6 +38,12 @@ function Playground({ readOnly = false, stacked = false }: Args) {
     };
     return {
       ...createDemoClient(),
+      async userRoleSources() {
+        return {
+          roles: { viewer: { actions: [{ privilege: 'reader' }], roleType: 'internal' } },
+          groupRoles: {},
+        };
+      },
       async getDashboard() {
         return structuredClone(current);
       },
@@ -62,7 +68,7 @@ function Playground({ readOnly = false, stacked = false }: Args) {
       <AppContext.Provider
         value={{
           client,
-          mode: 'demo',
+          mode: readOnly ? 'live' : 'demo',
           session: 0,
           needsLogin: false,
           identity: { id: 'admin', username: 'admin', source: 'server' },

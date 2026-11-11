@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createDemoDashboards } from './demoDashboards';
 import { dashboard } from './dashboardsContract';
 import classic from '../features/dashboards/__fixtures__/classic.json';
+import { appendSqlTile, executedSqlTile } from '../features/sql/sqlChart';
 describe('per-client dashboard demo', () => {
   it('provides SQL, PromQL and another owner fixtures', async () => {
     const client = createDemoDashboards(),
@@ -44,7 +45,44 @@ describe('per-client dashboard demo', () => {
     await client.deleteDashboard(saved.dashboardId);
     expect(await createDemoDashboards().listDashboards()).toHaveLength(3);
   });
-  it('uses server validation messages, exact tenant-wide titles and ownership', async () => {
+  it('allows admin edits, renames and SQL appends while preserving the shared owner', async () => {
+    const client = createDemoDashboards();
+    const row = (await client.listDashboards()).find((item) => item.title === 'Shared operations')!;
+    const original = await client.getDashboard(row.dashboardId);
+    const edited = structuredClone(original);
+    edited.tiles![0].title = 'Updated API events';
+    const saved = await client.updateDashboard(row.dashboardId, edited);
+    expect(saved.author).toBe(original.author);
+    expect((await client.getDashboard(row.dashboardId)).tiles![0].title).toBe('Updated API events');
+    const renamed = await client.updateDashboard(row.dashboardId, {
+      ...saved,
+      title: 'Renamed shared operations',
+      author: 'attempted-owner-change',
+    });
+    expect(renamed.author).toBe(original.author);
+    const added = executedSqlTile(classic.tiles[0], 'SELECT COUNT(*) AS events FROM "api_logs"');
+    const appended = await client.updateDashboard(row.dashboardId, appendSqlTile(renamed, added));
+    expect(await client.getDashboard(row.dashboardId)).toEqual(appended);
+    expect(appended).toMatchObject({
+      author: original.author,
+      created: original.created,
+      title: renamed.title,
+      tiles: [
+        saved.tiles![0],
+        expect.objectContaining({ tile_id: added.tile_id, chartQuery: added.chartQuery }),
+      ],
+    });
+    expect(
+      (await client.listDashboards()).find((item) => item.dashboardId === row.dashboardId),
+    ).toMatchObject({
+      author: original.author,
+      title: renamed.title,
+    });
+    await expect(client.setDashboardFavorite(row.dashboardId, true)).rejects.toThrow(
+      'you do not have permission',
+    );
+  });
+  it('uses server validation messages and exact tenant-wide titles', async () => {
     const c = createDemoDashboards();
     await expect(c.createDashboard({ title: '' })).rejects.toThrow('Title must be provided');
     const created = await c.createDashboard({ title: 'One' });
@@ -56,9 +94,6 @@ describe('per-client dashboard demo', () => {
       'Dashboard title must be unique',
     );
     const other = (await c.listDashboards()).find((row) => row.title === 'Shared operations')!;
-    await expect(c.updateDashboard(other.dashboardId, { title: 'New' })).rejects.toThrow(
-      'you do not have permission',
-    );
     await c.deleteDashboard(other.dashboardId);
     await expect(c.getDashboard(other.dashboardId)).rejects.toMatchObject({ status: 400 });
     await expect(
@@ -100,7 +135,7 @@ describe('per-client dashboard demo', () => {
   });
 });
 
-it('returns the exact server messages for missing dashboards and validates tiles before owner checks', async () => {
+it('returns the exact server messages for missing dashboards and validates shared dashboard tiles', async () => {
   const client = createDemoDashboards(),
     id = '01M4J000000000000000000099';
   await expect(client.getDashboard(id)).rejects.toThrow(

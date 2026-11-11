@@ -146,7 +146,7 @@ export function DashboardsList({
                     data-row-action={row.dashboardId}
                     disabled={refreshing}
                     items={[
-                      ...(owned
+                      ...(owned || isAdmin
                         ? [
                             {
                               id: 'rename',
