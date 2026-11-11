@@ -1574,7 +1574,6 @@ impl Metastore for $name {
                 .map_err(MetastoreError::ObjectStorageError)
         } else {
             // not local-disk, object storage
-            let mut result_file_list = HashSet::new();
             let root = tenant_id
                 .as_ref()
                 .map(|tenant| object_store::path::Path::from_iter([tenant.clone()]));
@@ -1594,29 +1593,41 @@ impl Metastore for $name {
                         && name != crate::storage::TOMBSTONE_ROOT_DIRECTORY
                 })
                 .collect::<Vec<_>>();
-            for stream in streams {
-                if !$local_listing && self.is_stream_deleting(&stream, tenant_id).await? {
-                    continue;
-                }
-                let stream_path = if let Some(root) = root.as_ref() {
-                    object_store::path::Path::from_iter([
-                        root.as_ref(),
-                        &stream,
-                        STREAM_ROOT_DIRECTORY,
-                    ])
-                } else {
-                    object_store::path::Path::from(format!("{}/{}", stream, STREAM_ROOT_DIRECTORY))
-                };
-                let resp = scoped_delimiter!($local_listing, self, Some(stream_path), tenant_id)?;
-                if resp
-                    .objects
-                    .iter()
-                    .any(|name| name.location.filename().unwrap().ends_with("stream.json"))
-                {
-                    result_file_list.insert(stream);
-                }
-            }
-            Ok(result_file_list)
+            let results = super::document_metastore::collect_dataset_probes(
+                streams.into_iter().map(|stream| {
+                    let root = root.clone();
+                    async move {
+                        if !$local_listing && self.is_stream_deleting(&stream, tenant_id).await? {
+                            return Ok::<_, MetastoreError>(None);
+                        }
+                        let stream_path = if let Some(root) = root.as_ref() {
+                            object_store::path::Path::from_iter([
+                                root.as_ref(),
+                                &stream,
+                                STREAM_ROOT_DIRECTORY,
+                            ])
+                        } else {
+                            object_store::path::Path::from(format!(
+                                "{}/{}",
+                                stream, STREAM_ROOT_DIRECTORY
+                            ))
+                        };
+                        let resp =
+                            scoped_delimiter!($local_listing, self, Some(stream_path), tenant_id)?;
+                        if resp
+                            .objects
+                            .iter()
+                            .any(|name| name.location.filename().unwrap().ends_with("stream.json"))
+                        {
+                            Ok(Some(stream))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                }),
+            )
+            .await?;
+            Ok(results.into_iter().flatten().collect())
         }
             })
     }
@@ -1626,6 +1637,18 @@ impl Metastore for $name {
 };
 }
 pub(crate) use document_metastore;
+
+/// Runs dataset probes sixteen at a time. All-or-error collection: a failed
+/// probe cannot publish a partial inventory.
+pub(crate) async fn collect_dataset_probes<T, E>(
+    probes: impl IntoIterator<Item = impl std::future::Future<Output = Result<T, E>>>,
+) -> Result<Vec<T>, E> {
+    use futures::{StreamExt, TryStreamExt};
+    futures::stream::iter(probes)
+        .buffer_unordered(16)
+        .try_collect()
+        .await
+}
 
 /// Classification belongs to the shared document layer. Never reconstruct a key.
 pub(crate) fn document_scope(key: &str) -> Option<(String, &'static str)> {

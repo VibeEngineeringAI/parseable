@@ -363,7 +363,51 @@ async fn parquet_scan_plan(
     state: &dyn Session,
     batch_size: usize,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let cache_options = if object_store_url.as_str() == "file:///" {
+        (0, 0, false)
+    } else {
+        (
+            Arc::as_ptr(&PARSEABLE.storage) as *const () as usize,
+            PARSEABLE.options.small_file_cache_size,
+            PARSEABLE.options.small_file_cache_enabled,
+        )
+    };
+    parquet_scan_plan_with_cache_options(
+        schema,
+        object_store_url,
+        partitions,
+        statistics,
+        projection,
+        filters,
+        limit,
+        state,
+        batch_size,
+        cache_options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn parquet_scan_plan_with_cache_options(
+    schema: SchemaRef,
+    object_store_url: ObjectStoreUrl,
+    partitions: Vec<Vec<PartitionedFile>>,
+    statistics: Statistics,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+    state: &dyn Session,
+    batch_size: usize,
+    cache_options: (usize, usize, bool),
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let (file_format, file_source) = build_parquet_scan_components(schema, filters, state)?;
+    let (cache_scope, cache_budget, cache_enabled) = cache_options;
+    let cache_store =
+        if object_store_url.as_str() != "file:///" && cache_enabled && cache_budget > 0 {
+            Some(state.runtime_env().object_store(&object_store_url)?)
+        } else {
+            None
+        };
 
     // create file groups from vec file partitions
     let file_groups = partitions.into_iter().map(FileGroup::new).collect_vec();
@@ -387,13 +431,55 @@ async fn parquet_scan_plan(
     let conf = conf_builder.build();
 
     // create the execution plan
-    file_format
+    let plan = file_format
         .create_physical_plan(
             state,
             // .as_any().downcast_ref::<SessionState>().unwrap(), // Remove this when ParquetFormat catches up
             conf,
         )
-        .await
+        .await?;
+    if let Some(store) = cache_store {
+        super::small_file_cache::install(
+            plan,
+            store,
+            cache_scope,
+            cache_budget,
+            cache_enabled,
+            state
+                .config()
+                .get_extension::<super::small_file_cache::RequestView>()
+                .unwrap_or_default(),
+        )
+    } else {
+        Ok(plan)
+    }
+}
+
+// A snapshot used with staging must be fetched after staging is leased. If
+// remote settings newly require staging, discard the first snapshot and retry.
+async fn capture_before_snapshot<T, M, C, L, F, I>(
+    predicted: bool,
+    mut capture: C,
+    mut load: L,
+    includes_staging: I,
+) -> DataFusionResult<(M, Option<T>)>
+where
+    C: FnMut() -> DataFusionResult<T>,
+    L: FnMut(bool) -> F,
+    F: std::future::Future<Output = DataFusionResult<M>>,
+    I: Fn(&M) -> bool,
+{
+    let pending = predicted.then(&mut capture);
+    let mut captured = None;
+    let mut metadata = load(false).await?;
+    if predicted && includes_staging(&metadata) {
+        captured = Some(pending.expect("predicted capture")?);
+    }
+    if !predicted && includes_staging(&metadata) {
+        captured = Some(capture()?);
+        metadata = load(true).await?;
+    }
+    Ok((metadata, captured))
 }
 
 impl StandardTableProvider {
@@ -906,22 +992,13 @@ impl TableProvider for StandardTableProvider {
             .map_err(|e| DataFusionError::Plan(e.to_string()))
         };
 
-        let object_store_format = if let Some(cache) = cache {
-            cache.format.get_or_try_init(load_format).await?.clone()
-        } else {
-            load_format().await?
-        };
-
-        let time_partition = object_store_format.time_partition;
-        let mut time_filters = extract_primary_filter(filters, &time_partition);
-        let include_staging = is_within_staging_window(&time_filters);
-        // Capture before reading the snapshot used by this scan. Upload publishes
-        // the manifest before unlinking staging: either source will then survive.
-        let (staged_records, staged_files) = if include_staging {
+        // Capture before the first remote read. Resident settings normally match
+        // remote settings; if they disagree about staging, capture and re-read.
+        // Publication always precedes staging unlink, so this order cannot hide
+        // a file uploaded while the query is being planned.
+        let capture = || -> DataFusionResult<_> {
             match PARSEABLE.get_stream(&self.stream, &self.tenant_id) {
                 Ok(staging) => {
-                    // Capture memory and leased files under the publication lock,
-                    // before reading the refreshed remote snapshot.
                     let (records, files) = staging
                         .capture_staging(&self.schema, capture_staging_parquet)
                         .map_err(|error| {
@@ -929,13 +1006,29 @@ impl TableProvider for StandardTableProvider {
                                 "Cannot capture staging record batches: {error}"
                             ))
                         })?;
-                    (records, files?)
+                    Ok((records, files?))
                 }
-                Err(_) => (Vec::new(), Vec::new()),
+                Err(_) => Ok((Vec::new(), Vec::new())),
             }
-        } else {
-            (Vec::new(), Vec::new())
         };
+        let captured_before_read =
+            is_within_staging_window(&extract_primary_filter(filters, &self.time_partition));
+        let read_format = |refresh: bool| async move {
+            if let Some(cache) = cache.filter(|_| !refresh) {
+                cache.format.get_or_try_init(load_format).await.cloned()
+            } else {
+                load_format().await
+            }
+        };
+        let (object_store_format, captured) =
+            capture_before_snapshot(captured_before_read, capture, read_format, |format| {
+                is_within_staging_window(&extract_primary_filter(filters, &format.time_partition))
+            })
+            .await?;
+        let (staged_records, staged_files) = captured.unwrap_or_default();
+        let time_partition = object_store_format.time_partition;
+        let mut time_filters = extract_primary_filter(filters, &time_partition);
+        let include_staging = is_within_staging_window(&time_filters);
         let mut merged_snapshot = Snapshot::default();
         if PARSEABLE.options.mode == Mode::Query || PARSEABLE.options.mode == Mode::Prism {
             let objects = PARSEABLE
@@ -950,18 +1043,6 @@ impl TableProvider for StandardTableProvider {
                     .manifest_list
                     .extend(format.snapshot.manifest_list);
             }
-        } else if include_staging {
-            // The first read supplies stream settings only; its snapshot may
-            // predate the staging capture and must not be used for this scan.
-            let refreshed: ObjectStoreFormat = serde_json::from_slice(
-                &PARSEABLE
-                    .metastore
-                    .get_stream_json(&self.stream, false, &self.tenant_id, false)
-                    .await
-                    .map_err(|e| DataFusionError::Plan(e.to_string()))?,
-            )
-            .map_err(|e| DataFusionError::Plan(e.to_string()))?;
-            merged_snapshot = refreshed.snapshot;
         } else {
             merged_snapshot = object_store_format.snapshot;
         }
@@ -2449,3 +2530,65 @@ mod ordering_tests;
 
 #[cfg(test)]
 mod exact_filter_tests;
+
+#[cfg(test)]
+mod snapshot_capture_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn publication_between_capture_and_read_cannot_hide_a_file() {
+        for predicted in [true, false] {
+            let published = AtomicUsize::new(0);
+            let reads = AtomicUsize::new(0);
+            let (snapshot, staging) = capture_before_snapshot(
+                predicted,
+                || {
+                    // Capture a lease, then simulate publication and unlink.
+                    let lease = "just-uploaded.parquet";
+                    published.store(1, Ordering::SeqCst);
+                    Ok(lease)
+                },
+                |_| async {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(published.load(Ordering::SeqCst))
+                },
+                |_| true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(snapshot, 1);
+            assert_eq!(staging, Some("just-uploaded.parquet"));
+            assert_eq!(reads.load(Ordering::SeqCst), if predicted { 1 } else { 2 });
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_queries_do_not_capture_staging() {
+        let (snapshot, staging) = capture_before_snapshot(
+            false,
+            || -> DataFusionResult<()> { panic!("historical scan must not lease staging") },
+            |_| async { Ok(42) },
+            |_| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot, 42);
+        assert_eq!(staging, None);
+    }
+    #[tokio::test]
+    async fn speculative_capture_error_only_fails_when_staging_is_needed() {
+        for needed in [false, true] {
+            let result = capture_before_snapshot(
+                true,
+                || -> DataFusionResult<()> {
+                    Err(DataFusionError::Execution("capture failed".into()))
+                },
+                |_| async { Ok(needed) },
+                |needed| *needed,
+            )
+            .await;
+            assert_eq!(result.is_err(), needed);
+        }
+    }
+}
