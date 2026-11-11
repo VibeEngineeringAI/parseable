@@ -184,22 +184,23 @@ mod tests {
         for fail in [false, true] {
             let active = AtomicUsize::new(0);
             let peak = AtomicUsize::new(0);
-            let result = super::super::document_metastore::collect_dataset_probes((0..64).map(|i| {
-                let active = &active;
-                let peak = &peak;
-                async move {
-                    let n = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(n, Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    if fail && i == 25 {
-                        Err("failed probe")
-                    } else {
-                        Ok(i)
+            let result =
+                super::super::document_metastore::collect_dataset_probes((0..64).map(|i| {
+                    let active = &active;
+                    let peak = &peak;
+                    async move {
+                        let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(n, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        if fail && i == 25 {
+                            Err("failed probe")
+                        } else {
+                            Ok(i)
+                        }
                     }
-                }
-            }))
-            .await;
+                }))
+                .await;
             assert_eq!(peak.load(Ordering::SeqCst), 16);
             if fail {
                 assert_eq!(result, Err("failed probe"));
