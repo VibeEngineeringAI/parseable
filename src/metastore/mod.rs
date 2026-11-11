@@ -67,6 +67,14 @@ pub enum MetastoreError {
 }
 
 impl MetastoreError {
+    /// Preserve provider errors at pre-existing ObjectStorage call sites.
+    pub(crate) fn into_storage_error(self) -> ObjectStorageError {
+        match self {
+            Self::ObjectStorageError(error) => error,
+            error => ObjectStorageError::MetastoreError(Box::new(error.to_detail())),
+        }
+    }
+
     pub fn to_detail(&self) -> MetastoreErrorDetail {
         match self {
             MetastoreError::Error {
@@ -169,5 +177,108 @@ impl MetastoreError {
             MetastoreError::InvalidJsonValue { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             MetastoreError::Error { status_code, .. } => *status_code,
         }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use std::path::Path;
+
+    // Deliberately conservative: applications cannot issue any raw object PUT,
+    // regardless of whether the key is a literal, a constant, or computed.
+    // Provider adapters implement the primitives; only the metastore may use
+    // them for metadata. The one multipart publisher uploads Parquet data.
+    fn violations(path: &str, source: &str) -> Vec<String> {
+        if matches!(
+            path,
+            "storage/s3.rs"
+                | "storage/gcs.rs"
+                | "storage/azure_blob.rs"
+                | "storage/localfs.rs"
+                | "metastore/metastores/object_store_metastore.rs"
+        ) {
+            return vec![];
+        }
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut errors = Vec::new();
+        for operation in [
+            ".put_object(",
+            ".upload_file(",
+            ".put_metadata_conditional(",
+            ".delete_metadata_conditional(",
+        ] {
+            if compact.contains(operation) {
+                errors.push(format!(
+                    "{path}: raw {operation} must enter through Metastore"
+                ));
+            }
+        }
+        for (operation, allowed_path) in [
+            (".delete_object(", "storage/object_storage.rs"),
+            (".delete_prefix(", ""),
+        ] {
+            let count = compact.matches(operation).count();
+            if count != usize::from(path == allowed_path) {
+                errors.push(format!("{path}: unexpected raw {operation} ({count})"));
+            }
+        }
+        let multipart = compact.matches(".upload_multipart(").count();
+        let allowed = usize::from(path == "storage/object_storage.rs");
+        if multipart != allowed {
+            errors.push(format!(
+                "{path}: unexpected multipart publisher ({multipart})"
+            ));
+        }
+        errors
+    }
+
+    fn inspect(root: &Path, path: &Path, errors: &mut Vec<String>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                inspect(root, &path, errors);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
+                errors.extend(violations(
+                    relative,
+                    &std::fs::read_to_string(&path).unwrap(),
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_writes_enter_through_metastore() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut errors = Vec::new();
+        inspect(&root, &root, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn guard_rejects_literal_and_computed_metadata_writes() {
+        for source in [
+            "store.put_object(stream_json_path(name, tenant), bytes, tenant).await",
+            "store\n . put_object (path, bytes, tenant).await",
+            "store.put_metadata_conditional(path, bytes, condition, tenant).await",
+            "store.upload_file(key, local, tenant).await",
+        ] {
+            assert!(!violations("application.rs", source).is_empty());
+        }
+        assert!(
+            violations(
+                "application.rs",
+                "#[cfg(test)] mod tests { store.put_object(path); }"
+            )
+            .is_empty()
+        );
+        assert!(
+            violations(
+                "metastore/metastores/object_store_metastore.rs",
+                "store.put_object(path)"
+            )
+            .is_empty()
+        );
     }
 }

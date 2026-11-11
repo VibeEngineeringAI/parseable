@@ -78,9 +78,12 @@ pub async fn delete(
         return Err(StreamNotFound(stream_name.clone()).into());
     }
 
-    let objectstore = PARSEABLE.storage.get_object_store();
     // Delete from storage
-    objectstore.delete_stream(&stream_name, &tenant_id).await?;
+    PARSEABLE
+        .metastore
+        .delete_stream(&stream_name, &tenant_id)
+        .await
+        .map_err(crate::metastore::MetastoreError::into_storage_error)?;
     let stream_dir = PARSEABLE.get_or_create_stream(&stream_name, &tenant_id);
     if let Err(err) = fs::remove_dir_all(&stream_dir.data_path) {
         warn!(

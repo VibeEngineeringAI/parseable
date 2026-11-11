@@ -1538,6 +1538,64 @@ impl Metastore for ObjectStoreMetastore {
         }
     }
 
+    async fn check_health(&self, tenant_id: &Option<String>) -> Result<(), MetastoreError> {
+        Ok(self.storage.check(tenant_id).await?)
+    }
+
+    async fn read_latency(&self, tenant_id: &Option<String>) -> std::time::Duration {
+        self.storage.get_latency(tenant_id).await
+    }
+
+    async fn stream_exists(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<bool, MetastoreError> {
+        Ok(self.storage.stream_exists(stream_name, tenant_id).await?)
+    }
+
+    async fn is_stream_deleting(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<bool, MetastoreError> {
+        Ok(crate::storage::object_storage::is_tombstoned(
+            self.storage.as_ref(),
+            stream_name,
+            tenant_id,
+        )
+        .await?)
+    }
+
+    async fn delete_stream(
+        &self,
+        stream_name: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<(), MetastoreError> {
+        Ok(self.storage.delete_stream(stream_name, tenant_id).await?)
+    }
+
+    async fn delete_stream_partition(
+        &self,
+        stream_name: &str,
+        date: &str,
+        tenant_id: &Option<String>,
+    ) -> Result<(), MetastoreError> {
+        let path =
+            crate::storage::object_storage::stream_data_path(stream_name, &[date], tenant_id);
+        Ok(self.storage.delete_prefix(&path, tenant_id).await?)
+    }
+
+    async fn list_tenant_candidates(&self) -> Result<Vec<String>, MetastoreError> {
+        Ok(self
+            .storage
+            .list_dirs_relative(&RelativePathBuf::from_iter([""]), &None)
+            .await?
+            .into_iter()
+            .filter(|d| !d.starts_with('.'))
+            .collect())
+    }
+
     async fn list_streams(
         &self,
         tenant_id: &Option<String>,
@@ -2097,5 +2155,111 @@ mod tests {
             storage.get_object(&path, &tenant_id).await,
             Err(ObjectStorageError::NoSuchKey(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod boundary_compatibility_tests {
+    use super::*;
+    use crate::storage::{LocalFS, object_storage::tombstone_path};
+
+    #[tokio::test]
+    async fn partition_deletion_preserves_tenant_scope_and_adjacent_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(dir.path().to_owned()));
+        let metastore = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        let tenant = Some("tenant".to_owned());
+        let keys = [
+            "tenant/logs/date=2026-01-01/hour=00/data.parquet",
+            "tenant/logs/date=2026-01-01/ingestor.node.manifest.json",
+            "tenant/logs/date=2026-01-02/ingestor.node.manifest.json",
+            "logs/date=2026-01-01/ingestor.node.manifest.json",
+        ];
+        for key in keys {
+            storage
+                .put_object(
+                    RelativePath::new(key),
+                    Bytes::from_static(b"original bytes"),
+                    &tenant,
+                )
+                .await
+                .unwrap();
+        }
+        metastore
+            .delete_stream_partition("logs", "date=2026-01-01", &tenant)
+            .await
+            .unwrap();
+        for key in &keys[..2] {
+            assert!(
+                storage
+                    .get_object(RelativePath::new(key), &tenant)
+                    .await
+                    .is_err()
+            );
+        }
+        for key in &keys[2..] {
+            assert_eq!(
+                storage
+                    .get_object(RelativePath::new(key), &tenant)
+                    .await
+                    .unwrap(),
+                Bytes::from_static(b"original bytes")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_seams_preserve_localfs_results_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalFS::new(dir.path().to_owned()));
+        let metastore = ObjectStoreMetastore {
+            storage: storage.clone(),
+        };
+        assert!(!metastore.stream_exists("logs", &None).await.unwrap());
+        assert!(!metastore.is_stream_deleting("logs", &None).await.unwrap());
+        let key = RelativePath::new("logs/.stream/.stream.json");
+        let bytes = Bytes::from_static(b"{\"version\":\"v7\",\"unknown\":true}");
+        storage.put_object(key, bytes.clone(), &None).await.unwrap();
+        assert_eq!(
+            metastore.stream_exists("logs", &None).await.unwrap(),
+            storage.stream_exists("logs", &None).await.unwrap()
+        );
+        // Discovery/existence probes never normalize or rewrite stored JSON.
+        assert_eq!(storage.get_object(key, &None).await.unwrap(), bytes);
+        storage
+            .put_object(
+                &tombstone_path("logs", &None),
+                Bytes::from_static(b"null"),
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(metastore.is_stream_deleting("logs", &None).await.unwrap());
+        let mut expected: Vec<_> = storage
+            .list_dirs_relative(RelativePath::new(""), &None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|d| !d.starts_with('.'))
+            .collect();
+        let mut actual = metastore.list_tenant_candidates().await.unwrap();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected);
+        metastore.delete_stream("logs", &None).await.unwrap();
+        assert!(!metastore.stream_exists("logs", &None).await.unwrap());
+        // Historical prefix deletion leaves the separate marker untouched.
+        assert!(metastore.is_stream_deleting("logs", &None).await.unwrap());
+        let raw_error = storage
+            .delete_stream("missing", &None)
+            .await
+            .unwrap_err()
+            .to_string();
+        let trait_error = metastore.delete_stream("missing", &None).await.unwrap_err();
+        assert!(
+            matches!(trait_error, MetastoreError::ObjectStorageError(error) if error.to_string() == raw_error)
+        );
     }
 }
