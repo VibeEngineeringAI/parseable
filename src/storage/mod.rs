@@ -45,7 +45,7 @@ mod gcs;
 mod localfs;
 #[cfg(test)]
 pub(crate) use localfs::LocalFS;
-mod metrics_layer;
+pub(crate) mod metrics_layer;
 pub use metrics_layer::{StorageMetricDelta, StorageMetricWindow, storage_metrics_provider_label};
 pub mod object_storage;
 pub mod retention;

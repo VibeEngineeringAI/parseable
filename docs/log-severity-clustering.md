@@ -83,8 +83,8 @@ of the base commit and this change with the same toolchain and lockfile. The
 server was pinned to four CPUs with `s3-store` on a local MinIO. Each arm ingested
 the same 3.6 million JSON rows (about 1% `ERROR`, 22 fields), event-time
 partitioned, with default 262,144-row groups. Values are medians over three
-rotated blocks. Bytes are the server's logical requested ranges
-(`parseable_storage_read_bytes_total`), not physical GETs. The run used
+rotated blocks. Bytes are successful response body bytes returned by storage
+(`parseable_storage_read_bytes_total`), not physical GET counts. The run used
 `scripts/ingest-performance/clustering_bench.py`.
 
 | Measure | Baseline | Clustering off | Clustering on |
