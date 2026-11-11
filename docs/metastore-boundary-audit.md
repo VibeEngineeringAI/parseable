@@ -144,3 +144,17 @@ Final validation on this branch:
   **1,379 passed, 0 failed, 4 ignored** (1,383 discovered), 79.65 seconds.
 - Both source-guard tests and both LocalFS compatibility fixtures passed.
 - `cargo fmt` and `git diff --check` passed. Cargo target remained in this worktree.
+
+
+## Combined PostgreSQL lifecycle implementation
+
+The original inventory above records the routing branch. In the combined branch,
+its seven missing methods are implemented by PostgreSQL as documented in
+[postgres-metastore.md](postgres-metastore.md#lifecycle-and-metadata-boundary).
+Backend primitives moved to `document_metastore.rs` and `postgres_documents.rs`
+are allowed by the source guard. The real MinIO lifecycle smoke supplements
+that source policy with bucket key assertions. All A operations now select the
+configured backend. B/C/D entries remain data plane, local recovery state or
+unused compatibility primitives. No additional active shared metadata bypass
+was found. PostgreSQL stream listing suppresses durable deletion markers, and
+HTTP DELETE permits explicit retry of such a stream after restart.

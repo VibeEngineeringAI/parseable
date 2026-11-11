@@ -1084,6 +1084,41 @@ impl ObjectStorage for LocalFS {
         url::Url::parse("file:///").unwrap()
     }
 
+    async fn metadata_inventory(
+        &self,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, ObjectStorageError> {
+        let mut dirs = vec![self.root.clone()];
+        let mut keys = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if entry.file_type()?.is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    if !entry.file_name().to_string_lossy().starts_with("hour=")
+                        && !entry.file_name().to_string_lossy().starts_with("minute=")
+                    {
+                        dirs.push(entry.path());
+                    }
+                } else if !entry.file_name().to_string_lossy().ends_with(".parquet") {
+                    keys.push((
+                        entry
+                            .path()
+                            .strip_prefix(&self.root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        meta.modified()?.into(),
+                    ));
+                }
+            }
+        }
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(keys)
+    }
+
     async fn list_with_delimiter(
         &self,
         _prefix: Option<object_store::path::Path>,

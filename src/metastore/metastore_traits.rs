@@ -49,6 +49,22 @@ pub use crate::storage::object_storage::{
 /// need different methods for different kinds of metadata.
 #[async_trait]
 pub trait Metastore: std::fmt::Debug + Send + Sync {
+    /// Optional SQL batch; the default performs no requests.
+    async fn manifest_batch(
+        &self,
+        _paths: &[String],
+        _tenant: &Option<String>,
+    ) -> Result<Option<HashMap<String, Option<Manifest>>>, MetastoreError> {
+        Ok(None)
+    }
+    /// SQL-only partition inventory for retention recovery.
+    async fn metadata_dates(
+        &self,
+        _stream: &str,
+        _tenant: &Option<String>,
+    ) -> Result<Vec<String>, MetastoreError> {
+        Ok(Vec::new())
+    }
     async fn initiate_connection(&self) -> Result<(), MetastoreError>;
     async fn get_objects(
         &self,

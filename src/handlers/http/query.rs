@@ -814,6 +814,7 @@ impl actix_web::ResponseError for QueryError {
             QueryError::JsonParse(_) => StatusCode::INTERNAL_SERVER_ERROR,
             QueryError::Execute(e) => e.status_code(),
             QueryError::MetastoreError(e) => e.status_code(),
+            QueryError::ObjectStorage(e) => e.http_status(),
             QueryError::Header(_) => StatusCode::BAD_REQUEST,
             QueryError::HeaderBuild(e) => actix_web::ResponseError::status_code(e),
             _ => StatusCode::BAD_REQUEST,

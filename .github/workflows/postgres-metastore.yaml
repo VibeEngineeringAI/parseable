@@ -1,0 +1,101 @@
+name: PostgreSQL metastore
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: postgres-metastore-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  contract-and-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: contract
+          POSTGRES_DB: contract
+        ports:
+          - 55439:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      P_TEST_REVIEW_S3_URL: http://127.0.0.1:59087
+      P_TEST_POSTGRES_URL: postgresql://postgres:contract@127.0.0.1:55439/contract?sslmode=disable
+      CARGO_BUILD_JOBS: 2
+      P_BUILD_NO_UI: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare Linux build resources
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          if sudo fallocate -l 16G /swap.build && sudo chmod 600 /swap.build \
+            && sudo mkswap /swap.build && sudo swapon /swap.build; then
+            echo "Added 16G swap"
+          else
+            sudo rm -f /swap.build
+            echo "::warning title=Swap::Could not add swap; continuing without it"
+          fi
+          free -h
+          df -h /
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          cache-key: postgres-metastore
+          tools: nextest
+      - name: Start isolated MinIO
+        run: |
+          docker run -d --name migration-minio -p 127.0.0.1:59087:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/parseablehq/minio:edge server /data
+          docker exec migration-minio mkdir -p /data/review /data/migration-unit
+          curl --fail --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:59087/minio/health/ready
+      - name: Migration and regressions on PostgreSQL 17 and MinIO
+        run: 'cargo test --locked --lib metastore:: -- --nocapture --test-threads=1'
+      - name: LocalFS migration and legacy locators
+        run: env -u P_TEST_REVIEW_S3_URL cargo test --locked --lib migration::tests::migration_round_trip_postgres -- --nocapture
+      - name: Deadline against paused PostgreSQL
+        env:
+          P_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: cargo test --locked --lib postgres_health_deadline_regression -- --nocapture --test-threads=1
+      - name: Shared contract and SQL fault tests (must execute)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --lib contract_tests::object_store_contract -- --nocapture 2>&1 | tee postgres-contract.log
+          cargo test --locked --lib contract_tests::postgres_contract -- --ignored --nocapture 2>&1 | tee -a postgres-contract.log
+          cargo test --locked --lib contract_tests::postgres_startup_cleanup -- --ignored --nocapture 2>&1 | tee -a postgres-contract.log
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('postgres-contract.log').read_text()
+          assert 'postgres_contract ... ok' in text, text
+          assert 'postgres_startup_cleanup ... ok' in text, text
+          assert '0 failed; 0 ignored;' in text, text
+          assert 'skipping PostgreSQL' not in text, text
+          PY
+      - name: Build smoke binary
+        run: cargo build --locked
+      - name: Object store, SQL plaintext and verified TLS end to end
+        run: python3 scripts/postgres-metastore-smoke.py
+      - name: Offline migration end to end
+        run: python3 scripts/postgres-metastore-migration-smoke.py
+      - name: Offline migration with verified PostgreSQL TLS
+        env:
+          P_MIGRATION_TLS: 1
+        run: python3 scripts/postgres-metastore-migration-smoke.py
+      - name: Remove isolated MinIO
+        if: always()
+        run: docker rm -f migration-minio
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postgres-metastore-evidence
+          path: |
+            postgres-contract.log
+            .postgres-smoke/results.json
+            .postgres-smoke/runs/*.json
+            docs/validation/postgres-metastore-smoke.json
+            .postgres-smoke/*.log
+          if-no-files-found: error

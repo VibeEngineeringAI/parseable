@@ -109,11 +109,17 @@ async fn storage_info(config: &Parseable) {
         );
     }
 
+    let probe = if config.options.postgres.enabled() {
+        "PostgreSQL + data bucket probe"
+    } else {
+        "latency"
+    };
     eprintln!(
         "\
-    {:8}Store:              \"{}\", (latency: {:?})",
+    {:8}Store:              \"{}\", ({}: {:?})",
         "",
         storage.get_endpoint(),
+        probe,
         latency
     );
 }

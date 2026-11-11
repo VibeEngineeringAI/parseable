@@ -69,7 +69,15 @@ pub async fn delete(
     // if the stream not found in memory map,
     //check if it exists in the storage
     //create stream and schema from storage
-    if !PARSEABLE.streams.contains(&stream_name, &tenant_id)
+    // A crashed PostgreSQL deletion is deliberately absent from stream loading,
+    // but an explicit DELETE must still be able to finish it after restart.
+    let pending_delete = PARSEABLE.options.postgres.enabled()
+        && PARSEABLE
+            .metastore
+            .is_stream_deleting(&stream_name, &tenant_id)
+            .await?;
+    if !pending_delete
+        && !PARSEABLE.streams.contains(&stream_name, &tenant_id)
         && !PARSEABLE
             .create_stream_and_schema_from_storage(&stream_name, &tenant_id)
             .await

@@ -1165,6 +1165,24 @@ impl ObjectStorage for Gcs {
             .collect::<Vec<_>>())
     }
 
+    async fn metadata_hidden_prefix(
+        &self,
+        prefix: object_store::path::Path,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, ObjectStorageError> {
+        use futures::TryStreamExt;
+        self.client
+            .list(Some(&prefix))
+            .map_ok(|o| {
+                (
+                    crate::storage::object_storage::decode_metadata_key(o.location.as_ref()),
+                    o.last_modified,
+                )
+            })
+            .try_collect()
+            .await
+            .map_err(Into::into)
+    }
+
     async fn list_with_delimiter(
         &self,
         prefix: Option<object_store::path::Path>,

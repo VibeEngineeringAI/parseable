@@ -236,7 +236,7 @@ pub enum FiltersError {
 impl actix_web::ResponseError for FiltersError {
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::ObjectStorage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ObjectStorage(e) => e.http_status(),
             Self::Serde(_) => StatusCode::BAD_REQUEST,
             Self::Metadata(_) => StatusCode::BAD_REQUEST,
             Self::UserDoesNotExist(_) => StatusCode::NOT_FOUND,

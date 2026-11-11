@@ -242,9 +242,34 @@ mod action {
 
         let retain_until = get_retain_until(Utc::now().date_naive(), days as u64);
 
-        let Ok(mut dates) = store.list_dates(&stream_name, tenant_id).await else {
-            return;
+        let mut dates = match store.list_dates(&stream_name, tenant_id).await {
+            Ok(dates) => dates,
+            Err(crate::storage::ObjectStorageError::NoSuchKey(_))
+                if PARSEABLE.options.postgres.enabled() =>
+            {
+                Vec::new()
+            }
+            Err(crate::storage::ObjectStorageError::IoError(e))
+                if PARSEABLE.options.postgres.enabled()
+                    && e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Vec::new()
+            }
+            Err(_) => return,
         };
+        match PARSEABLE
+            .metastore
+            .metadata_dates(&stream_name, tenant_id)
+            .await
+        {
+            Ok(sql_dates) => dates.extend(sql_dates),
+            Err(e) => {
+                error!("retention SQL inventory failed: {e}");
+                return;
+            }
+        }
+        dates.sort();
+        dates.dedup();
         dates.retain(|date| date.starts_with("date"));
         let dates_to_delete = dates
             .into_iter()

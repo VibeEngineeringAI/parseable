@@ -662,6 +662,87 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
     fn absolute_url(&self, prefix: &RelativePath) -> object_store::path::Path;
     fn store_url(&self) -> url::Url;
 
+    async fn check_migration_guard(&self) -> Result<(), ObjectStorageError> {
+        // ObjectStorage is object safe; use its primitives directly here.
+        for key in [
+            crate::metastore::metastores::migration::BUSY,
+            crate::metastore::metastores::migration::PAIR,
+        ] {
+            match self.get_object(RelativePath::new(key), &None).await {
+                Ok(ref id)
+                    if key.ends_with("postgres-metastore-id")
+                        && std::env::var("P_ALLOW_PAIRED_BUCKET")
+                            .is_ok_and(|v| v.as_bytes() == id.as_ref()) => {}
+                Ok(_) => {
+                    return Err(ObjectStorageError::Custom(format!(
+                        "bucket has {key}: PostgreSQL pairing or offline migration; complete export before object-store startup (P_ALLOW_PAIRED_BUCKET=<pairing-id> overrides pairing only)"
+                    )));
+                }
+                Err(ObjectStorageError::NoSuchKey(_)) => {}
+                Err(ObjectStorageError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                }
+                Err(e) => {
+                    return Err(ObjectStorageError::Custom(format!(
+                        "cannot probe migration marker {key}: {e}; retry after restoring bucket access"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw inventory for offline document migration; retains keys, never bodies.
+    async fn metadata_inventory(
+        &self,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, ObjectStorageError> {
+        let mut pending = vec![None];
+        let mut keys = Vec::new();
+        while let Some(prefix) = pending.pop() {
+            let listing = self.list_with_delimiter(prefix).await?;
+            for prefix in listing.common_prefixes {
+                if prefix
+                    .parts()
+                    .any(|c| c.as_ref().starts_with("hour=") || c.as_ref().starts_with("minute="))
+                {
+                    continue;
+                }
+                if prefix.filename().is_some_and(|p| p.starts_with('.')) {
+                    keys.extend(self.metadata_hidden_prefix(prefix).await?);
+                } else {
+                    pending.push(Some(prefix));
+                }
+            }
+            keys.extend(
+                listing
+                    .objects
+                    .into_iter()
+                    .filter(|o| !o.location.as_ref().ends_with(".parquet"))
+                    .map(|o| (decode_metadata_key(o.location.as_ref()), o.last_modified)),
+            );
+        }
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(keys)
+    }
+
+    async fn metadata_hidden_prefix(
+        &self,
+        prefix: object_store::path::Path,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, ObjectStorageError> {
+        let mut pending = vec![prefix];
+        let mut keys = Vec::new();
+        while let Some(prefix) = pending.pop() {
+            let listing = self.list_with_delimiter(Some(prefix)).await?;
+            pending.extend(listing.common_prefixes);
+            keys.extend(
+                listing
+                    .objects
+                    .into_iter()
+                    .map(|o| (decode_metadata_key(o.location.as_ref()), o.last_modified)),
+            );
+        }
+        Ok(keys)
+    }
+
     async fn list_with_delimiter(
         &self,
         prefix: Option<object_store::path::Path>,
@@ -2478,4 +2559,24 @@ mod query_reload_tests {
         assert!(stream.get_schema().fields().is_empty());
         assert_eq!(stream.schema_files().len(), 1);
     }
+}
+
+/// Decode exactly one object_store path encoding layer.
+pub(crate) fn decode_metadata_key(key: &str) -> String {
+    let bytes = key.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(n) = u8::from_str_radix(&key[i + 1..i + 3], 16)
+        {
+            out.push(n);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("object_store paths encode UTF-8 keys")
 }

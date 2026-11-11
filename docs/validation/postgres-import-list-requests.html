@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8">
+<style>body{font:14px var(--font-sans);color:var(--foreground)}svg{width:100%;height:160px}text{fill:var(--foreground);font:13px var(--font-sans)}.axis{stroke:var(--border)}small{color:var(--muted-foreground)}</style>
+<p>Estimated LIST requests for one inventory: 20 streams × 30 days</p>
+<svg viewBox="0 0 660 160" role="img" aria-label="Logarithmic chart: previous inventory 879041 requests, hardened inventory 641 requests">
+<g transform="translate(110,15)">
+<path class="axis" d="M0 0V110M80 0V110M160 0V110M240 0V110M320 0V110M400 0V110M480 0V110"/>
+<rect y="10" width="475.5" height="25" rx="3" fill="var(--chart-2)"/>
+<rect y="60" width="224.6" height="25" rx="3" fill="var(--chart-1)"/>
+<text x="-105" y="28">Previous</text><text x="-105" y="78">Hardened</text>
+<text x="390" y="52">879,041</text><text x="235" y="78">641</text>
+<text x="0" y="134">1</text><text x="155" y="134">100</text><text x="305" y="134">10,000</text><text x="450" y="134">1,000,000</text>
+</g></svg>
+<small>Log scale. Excludes global hidden-metadata pages. Two import walks: 1,758,082 → 1,282 requests. GET costs depend on metadata count; hour/minute prefixes and Parquet files are excluded.</small>

@@ -1,0 +1,3307 @@
+{
+  "runs": [
+    {
+      "requested_modes": [
+        "object-store",
+        "postgres-tls",
+        "postgres"
+      ],
+      "source_commit": "1428d2cc45c4f60d164a89713ca93bcd896c76e5",
+      "binary_sha256": "8fb88e03aaf8417443f1e496cac9a5cf1a696661d3133adadcc252d75f2887ad",
+      "source_diff_sha256": "c6974df8d3d4d6c26e2fa5a22c93838e9fd8b7d21e14504d12b40e5813df0a31",
+      "image_digests": {
+        "postgres:17-alpine": [
+          "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24"
+        ],
+        "quay.io/parseablehq/minio:edge": [
+          "quay.io/parseablehq/minio@sha256:88276d0a028d758ffaf80d65dd80071386e91b4114251a3dda101eadf000faeb"
+        ]
+      },
+      "measurement": "Node-local storage counter delta during five queries, including background traffic; not isolated requests per query.",
+      "object-store": {
+        "lazy_reload": true,
+        "query": "[{\"count\":1}]",
+        "dashboard": {
+          "version": "v1",
+          "title": "Postgres smoke",
+          "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+          "dashboardId": "01M74SV622YTQ2Y75HZE11AVJB",
+          "created": "2026-11-11T07:58:30.978106403+00:00",
+          "modified": "2026-11-11T07:58:30.978106403+00:00",
+          "tags": null,
+          "isFavorite": false,
+          "dashboardType": "Dashboard",
+          "tiles": [],
+          "tenantId": null,
+          "revision": "2d53005fca7a3b566744600d766140032fe8ad13cc9d01b1442619fc34bc8a24"
+        },
+        "keys": [
+          ".parseable/.parseable.json",
+          ".parseable/ingestor.d97d0c2e2ddd006.json",
+          ".parseable/querier.5bef5998cbd41f0.json",
+          ".users/.dashboard-locations/01M74SV622YTQ2Y75HZE11AVJB.json",
+          ".users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json",
+          ".users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74SV622YTQ2Y75HZE11AVJB.json",
+          "lazy/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "lazy/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "lazy/.stream/.schema",
+          "lazy/.stream/.stream.json",
+          "lazy/date=2026-11-11/hour=07/minute=59/<host>d97d0c2e2ddd006.data.01M74SXX475GMD681ENW5BAMAA.parquet",
+          "lazy/date=2026-11-11/ingestor.<host>.d97d0c2e2ddd006.manifest.json",
+          "pstats/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "pstats/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "pstats/.stream/.schema",
+          "pstats/.stream/.stream.json",
+          "pstats/date=2026-11-11/<host>.manifest.json",
+          "pstats/date=2026-11-11/hour=07/minute=57/dataset_name=smoke/<host>.data.01M74SW2MA5GZW7RNJRMWRNB3T.parquet",
+          "smoke/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "smoke/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "smoke/.stream/.schema",
+          "smoke/.stream/.stream.json",
+          "smoke/date=2026-11-11/<host>.manifest.json",
+          "smoke/date=2026-11-11/hour=07/minute=57/<host>.data.01M74ST81AX4XAJZZ14Z78ZGWZ.parquet"
+        ],
+        "non_parquet_keys": [
+          ".parseable/.parseable.json",
+          ".parseable/ingestor.d97d0c2e2ddd006.json",
+          ".parseable/querier.5bef5998cbd41f0.json",
+          ".users/.dashboard-locations/01M74SV622YTQ2Y75HZE11AVJB.json",
+          ".users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json",
+          ".users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74SV622YTQ2Y75HZE11AVJB.json",
+          "lazy/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "lazy/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "lazy/.stream/.schema",
+          "lazy/.stream/.stream.json",
+          "lazy/date=2026-11-11/ingestor.<host>.d97d0c2e2ddd006.manifest.json",
+          "pstats/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "pstats/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "pstats/.stream/.schema",
+          "pstats/.stream/.stream.json",
+          "pstats/date=2026-11-11/<host>.manifest.json",
+          "smoke/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "smoke/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "smoke/.stream/.schema",
+          "smoke/.stream/.stream.json",
+          "smoke/date=2026-11-11/<host>.manifest.json"
+        ],
+        "request_delta": {
+          "parseable_storage_request_response_time_count{method=\"GET\",provider=\"s3\",status=\"200\"}": 30.0,
+          "parseable_storage_request_response_time_count{method=\"GET_RANGES\",provider=\"s3\",status=\"200\"}": 5.0,
+          "parseable_storage_request_response_time_count{method=\"LIST\",provider=\"s3\",status=\"200\"}": 5.0,
+          "parseable_storage_request_response_time_count{method=\"LIST_DELIM\",provider=\"s3\",status=\"200\"}": 5.0
+        },
+        "observed_requests_during_window_divided_by_queries": 9.0,
+        "bucket_outage_readiness": 503,
+        "delete_recreate": true,
+        "final_keys": [
+          ".parseable/.parseable.json",
+          ".parseable/ingestor.d97d0c2e2ddd006.json",
+          ".parseable/querier.5bef5998cbd41f0.json",
+          ".users/.dashboard-locations/01M74SV622YTQ2Y75HZE11AVJB.json",
+          ".users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json",
+          ".users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74SV622YTQ2Y75HZE11AVJB.json",
+          "lazy/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "lazy/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "lazy/.stream/.schema",
+          "lazy/.stream/.stream.json",
+          "lazy/date=2026-11-11/hour=07/minute=59/<host>d97d0c2e2ddd006.data.01M74SXX475GMD681ENW5BAMAA.parquet",
+          "lazy/date=2026-11-11/ingestor.<host>.d97d0c2e2ddd006.manifest.json",
+          "pstats/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "pstats/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "pstats/.stream/.schema",
+          "pstats/.stream/.stream.json",
+          "pstats/date=2026-11-11/<host>.manifest.json",
+          "pstats/date=2026-11-11/hour=07/minute=57/dataset_name=smoke/<host>.data.01M74SW2MA5GZW7RNJRMWRNB3T.parquet",
+          "pstats/date=2026-11-11/hour=07/minute=59/dataset_name=lazy/<host>d97d0c2e2ddd006.data.01M74SZQQ6SAEGTFW58C90P919.parquet",
+          "pstats/date=2026-11-11/ingestor.<host>.d97d0c2e2ddd006.manifest.json",
+          "smoke/.stream/.ingestor.d97d0c2e2ddd006.schema",
+          "smoke/.stream/.ingestor.d97d0c2e2ddd006.stream.json",
+          "smoke/.stream/.schema",
+          "smoke/.stream/.stream.json",
+          "smoke/date=2026-11-11/hour=08/minute=00/<host>d97d0c2e2ddd006.data.01M74SZQQ6PP5HSKS6P1JXW6TQ.parquet",
+          "smoke/date=2026-11-11/ingestor.<host>.d97d0c2e2ddd006.manifest.json"
+        ]
+      },
+      "postgres-tls": {
+        "trusted_ca_restart": true,
+        "untrusted_ca_rejected": true,
+        "untrusted_ca_output": "Error: ObjectStorageError: PostgreSQL metastore unavailable: Error occurred while creating a new object: error performing TLS handshake\n\nCaused by:\n    PostgreSQL metastore unavailable: Error occurred while creating a new object: error performing TLS handshake\n",
+        "untrusted_ca_server_alert": "2026-11-11 08:01:47.935 UTC [127] LOG:  could not accept SSL connection: tlsv1 alert unknown ca\n",
+        "lazy_reload": true,
+        "query": "[{\"count\":1}]",
+        "dashboard": {
+          "version": "v1",
+          "title": "Postgres smoke",
+          "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+          "dashboardId": "01M74T2GY6Y31B6B74N9XGF19Z",
+          "created": "2026-11-11T08:02:31.494659236+00:00",
+          "modified": "2026-11-11T08:02:31.494659236+00:00",
+          "tags": null,
+          "isFavorite": false,
+          "dashboardType": "Dashboard",
+          "tiles": [],
+          "tenantId": null,
+          "revision": "feb4fe847e41a4f08b8369a90a246a4a9e291aa10b9b85ad6b1463b6dab7b347"
+        },
+        "keys": [
+          ".parseable/postgres-metastore-id",
+          "lazy/date=2026-11-11/hour=08/minute=03/<host>6f97a7d0983d3d9.data.01M74T57RBAGCEEZ73TRR5SGXR.parquet",
+          "pstats/date=2026-11-11/hour=08/minute=01/dataset_name=smoke/<host>.data.01M74T3DK1EF85HBBCGG580X96.parquet",
+          "smoke/date=2026-11-11/hour=08/minute=01/<host>.data.01M74T1K01S1D4BJKHY1AR1PYM.parquet"
+        ],
+        "non_parquet_keys": [
+          ".parseable/postgres-metastore-id"
+        ],
+        "request_delta": {
+          "parseable_storage_request_response_time_count{method=\"GET_RANGES\",provider=\"s3\",status=\"200\"}": 5.0
+        },
+        "observed_requests_during_window_divided_by_queries": 1.0,
+        "database_outage": {
+          "readiness": 503,
+          "request_failed": true,
+          "seconds": 0.004449435044080019
+        },
+        "bucket_outage_readiness": 503,
+        "deleted_stream_rows": 0,
+        "delete_recreate": true,
+        "final_keys": [
+          ".parseable/postgres-metastore-id",
+          "lazy/date=2026-11-11/hour=08/minute=03/<host>6f97a7d0983d3d9.data.01M74T57RBAGCEEZ73TRR5SGXR.parquet",
+          "pstats/date=2026-11-11/hour=08/minute=01/dataset_name=smoke/<host>.data.01M74T3DK1EF85HBBCGG580X96.parquet",
+          "pstats/date=2026-11-11/hour=08/minute=03/dataset_name=lazy/<host>6f97a7d0983d3d9.data.01M74T72B8N681THKECS821NH4.parquet",
+          "smoke/date=2026-11-11/hour=08/minute=04/<host>6f97a7d0983d3d9.data.01M74T72B8XG3BJ1XATNGYWSRA.parquet"
+        ],
+        "interrupted_deletion_restart": [
+          {
+            "step": "before-data",
+            "hidden": true,
+            "cold_load_rejected": true,
+            "http_retry": true,
+            "recreation": true
+          },
+          {
+            "step": "after-data",
+            "hidden": true,
+            "cold_load_rejected": true,
+            "http_retry": true,
+            "recreation": true
+          }
+        ]
+      },
+      "postgres": {
+        "lazy_reload": true,
+        "query": "[{\"count\":1}]",
+        "dashboard": {
+          "version": "v1",
+          "title": "Postgres smoke",
+          "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+          "dashboardId": "01M74TBP2FCCBXZH3H1K9PQW72",
+          "created": "2026-11-11T08:07:31.663110272+00:00",
+          "modified": "2026-11-11T08:07:31.663110272+00:00",
+          "tags": null,
+          "isFavorite": false,
+          "dashboardType": "Dashboard",
+          "tiles": [],
+          "tenantId": null,
+          "revision": "84b5f12dd1b98ed78f48a43b1b089615ee0da3e2db1df3e52e0f1e1dd2e83957"
+        },
+        "keys": [
+          ".parseable/postgres-metastore-id",
+          "lazy/date=2026-11-11/hour=08/minute=08/<host>496c429a726b98c.data.01M74TEDA543YCHYXEA3F0QAEA.parquet",
+          "pstats/date=2026-11-11/hour=08/minute=06/dataset_name=smoke/<host>.data.01M74TCJNQQ6KVX07JH6RJ4GD0.parquet",
+          "smoke/date=2026-11-11/hour=08/minute=06/<host>.data.01M74TAR2QY8AMHTG8F6CHMSTZ.parquet"
+        ],
+        "non_parquet_keys": [
+          ".parseable/postgres-metastore-id"
+        ],
+        "request_delta": {
+          "parseable_storage_request_response_time_count{method=\"GET_RANGES\",provider=\"s3\",status=\"200\"}": 5.0
+        },
+        "observed_requests_during_window_divided_by_queries": 1.0,
+        "database_outage": {
+          "readiness": 503,
+          "request_failed": true,
+          "seconds": 0.004181399941444397
+        },
+        "bucket_outage_readiness": 503,
+        "deleted_stream_rows": 0,
+        "delete_recreate": true,
+        "final_keys": [
+          ".parseable/postgres-metastore-id",
+          "lazy/date=2026-11-11/hour=08/minute=08/<host>496c429a726b98c.data.01M74TEDA543YCHYXEA3F0QAEA.parquet",
+          "pstats/date=2026-11-11/hour=08/minute=06/dataset_name=smoke/<host>.data.01M74TCJNQQ6KVX07JH6RJ4GD0.parquet",
+          "pstats/date=2026-11-11/hour=08/minute=08/dataset_name=lazy/<host>496c429a726b98c.data.01M74TG7X53KFBJAX3ESJVYHBF.parquet",
+          "smoke/date=2026-11-11/hour=08/minute=09/<host>496c429a726b98c.data.01M74TG7X5ZB4F5KWD9PPBXNMP.parquet"
+        ],
+        "interrupted_deletion_restart": [
+          {
+            "step": "before-data",
+            "hidden": true,
+            "cold_load_rejected": true,
+            "http_retry": true,
+            "recreation": true
+          },
+          {
+            "step": "after-data",
+            "hidden": true,
+            "cold_load_rejected": true,
+            "http_retry": true,
+            "recreation": true
+          }
+        ]
+      },
+      "startup_rejections": {
+        "future-schema": "Error: ObjectStorageError: PostgreSQL metastore unavailable: unsupported schema/protocol version; upgrade this server\n\nCaused by:\n    PostgreSQL metastore unavailable: unsupported schema/protocol version; upgrade this server\n",
+        "wrong-id": "Error: ObjectStorageError: PostgreSQL metastore unavailable: backend/bucket identity mismatch\n\nCaused by:\n    PostgreSQL metastore unavailable: backend/bucket identity mismatch\n",
+        "unreachable": "Error: ObjectStorageError: PostgreSQL metastore unavailable: Error occurred while creating a new object: error connecting to server\n\nCaused by:\n    PostgreSQL metastore unavailable: Error occurred while creating a new object: error connecting to server\n"
+      },
+      "postgres_rows": "tenant |   kind   |                                                        key                                                         | version | bytes \n--------+----------+--------------------------------------------------------------------------------------------------------------------+---------+-------\n        | document | .parseable/.parseable.json                                                                                         |     121 |   384\n        | document | .parseable/ingestor.496c429a726b98c.json                                                                           |      39 |   241\n        | document | .parseable/querier.36256ead0ab8108.json                                                                            |     123 |   240\n        | document | .users/.dashboard-locations/01M74TBP2FCCBXZH3H1K9PQW72.json                                                        |      16 |   119\n        | document | .users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json                     |      18 |   170\n        | document | .users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74TBP2FCCBXZH3H1K9PQW72.json |      17 |   545\n        | schema   | lazy/.stream/.ingestor.496c429a726b98c.schema                                                                      |      56 |   585\n        | stream   | lazy/.stream/.ingestor.496c429a726b98c.stream.json                                                                 |      54 |   853\n        | schema   | lazy/.stream/.schema                                                                                               |     131 |   585\n        | stream   | lazy/.stream/.stream.json                                                                                          |      58 |   597\n        | manifest | lazy/date=2026-11-11/ingestor.<host>.496c429a726b98c.manifest.json                                         |      52 |   422\n        | schema   | pstats/.stream/.ingestor.496c429a726b98c.schema                                                                    |     148 |  1117\n        | stream   | pstats/.stream/.ingestor.496c429a726b98c.stream.json                                                               |     146 |   898\n        | schema   | pstats/.stream/.schema                                                                                             |     127 |  1117\n        | stream   | pstats/.stream/.stream.json                                                                                        |      23 |   867\n        | manifest | pstats/date=2026-11-11/<host>.manifest.json                                                                |      21 |   533\n        | manifest | pstats/date=2026-11-11/ingestor.<host>.496c429a726b98c.manifest.json                                       |     144 |   804\n        | schema   | smoke/.stream/.ingestor.496c429a726b98c.schema                                                                     |     141 |    27\n        | stream   | smoke/.stream/.ingestor.496c429a726b98c.stream.json                                                                |     142 |   597\n        | schema   | smoke/.stream/.schema                                                                                              |     139 |    27\n        | stream   | smoke/.stream/.stream.json                                                                                         |     140 |   597\n(21 rows)",
+      "commands": [
+        {
+          "argv": [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            "parseable-pg-smoke-3714167-0",
+            "-e",
+            "POSTGRES_PASSWORD=smoke",
+            "-e",
+            "POSTGRES_DB=parseable",
+            "-p",
+            "127.0.0.1:35731:5432",
+            "postgres:17-alpine"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            "parseable-pg-smoke-3714167-1",
+            "-e",
+            "MINIO_ROOT_USER=minioadmin",
+            "-e",
+            "MINIO_ROOT_PASSWORD=minioadmin",
+            "-p",
+            "127.0.0.1:50141:9000",
+            "quay.io/parseablehq/minio:edge",
+            "server",
+            "/data"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "pg_isready",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "postgres"
+          ],
+          "exit_code": 2
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "pg_isready",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "postgres"
+          ],
+          "exit_code": 2
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "pg_isready",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "postgres"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "<checkout>/.postgres-smoke/tls/ca.key",
+            "-out",
+            "<checkout>/.postgres-smoke/tls/ca.crt",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=Smoke CA"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "openssl",
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "<checkout>/.postgres-smoke/tls/server.key",
+            "-out",
+            "<checkout>/.postgres-smoke/tls/server.csr",
+            "-subj",
+            "/CN=localhost"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "openssl",
+            "x509",
+            "-req",
+            "-in",
+            "<checkout>/.postgres-smoke/tls/server.csr",
+            "-CA",
+            "<checkout>/.postgres-smoke/tls/ca.crt",
+            "-CAkey",
+            "<checkout>/.postgres-smoke/tls/ca.key",
+            "-CAcreateserial",
+            "-out",
+            "<checkout>/.postgres-smoke/tls/server.crt",
+            "-days",
+            "2",
+            "-extfile",
+            "<checkout>/.postgres-smoke/tls/extensions"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "cp",
+            "<checkout>/.postgres-smoke/tls/server.key",
+            "parseable-pg-smoke-3714167-0:/var/lib/postgresql/data/server.key"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "cp",
+            "<checkout>/.postgres-smoke/tls/server.crt",
+            "parseable-pg-smoke-3714167-0:/var/lib/postgresql/data/server.crt"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "sh",
+            "-c",
+            "chown postgres:postgres /var/lib/postgresql/data/server.* && chmod 600 /var/lib/postgresql/data/server.key"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-c",
+            "ALTER SYSTEM SET ssl='on';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-c",
+            "SELECT pg_reload_conf();"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "rev-parse",
+            "HEAD"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "diff",
+            "HEAD"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "image",
+            "inspect",
+            "postgres:17-alpine"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "image",
+            "inspect",
+            "quay.io/parseablehq/minio:edge"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-1",
+            "mkdir",
+            "-p",
+            "/data/smoke-object-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "stop",
+            "parseable-pg-smoke-3714167-1"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "start",
+            "parseable-pg-smoke-3714167-1"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-1",
+            "mkdir",
+            "-p",
+            "/data/smoke-postgres-tls"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-c",
+            "CREATE DATABASE tls;"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "<checkout>/.postgres-smoke/tls/wrong.key",
+            "-out",
+            "<checkout>/.postgres-smoke/tls/wrong.crt",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=Wrong CA"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "logs",
+            "parseable-pg-smoke-3714167-0"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "logs",
+            "parseable-pg-smoke-3714167-0"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "stop",
+            "parseable-pg-smoke-3714167-0"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "start",
+            "parseable-pg-smoke-3714167-0"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "stop",
+            "parseable-pg-smoke-3714167-1"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "start",
+            "parseable-pg-smoke-3714167-1"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT count(*) FROM parseable_documents WHERE starts_with(key,'smoke/');"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "INSERT INTO parseable_documents(tenant,key,kind,body) VALUES('','smoke/.stream/.deleting','document',''::bytea);"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT count(*) FROM parseable_documents WHERE starts_with(key,'smoke/');"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "CREATE FUNCTION smoke_delete_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected row deletion failure'; END $$; CREATE TRIGGER smoke_delete_fault BEFORE DELETE ON parseable_documents FOR EACH ROW EXECUTE FUNCTION smoke_delete_fault();"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "DROP TRIGGER smoke_delete_fault ON parseable_documents; DROP FUNCTION smoke_delete_fault();"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "tls",
+            "-Atc",
+            "SELECT count(*) FROM parseable_documents WHERE starts_with(key,'smoke/');"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-1",
+            "mkdir",
+            "-p",
+            "/data/smoke-postgres"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'lazy/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "stop",
+            "parseable-pg-smoke-3714167-0"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "start",
+            "parseable-pg-smoke-3714167-0"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "stop",
+            "parseable-pg-smoke-3714167-1"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "start",
+            "parseable-pg-smoke-3714167-1"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT count(*) FROM parseable_documents WHERE starts_with(key,'smoke/');"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "INSERT INTO parseable_documents(tenant,key,kind,body) VALUES('','smoke/.stream/.deleting','document',''::bytea);"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT count(*) FROM parseable_documents WHERE starts_with(key,'smoke/');"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT convert_from(body,'UTF8') FROM parseable_documents WHERE tenant='' AND starts_with(key,'smoke/.stream/') AND right(key,11)='stream.json';"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "CREATE FUNCTION smoke_delete_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected row deletion failure'; END $$; CREATE TRIGGER smoke_delete_fault BEFORE DELETE ON parseable_documents FOR EACH ROW EXECUTE FUNCTION smoke_delete_fault();"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "DROP TRIGGER smoke_delete_fault ON parseable_documents; DROP FUNCTION smoke_delete_fault();"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-Atc",
+            "SELECT count(*) FROM parseable_documents WHERE starts_with(key,'smoke/');"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-c",
+            "UPDATE parseable_backend SET schema_version=3;"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-c",
+            "UPDATE parseable_backend SET schema_version=2;"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        },
+        {
+          "argv": [
+            "docker",
+            "exec",
+            "parseable-pg-smoke-3714167-0",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "parseable",
+            "-c",
+            "SELECT tenant,kind,key,version,octet_length(body) AS bytes FROM parseable_documents ORDER BY tenant,key;"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "rm",
+            "-f",
+            "parseable-pg-smoke-3714167-1"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "docker",
+            "rm",
+            "-f",
+            "parseable-pg-smoke-3714167-0"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        },
+        {
+          "argv": [
+            "<checkout>/target/debug/parseable",
+            "s3-store"
+          ],
+          "exit_code": 1
+        }
+      ],
+      "success": true,
+      "validation": {
+        "commands": [
+          {
+            "name": "library-without-url",
+            "argv": [
+              "cargo",
+              "test",
+              "--lib",
+              "--",
+              "--nocapture"
+            ],
+            "exit_code": 0,
+            "log": "<checkout>/.postgres-smoke/library-without-url.log",
+            "summaries": [
+              "test result: ok. 1398 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 75.00s"
+            ]
+          },
+          {
+            "name": "library-with-url",
+            "argv": [
+              "cargo",
+              "test",
+              "--lib",
+              "--",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "exit_code": 0,
+            "log": "<checkout>/.postgres-smoke/library-with-url.log",
+            "summaries": [
+              "test result: ok. 1398 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 137.63s"
+            ]
+          },
+          {
+            "name": "contracts",
+            "argv": [
+              "cargo",
+              "test",
+              "--lib",
+              "contract_tests",
+              "--",
+              "--nocapture",
+              "--test-threads=1"
+            ],
+            "exit_code": 0,
+            "log": "<checkout>/.postgres-smoke/contracts.log",
+            "summaries": [
+              "test result: ok. 10 passed; 0 failed; 3 ignored; 0 measured; 1392 filtered out; finished in 1.77s"
+            ]
+          },
+          {
+            "name": "postgres-contract",
+            "argv": [
+              "cargo",
+              "test",
+              "--lib",
+              "contract_tests::postgres_contract",
+              "--",
+              "--ignored",
+              "--nocapture"
+            ],
+            "exit_code": 0,
+            "log": "<checkout>/.postgres-smoke/postgres-contract.log",
+            "summaries": [
+              "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1404 filtered out; finished in 5.51s"
+            ]
+          },
+          {
+            "name": "startup-cleanup",
+            "argv": [
+              "cargo",
+              "test",
+              "--lib",
+              "contract_tests::postgres_startup_cleanup",
+              "--",
+              "--ignored",
+              "--nocapture"
+            ],
+            "exit_code": 0,
+            "log": "<checkout>/.postgres-smoke/startup-cleanup.log",
+            "summaries": [
+              "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1404 filtered out; finished in 0.75s"
+            ]
+          },
+          {
+            "name": "paused-health",
+            "argv": [
+              "cargo",
+              "test",
+              "--lib",
+              "postgres_health_deadline_regression",
+              "--",
+              "--nocapture"
+            ],
+            "exit_code": 0,
+            "log": "<checkout>/.postgres-smoke/paused-health.log",
+            "summaries": [
+              "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1404 filtered out; finished in 0.94s"
+            ]
+          },
+          {
+            "name": "clippy",
+            "argv": [
+              "cargo",
+              "clippy",
+              "--all-targets"
+            ],
+            "exit_code": 0,
+            "log": "<checkout>/.postgres-smoke/clippy.log",
+            "summaries": []
+          }
+        ],
+        "success": true
+      },
+      "http_requests": [
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/ingest",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke/retention",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/dashboards",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/dashboards",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/metrics",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/metrics",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 503
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/ingest",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke/retention",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/dashboards",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/dashboards",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/metrics",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/metrics",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 503
+        },
+        {
+          "path": "/logstream/outage",
+          "method": "PUT",
+          "status": 503
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 503
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 503
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 400
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 503
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 400
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/ingest",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke/retention",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/dashboards",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/dashboards",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/metrics",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/metrics",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 503
+        },
+        {
+          "path": "/logstream/outage",
+          "method": "PUT",
+          "status": 503
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 503
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 503
+        },
+        {
+          "path": "/readiness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 200
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 400
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 503
+        },
+        {
+          "path": "/liveness",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/logstream",
+          "method": "GET",
+          "status": 200
+        },
+        {
+          "path": "/query",
+          "method": "POST",
+          "status": 400
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "DELETE",
+          "status": 200
+        },
+        {
+          "path": "/logstream/smoke",
+          "method": "PUT",
+          "status": 200
+        }
+      ]
+    }
+  ]
+}

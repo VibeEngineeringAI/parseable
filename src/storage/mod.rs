@@ -561,6 +561,10 @@ impl Default for ObjectStoreFormat {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObjectStorageError {
+    #[error("PostgreSQL metastore unavailable: {0}")]
+    MetastoreUnavailable(String),
+    #[error("stream deletion pending; retry DELETE before creating the stream")]
+    StreamDeleting,
     // no such key inside the object storage
     #[error("{0} not found")]
     NoSuchKey(String),
@@ -605,6 +609,24 @@ pub enum ObjectStorageError {
         attempted: std::path::PathBuf,
         root: std::path::PathBuf,
     },
+}
+
+impl ObjectStorageError {
+    pub(crate) fn http_status(&self) -> actix_web::http::StatusCode {
+        use actix_web::http::StatusCode;
+        match self {
+            Self::MetastoreUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::StreamDeleting => StatusCode::CONFLICT,
+            Self::MetastoreError(detail)
+                if detail.operation == "ObjectStorageError"
+                    && matches!(detail.status_code, 409 | 503) =>
+            {
+                StatusCode::from_u16(detail.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 pub fn to_object_store_path(path: &RelativePath) -> Path {
