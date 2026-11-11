@@ -1,0 +1,205 @@
+{
+  "object-store": {
+    "lazy_reload": true,
+    "query": "[{\"count\":1}]",
+    "dashboard": {
+      "version": "v1",
+      "title": "Postgres smoke",
+      "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+      "dashboardId": "01M74QAKS40EBX60MNDX4ZJRJH",
+      "created": "2026-11-11T07:14:30.820382797+00:00",
+      "modified": "2026-11-11T07:14:30.820382797+00:00",
+      "tags": null,
+      "isFavorite": false,
+      "dashboardType": "Dashboard",
+      "tiles": [],
+      "tenantId": null,
+      "revision": "410760f4f6ce9417312ed35635650d0ed5d2121c45bd21069d7bea97a6214f64"
+    },
+    "keys": [
+      ".parseable/.parseable.json",
+      ".parseable/ingestor.991bf8aa66a3be0.json",
+      ".parseable/querier.ce5fd278a14f75c.json",
+      ".users/.dashboard-locations/01M74QAKS40EBX60MNDX4ZJRJH.json",
+      ".users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json",
+      ".users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74QAKS40EBX60MNDX4ZJRJH.json",
+      "lazy/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "lazy/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "lazy/.stream/.schema",
+      "lazy/.stream/.stream.json",
+      "lazy/date=2026-11-11/hour=07/minute=14/<host>991bf8aa66a3be0.data.01M74QBH6TVHY0D3F6775WMZDN.parquet",
+      "lazy/date=2026-11-11/ingestor.<host>.991bf8aa66a3be0.manifest.json",
+      "pstats/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "pstats/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "pstats/.stream/.schema",
+      "pstats/.stream/.stream.json",
+      "pstats/date=2026-11-11/<host>.manifest.json",
+      "pstats/date=2026-11-11/hour=07/minute=13/dataset_name=smoke/<host>.data.01M74QARNVN5BPQ7Z8CJJJYE04.parquet",
+      "smoke/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "smoke/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "smoke/.stream/.schema",
+      "smoke/.stream/.stream.json",
+      "smoke/date=2026-11-11/<host>.manifest.json",
+      "smoke/date=2026-11-11/hour=07/minute=13/<host>.data.01M74Q9NS8KCT5185X617N4M6Y.parquet"
+    ],
+    "non_parquet_keys": [
+      ".parseable/.parseable.json",
+      ".parseable/ingestor.991bf8aa66a3be0.json",
+      ".parseable/querier.ce5fd278a14f75c.json",
+      ".users/.dashboard-locations/01M74QAKS40EBX60MNDX4ZJRJH.json",
+      ".users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json",
+      ".users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74QAKS40EBX60MNDX4ZJRJH.json",
+      "lazy/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "lazy/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "lazy/.stream/.schema",
+      "lazy/.stream/.stream.json",
+      "lazy/date=2026-11-11/ingestor.<host>.991bf8aa66a3be0.manifest.json",
+      "pstats/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "pstats/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "pstats/.stream/.schema",
+      "pstats/.stream/.stream.json",
+      "pstats/date=2026-11-11/<host>.manifest.json",
+      "smoke/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "smoke/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "smoke/.stream/.schema",
+      "smoke/.stream/.stream.json",
+      "smoke/date=2026-11-11/<host>.manifest.json"
+    ],
+    "request_delta": {
+      "parseable_storage_request_response_time_count{method=\"GET\",provider=\"s3\",status=\"200\"}": 30.0,
+      "parseable_storage_request_response_time_count{method=\"GET_RANGES\",provider=\"s3\",status=\"200\"}": 5.0,
+      "parseable_storage_request_response_time_count{method=\"LIST\",provider=\"s3\",status=\"200\"}": 5.0,
+      "parseable_storage_request_response_time_count{method=\"LIST_DELIM\",provider=\"s3\",status=\"200\"}": 5.0
+    },
+    "requests_per_query": 9.0,
+    "bucket_outage_readiness": 503,
+    "delete_recreate": true,
+    "final_keys": [
+      ".parseable/.parseable.json",
+      ".parseable/ingestor.991bf8aa66a3be0.json",
+      ".parseable/querier.ce5fd278a14f75c.json",
+      ".users/.dashboard-locations/01M74QAKS40EBX60MNDX4ZJRJH.json",
+      ".users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json",
+      ".users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74QAKS40EBX60MNDX4ZJRJH.json",
+      "lazy/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "lazy/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "lazy/.stream/.schema",
+      "lazy/.stream/.stream.json",
+      "lazy/date=2026-11-11/hour=07/minute=14/<host>991bf8aa66a3be0.data.01M74QBH6TVHY0D3F6775WMZDN.parquet",
+      "lazy/date=2026-11-11/ingestor.<host>.991bf8aa66a3be0.manifest.json",
+      "pstats/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "pstats/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "pstats/.stream/.schema",
+      "pstats/.stream/.stream.json",
+      "pstats/date=2026-11-11/<host>.manifest.json",
+      "pstats/date=2026-11-11/hour=07/minute=13/dataset_name=smoke/<host>.data.01M74QARNVN5BPQ7Z8CJJJYE04.parquet",
+      "pstats/date=2026-11-11/hour=07/minute=14/dataset_name=lazy/<host>991bf8aa66a3be0.data.01M74QDBSTHC3RTVX7DSBDG4R6.parquet",
+      "pstats/date=2026-11-11/ingestor.<host>.991bf8aa66a3be0.manifest.json",
+      "smoke/.stream/.ingestor.991bf8aa66a3be0.schema",
+      "smoke/.stream/.ingestor.991bf8aa66a3be0.stream.json",
+      "smoke/.stream/.schema",
+      "smoke/.stream/.stream.json",
+      "smoke/date=2026-11-11/hour=07/minute=15/<host>991bf8aa66a3be0.data.01M74QDBSTPQCEJ9QBFKANH753.parquet",
+      "smoke/date=2026-11-11/ingestor.<host>.991bf8aa66a3be0.manifest.json"
+    ]
+  },
+  "postgres-tls": {
+    "lazy_reload": true,
+    "query": "[{\"count\":1}]",
+    "dashboard": {
+      "version": "v1",
+      "title": "Postgres smoke",
+      "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+      "dashboardId": "01M74QG3P3MHGHPFMD9S98MPTQ",
+      "created": "2026-11-11T07:17:30.947201084+00:00",
+      "modified": "2026-11-11T07:17:30.947201084+00:00",
+      "tags": null,
+      "isFavorite": false,
+      "dashboardType": "Dashboard",
+      "tiles": [],
+      "tenantId": null,
+      "revision": "4d9eab070b7637613a929c14f1303c15ac4e4f9ad1e9c8066863366625de52d4"
+    },
+    "keys": [
+      ".parseable/postgres-metastore-id",
+      "lazy/date=2026-11-11/hour=07/minute=17/<host>0c643310e0de82d.data.01M74QH0C4PR4JWSPKVY2FQYD9.parquet",
+      "pstats/date=2026-11-11/hour=07/minute=16/dataset_name=smoke/<host>.data.01M74QG8JNMAZ9Z6MJWE1BE3SK.parquet",
+      "smoke/date=2026-11-11/hour=07/minute=16/<host>.data.01M74QF5SMF7ND9BTQE3139FZ6.parquet"
+    ],
+    "non_parquet_keys": [
+      ".parseable/postgres-metastore-id"
+    ],
+    "request_delta": {
+      "parseable_storage_request_response_time_count{method=\"GET_RANGES\",provider=\"s3\",status=\"200\"}": 5.0
+    },
+    "requests_per_query": 1.0,
+    "database_outage": {
+      "readiness": 503,
+      "request_failed": true,
+      "seconds": 0.004562790039926767
+    },
+    "bucket_outage_readiness": 503,
+    "deleted_stream_rows": 0,
+    "delete_recreate": true,
+    "final_keys": [
+      ".parseable/postgres-metastore-id",
+      "lazy/date=2026-11-11/hour=07/minute=17/<host>0c643310e0de82d.data.01M74QH0C4PR4JWSPKVY2FQYD9.parquet",
+      "pstats/date=2026-11-11/hour=07/minute=16/dataset_name=smoke/<host>.data.01M74QG8JNMAZ9Z6MJWE1BE3SK.parquet",
+      "pstats/date=2026-11-11/hour=07/minute=17/dataset_name=lazy/<host>0c643310e0de82d.data.01M74QJTZ4XZF0G5S9QQYCKVXT.parquet",
+      "smoke/date=2026-11-11/hour=07/minute=18/<host>0c643310e0de82d.data.01M74QJTZ4TK4Y4VW9DNG33BXF.parquet"
+    ],
+    "untrusted_ca_rejected": true
+  },
+  "postgres": {
+    "lazy_reload": true,
+    "query": "[{\"count\":1}]",
+    "dashboard": {
+      "version": "v1",
+      "title": "Postgres smoke",
+      "author": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+      "dashboardId": "01M74QNKSP83NNEMXQKJET4Q55",
+      "created": "2026-11-11T07:20:31.286622700+00:00",
+      "modified": "2026-11-11T07:20:31.286622700+00:00",
+      "tags": null,
+      "isFavorite": false,
+      "dashboardType": "Dashboard",
+      "tiles": [],
+      "tenantId": null,
+      "revision": "0fff761b383dd11e360a71fdb08cf1df18bb871cab49903853a19b1aa608d99c"
+    },
+    "keys": [
+      ".parseable/postgres-metastore-id",
+      "lazy/date=2026-11-11/hour=07/minute=20/<host>b98cdf90ef5f01d.data.01M74QPGD6ZHAMA3M61E0P12J1.parquet",
+      "pstats/date=2026-11-11/hour=07/minute=19/dataset_name=smoke/<host>.data.01M74QNRP8KGH60YDSV2PMSBRQ.parquet",
+      "smoke/date=2026-11-11/hour=07/minute=19/<host>.data.01M74QMNWYNPWNFQVWVVKRYPFH.parquet"
+    ],
+    "non_parquet_keys": [
+      ".parseable/postgres-metastore-id"
+    ],
+    "request_delta": {
+      "parseable_storage_request_response_time_count{method=\"GET_RANGES\",provider=\"s3\",status=\"200\"}": 5.0
+    },
+    "requests_per_query": 1.0,
+    "database_outage": {
+      "readiness": 503,
+      "request_failed": true,
+      "seconds": 0.003669349942356348
+    },
+    "bucket_outage_readiness": 503,
+    "deleted_stream_rows": 0,
+    "delete_recreate": true,
+    "final_keys": [
+      ".parseable/postgres-metastore-id",
+      "lazy/date=2026-11-11/hour=07/minute=20/<host>b98cdf90ef5f01d.data.01M74QPGD6ZHAMA3M61E0P12J1.parquet",
+      "pstats/date=2026-11-11/hour=07/minute=19/dataset_name=smoke/<host>.data.01M74QNRP8KGH60YDSV2PMSBRQ.parquet",
+      "pstats/date=2026-11-11/hour=07/minute=20/dataset_name=lazy/<host>b98cdf90ef5f01d.data.01M74QRB07K2NWMWJCFB4WYB7G.parquet",
+      "smoke/date=2026-11-11/hour=07/minute=21/<host>b98cdf90ef5f01d.data.01M74QRB07D45VQGFJ851YWQ8R.parquet"
+    ]
+  },
+  "startup_rejections": {
+    "future-schema": "Error: ObjectStorageError: PostgreSQL metastore unavailable: unsupported schema/protocol version; upgrade this server\n\nCaused by:\n    PostgreSQL metastore unavailable: unsupported schema/protocol version; upgrade this server\n",
+    "wrong-id": "Error: ObjectStorageError: PostgreSQL metastore unavailable: backend/bucket identity mismatch\n\nCaused by:\n    PostgreSQL metastore unavailable: backend/bucket identity mismatch\n",
+    "unreachable": "Error: ObjectStorageError: PostgreSQL metastore unavailable: Error occurred while creating a new object: error connecting to server\n\nCaused by:\n    PostgreSQL metastore unavailable: Error occurred while creating a new object: error connecting to server\n"
+  },
+  "postgres_rows": "tenant |   kind   |                                                        key                                                         | version | bytes \n--------+----------+--------------------------------------------------------------------------------------------------------------------+---------+-------\n        | document | .parseable/.parseable.json                                                                                         |      27 |   384\n        | document | .parseable/ingestor.b98cdf90ef5f01d.json                                                                           |      37 |   241\n        | document | .parseable/querier.e89f2bd5be65301.json                                                                            |      28 |   240\n        | document | .users/.dashboard-locations/01M74QNKSP83NNEMXQKJET4Q55.json                                                        |      16 |   119\n        | document | .users/.dashboard-titles/571a2cefe2d0d1a9a26dab4810a5556875c7d7531d4f558a8f7b28ab486e2395.json                     |      18 |   170\n        | document | .users/8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918/dashboards/01M74QNKSP83NNEMXQKJET4Q55.json |      17 |   545\n        | schema   | lazy/.stream/.ingestor.b98cdf90ef5f01d.schema                                                                      |      54 |   585\n        | stream   | lazy/.stream/.ingestor.b98cdf90ef5f01d.stream.json                                                                 |      52 |   853\n        | schema   | lazy/.stream/.schema                                                                                               |      56 |   585\n        | stream   | lazy/.stream/.stream.json                                                                                          |      55 |   597\n        | manifest | lazy/date=2026-11-11/ingestor.<host>.b98cdf90ef5f01d.manifest.json                                         |      50 |   423\n        | schema   | pstats/.stream/.ingestor.b98cdf90ef5f01d.schema                                                                    |      81 |  1117\n        | stream   | pstats/.stream/.ingestor.b98cdf90ef5f01d.stream.json                                                               |      79 |   895\n        | schema   | pstats/.stream/.schema                                                                                             |      32 |  1117\n        | stream   | pstats/.stream/.stream.json                                                                                        |      21 |   867\n        | manifest | pstats/date=2026-11-11/<host>.manifest.json                                                                |      19 |   559\n        | manifest | pstats/date=2026-11-11/ingestor.<host>.b98cdf90ef5f01d.manifest.json                                       |      77 |   697\n        | schema   | smoke/.stream/.ingestor.b98cdf90ef5f01d.schema                                                                     |      73 |   585\n        | stream   | smoke/.stream/.ingestor.b98cdf90ef5f01d.stream.json                                                                |      71 |   854\n        | schema   | smoke/.stream/.schema                                                                                              |      75 |   585\n        | stream   | smoke/.stream/.stream.json                                                                                         |      59 |   597\n        | manifest | smoke/date=2026-11-11/ingestor.<host>.b98cdf90ef5f01d.manifest.json                                        |      69 |   412\n(22 rows)"
+}

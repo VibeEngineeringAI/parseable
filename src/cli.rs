@@ -137,6 +137,11 @@ pub struct GcsStoreArgs {
 
 #[derive(Parser, Debug, Default)]
 pub struct Options {
+    #[command(flatten)]
+    pub migration: crate::metastore::metastores::migration::MigrationOptions,
+    #[command(flatten)]
+    pub postgres: crate::metastore::metastores::postgres_metastore::PostgresOptions,
+
     // Authentication
     #[arg(long, env = "P_USERNAME", help = "Admin username to be set for this Parseable server", default_value = DEFAULT_USERNAME)]
     pub username: String,

@@ -1,0 +1,213 @@
+{
+  "commands": [
+    {
+      "name": "library-without-url",
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/library-without-url.log",
+      "summaries": [
+        "test result: ok. 1398 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 75.00s"
+      ]
+    },
+    {
+      "name": "library-with-url",
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "--",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/library-with-url.log",
+      "summaries": [
+        "test result: ok. 1398 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 137.63s"
+      ]
+    },
+    {
+      "name": "contracts",
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "contract_tests",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/contracts.log",
+      "summaries": [
+        "test result: ok. 10 passed; 0 failed; 3 ignored; 0 measured; 1392 filtered out; finished in 1.77s"
+      ]
+    },
+    {
+      "name": "postgres-contract",
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "contract_tests::postgres_contract",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/postgres-contract.log",
+      "summaries": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1404 filtered out; finished in 5.51s"
+      ]
+    },
+    {
+      "name": "startup-cleanup",
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "contract_tests::postgres_startup_cleanup",
+        "--",
+        "--ignored",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/startup-cleanup.log",
+      "summaries": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1404 filtered out; finished in 0.75s"
+      ]
+    },
+    {
+      "name": "paused-health",
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "postgres_health_deadline_regression",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/paused-health.log",
+      "summaries": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1404 filtered out; finished in 0.94s"
+      ]
+    },
+    {
+      "name": "clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--all-targets"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/clippy.log",
+      "summaries": []
+    },
+    {
+      "name": "focused-localfs",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 34 passed; 0 failed; 3 ignored; 0 measured; 1368 filtered out; finished in 9.08s"
+      ]
+    },
+    {
+      "name": "focused-minio",
+      "argv": [
+        "cargo",
+        "test",
+        "--lib",
+        "metastore::",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/focused-minio.log",
+      "summaries": [
+        "test result: ok. 34 passed; 0 failed; 3 ignored; 0 measured; 1368 filtered out; finished in 10.77s"
+      ]
+    },
+    {
+      "name": "final-build",
+      "argv": [
+        "cargo",
+        "build"
+      ],
+      "exit_code": 0,
+      "log": "<checkout>/.postgres-smoke/final-build.log",
+      "summaries": []
+    },
+    {
+      "name": "cli-scope-and-help",
+      "exit_code": 0,
+      "flags": 5
+    },
+    {
+      "name": "legacy-layouts-and-minio",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 34 passed; 0 failed; 3 ignored; 0 measured; 1368 filtered out; finished in 10.64s"
+      ],
+      "log_sha256": "ff9958a1ad0394e52c04f10db1143cdb29bba5f57076c20da99b5f1090a72841"
+    },
+    {
+      "name": "abort-and-pinned-preflight",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1404 filtered out; finished in 1.90s"
+      ],
+      "log_sha256": "7dbd844df0d6555df0b6c4393a0f3fdf68f680c3e396ec8de8abcadda8bfbdf8"
+    },
+    {
+      "name": "final-clippy",
+      "exit_code": 0,
+      "log_sha256": "c36993dc1ec5f5e4a472a4a8c99619da26e0e30fbc46d259016bbd857db75179"
+    },
+    {
+      "name": "verified-build",
+      "exit_code": 0,
+      "log_sha256": "b7a890fd5f3d3fbfff9c8b0a146f9880bf12076a1ebe4aef82460c7ffe8e22c3"
+    }
+  ],
+  "success": true,
+  "end_to_end": {
+    "main_modes": [
+      "object-store",
+      "postgres-tls",
+      "postgres"
+    ],
+    "main_success": true,
+    "migration_plaintext_success": true,
+    "migration_verified_tls_success": true
+  },
+  "migration_end_to_end": [
+    {
+      "mode": "plaintext",
+      "success": true,
+      "log_sha256": "1dda51d6b4c53a068158afd8d7af090dff8145b58d278ac68f2a51ac552054a4"
+    },
+    {
+      "mode": "verified-tls",
+      "success": true,
+      "log_sha256": "1dda51d6b4c53a068158afd8d7af090dff8145b58d278ac68f2a51ac552054a4"
+    }
+  ],
+  "failure_injection": {
+    "import-marker-spool-before-commit": "rerun import or import --abort; object-store guard admits startup after abort",
+    "import-commit-paired": "rerun import; abort refuses committed documents",
+    "export-marker-ready": "export --abort; restarted PostgreSQL backend admits startup",
+    "export-state-object-write-bucket-delete-pair-removed": "rerun export; abort refuses; exported bucket guard admits startup and PostgreSQL startup refuses"
+  },
+  "clippy_warnings": {
+    "library_test": 21,
+    "integration_test": 1,
+    "new": 0
+  },
+  "workflow_yaml_parsed": true
+}

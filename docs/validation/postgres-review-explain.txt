@@ -1,0 +1,133 @@
+CREATE TABLE
+CREATE SEQUENCE
+CREATE TABLE
+ALTER TABLE
+CREATE INDEX
+CREATE FUNCTION
+DROP TRIGGER
+CREATE TRIGGER
+UPDATE 0
+INSERT 0 200000
+INSERT 0 400
+ANALYZE
+ count  | count
+--------+-------
+ 200400 |     4
+(1 row)
+
+                                                                                                         QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=16.88..16.88 rows=2 width=43) (actual time=8.587..8.656 rows=2000 loops=1)
+   Sort Key: key COLLATE "C"
+   Sort Method: quicksort  Memory: 49kB
+   Buffers: shared hit=974 read=1064 written=961
+   ->  Bitmap Heap Scan on parseable_documents  (cost=8.88..16.87 rows=2 width=43) (actual time=0.765..7.578 rows=2000 loops=1)
+         Recheck Cond: (((tenant = 'tenant-1'::text) AND (key = 'tenant-1/logs/date=001'::text)) OR ((tenant = 'tenant-1'::text) AND (key >= 'tenant-1/logs/date=001/'::text) AND (key < 'tenant-1/logs/date=0010'::text)))
+         Heap Blocks: exact=2000
+         Buffers: shared hit=974 read=1064 written=961
+         ->  BitmapOr  (cost=8.88..8.88 rows=2 width=0) (actual time=0.520..0.522 rows=0 loops=1)
+               Buffers: shared hit=25 read=13
+               ->  Bitmap Index Scan on parseable_documents_pkey  (cost=0.00..4.43 rows=1 width=0) (actual time=0.009..0.009 rows=0 loops=1)
+                     Index Cond: ((tenant = 'tenant-1'::text) AND (key = 'tenant-1/logs/date=001'::text))
+                     Buffers: shared hit=3
+               ->  Bitmap Index Scan on parseable_documents_pkey  (cost=0.00..4.45 rows=2 width=0) (actual time=0.511..0.511 rows=2000 loops=1)
+                     Index Cond: ((tenant = 'tenant-1'::text) AND (key >= 'tenant-1/logs/date=001/'::text) AND (key < 'tenant-1/logs/date=0010'::text))
+                     Buffers: shared hit=22 read=13
+ Planning:
+   Buffers: shared hit=11
+ Planning Time: 0.200 ms
+ Execution Time: 8.808 ms
+(20 rows)
+
+                                                                                                         QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=16.88..16.88 rows=2 width=1068) (actual time=3.188..3.240 rows=2000 loops=1)
+   Sort Key: key COLLATE "C"
+   Sort Method: quicksort  Memory: 2174kB
+   Buffers: shared hit=2038
+   ->  Bitmap Heap Scan on parseable_documents  (cost=8.88..16.87 rows=2 width=1068) (actual time=0.645..1.645 rows=2000 loops=1)
+         Recheck Cond: (((tenant = 'tenant-1'::text) AND (key = 'tenant-1/logs/date=001'::text)) OR ((tenant = 'tenant-1'::text) AND (key >= 'tenant-1/logs/date=001/'::text) AND (key < 'tenant-1/logs/date=0010'::text)))
+         Heap Blocks: exact=2000
+         Buffers: shared hit=2038
+         ->  BitmapOr  (cost=8.88..8.88 rows=2 width=0) (actual time=0.410..0.411 rows=0 loops=1)
+               Buffers: shared hit=38
+               ->  Bitmap Index Scan on parseable_documents_pkey  (cost=0.00..4.43 rows=1 width=0) (actual time=0.009..0.009 rows=0 loops=1)
+                     Index Cond: ((tenant = 'tenant-1'::text) AND (key = 'tenant-1/logs/date=001'::text))
+                     Buffers: shared hit=3
+               ->  Bitmap Index Scan on parseable_documents_pkey  (cost=0.00..4.45 rows=2 width=0) (actual time=0.400..0.400 rows=2000 loops=1)
+                     Index Cond: ((tenant = 'tenant-1'::text) AND (key >= 'tenant-1/logs/date=001/'::text) AND (key < 'tenant-1/logs/date=0010'::text))
+                     Buffers: shared hit=35
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.157 ms
+ Execution Time: 3.436 ms
+(20 rows)
+
+                                                                        QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using parseable_documents_pkey on parseable_documents  (cost=0.42..12.87 rows=1 width=1068) (actual time=0.050..0.053 rows=2 loops=1)
+   Index Cond: ((tenant = 'tenant-1'::text) AND (key = ANY ('{tenant-1/logs/date=001/1.manifest.json,tenant-1/logs/date=001/101.manifest.json}'::text[])))
+   Buffers: shared hit=5
+ Planning Time: 0.075 ms
+ Execution Time: 0.070 ms
+(5 rows)
+
+                                                                       QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using parseable_stream_inventory on parseable_documents  (cost=0.27..23.76 rows=5 width=43) (actual time=0.044..0.076 rows=100 loops=1)
+   Index Cond: (tenant = 'tenant-1'::text)
+   Heap Fetches: 100
+   Buffers: shared hit=41
+ Planning:
+   Buffers: shared hit=2
+ Planning Time: 0.194 ms
+ Execution Time: 0.093 ms
+(8 rows)
+
+BEGIN
+                                                                                                         QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on parseable_documents  (cost=8.88..16.87 rows=0 width=0) (actual time=2.070..2.071 rows=0 loops=1)
+   Buffers: shared hit=4038 dirtied=1054
+   ->  Bitmap Heap Scan on parseable_documents  (cost=8.88..16.87 rows=2 width=6) (actual time=0.465..1.629 rows=2000 loops=1)
+         Recheck Cond: (((tenant = 'tenant-1'::text) AND (key = 'tenant-1/logs/date=001'::text)) OR ((tenant = 'tenant-1'::text) AND (key >= 'tenant-1/logs/date=001/'::text) AND (key < 'tenant-1/logs/date=0010'::text)))
+         Heap Blocks: exact=2000
+         Buffers: shared hit=2038
+         ->  BitmapOr  (cost=8.88..8.88 rows=2 width=0) (actual time=0.300..0.301 rows=0 loops=1)
+               Buffers: shared hit=38
+               ->  Bitmap Index Scan on parseable_documents_pkey  (cost=0.00..4.43 rows=1 width=0) (actual time=0.006..0.006 rows=0 loops=1)
+                     Index Cond: ((tenant = 'tenant-1'::text) AND (key = 'tenant-1/logs/date=001'::text))
+                     Buffers: shared hit=3
+               ->  Bitmap Index Scan on parseable_documents_pkey  (cost=0.00..4.45 rows=2 width=0) (actual time=0.294..0.294 rows=2000 loops=1)
+                     Index Cond: ((tenant = 'tenant-1'::text) AND (key >= 'tenant-1/logs/date=001/'::text) AND (key < 'tenant-1/logs/date=0010'::text))
+                     Buffers: shared hit=35
+ Planning Time: 0.061 ms
+ Execution Time: 2.156 ms
+(16 rows)
+
+ROLLBACK
+ rows_after_populated_collation_migration
+------------------------------------------
+                                   200400
+(1 row)
+
+ attcollation
+--------------
+ "C"
+(1 row)
+
+                                                                         QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=18.65..18.66 rows=1 width=1) (actual time=0.047..0.048 rows=1 loops=1)
+   Buffers: shared hit=2 read=2
+   InitPlan 1
+     ->  Index Only Scan using parseable_documents_pkey on parseable_documents  (cost=0.42..18.65 rows=1 width=0) (actual time=0.046..0.046 rows=1 loops=1)
+           Index Cond: ((tenant = 'tenant-1'::text) AND (key >= 'tenant-1/stream-1/.stream/'::text) AND (key < 'tenant-1/stream-1/.stream0'::text))
+           Filter: (key ~~ '%stream.json'::text)
+           Heap Fetches: 0
+           Buffers: shared hit=2 read=2
+ Planning:
+   Buffers: shared hit=102 read=2
+ Planning Time: 0.772 ms
+ Execution Time: 0.101 ms
+(12 rows)

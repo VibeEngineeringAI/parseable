@@ -1,0 +1,155 @@
+{
+  "success": true,
+  "base_commit": "b96259b05238bae99ca48d5bee3cee9943b399d5",
+  "checks": [
+    {
+      "name": "full-library-postgres-minio",
+      "command": "cargo test --locked --lib -- --test-threads=1",
+      "passed": 1405,
+      "failed": 0,
+      "ignored": 7
+    },
+    {
+      "name": "full-library-no-database",
+      "command": "cargo test --locked --lib -- --nocapture --test-threads=1",
+      "prerequisites_unset": [
+        "P_TEST_POSTGRES_URL",
+        "P_TEST_REVIEW_S3_URL"
+      ],
+      "visible_skips": true,
+      "passed": 1405,
+      "failed": 0,
+      "ignored": 7
+    },
+    {
+      "name": "contracts-and-startup",
+      "command": "cargo test --locked --lib contract_tests:: -- --include-ignored --skip startup_cleanup_child --nocapture --test-threads=1",
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "focused-metastore",
+      "command": "cargo test --locked --lib metastore:: -- --nocapture --test-threads=1",
+      "passed": 37,
+      "failed": 0,
+      "ignored": 3
+    },
+    {
+      "name": "localfs-migration",
+      "command": "cargo test --lib migration::tests::migration_round_trip_postgres -- --nocapture",
+      "prerequisites_unset": [
+        "P_TEST_REVIEW_S3_URL"
+      ],
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "paused-postgres-deadline",
+      "command": "cargo test --lib postgres_health_deadline_regression -- --nocapture --test-threads=1",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "upload-sibling-drain",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "build",
+      "command": "cargo build",
+      "exit_code": 0
+    },
+    {
+      "name": "smoke",
+      "command": "python3 scripts/postgres-metastore-smoke.py",
+      "modes": [
+        "object-store",
+        "postgres",
+        "postgres-tls"
+      ],
+      "exit_code": 0,
+      "evidence": "docs/validation/postgres-metastore-smoke.json"
+    },
+    {
+      "name": "migration-smoke",
+      "command": "python3 scripts/postgres-metastore-migration-smoke.py",
+      "modes": [
+        "plaintext",
+        "verified-tls"
+      ],
+      "exit_code": 0,
+      "evidence": [
+        "docs/validation/postgres-migration.json",
+        "docs/validation/postgres-migration-tls.json"
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --all-targets",
+      "exit_code": 0,
+      "new_warnings": 0,
+      "existing_library_test_warnings": 21
+    },
+    {
+      "name": "script-syntax-and-workflow-yaml",
+      "exit_code": 0
+    },
+    {
+      "name": "diff-whitespace",
+      "command": "git diff --check b96259b0",
+      "exit_code": 0
+    }
+  ],
+  "first_hosted_ci": {
+    "conclusion": "failure",
+    "headSha": "b96259b05238bae99ca48d5bee3cee9943b399d5",
+    "status": "completed",
+    "url": "https://github.com/VibeEngineeringAI/parseable/actions/runs/43037438052",
+    "reason": "Runner setup could not resolve Ubuntu package mirror; compilation and tests never started.",
+    "code_failure": false,
+    "expanded_workflow_pushed": false
+  },
+  "regression_fixture_note": "Functional metadata SQL tests use a 30-second budget after intermittent shared-host I/O timeouts. Dedicated short deadline and cancellation assertions retain their original budgets.",
+  "import_estimates": {
+    "assumptions": [
+      "30 days",
+      "one manifest per stream/day",
+      "two stream documents per stream",
+      "two inventories",
+      "two metadata-body reads",
+      "snapshot-reference validation reads",
+      "150 milliseconds per request",
+      "16 concurrent reads"
+    ],
+    "deployments": [
+      {
+        "streams": 20,
+        "requests": 3180,
+        "latency_only_lower_bound_seconds": 29.8125
+      },
+      {
+        "streams": 1000,
+        "requests": 159000,
+        "latency_only_lower_bound_seconds": 1490.625
+      }
+    ],
+    "limitations": "Estimates, not benchmarks. Discovery dependencies, pagination, SQL, disk and body transfer add time."
+  },
+  "uploader_policy": "Only after confirming PostgreSQL deletion pending: settle upload siblings, compensate remote parquet for the batch, then retire staged parquet and schema. Retain staging when deletion is unconfirmed or cleanup fails.",
+  "remaining_limits": [
+    "Publication delayed beyond final SQL deletion requires stream incarnation fencing (issue 142).",
+    "SQL cancellation is best effort; timed-out writes and COMMIT can have ambiguous outcomes.",
+    "Transfers require all writers stopped and a direct or session-pooled PostgreSQL connection.",
+    "Literal EXPLAIN does not establish generic prepared-plan performance."
+  ],
+  "redaction": {
+    "home_paths": 0,
+    "checkout_paths": 0,
+    "hostname_occurrences": 0
+  },
+  "containers_removed": true
+}

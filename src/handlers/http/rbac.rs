@@ -649,7 +649,7 @@ impl actix_web::ResponseError for RBACError {
             Self::UserDoesNotExist => StatusCode::NOT_FOUND,
             Self::SerdeError(_) => StatusCode::BAD_REQUEST,
             Self::ValidationError(_) => StatusCode::BAD_REQUEST,
-            Self::ObjectStorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ObjectStorageError(e) => e.http_status(),
             Self::Network(_) => StatusCode::BAD_GATEWAY,
             Self::Anyhow(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RoleValidationError => StatusCode::BAD_REQUEST,

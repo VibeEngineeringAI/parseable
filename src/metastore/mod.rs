@@ -97,7 +97,7 @@ impl MetastoreError {
                 file_path: None,
                 timestamp: Some(chrono::Utc::now()),
                 metadata: std::collections::HashMap::new(),
-                status_code: 500,
+                status_code: self.status_code().as_u16(),
             },
             MetastoreError::JsonParseError(e) => MetastoreErrorDetail {
                 operation: "JsonParseError".to_string(),
@@ -168,6 +168,12 @@ impl MetastoreError {
 
     pub fn status_code(&self) -> StatusCode {
         match self {
+            MetastoreError::ObjectStorageError(ObjectStorageError::MetastoreUnavailable(_)) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            MetastoreError::ObjectStorageError(ObjectStorageError::StreamDeleting) => {
+                StatusCode::CONFLICT
+            }
             MetastoreError::ObjectStorageError(..) => StatusCode::INTERNAL_SERVER_ERROR,
             MetastoreError::JsonParseError(..) => StatusCode::INTERNAL_SERVER_ERROR,
             MetastoreError::ManifestCodecError(..) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -196,41 +202,173 @@ mod boundary_tests {
                 | "storage/azure_blob.rs"
                 | "storage/localfs.rs"
                 | "metastore/metastores/object_store_metastore.rs"
+                | "metastore/metastores/document_metastore.rs"
+                | "metastore/metastores/migration.rs"
+                | "metastore/metastores/postgres_documents.rs"
+                | "metastore/metastores/postgres_metastore.rs"
         ) {
             return vec![];
         }
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        let tokens = production_tokens(source);
         let mut errors = Vec::new();
-        for operation in [
-            ".put_object(",
-            ".upload_file(",
-            ".put_metadata_conditional(",
-            ".delete_metadata_conditional(",
-        ] {
-            if compact.contains(operation) {
-                errors.push(format!(
-                    "{path}: raw {operation} must enter through Metastore"
-                ));
+        let mut functions: Vec<(String, usize)> = Vec::new();
+        let mut pending = None;
+        let mut depth = 0usize;
+        for (i, token) in tokens.iter().enumerate() {
+            if token == "fn" {
+                pending = tokens.get(i + 1).cloned();
             }
-        }
-        for (operation, allowed_path) in [
-            (".delete_object(", "storage/object_storage.rs"),
-            (".delete_prefix(", ""),
-        ] {
-            let count = compact.matches(operation).count();
-            if count != usize::from(path == allowed_path) {
-                errors.push(format!("{path}: unexpected raw {operation} ({count})"));
+            if token == "{" {
+                depth += 1;
+                if let Some(name) = pending.take() {
+                    functions.push((name, depth));
+                }
+            } else if token == "}" {
+                if functions.last().is_some_and(|(_, d)| *d == depth) {
+                    functions.pop();
+                }
+                depth = depth.saturating_sub(1);
+            } else if token == ";" {
+                pending = None;
             }
-        }
-        let multipart = compact.matches(".upload_multipart(").count();
-        let allowed = usize::from(path == "storage/object_storage.rs");
-        if multipart != allowed {
-            errors.push(format!(
-                "{path}: unexpected multipart publisher ({multipart})"
-            ));
+            let function = functions
+                .last()
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("<module>");
+            if i > 0 && tokens[i - 1] == "fn" {
+                continue;
+            }
+            if tokens.get(i + 1).map(String::as_str) != Some("(") {
+                continue;
+            }
+            let allowed = path == "storage/object_storage.rs"
+                && matches!(
+                    (function, token.as_str()),
+                    ("upload_single_parquet_file", "upload_multipart")
+                        | ("upload_single_parquet_file", "delete_object")
+                        | ("compensate_uploaded_parquet", "delete_object")
+                );
+            if !allowed
+                && matches!(
+                    token.as_str(),
+                    "put_object"
+                        | "upload_file"
+                        | "put_metadata_conditional"
+                        | "delete_metadata_conditional"
+                        | "delete_object"
+                        | "delete_prefix"
+                        | "upload_multipart"
+                        | "put"
+                        | "put_opts"
+                        | "put_multipart"
+                        | "put_multipart_opts"
+                        | "delete"
+                        | "delete_stream"
+                )
+            {
+                // Generic raw object_store names need an explicit receiver/type hint;
+                // otherwise ordinary HTTP delete handlers would be false positives.
+                let generic = matches!(
+                    token.as_str(),
+                    "put"
+                        | "put_opts"
+                        | "put_multipart"
+                        | "put_multipart_opts"
+                        | "delete"
+                        | "delete_stream"
+                );
+                let context = tokens[i.saturating_sub(5)..i].join("");
+                if !generic || context.contains("object_store") || context.contains("ObjectStore::")
+                {
+                    errors.push(format!(
+                        "{path}::{function}: raw {token} must enter through Metastore"
+                    ));
+                }
+            }
         }
         errors
+    }
+
+    // Lexical policy, not Rust type/provenance analysis: aliases, wrappers,
+    // generated macro bodies and unrecognised mutation APIs can evade this.
+    // Allowed backend modules and the two named Parquet sites require review.
+    fn production_tokens(source: &str) -> Vec<String> {
+        // Skip comments and literals before token matching, retaining punctuation.
+        let pattern = regex::Regex::new(r####"(?s)//[^\n]*|/\*|(?:br|cr|r)(\#*)"|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])'|[A-Za-z_][A-Za-z_0-9]*|[^\s]"####).unwrap();
+        let mut tokens = Vec::new();
+        let mut offset = 0;
+        while let Some(m) = pattern.find(&source[offset..]) {
+            let text = m.as_str();
+            let start = offset + m.start();
+            offset += m.end();
+            if text == "/*" {
+                let mut depth = 1;
+                while offset < source.len() && depth > 0 {
+                    if source[offset..].starts_with("/*") {
+                        depth += 1;
+                        offset += 2;
+                    } else if source[offset..].starts_with("*/") {
+                        depth -= 1;
+                        offset += 2;
+                    } else {
+                        offset += source[offset..].chars().next().unwrap().len_utf8();
+                    }
+                }
+            } else if (text.starts_with('r') || text.starts_with("br") || text.starts_with("cr"))
+                && text.ends_with('"')
+            {
+                let closing = format!(
+                    "\"{}",
+                    "#".repeat(text.bytes().filter(|b| *b == b'#').count())
+                );
+                offset = source[offset..]
+                    .find(&closing)
+                    .map(|n| offset + n + closing.len())
+                    .unwrap_or(source.len());
+            } else if text.starts_with("//") || text.starts_with('"') || text.starts_with('\'') {
+                // Literal content cannot contain a production call.
+            } else {
+                tokens.push(source[start..offset].to_owned());
+            }
+        }
+        let mut production = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let cfg = ["#", "[", "cfg", "(", "test", ")", "]", "mod"];
+            if tokens[i..]
+                .iter()
+                .map(String::as_str)
+                .take(cfg.len())
+                .eq(cfg)
+            {
+                i += cfg.len();
+                while i < tokens.len() && tokens[i] != "{" && tokens[i] != ";" {
+                    i += 1;
+                }
+                if tokens.get(i).map(String::as_str) == Some(";") {
+                    i += 1;
+                    continue;
+                }
+                let mut depth = 0;
+                while i < tokens.len() {
+                    if tokens[i] == "{" {
+                        depth += 1;
+                    }
+                    if tokens[i] == "}" {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            } else {
+                production.push(tokens[i].clone());
+                i += 1;
+            }
+        }
+        production
     }
 
     fn inspect(root: &Path, path: &Path, errors: &mut Vec<String>) {
@@ -260,12 +398,17 @@ mod boundary_tests {
     fn guard_rejects_literal_and_computed_metadata_writes() {
         for source in [
             "store.put_object(stream_json_path(name, tenant), bytes, tenant).await",
+            "ObjectStorage::put_object(store, path, bytes, tenant)",
+            "#[cfg(test)] mod tests; fn production() { store.put_object(path); }",
+            "#[cfg(test)] mod tests {} fn production() { store.put_object(path); }",
+            "object_store::ObjectStore::put(store, path, bytes)",
             "store\n . put_object (path, bytes, tenant).await",
             "store.put_metadata_conditional(path, bytes, condition, tenant).await",
             "store.upload_file(key, local, tenant).await",
         ] {
             assert!(!violations("application.rs", source).is_empty());
         }
+        assert!(violations("application.rs", r###"fn ok() { let s = r#"store.put_object(path)"#; /* outer /* nested */ store.put_object(path) */ }"###).is_empty());
         assert!(
             violations(
                 "application.rs",

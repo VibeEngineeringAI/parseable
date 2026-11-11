@@ -8,6 +8,10 @@ categories = ["logs", "observability", "metrics", "traces"]
 build = "build.rs"
 
 [dependencies]
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+tokio-postgres-rustls = "0.14"
+webpki-roots = "1"
 # Arrow and DataFusion ecosystem
 arrow = "59.2.0"
 arrow-array = "59.2.0"

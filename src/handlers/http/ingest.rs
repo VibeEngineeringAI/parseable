@@ -400,7 +400,8 @@ pub async fn post_event(
                 .await
             {
                 Ok(true) => {}
-                Ok(false) | Err(_) => return Err(StreamNotFound(stream_name.clone()).into()),
+                Ok(false) => return Err(StreamNotFound(stream_name.clone()).into()),
+                Err(e) => return Err(e.into()),
             }
         } else {
             return Err(StreamNotFound(stream_name.clone()).into());
@@ -582,15 +583,16 @@ impl actix_web::ResponseError for PostError {
 
             JsonFlattenError(e) if e.is_limit_exceeded() => StatusCode::BAD_REQUEST,
 
-            Event(_)
-            | CreateStream(_)
-            | CustomError(_)
-            | NetworkError(_)
-            | ObjectStorageError(_)
-            | DashboardError(_)
-            | FiltersError(_)
-            | StreamError(_)
-            | JsonFlattenError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ObjectStorageError(e) => e.http_status(),
+            CreateStream(CreateStreamError::Storage { err, .. }) => err.http_status(),
+            StreamError(super::logstream::error::StreamError::Storage(
+                e @ (crate::storage::ObjectStorageError::MetastoreUnavailable(_)
+                | crate::storage::ObjectStorageError::StreamDeleting),
+            )) => e.http_status(),
+            Event(_) | CreateStream(_) | CustomError(_) | NetworkError(_) | DashboardError(_)
+            | FiltersError(_) | StreamError(_) | JsonFlattenError(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
 
             StreamNotFound(_) => StatusCode::NOT_FOUND,
 

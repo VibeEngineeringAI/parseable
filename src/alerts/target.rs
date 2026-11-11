@@ -208,6 +208,7 @@ pub struct Target {
     pub target: TargetType,
     #[serde(default = "Ulid::new")]
     pub id: Ulid,
+    #[serde(rename = "tenantId")]
     pub tenant: Option<String>,
 }
 
@@ -523,6 +524,7 @@ pub struct TargetVerifier {
     pub notification_config: Option<NotificationConfigVerifier>,
     #[serde(default = "Ulid::new")]
     pub id: Ulid,
+    #[serde(alias = "tenant")]
     pub tenant_id: Option<String>,
 }
 
