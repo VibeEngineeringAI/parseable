@@ -68,9 +68,10 @@ services:
         max_attempts: 3
 
   quest:
-    image: ${QUEST_IMAGE:-quay.io/parseablehq/quest:main}
+    extends:
+      file: docker-compose-quest.yaml
+      service: quest-source${QUEST_IMAGE:+-image}
     platform: linux/amd64
-    pull_policy: ${QUEST_PULL_POLICY:-always}
     command: [
       "load",
       "http://parseable:8000",
