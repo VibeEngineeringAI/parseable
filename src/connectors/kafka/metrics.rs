@@ -24,6 +24,16 @@ use prometheus::{
 use rdkafka::Statistics;
 use std::sync::{Arc, RwLock};
 
+/// Rejected records, without attacker-controlled labels.
+pub static TENANT_MISMATCH_DROPPED: once_cell::sync::Lazy<prometheus::IntCounter> =
+    once_cell::sync::Lazy::new(|| {
+        prometheus::IntCounter::new(
+            "parseable_kafka_tenant_mismatch_dropped_total",
+            "Kafka records dropped because a tenant header disagrees with trusted configuration",
+        )
+        .expect("valid Kafka tenant counter")
+    });
+
 #[derive(Debug)]
 pub struct KafkaMetricsCollector {
     stats: Arc<RwLock<Statistics>>,

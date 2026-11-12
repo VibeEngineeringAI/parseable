@@ -94,6 +94,7 @@ where
 
     let kafka_streams = KafkaStreams::init(kafka_context, stream_state, shutdown_handle.clone())?;
 
+    registry.register(Box::new(kafka::metrics::TENANT_MISMATCH_DROPPED.clone()))?;
     let stats = kafka_streams.statistics();
     registry.register(Box::new(KafkaMetricsCollector::new(stats)?))?;
 

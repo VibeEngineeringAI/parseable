@@ -24,9 +24,9 @@ use crate::connectors::kafka::{
     ConsumerRecord, KafkaContext, StreamConsumer, TopicPartition, partition_stream,
 };
 use futures_util::FutureExt;
+use rdkafka::Message;
 use rdkafka::Statistics;
 use rdkafka::consumer::Consumer;
-use rdkafka::message::BorrowedMessage;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
@@ -38,6 +38,7 @@ pub struct KafkaStreams {
     stream_state: Arc<RwLock<StreamState>>,
     statistics: Arc<std::sync::RwLock<Statistics>>,
     shutdown_handle: Shutdown,
+    multi_tenant: bool,
 }
 
 impl KafkaStreams {
@@ -47,6 +48,20 @@ impl KafkaStreams {
         shutdown_handle: Shutdown,
     ) -> anyhow::Result<KafkaStreams> {
         info!("Initializing KafkaStreams...");
+        let multi_tenant = crate::parseable::PARSEABLE.options.is_multi_tenant();
+        context.config.validate_tenant_mode(multi_tenant)?;
+        if multi_tenant
+            && context
+                .config
+                .consumer
+                .as_ref()
+                .and_then(|config| config.tenant_id.as_ref())
+                .is_none()
+        {
+            warn!(
+                "Multi-tenant Kafka consumer has no destination tenant; set --consumer-tenant-id / P_KAFKA_CONSUMER_TENANT_ID. Headerless records use the default destination; records carrying tenant headers are dropped"
+            );
+        }
         let statistics = Arc::clone(&context.statistics);
         let consumer = KafkaStreams::create_consumer(context);
         info!("KafkaStreams initialized successfully.");
@@ -56,6 +71,7 @@ impl KafkaStreams {
             stream_state,
             statistics,
             shutdown_handle,
+            multi_tenant,
         })
     }
 
@@ -102,6 +118,13 @@ impl KafkaStreams {
     pub fn partitioned(&self) -> ReceiverStream<PartitionStreamReceiver> {
         let (stream_tx, stream_rx) = mpsc::channel(100);
         let consumer = self.consumer();
+        let multi_tenant = self.multi_tenant;
+        let configured_tenant = consumer
+            .context()
+            .config
+            .consumer
+            .as_ref()
+            .and_then(|config| config.tenant_id.clone());
         let stream_state = self.state();
         let tokio_handle = tokio::runtime::Handle::current();
         let shutdown_handle = self.shutdown_handle.clone();
@@ -112,7 +135,7 @@ impl KafkaStreams {
                     let result: Result<(), ConnectorError> = tokio::select! {
                         result = consumer.recv() => {
                             match result {
-                                Ok(msg) => KafkaStreams::handle_message(msg, &stream_state, &stream_tx).await.map_err(Into::into),
+                                Ok(msg) => KafkaStreams::handle_message(msg, &stream_state, &stream_tx, configured_tenant.as_deref(), multi_tenant).await.map_err(Into::into),
                                 Err(e) => Err(e.into())
                             }
                         }
@@ -152,14 +175,16 @@ impl KafkaStreams {
     }
 
     /// Handle individual Kafka message and route it to the proper partition stream
-    async fn handle_message(
-        msg: BorrowedMessage<'_>,
+    async fn handle_message<M: Message>(
+        msg: M,
         stream_state: &RwLock<StreamState>,
         stream_tx: &mpsc::Sender<PartitionStreamReceiver>,
+        configured_tenant: Option<&str>,
+        multi_tenant: bool,
     ) -> anyhow::Result<()> {
+        let tp = TopicPartition::new(msg.topic().to_owned(), msg.partition());
+        let consumer_record = ConsumerRecord::from_message(msg, configured_tenant, multi_tenant);
         let mut state = stream_state.write().await;
-        let tp = TopicPartition::from_kafka_msg(&msg);
-        let consumer_record = ConsumerRecord::from_borrowed_msg(msg);
 
         let partition_stream_tx =
             KafkaStreams::get_or_create_partition_stream(&mut state, stream_tx, tp).await;
@@ -242,5 +267,54 @@ impl KafkaStreams {
                 error!("Error subscribing to topics: {:?} {:?}", topics, e);
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn rejected_record_is_delivered_to_partition_stream_receiver() {
+        let state = RwLock::new(StreamState::new(1));
+        let (tx, mut rx) = mpsc::channel(1);
+        KafkaStreams::handle_message(
+            crate::connectors::kafka::message_conversion_tests::message("tenant-b"),
+            &state,
+            &tx,
+            Some("tenant-a"),
+            true,
+        )
+        .await
+        .unwrap();
+        let partition = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("rejected record must create a partition stream")
+            .unwrap();
+        assert_eq!(
+            partition.topic_partition(),
+            &TopicPartition::new("trusted-topic".into(), 3)
+        );
+        partition
+            .run_drain(|mut records| async move {
+                let record = tokio::time::timeout(Duration::from_secs(1), records.next())
+                    .await
+                    .expect("marker must be routed to the partition receiver")
+                    .unwrap();
+                assert_eq!(
+                    record,
+                    ConsumerRecord::new(
+                        None,
+                        None,
+                        "trusted-topic".into(),
+                        3,
+                        42,
+                        Some(123456),
+                        Some("tenant-a".into()),
+                    )
+                );
+            })
+            .await;
     }
 }

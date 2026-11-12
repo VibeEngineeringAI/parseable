@@ -277,7 +277,6 @@ fn build_events<'a>(
     for record in records {
         let _span = record_span(record).entered();
         let Some(payload) = record.payload.as_ref() else {
-            warn!("Skipping Kafka record without a payload");
             continue;
         };
         total_payload_size += payload.len() as u64;
@@ -340,6 +339,11 @@ impl Processor<Vec<ConsumerRecord>, ()> for ParseableSinkProcessor {
         let len = records.len();
         debug!("Processing {len} records");
 
+        // Offset-only markers and tombstones need no stream or metadata access.
+        if !chunk_needs_stream(&records) {
+            return Ok(());
+        }
+
         let stream_name = records.first().map(|r| r.topic.clone()).unwrap_or_default();
         let tenant_id = records.first().and_then(|r| r.tenant_id.clone());
 
@@ -397,34 +401,61 @@ where
             self.buffer_config.buffer_timeout,
         );
 
-        chunked_stream
-            .for_each_concurrent(None, |records| async {
-                if let Some(last_record) = records.iter().max_by_key(|r| r.offset) {
-                    let tpl = last_record.offset_to_commit().unwrap();
-                    let record_count = records.len();
-
-                    if let Err(e) = self.processor.process(records).await {
-                        error!(
-                            "Failed to process {} records for {:?}; offsets up to {:?} will still be committed and these records are dropped: {:?}",
-                            record_count, tp, tpl, e
-                        );
-                    }
-
-                    //CommitMode::Async race condition.
-                    //@see https://github.com/confluentinc/librdkafka/issues/4534
-                    //@see https://github.com/confluentinc/librdkafka/issues/4059
-                    if let Err(e) = self.consumer.commit(&tpl, CommitMode::Sync) {
-                        error!(error = %e, "Failed to commit offsets for {:?}", tpl);
-                    } else {
-                        debug!("Committed offsets for {:?}", tpl);
-                    }
-                }
-            })
-            .await;
+        process_partition_chunks(self.processor.as_ref(), tp, chunked_stream, |tpl| {
+            // Synchronous commits avoid librdkafka's asynchronous commit race.
+            if let Err(e) = self.consumer.commit(tpl, CommitMode::Sync) {
+                error!(error = %e, "Failed to commit offsets for {:?}", tpl);
+            } else {
+                debug!("Committed offsets for {:?}", tpl);
+            }
+        })
+        .await;
 
         self.processor.post_stream().await?;
 
         Ok(())
+    }
+}
+
+/// Eight chunks allow useful processing overlap while bounding memory and CPU
+/// work per partition. Ordered buffering holds commits behind earlier chunks.
+const MAX_IN_FLIGHT_CHUNKS_PER_PARTITION: usize = 8;
+
+fn chunk_needs_stream(records: &[ConsumerRecord]) -> bool {
+    records.iter().any(|record| record.payload.is_some())
+}
+
+/// Process chunks concurrently, yielding commit offsets in partition input order.
+async fn process_partition_chunks<P, S>(
+    processor: &P,
+    tp: TopicPartition,
+    chunks: S,
+    mut commit: impl FnMut(&rdkafka::TopicPartitionList),
+) where
+    P: Processor<Vec<ConsumerRecord>, ()>,
+    S: futures_util::Stream<Item = Vec<ConsumerRecord>>,
+{
+    let completed = chunks.map(|records| {
+        let tp = &tp;
+        async move {
+            let last_record = records.iter().max_by_key(|r| r.offset)?;
+            let tpl = last_record.offset_to_commit().unwrap();
+            let record_count = records.len();
+            if let Err(e) = processor.process(records).await {
+                // Preserve the connector's existing drop-on-processing-error policy.
+                error!(
+                    "Failed to process {} records for {:?}; offsets up to {:?} will still be committed and these records are dropped: {:?}",
+                    record_count, tp, tpl, e
+                );
+            }
+            Some(tpl)
+        }
+    }).buffered(MAX_IN_FLIGHT_CHUNKS_PER_PARTITION);
+    futures_util::pin_mut!(completed);
+    while let Some(tpl) = completed.next().await {
+        if let Some(tpl) = tpl {
+            commit(&tpl);
+        }
     }
 }
 
@@ -711,10 +742,13 @@ mod tests {
         tracing::subscriber::with_default(subscriber, check);
         let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         let warnings: Vec<_> = output.lines().collect();
-        assert_eq!(warnings.len(), 12, "{output}");
+        assert_eq!(warnings.len(), 11, "{output}");
+        // Offset markers and tombstones are intentionally silent.
+        assert!(!output.contains("offset=107"), "{output}");
+        assert!(!output.contains("without a payload"), "{output}");
         for (warning, offset) in warnings
             .iter()
-            .zip([100, 101, 102, 103, 106, 107, 105, 200, 201, 202, 203, 204])
+            .zip([100, 101, 102, 103, 106, 105, 200, 201, 202, 203, 204])
         {
             for field in [
                 "topic=test".to_owned(),
@@ -988,5 +1022,139 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod offset_marker_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn marker(offset: i64) -> ConsumerRecord {
+        ConsumerRecord::new(None, None, "rejected".into(), 2, offset, Some(123), None)
+    }
+
+    fn committed_offset(tpl: &rdkafka::TopicPartitionList) -> i64 {
+        assert_eq!(tpl.count(), 1);
+        let entry = tpl.find_partition("rejected", 2).unwrap();
+        match entry.offset() {
+            rdkafka::Offset::Offset(offset) => offset,
+            other => panic!("unexpected offset: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn all_rejected_partition_commits_next_offset() {
+        let mut commits = Vec::new();
+        process_partition_chunks(
+            &GatedProcessor {
+                release: Mutex::new(None),
+                processed: Mutex::new(Vec::new()),
+            },
+            TopicPartition::new("rejected".into(), 2),
+            futures_util::stream::iter([vec![marker(10), marker(11)], vec![marker(12)]]),
+            |tpl| commits.push(committed_offset(tpl)),
+        )
+        .await;
+        assert_eq!(commits, [12, 13]);
+    }
+
+    struct GatedProcessor {
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        processed: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl Processor<Vec<ConsumerRecord>, ()> for GatedProcessor {
+        async fn process(&self, records: Vec<ConsumerRecord>) -> anyhow::Result<()> {
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                release.await?;
+            }
+            self.processed.lock().unwrap().extend(
+                records
+                    .iter()
+                    .filter(|r| r.payload.is_some())
+                    .map(|r| r.offset),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_tail_waits_for_accepted_records_before_commit() {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let processor = GatedProcessor {
+            release: Mutex::new(Some(wait)),
+            processed: Mutex::new(Vec::new()),
+        };
+        let mut accepted = marker(10);
+        accepted.payload = Some(br#"{"value":1}"#.to_vec());
+        let commits = Mutex::new(Vec::new());
+        let processing = process_partition_chunks(
+            &processor,
+            TopicPartition::new("rejected".into(), 2),
+            futures_util::stream::iter([vec![accepted, marker(11)], vec![marker(12), marker(13)]]),
+            |tpl| {
+                assert_eq!(*processor.processed.lock().unwrap(), [10]);
+                commits.lock().unwrap().push(committed_offset(tpl));
+            },
+        );
+        tokio::pin!(processing);
+        assert!(futures_util::poll!(&mut processing).is_pending());
+        assert!(commits.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        processing.await;
+        assert_eq!(*commits.lock().unwrap(), [12, 14]);
+    }
+
+    #[test]
+    fn chunk_needs_stream_only_for_payload_records() {
+        assert!(!chunk_needs_stream(&[]));
+        assert!(!chunk_needs_stream(&[marker(1), marker(2)]));
+        let mut accepted = marker(3);
+        accepted.payload = Some(b"{}".to_vec());
+        assert!(chunk_needs_stream(&[marker(2), accepted]));
+    }
+
+    struct OverlapProcessor {
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        started: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl Processor<Vec<ConsumerRecord>, ()> for OverlapProcessor {
+        async fn process(&self, records: Vec<ConsumerRecord>) -> anyhow::Result<()> {
+            let offset = records[0].offset;
+            self.started.lock().unwrap().push(offset);
+            if offset == 10 {
+                let wait = self.release.lock().unwrap().take().unwrap();
+                wait.await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn later_chunk_starts_while_earlier_chunk_blocks_commits() {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let processor = OverlapProcessor {
+            release: Mutex::new(Some(wait)),
+            started: Mutex::new(Vec::new()),
+        };
+        let commits = Mutex::new(Vec::new());
+        let processing = process_partition_chunks(
+            &processor,
+            TopicPartition::new("rejected".into(), 2),
+            futures_util::stream::iter([vec![marker(10)], vec![marker(11)]]),
+            |tpl| commits.lock().unwrap().push(committed_offset(tpl)),
+        );
+        tokio::pin!(processing);
+        assert!(futures_util::poll!(&mut processing).is_pending());
+        assert_eq!(*processor.started.lock().unwrap(), [10, 11]);
+        assert!(commits.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        processing.await;
+        assert_eq!(*commits.lock().unwrap(), [11, 12]);
     }
 }
