@@ -36,9 +36,11 @@ def fail(message):
 
 
 def request(path, *, method="GET", params=None, body=None, auth=True, timeout=15,
-            username=None, password=None):
+            username=None, password=None, stream=None):
     url = f"{BASE_URL}{path}"
     headers = {"Accept": "application/json"}
+    if stream is not None:
+        headers["X-P-Stream"] = stream
     if auth:
         credentials = (
             f"{username if username is not None else USERNAME}:"
@@ -111,6 +113,18 @@ def ingest(stream, metric, suffix, values):
                 fail(f"OTLP ingestion returned HTTP {response.status}")
     except urllib.error.HTTPError as exc:
         fail(f"OTLP ingestion failed, HTTP {exc.code}: {exc.read().decode(errors='replace')}")
+
+    # The scan can end at the minute boundary preceding this successful write.
+    # Evaluate transitions only after the instant query sees this batch.
+    deadline = time.monotonic() + max(75, WAIT_SECONDS)
+    while time.monotonic() < deadline:
+        status, raw = request("/prometheus/api/v1/query", params={"query": metric}, stream=stream)
+        vector = data_success(status, raw, "read fixture samples")["result"]
+        observed = {row["metric"]["host"]: float(row["value"][1]) for row in vector}
+        if observed == values:
+            return
+        time.sleep(1)
+    fail(f"fixture samples for {stream} did not become queryable")
 
 
 class LocalWebhook:
@@ -283,7 +297,8 @@ def main():
             "alertType": "threshold",
             "thresholdConfig": {"operator": ">", "value": 5},
             "promqlConfig": {"holdDuration": "2s"},
-            "evalConfig": {"rollingWindow": {"evalStart": "1m", "evalEnd": "now", "evalFrequency": 1}},
+            # This fixture drives each evaluation explicitly, including retry.
+            "evalConfig": {"rollingWindow": {"evalStart": "1m", "evalEnd": "now", "evalFrequency": 10}},
             "notificationConfig": {"interval": 1},
             "targets": targets,
         }
@@ -340,7 +355,8 @@ def main():
         # Host A fires only after a continuous breach; B starts its own clock later.
         ingest(stream, metric, suffix, {"host-a": 9.0, "host-b": 3.0})
         evaluate(alert_id)
-        wait_runtime(alert_id, lambda r: instance(r, "host-a") is not None, "host-a pending")
+        wait_runtime(alert_id, lambda r: instance(r, "host-a") is not None
+                     and instance(r, "host-a").get("state") == "pending", "host-a pending")
         time.sleep(2.1)
         evaluate(alert_id)
         runtime = wait_runtime(
