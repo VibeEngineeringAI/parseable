@@ -564,7 +564,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
     if notify && may_deliver {
         // Each evaluation makes at most one delivery attempt per queued transition.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let deployment = updated.get_context().deployment_info;
+        let mut context = updated.get_context(Default::default());
         let valid_until = firing_valid_until(&updated, now);
         for delivery in runtime
             .deliveries
@@ -575,13 +575,19 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            let message =
+            context.message =
                 instance_message(&updated, &delivery.labels, delivery.value, delivery.firing);
+            context.alert_info.alert_state = if delivery.firing {
+                AlertState::Triggered
+            } else {
+                AlertState::NotTriggered
+            };
+            context.series = vec![delivery.labels.clone().into_iter().collect()];
             let alert = alertmanager_alert(
                 &updated.title,
-                &deployment,
+                &context.deployment_info,
                 &delivery.labels,
-                message.clone(),
+                context.message.clone(),
                 if delivery.firing { valid_until } else { now },
             );
             delivery.attempts += 1;
@@ -592,7 +598,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
             let result = match target_result {
                 Ok(target) => match tokio::time::timeout_at(
                     deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
-                    target.deliver_promql(&updated.tenant_id, &message, &[alert]),
+                    target.deliver_promql(&updated.tenant_id, &context, &[alert]),
                 )
                 .await
                 {

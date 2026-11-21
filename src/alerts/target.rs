@@ -213,6 +213,48 @@ pub struct Target {
 }
 
 impl Target {
+    /// Normalize Prism's custom-header input only on create/update. Stored headers
+    /// retain their original meaning when targets are loaded or delivered.
+    pub(crate) fn apply_webhook_format(
+        &mut self,
+        previous: Option<&Target>,
+    ) -> Result<(), AlertError> {
+        let TargetType::Other(webhook) = &mut self.target else {
+            return Ok(());
+        };
+        const FORMAT_HEADER: &str = "X-Parseable-Payload-Format";
+        for (_, value) in webhook
+            .headers
+            .extract_if(|name, _| name.eq_ignore_ascii_case(FORMAT_HEADER))
+        {
+            let format = match value.as_str() {
+                "json" => PayloadFormat::Json,
+                "text" => PayloadFormat::Text,
+                _ => {
+                    return Err(AlertError::ValidationFailure(format!(
+                        "{FORMAT_HEADER} must be json or text"
+                    )));
+                }
+            };
+            if webhook
+                .payload_format
+                .replace(format)
+                .is_some_and(|field| field != format)
+            {
+                return Err(AlertError::ValidationFailure(
+                    "Conflicting webhook payload formats".into(),
+                ));
+            }
+        }
+        // An older UI cannot echo payloadFormat when editing a JSON target.
+        if webhook.payload_format.is_none()
+            && let Some(TargetType::Other(old)) = previous.map(|target| &target.target)
+        {
+            webhook.payload_format = old.payload_format;
+        }
+        Ok(())
+    }
+
     pub async fn validate_outbound_policy(&self) -> Result<(), AlertError> {
         let tenant_id = &self.tenant;
         match &self.target {
@@ -277,6 +319,7 @@ impl Target {
                     "type":"webhook",
                     "endpoint": format!("{}://********", other_web_hook.endpoint.scheme()),
                     "headers":safe_headers,
+                    "payloadFormat":other_web_hook.payload_format.unwrap_or_default(),
                     "skipTlsCheck":other_web_hook.skip_tls_check,
                     "id":self.id
                 })
@@ -317,11 +360,11 @@ impl Target {
 
     /// Delivery with an observable result for the persisted PromQL notification outbox.
     /// Alertmanager receives `alerts`, which keep the series labels; Slack and
-    /// webhook targets receive `message`.
+    /// webhook targets use the queued transition in `context`.
     pub async fn deliver_promql(
         &self,
         tenant: &Option<String>,
-        message: &str,
+        context: &Context,
         alerts: &[Value],
     ) -> Result<(), String> {
         let request = match &self.target {
@@ -338,7 +381,7 @@ impl Target {
                 prepared
                     .client
                     .post(target.endpoint.clone())
-                    .json(&serde_json::json!({"text": message}))
+                    .json(&serde_json::json!({"text": context.message}))
             }
             TargetType::Other(target) => {
                 let prepared = outbound_http_policy::prepare_alert_target(
@@ -350,11 +393,7 @@ impl Target {
                 )
                 .await
                 .map_err(|e| e.sanitized_message().to_string())?;
-                prepared
-                    .client
-                    .post(target.endpoint.clone())
-                    .headers(prepared.headers)
-                    .body(message.to_owned())
+                target.webhook_request(prepared, context, &context.message)
             }
             TargetType::AlertManager(target) => return target.post_promql(tenant, alerts).await,
         };
@@ -371,7 +410,14 @@ impl Target {
         trace!("target.call context- {context:?}");
         let timeout = context.notification_config.clone();
         let resolves = context.alert_info.alert_state;
-        let mut state = timeout.state.lock().unwrap();
+        let target_state = timeout
+            .target_states
+            .lock()
+            .unwrap()
+            .entry(self.id)
+            .or_default()
+            .clone();
+        let mut state = target_state.lock().unwrap();
         trace!("target.call state- {state:?}");
         state.alert_state = resolves;
 
@@ -385,7 +431,7 @@ impl Target {
                     state.timed_out = true;
                     state.awaiting_resolve = true;
                     drop(state);
-                    self.spawn_timeout_task(&timeout, context.clone());
+                    self.spawn_timeout_task(&timeout, target_state, context);
                 }
             }
             alert_state @ AlertState::NotTriggered => {
@@ -408,9 +454,13 @@ impl Target {
         }
     }
 
-    fn spawn_timeout_task(&self, target_timeout: &NotificationConfig, alert_context: Context) {
+    fn spawn_timeout_task(
+        &self,
+        target_timeout: &NotificationConfig,
+        state: SharedTimeoutState,
+        alert_context: Context,
+    ) {
         trace!("repeat-\n{target_timeout:?}");
-        let state = Arc::clone(&target_timeout.state);
         let retry = target_timeout.times;
         let timeout = target_timeout.interval;
         let target = self.target.clone();
@@ -418,7 +468,7 @@ impl Target {
         let tenant_id = self.tenant.clone();
 
         let sleep_and_check_if_call =
-            move |timeout_state: Arc<Mutex<TimeoutState>>, current_state: AlertState| async move {
+            move |timeout_state: SharedTimeoutState, current_state: AlertState| async move {
                 tokio::time::sleep(Duration::from_secs(timeout * 60)).await;
 
                 let mut state = timeout_state.lock().unwrap();
@@ -649,20 +699,64 @@ impl CallableTarget for SlackWebHook {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PayloadFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OtherWebHook {
     endpoint: Url,
     #[serde(default)]
     headers: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_format: Option<PayloadFormat>,
     #[serde(default)]
     skip_tls_check: bool,
+}
+
+impl OtherWebHook {
+    fn webhook_request(
+        &self,
+        prepared: outbound_http_policy::PreparedAlertTarget,
+        payload: &Context,
+        message: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut headers = prepared.headers;
+        let request = prepared.client.post(self.endpoint.clone());
+        match self.payload_format.unwrap_or_default() {
+            PayloadFormat::Text => request.headers(headers).body(message.to_owned()),
+            PayloadFormat::Json => {
+                // reqwest's json() only sets Content-Type if it is absent.
+                headers.remove(http::header::CONTENT_TYPE);
+                let status = match payload.alert_info.alert_state {
+                    AlertState::Triggered => "firing",
+                    AlertState::NotTriggered => "resolved",
+                    AlertState::Disabled => "disabled",
+                };
+                request.headers(headers).json(&json!({
+                    "status": status,
+                    "alertId": payload.alert_info.alert_id,
+                    "alertName": payload.alert_info.alert_name,
+                    "severity": payload.alert_info.severity,
+                    "service": payload.service,
+                    "series": payload.series,
+                    "message": message,
+                }))
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl CallableTarget for OtherWebHook {
     async fn call(&self, tenant_id: &Option<String>, payload: &Context) {
-        let alert = match payload.alert_info.alert_state {
+        let message = match payload.alert_info.alert_state {
             AlertState::Triggered => payload.message.clone(),
             AlertState::NotTriggered => payload.default_resolved_string(),
             AlertState::Disabled => payload.default_disabled_string(),
@@ -685,11 +779,8 @@ impl CallableTarget for OtherWebHook {
                 return;
             }
         };
-        let request = prepared
-            .client
-            .post(self.endpoint.clone())
-            .headers(prepared.headers);
-        if let Err(e) = request.body(alert).send().await {
+        let request = self.webhook_request(prepared, payload, &message);
+        if let Err(e) = request.send().await {
             error!(
                 "Couldn't make call to webhook, error:{}",
                 safe_delivery_error(e)
@@ -821,7 +912,7 @@ pub struct NotificationConfig {
     #[serde(skip)]
     pub times: Retry,
     #[serde(skip)]
-    pub state: Arc<Mutex<TimeoutState>>,
+    target_states: Arc<Mutex<HashMap<Ulid, SharedTimeoutState>>>,
 }
 
 impl Default for NotificationConfig {
@@ -829,10 +920,12 @@ impl Default for NotificationConfig {
         Self {
             interval: 1,
             times: Retry::default(),
-            state: Arc::<Mutex<TimeoutState>>::default(),
+            target_states: Default::default(),
         }
     }
 }
+
+type SharedTimeoutState = Arc<Mutex<TimeoutState>>;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TimeoutState {
@@ -891,6 +984,7 @@ mod tests {
     fn webhook(endpoint: Url) -> TargetType {
         TargetType::Other(OtherWebHook {
             endpoint,
+            payload_format: None,
             headers: HashMap::from([("X-Api-Key".into(), "SECRET-HEADER-VALUE".into())]),
             skip_tls_check: false,
         })
@@ -1121,7 +1215,7 @@ mod tests {
             other.mask(),
             json!({
                 "name":"redaction-target","type":"webhook","endpoint":"http://********",
-                "headers":{"X-Api-Key":"********"},"skipTlsCheck":false,"id":id
+                "headers":{"X-Api-Key":"********"},"payloadFormat":"text","skipTlsCheck":false,"id":id
             })
         );
 
@@ -1250,7 +1344,7 @@ mod tests {
         let (port, server) = serve_once("500 Internal Server Error");
         let target = named(webhook(secret_url(&format!("127.0.0.1:{port}"))), &tenant);
         let status = target
-            .deliver_promql(&target.tenant, "message", &[])
+            .deliver_promql(&target.tenant, &context(), &[])
             .await
             .unwrap_err();
         let request = server.join().unwrap().to_ascii_lowercase();
@@ -1261,7 +1355,7 @@ mod tests {
         let port = refused_port();
         let target = named(webhook(secret_url(&format!("127.0.0.1:{port}"))), &tenant);
         let transport = target
-            .deliver_promql(&target.tenant, "message", &[])
+            .deliver_promql(&target.tenant, &context(), &[])
             .await
             .unwrap_err();
         assert!(transport.contains("error sending request"), "{transport}");
@@ -1282,7 +1376,7 @@ mod tests {
             &tenant,
         );
         let status = target
-            .deliver_promql(&target.tenant, "message", &alerts)
+            .deliver_promql(&target.tenant, &context(), &alerts)
             .await
             .unwrap_err();
         let request = server.join().unwrap().to_ascii_lowercase();
@@ -1323,7 +1417,7 @@ mod tests {
         );
         let denied = named(webhook(secret_url("secret-denied.example")), &tenant);
         let error = denied
-            .deliver_promql(&denied.tenant, "message", &[])
+            .deliver_promql(&denied.tenant, &context(), &[])
             .await
             .unwrap_err();
         assert_eq!(error, "Target domain is denied by outbound policy");
@@ -1338,7 +1432,7 @@ mod tests {
             &tenant,
         );
         let error = slack
-            .deliver_promql(&slack.tenant, "message", &[])
+            .deliver_promql(&slack.tenant, &context(), &[])
             .await
             .unwrap_err();
         assert_eq!(error, "Slack target host is invalid");
@@ -1346,7 +1440,7 @@ mod tests {
         // A public, non-allowlisted address may receive alerts but not credentials.
         let blocked = named(alertmanager(secret_url("203.0.113.10"), true), &tenant);
         let error = blocked
-            .deliver_promql(&blocked.tenant, "message", &[])
+            .deliver_promql(&blocked.tenant, &context(), &[])
             .await
             .unwrap_err();
         assert_eq!(error, "Target credentials blocked by outbound policy");

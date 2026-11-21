@@ -18,7 +18,8 @@
 
 use crate::{
     alerts::{
-        AlertConfig, AlertError, AlertQueryType, AlertState, AlertType, EvalConfig, Severity,
+        AlertConfig, AlertError, AlertNotification, AlertQueryType, AlertState, AlertType,
+        EvalConfig, Severity,
         alert_enums::NotificationState,
         alert_structs::{Context, ThresholdConfig},
     },
@@ -49,7 +50,7 @@ pub trait MessageCreation {
 
 #[async_trait]
 pub trait AlertTrait: Debug + Send + Sync + MetastoreObject {
-    async fn eval_alert(&self) -> Result<Option<String>, AlertError>;
+    async fn eval_alert(&self) -> Result<Option<AlertNotification>, AlertError>;
     async fn validate(&self, session_key: &SessionKey) -> Result<(), AlertError>;
     async fn update_notification_state(
         &mut self,
@@ -58,7 +59,7 @@ pub trait AlertTrait: Debug + Send + Sync + MetastoreObject {
     async fn update_state(
         &mut self,
         alert_state: AlertState,
-        trigger_notif: Option<String>,
+        trigger_notif: Option<AlertNotification>,
     ) -> Result<(), AlertError>;
     fn get_id(&self) -> &Ulid;
     fn get_severity(&self) -> &Severity;
@@ -98,7 +99,7 @@ pub trait AlertManagerTrait: Send + Sync {
         &self,
         alert_id: Ulid,
         new_state: AlertState,
-        trigger_notif: Option<String>,
+        trigger_notif: Option<AlertNotification>,
         tenant_id: &Option<String>,
     ) -> Result<(), AlertError>;
     async fn update_notification_state(

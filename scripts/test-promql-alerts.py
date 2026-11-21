@@ -122,6 +122,7 @@ class LocalWebhook:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen()
         self.port = self.sock.getsockname()[1]
+        self.headers = []
         self.messages = []
         self.statuses = []
         self.fail_next = 0
@@ -151,6 +152,9 @@ class LocalWebhook:
                             length = int(line.split(b":", 1)[1].strip())
                     while len(body) < length:
                         body += client.recv(4096)
+                    headers = {name.lower(): value.strip() for name, value in
+                               (line.split(b":", 1) for line in head.split(b"\r\n")[1:])}
+                    self.headers.append((headers.get(b"content-type"), headers.get(b"authorization")))
                     self.messages.append(body[:length].decode(errors="replace"))
                     status = 503 if self.fail_next else 204
                     if self.fail_next:
@@ -257,6 +261,8 @@ def main():
             target = {
                 "name": f"PromQL alert smoke {suffix}",
                 "type": "webhook",
+                "payloadFormat": "json",
+                "headers": {"Authorization": "Bearer local-fixture"},
                 "endpoint": f"http://127.0.0.1:{receiver.port}/notify",
             }
             status, raw = request(f"{API_PREFIX}/targets", method="POST", body=target)
@@ -380,8 +386,14 @@ def main():
             deadline = time.monotonic() + WAIT_SECONDS
             while time.monotonic() < deadline and len(receiver.messages) < 3:
                 time.sleep(0.1)
-            if not any("resolved" in message.lower() for message in receiver.messages):
-                fail(f"local webhook did not receive a recovery notification: {receiver.messages}")
+            events = [json.loads(message) for message in receiver.messages]
+            for transition in ("firing", "resolved"):
+                if not any(event["status"] == transition and event["alertId"] == alert_id
+                           and event["message"] and event["series"][0]["host"] == "host-a"
+                           for event in events):
+                    fail(f"missing {transition} JSON event for host-a")
+            if any(pair != (b"application/json", b"Bearer local-fixture") for pair in receiver.headers):
+                fail("incorrect JSON content type or fixture bearer header")
 
         # Create a second rule through a scoped writer so its scheduled identity
         # is that user, not the administrator running this smoke test.

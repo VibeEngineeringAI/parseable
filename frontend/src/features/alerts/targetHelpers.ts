@@ -17,6 +17,7 @@ export type TargetDraft = {
   name: string;
   type: AlertTargetType;
   endpoint: string;
+  payloadFormat: 'text' | 'json';
   skipTls: boolean;
   username: string;
   password: string;
@@ -27,6 +28,7 @@ export function targetDraft(target?: AlertTarget): TargetDraft {
     name: target?.name ?? '',
     type: target ? targetType(target) : 'webhook',
     endpoint: '',
+    payloadFormat: target?.payloadFormat ?? 'text',
     skipTls: target?.skipTlsCheck ?? false,
     // Credentials come back masked, so both start empty and must be re-entered together.
     username: '',
@@ -120,6 +122,7 @@ export function buildTargetPayload(draft: TargetDraft): AlertTargetRequest {
   return {
     ...base,
     type: 'webhook',
+    payloadFormat: draft.payloadFormat,
     skipTlsCheck: draft.skipTls,
     headers: Object.fromEntries(
       draft.headers
