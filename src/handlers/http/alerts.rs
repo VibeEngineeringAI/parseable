@@ -518,7 +518,12 @@ pub async fn disable_alert_internal(
     user_auth_for_alert_config(session_key, &alert.to_alert_config()).await?;
 
     alerts
-        .update_state(alert_id, AlertState::Disabled, Some("".into()), tenant_id)
+        .update_state(
+            alert_id,
+            AlertState::Disabled,
+            Some(Default::default()),
+            tenant_id,
+        )
         .await?;
     let alert = alerts.get_alert_by_id(alert_id, tenant_id).await?;
 
@@ -571,7 +576,7 @@ pub async fn enable_alert_internal(
         .update_state(
             alert_id,
             AlertState::NotTriggered,
-            Some("".into()),
+            Some(Default::default()),
             tenant_id,
         )
         .await?;

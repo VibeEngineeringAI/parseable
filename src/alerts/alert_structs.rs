@@ -69,6 +69,8 @@ const RESERVED_FIELDS: &[&str] = &[
     "notification_config",
     "created",
     "tags",
+    "lastBreachedSeries",
+    "last_breached_series",
     "lastTriggeredAt",
     "last_triggered_at",
 ];
@@ -88,10 +90,20 @@ pub struct Alerts {
     pub sender: mpsc::Sender<AlertTask>,
 }
 
+pub type SeriesLabels = HashMap<String, String>;
+
+#[derive(Debug, Clone, Default)]
+pub struct AlertNotification {
+    pub message: String,
+    pub series: Vec<SeriesLabels>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Context {
     pub alert_info: AlertInfo,
     pub deployment_info: DeploymentInfo,
+    pub service: Option<String>,
+    pub series: Vec<SeriesLabels>,
     pub message: String,
     pub notification_config: NotificationConfig,
 }
@@ -106,6 +118,8 @@ impl Context {
         Self {
             alert_info,
             deployment_info,
+            service: None,
+            series: Vec::new(),
             message,
             notification_config,
         }
@@ -403,6 +417,7 @@ impl AlertRequest {
             notification_config: self.notification_config,
             created: created_timestamp,
             tags: self.tags,
+            last_breached_series: Vec::new(),
             last_triggered_at: None,
             other_fields,
             tenant_id,
@@ -435,6 +450,8 @@ pub struct AlertConfig {
     pub notification_config: NotificationConfig,
     pub created: DateTime<Utc>,
     pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_breached_series: Vec<SeriesLabels>,
     pub last_triggered_at: Option<DateTime<Utc>>,
     #[serde(flatten)]
     pub other_fields: Option<serde_json::Map<String, Value>>,

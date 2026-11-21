@@ -503,6 +503,19 @@ describe('target forms', () => {
       password: 'Enter the real password, not the mask.',
     });
   });
+  it('defaults webhooks to text and preserves an edited JSON selection', () => {
+    expect(targetDraft().payloadFormat).toBe('text');
+    const form = targetDraft({
+      id: 't',
+      name: 'automation',
+      type: 'webhook',
+      endpoint: '',
+      payloadFormat: 'json',
+    });
+    expect(buildTargetPayload(form)).toHaveProperty('payloadFormat', 'json');
+    form.payloadFormat = 'text';
+    expect(buildTargetPayload(form)).toHaveProperty('payloadFormat', 'text');
+  });
   it('omits TLS and auth fields for Slack', () => {
     const form = {
       ...targetDraft(),

@@ -48,6 +48,7 @@ pub async fn post_internal(
     tenant_id: &Option<String>,
 ) -> Result<serde_json::Value, AlertError> {
     target.tenant.clone_from(tenant_id);
+    target.apply_webhook_format(None)?;
     target.validate_outbound_policy().await?;
     // should check for duplicacy and liveness (??)
     // add to the map
@@ -153,6 +154,7 @@ pub async fn update(
     // esnure that the supplied target id is assigned to the target config
     target.id = target_id;
     target.tenant = tenant_id;
+    target.apply_webhook_format(Some(&old_target))?;
     target.validate_outbound_policy().await?;
     // should check for duplicacy and liveness (??)
     // add to the map
@@ -187,6 +189,8 @@ mod tests {
         let denied_domain = "sensitive.internal.example";
         let target: Target = serde_json::from_value(json!({
             "name": "sensitive-target",
+            "payloadFormat": "json",
+            "headers": {"Authorization": "Bearer fixture"},
             "type": "webhook",
             "endpoint": format!("https://{denied_domain}/hook"),
             "tenantId": tenant
@@ -221,6 +225,11 @@ mod tests {
         assert_eq!(
             response[0]["error"],
             "Target domain is denied by outbound policy"
+        );
+        assert_eq!(response[0]["target"]["payloadFormat"], "json");
+        assert_eq!(
+            response[0]["target"]["headers"]["Authorization"],
+            "********"
         );
         assert!(!response.to_string().contains(denied_domain));
     }
@@ -346,6 +355,22 @@ mod tests {
             "203.0.113.10",
         ] {
             assert!(!text.contains(secret), "{secret} leaked in: {text}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn create_rejects_invalid_or_conflicting_webhook_formats() {
+        let app = test::init_service(App::new().route("/targets", web::post().to(post))).await;
+        for (field, control) in [("xml", "json"), ("json", "text"), ("text", "invalid")] {
+            let request = test::TestRequest::post()
+                .uri("/targets")
+                .set_json(json!({
+                    "type": "webhook", "name": "fixture", "endpoint": "http://127.0.0.1",
+                    "payloadFormat": field, "headers": {"X-Parseable-Payload-Format": control}
+                }))
+                .to_request();
+            let response = test::call_service(&app, request).await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
         }
     }
 }

@@ -44,7 +44,7 @@ use crate::{
     utils::time::TimeRange,
 };
 
-use super::{ALERTS, AlertError, AlertOperator, AlertState};
+use super::{ALERTS, AlertError, AlertNotification, AlertOperator, AlertState};
 
 /// accept the alert
 ///
@@ -71,9 +71,9 @@ pub async fn evaluate_alert(alert: &dyn AlertTrait) -> Result<(), AlertError> {
     if alert.get_query_type() == super::AlertQueryType::Promql {
         return super::promql_alerts::evaluate(*alert.get_id(), alert.get_tenant_id()).await;
     }
-    let message = alert.eval_alert().await?;
+    let notification = alert.eval_alert().await?;
 
-    update_alert_state(alert, message).await
+    update_alert_state(alert, notification).await
 }
 
 /// Extract time range from alert evaluation configuration
@@ -260,7 +260,7 @@ pub fn evaluate_condition(operator: &AlertOperator, actual: f64, expected: f64) 
 
 async fn update_alert_state(
     alert: &dyn AlertTrait,
-    message: Option<String>,
+    notification: Option<AlertNotification>,
 ) -> Result<(), AlertError> {
     // Get the alert manager reference while holding the lock briefly
     let alerts = {
@@ -273,12 +273,12 @@ async fn update_alert_state(
     };
 
     // Now perform the state update
-    if let Some(msg) = message {
+    if let Some(event) = notification {
         alerts
             .update_state(
                 *alert.get_id(),
                 AlertState::Triggered,
-                Some(msg),
+                Some(event),
                 alert.get_tenant_id(),
             )
             .await
@@ -291,7 +291,7 @@ async fn update_alert_state(
             .update_state(
                 *alert.get_id(),
                 AlertState::NotTriggered,
-                Some("".into()),
+                Some(Default::default()),
                 alert.get_tenant_id(),
             )
             .await

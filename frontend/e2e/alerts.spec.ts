@@ -488,6 +488,8 @@ test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the
   await status.evaluate((element) => element.setAttribute('data-live-region', 'existing'));
   await page.getByRole('button', { name: 'New target', exact: true }).click();
   let sheet = page.getByRole('dialog', { name: 'New target', exact: true });
+  await expect(sheet.getByLabel('Payload format')).toHaveValue('text');
+  await sheet.getByLabel('Payload format').selectOption('json');
   await sheet.getByLabel('Target name').fill('Test hook');
   await sheet.getByLabel('Endpoint URL').fill('https://example.com/secret-token');
   await sheet.getByRole('button', { name: 'Add header' }).click();
@@ -504,6 +506,7 @@ test('target CRUD masks secrets, requires endpoint re-entry and keeps 409 in the
   await rowAction(page, 'Test hook', 'Edit');
   sheet = page.getByRole('dialog', { name: 'Edit target', exact: true });
   await expect(sheet.getByLabel('Endpoint URL')).toHaveValue('');
+  await expect(sheet.getByLabel('Payload format')).toHaveValue('json');
   await expect(sheet.getByLabel('Header 1 value')).toHaveValue('');
   await expect(sheet.getByLabel('Target name')).toHaveAttribute('readonly', '');
   await expect(

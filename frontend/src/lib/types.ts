@@ -335,6 +335,7 @@ export type AlertTargetRequest =
       name: string;
       type: 'webhook';
       endpoint: string;
+      payloadFormat?: 'text' | 'json';
       headers?: Record<string, string>;
       skipTlsCheck: boolean;
     }
@@ -352,6 +353,7 @@ export type AlertTarget = {
   name: string;
   type: AlertTargetType;
   endpoint: string;
+  payloadFormat?: 'text' | 'json';
   headers?: Record<string, string>;
   skipTlsCheck?: boolean;
   username?: string | null;

@@ -88,6 +88,8 @@ describe('alerts response contracts', () => {
     expect(alertTargetStatus(targetFixture)).toBe(false);
     expect(alertTargetStatus({ target: targetFixture, enabled: 'true' })).toBe(false);
     expect(alertTarget({ ...targetFixture, headers: { token: 123 } })).toBe(false);
+    expect(alertTarget({ ...targetFixture, payloadFormat: 'json' })).toBe(true);
+    expect(alertTarget({ ...targetFixture, payloadFormat: 'xml' })).toBe(false);
     expect(alertTarget({ ...targetFixture, skipTlsCheck: 'true' })).toBe(false);
   });
 });

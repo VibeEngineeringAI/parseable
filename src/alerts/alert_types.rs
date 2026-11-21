@@ -27,10 +27,10 @@ use ulid::Ulid;
 
 use crate::{
     alerts::{
-        AlertConfig, AlertError, AlertQueryType, AlertState, AlertType, AlertVersion, EvalConfig,
-        Severity, ThresholdConfig,
+        AlertConfig, AlertError, AlertNotification, AlertQueryType, AlertState, AlertType,
+        AlertVersion, EvalConfig, Severity, ThresholdConfig,
         alert_enums::NotificationState,
-        alert_structs::{AlertStateEntry, GroupResult},
+        alert_structs::{AlertQueryResult, AlertStateEntry, GroupResult, SeriesLabels},
         alert_traits::{AlertTrait, MessageCreation},
         alerts_utils::{evaluate_condition, execute_alert_query, extract_time_range},
         get_number_of_agg_exprs,
@@ -72,6 +72,8 @@ pub struct ThresholdAlert {
     pub created: DateTime<Utc>,
     pub tags: Option<Vec<String>>,
     pub datasets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_breached_series: Vec<SeriesLabels>,
     pub last_triggered_at: Option<DateTime<Utc>>,
     #[serde(flatten)]
     pub other_fields: Option<serde_json::Map<String, Value>>,
@@ -90,7 +92,7 @@ impl MetastoreObject for ThresholdAlert {
 
 #[async_trait]
 impl AlertTrait for ThresholdAlert {
-    async fn eval_alert(&self) -> Result<Option<String>, AlertError> {
+    async fn eval_alert(&self) -> Result<Option<AlertNotification>, AlertError> {
         self.validate_oss_query_type()?;
         if self.query_type == AlertQueryType::Promql {
             super::promql_alerts::authorize_execution(&self.to_alert_config())
@@ -111,7 +113,12 @@ impl AlertTrait for ThresholdAlert {
                         self.threshold_config.value,
                     )
                 })
-                .map(|(_, value)| self.create_threshold_message(value))
+                .map(|(labels, value)| {
+                    Ok(AlertNotification {
+                        message: self.create_threshold_message(value)?,
+                        series: vec![labels.into_iter().collect()],
+                    })
+                })
                 .transpose();
         }
 
@@ -142,44 +149,7 @@ impl AlertTrait for ThresholdAlert {
         let query_result =
             execute_alert_query(auth, self.get_query(), &time_range, &self.tenant_id).await?;
 
-        if query_result.is_simple_query {
-            // Handle simple queries
-            let final_value = query_result.get_single_value();
-            let result = evaluate_condition(
-                &self.threshold_config.operator,
-                final_value,
-                self.threshold_config.value,
-            );
-
-            let message = if result {
-                Some(self.create_threshold_message(final_value)?)
-            } else {
-                None
-            };
-            Ok(message)
-        } else {
-            // Handle GROUP BY queries - evaluate each group
-            let mut breached_groups = Vec::new();
-
-            for group in &query_result.groups {
-                let result = evaluate_condition(
-                    &self.threshold_config.operator,
-                    group.aggregate_value,
-                    self.threshold_config.value,
-                );
-
-                if result {
-                    breached_groups.push(group.clone());
-                }
-            }
-
-            let message = if !breached_groups.is_empty() {
-                Some(self.create_group_message(&breached_groups)?)
-            } else {
-                None
-            };
-            Ok(message)
-        }
+        self.threshold_notification(query_result)
     }
 
     async fn validate(&self, session_key: &SessionKey) -> Result<(), AlertError> {
@@ -280,11 +250,12 @@ impl AlertTrait for ThresholdAlert {
     async fn update_state(
         &mut self,
         new_state: AlertState,
-        trigger_notif: Option<String>,
+        mut trigger_notif: Option<AlertNotification>,
     ) -> Result<(), AlertError> {
         if self.query_type == AlertQueryType::Promql && new_state == AlertState::Disabled {
             super::promql_alerts::reset_runtime_for_disable(&mut self.other_fields);
         }
+        self.update_breached_series(new_state, trigger_notif.as_mut());
         if self.state.eq(&AlertState::Disabled) {
             warn!(
                 "Alert- {} is currently Disabled. Updating state to {new_state}.",
@@ -505,6 +476,7 @@ impl From<AlertConfig> for ThresholdAlert {
             created: value.created,
             tags: value.tags,
             datasets: value.datasets,
+            last_breached_series: value.last_breached_series,
             last_triggered_at: value.last_triggered_at,
             other_fields: value.other_fields,
             tenant_id: value.tenant_id,
@@ -531,6 +503,7 @@ impl From<ThresholdAlert> for AlertConfig {
             created: val.created,
             tags: val.tags,
             datasets: val.datasets,
+            last_breached_series: val.last_breached_series,
             last_triggered_at: val.last_triggered_at,
             other_fields: val.other_fields,
             tenant_id: val.tenant_id,
@@ -552,6 +525,65 @@ impl ThresholdAlert {
         }
 
         Ok(())
+    }
+
+    fn update_breached_series(
+        &mut self,
+        state: AlertState,
+        notification: Option<&mut AlertNotification>,
+    ) {
+        match (state, notification) {
+            (AlertState::Triggered, Some(event)) => {
+                self.last_breached_series.clone_from(&event.series)
+            }
+            (AlertState::NotTriggered, Some(event)) => {
+                event.series = std::mem::take(&mut self.last_breached_series)
+            }
+            (AlertState::Disabled | AlertState::NotTriggered, _) => {
+                self.last_breached_series.clear()
+            }
+            _ => {}
+        }
+    }
+
+    fn threshold_notification(
+        &self,
+        query_result: AlertQueryResult,
+    ) -> Result<Option<AlertNotification>, AlertError> {
+        let breaches = |value| {
+            evaluate_condition(
+                &self.threshold_config.operator,
+                value,
+                self.threshold_config.value,
+            )
+        };
+        if query_result.is_simple_query {
+            let value = query_result.get_single_value();
+            if breaches(value) {
+                return Ok(Some(AlertNotification {
+                    message: self.create_threshold_message(value)?,
+                    series: Vec::new(),
+                }));
+            }
+            return Ok(None);
+        }
+
+        let breached_groups: Vec<_> = query_result
+            .groups
+            .into_iter()
+            .filter(|group| breaches(group.aggregate_value))
+            .collect();
+        if breached_groups.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(AlertNotification {
+            message: self.create_group_message(&breached_groups)?,
+            series: breached_groups
+                .into_iter()
+                .map(|group| group.group_values)
+                .collect(),
+        }))
     }
 
     fn create_group_message(&self, breached_groups: &[GroupResult]) -> Result<String, AlertError> {
@@ -584,5 +616,50 @@ impl ThresholdAlert {
         message.push_str(&format!("\nQuery:\n{}", self.get_query()));
 
         Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn grouped_recovery_carries_the_last_breached_labels_across_reload() {
+        let legacy: AlertConfig = serde_json::from_value(json!({
+            "version": "v2", "severity": "high", "title": "Errors",
+            "query": "SELECT service, COUNT(*) AS errors FROM logs GROUP BY service",
+            "alertType": "threshold", "thresholdConfig": {"operator": ">", "value": 5},
+            "evalConfig": {"rollingWindow": {"evalStart": "5m", "evalEnd": "now", "evalFrequency": 1}},
+            "targets": [], "notificationConfig": {"interval": 1}, "notificationState": "notify",
+            "created": "2026-01-01T00:00:00Z", "datasets": ["logs"]
+        })).unwrap();
+        let mut alert = ThresholdAlert::from(legacy);
+        let labels = SeriesLabels::from([("service".into(), "checkout".into())]);
+        let result = AlertQueryResult {
+            is_simple_query: false,
+            groups: vec![
+                GroupResult {
+                    group_values: labels.clone(),
+                    aggregate_value: 7.0,
+                },
+                GroupResult {
+                    group_values: SeriesLabels::from([("service".into(), "search".into())]),
+                    aggregate_value: 1.0,
+                },
+            ],
+        };
+        let mut fired = alert.threshold_notification(result).unwrap().unwrap();
+        assert_eq!(fired.series, vec![labels.clone()]);
+        assert!(fired.message.contains("service: checkout"));
+        alert.update_breached_series(AlertState::Triggered, Some(&mut fired));
+
+        let stored = serde_json::to_vec(&alert.to_alert_config()).unwrap();
+        let mut loaded =
+            ThresholdAlert::from(serde_json::from_slice::<AlertConfig>(&stored).unwrap());
+        let mut resolved = AlertNotification::default();
+        loaded.update_breached_series(AlertState::NotTriggered, Some(&mut resolved));
+        assert_eq!(resolved.series, vec![labels]);
+        assert!(loaded.last_breached_series.is_empty());
     }
 }

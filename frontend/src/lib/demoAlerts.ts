@@ -179,7 +179,7 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
       if ((sql.match(/\bselect\b/gi) ?? []).length > 1) fail('Subquery not allowed');
     }
   }
-  function mask(body: AlertTargetRequest, id: string): AlertTarget {
+  function mask(body: AlertTargetRequest, id: string, previous?: AlertTarget): AlertTarget {
     const endpoint = `${new URL(body.endpoint).protocol}//********`;
     if (body.type === 'slack') return { id, name: body.name, type: 'slack', endpoint };
     if (body.type === 'alertManager')
@@ -198,6 +198,7 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
       name: body.name,
       type: 'webhook',
       endpoint,
+      payloadFormat: body.payloadFormat ?? previous?.payloadFormat ?? 'text',
       headers: Object.fromEntries(Object.keys(body.headers ?? {}).map((key) => [key, '********'])),
       skipTlsCheck: body.skipTlsCheck,
     };
@@ -359,7 +360,7 @@ export function createDemoAlerts(now = Date.now()): Pick<ParseableClient, Method
       const previous = getTarget(id);
       if (body.name !== previous.target.name) fail("Can't modify target name");
       validateTargetBody(body);
-      previous.target = mask(body, id);
+      previous.target = mask(body, id, previous.target);
       previous.enabled = true;
       delete previous.error;
       return clone(previous.target);

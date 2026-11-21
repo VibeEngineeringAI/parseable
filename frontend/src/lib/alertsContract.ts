@@ -120,6 +120,7 @@ export function alertTarget(value: unknown): value is AlertTarget {
     object(value) &&
     ['id', 'name', 'endpoint'].every((key) => typeof value[key] === 'string') &&
     oneOf(value.type, ['slack', 'webhook', 'alertManager']) &&
+    (value.payloadFormat === undefined || oneOf(value.payloadFormat, ['text', 'json'])) &&
     (value.headers === undefined || labels(value.headers)) &&
     (value.skipTlsCheck === undefined || typeof value.skipTlsCheck === 'boolean') &&
     (value.username === undefined || nullableString(value.username)) &&

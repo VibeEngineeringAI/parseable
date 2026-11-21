@@ -128,6 +128,19 @@ export function TargetSheet({
           onChange={(event) => update('endpoint', event.target.value)}
         />
         {draft.type === 'webhook' && (
+          <Select
+            label="Payload format"
+            value={draft.payloadFormat}
+            disabled={mutation.pending}
+            onChange={(event) =>
+              update('payloadFormat', event.target.value as TargetDraft['payloadFormat'])
+            }
+          >
+            <option value="text">Plain text</option>
+            <option value="json">JSON</option>
+          </Select>
+        )}
+        {draft.type === 'webhook' && (
           <fieldset
             className="alerts-fieldset"
             aria-describedby={errors.headers ? headersError : undefined}

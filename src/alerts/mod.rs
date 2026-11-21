@@ -45,15 +45,17 @@ pub mod alerts_utils;
 pub mod outbound_http_policy;
 pub mod promql_alerts;
 pub mod target;
+#[cfg(test)]
+mod webhook_tests;
 
 pub use crate::alerts::alert_enums::{
     AggregateFunction, AlertOperator, AlertQueryType, AlertState, AlertTask, AlertType,
     AlertVersion, EvalConfig, LogicalOperator, NotificationState, Severity, WhereConfigOperator,
 };
 pub use crate::alerts::alert_structs::{
-    AlertConfig, AlertInfo, AlertRequest, AlertStateEntry, Alerts, AlertsInfo, AlertsInfoByState,
-    AlertsSummary, BasicAlertFields, Context, DeploymentInfo, RollingWindow, StateTransition,
-    ThresholdConfig,
+    AlertConfig, AlertInfo, AlertNotification, AlertRequest, AlertStateEntry, Alerts, AlertsInfo,
+    AlertsInfoByState, AlertsSummary, BasicAlertFields, Context, DeploymentInfo, RollingWindow,
+    StateTransition, ThresholdConfig,
 };
 use crate::alerts::alert_traits::{AlertManagerTrait, AlertTrait};
 use crate::alerts::alert_types::ThresholdAlert;
@@ -243,6 +245,7 @@ impl AlertConfig {
             notification_config: NotificationConfig::default(),
             created: Utc::now(),
             tags: None,
+            last_breached_series: Vec::new(),
             last_triggered_at: None,
             other_fields: None,
             tenant_id: tenant_id.clone(),
@@ -698,7 +701,7 @@ impl AlertConfig {
         }
     }
 
-    fn get_context(&self) -> Context {
+    fn get_context(&self, notification: AlertNotification) -> Context {
         let deployment_instance = format!(
             "{}://{}",
             PARSEABLE.options.get_scheme(),
@@ -707,24 +710,36 @@ impl AlertConfig {
         let deployment_id = storage::StorageMetadata::global().deployment_id;
         let deployment_mode = storage::StorageMetadata::global().mode.to_string();
 
-        Context::new(
-            AlertInfo::new(
+        Context {
+            alert_info: AlertInfo::new(
                 self.id,
                 self.title.clone(),
                 self.state,
                 alert_enums::NotificationState::Notify,
                 self.severity.clone().to_string(),
             ),
-            DeploymentInfo::new(deployment_instance, deployment_id, deployment_mode),
-            self.notification_config.clone(),
-            String::default(),
-        )
+            deployment_info: DeploymentInfo::new(
+                deployment_instance,
+                deployment_id,
+                deployment_mode,
+            ),
+            notification_config: self.notification_config.clone(),
+            message: notification.message,
+            series: notification.series,
+            service: self
+                .other_fields
+                .as_ref()
+                .and_then(|fields| fields.get("service"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned),
+        }
     }
 
-    pub async fn trigger_notifications(&self, message: String) -> Result<(), AlertError> {
-        let mut context = self.get_context();
-        context.message.clone_from(&message);
-
+    pub async fn trigger_notifications(
+        &self,
+        notification: AlertNotification,
+    ) -> Result<(), AlertError> {
+        let context = self.get_context(notification);
         for target_id in &self.targets {
             let target = TARGETS.get_target_by_id(target_id, &self.tenant_id).await?;
             if let Err(e) = target.validate_outbound_policy().await {
@@ -1513,7 +1528,7 @@ impl AlertManagerTrait for Alerts {
         &self,
         alert_id: Ulid,
         new_state: AlertState,
-        trigger_notif: Option<String>,
+        trigger_notif: Option<AlertNotification>,
         tenant_id: &Option<String>,
     ) -> Result<(), AlertError> {
         let (mut alert, should_delete_task, should_create_task) = {
