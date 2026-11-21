@@ -626,7 +626,7 @@ pub async fn evaluate(id: Ulid, tenant_id: &Option<String>) -> Result<(), AlertE
             .map(|instance| {
                 alertmanager_alert(
                     &updated.title,
-                    &deployment,
+                    &context.deployment_info,
                     &instance.labels,
                     instance_message(&updated, &instance.labels, instance.value, true),
                     valid_until,
